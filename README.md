@@ -112,11 +112,46 @@ an exception-return bug (instruction-abort ELR pointing at the wrong PC).
 - **Remaining work**: a small tail of Advanced-SIMD opcodes is still grown on
   demand (the kernel/musl exercise more NEON than the firmware); a subtle
   correctness issue can surface deep in a complex init script. Interpreter
-  **performance** is ~40 MIPS, so a full distro boot is slow — a decoded-
-  instruction cache (still not a JIT) would speed it up. **virtio-blk** (for a
-  disk-backed rootfs) is future work; today the rootfs is the fw_cfg initramfs.
+  **performance** is ~40 MIPS, so a full distro boot is slow (see *Performance
+  notes* below for why a decoded-instruction cache did **not** help). **virtio-blk**
+  (for a disk-backed rootfs) is future work; today the rootfs is the fw_cfg
+  initramfs.
 
 These are incremental extensions along the path already established. The hard
 parts — a correct CPU/MMU/exception core, the device model, the CFI flash and
 firmware↔platform contract (DTB, fw_cfg, PSCI), and the full firmware→kernel→
 userspace hand-off — are done and validated against QEMU.
+
+## Performance notes
+
+The interpreter runs at **~40 MIPS** (firmware boot prefix, `-O2`, single core).
+A pure interpreter spends its time on the per-instruction work itself — fetch,
+operand extraction, the ALU/memory operation — not on classifying the opcode.
+
+### Decoded-instruction cache — evaluated, not adopted
+
+A **decoded-instruction cache** (the classic "memoize the decode" interpreter
+optimization, *not* a JIT) was implemented and benchmarked, then reverted. It was
+a direct-mapped table keyed by PC that cached the resolved group-handler function
+pointer for each instruction word, re-validated against the live word on every
+hit (so it stayed correct for self-modifying / decompressed code with no flush).
+
+It was **correct** — full CPU state stayed byte-for-byte identical to the plain
+interpreter over 50M firmware instructions, at a ~99.99% hit rate — but it **did
+not improve throughput; it was ~5–6% slower**. Findings, kept here so the
+experiment isn't blindly repeated:
+
+- This decode tree is **shallow and branch-predictable** (a 4-bit top-level
+  `switch`, then short per-group chains). The classification a cache hit skips is
+  only a handful of correctly-predicted branches — cheaper than what the cache
+  adds: an **indirect call** through the cached pointer (mispredicts) plus the
+  **data-cache pressure** of a ~1 MB table.
+- At ~90 cycles/instruction the hot loop is extremely sensitive: merely *defining*
+  the function-pointer classifier inside `decode.c` (taking the handlers'
+  addresses) perturbed that translation unit's codegen by ~6%, even when the cache
+  was disabled.
+- The real lever for a pure interpreter is **operand pre-decode** — caching a
+  fully decoded form (opcode id + pre-extracted operands) dispatched via a dense
+  `switch`, so a hit skips operand extraction too, not just classification. That,
+  or accepting the current speed, is the path forward; a function-pointer decode
+  cache is not.
