@@ -628,11 +628,69 @@ static void ldst_vector_multi(CPU *c, u32 insn) {
     if (post) set_xsp(c, Rn, base + ((Rm == 31) ? total : reg_x(c, Rm)));
 }
 
+/* AdvSIMD load/store single structure: LD1/2/3/4 and ST1/2/3/4 to/from a single
+ * lane, plus LD1R/2R/3R/4R (load one element and replicate it across all lanes).
+ * Single-lane loads leave the other lanes of the destination unchanged. Used by
+ * memset/strlen-class routines and struct-of-arrays NEON code. Post-indexed
+ * form supported. */
+static void ldst_vector_single(CPU *c, u32 insn) {
+    unsigned Q = BIT(30), post = BIT(23), L = BIT(22), R = BIT(21);
+    unsigned Rm = BITS(20, 16), opcode = BITS(15, 13), S = BIT(12);
+    unsigned size = BITS(11, 10), Rn = BITS(9, 5), Rt = BITS(4, 0);
+
+    unsigned scale = opcode >> 1;                       /* opcode<2:1> */
+    unsigned selem = (((opcode & 1) << 1) | R) + 1;    /* 1..4 registers */
+    bool replicate = false;
+    unsigned index = 0, ebytes = 0;
+
+    switch (scale) {
+        case 0: ebytes = 1; index = (Q << 3) | (S << 2) | size; break;       /* B */
+        case 1:
+            if (size & 1) { undefined(c, insn); return; }
+            ebytes = 2; index = (Q << 2) | (S << 1) | (size >> 1); break;     /* H */
+        case 2:
+            if (size & 2) { undefined(c, insn); return; }
+            if ((size & 1) == 0) { ebytes = 4; index = (Q << 1) | S; }        /* S */
+            else { if (S) { undefined(c, insn); return; } ebytes = 8; index = Q; } /* D */
+            break;
+        default:                                          /* scale == 3: replicate */
+            if (!L || S) { undefined(c, insn); return; }
+            replicate = true; ebytes = 1u << size; break;
+    }
+
+    u64 base = reg_xsp(c, Rn), addr = base;
+    unsigned total = selem * ebytes;
+
+    for (unsigned r = 0; r < selem; r++) {
+        unsigned vt = (Rt + r) & 31;
+        u64 elem = 0;
+        if (replicate) {
+            if (!mem_read(c, addr, ebytes, &elem)) return;
+            V128 v; v.d[0] = v.d[1] = 0;
+            unsigned lanes = (Q ? 16 : 8) / ebytes;
+            for (unsigned i = 0; i < lanes; i++) memcpy(&v.b[i * ebytes], &elem, ebytes);
+            c->v[vt] = v;
+        } else if (L) {                                   /* load one lane, rest unchanged */
+            if (!mem_read(c, addr, ebytes, &elem)) return;
+            memcpy(&c->v[vt].b[index * ebytes], &elem, ebytes);
+        } else {                                          /* store one lane */
+            memcpy(&elem, &c->v[vt].b[index * ebytes], ebytes);
+            if (!mem_write(c, addr, ebytes, elem)) return;
+        }
+        addr += ebytes;
+    }
+
+    if (post) set_xsp(c, Rn, base + ((Rm == 31) ? total : reg_x(c, Rm)));
+}
+
 static void loads_stores(CPU *c, u32 insn) {
     unsigned b2927 = BITS(29, 27);
     if (b2927 == 0x1 && BITS(26, 24) == 0) { ldst_exclusive(c, insn); return; }
     if (b2927 == 0x1 && BIT(26) == 1 && BIT(25) == 0 && BIT(24) == 0) {
         ldst_vector_multi(c, insn); return;    /* AdvSIMD load/store multiple structures */
+    }
+    if (b2927 == 0x1 && BIT(26) == 1 && BIT(25) == 0 && BIT(24) == 1) {
+        ldst_vector_single(c, insn); return;   /* AdvSIMD load/store single structure */
     }
     if (b2927 == 0x3 && BITS(25, 24) == 0) { ldst_literal(c, insn); return; }
     if (b2927 == 0x5) { ldst_pair(c, insn); return; }
