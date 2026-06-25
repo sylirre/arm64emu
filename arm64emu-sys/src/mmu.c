@@ -4,6 +4,8 @@
 #include "machine.h"
 #include "esr.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ---------- software TLB (single CPU) ---------- */
 #define TLB_ENTRIES 4096
@@ -145,6 +147,15 @@ bool mmu_translate(CPU *c, u64 va, AccType acc, u64 *pa_out) {
 
 /* ---------- typed accesses ---------- */
 bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
+    u64 off = va & 0xfffULL;
+    if (off + size > 0x1000 && (c->sctlr[1] & 1)) {       /* spans two pages */
+        unsigned first = 0x1000u - (unsigned)off;
+        u64 lo = 0, hi = 0;
+        if (!mem_read(c, va, first, &lo)) return false;
+        if (!mem_read(c, va + first, size - first, &hi)) return false;
+        *out = lo | (hi << (first * 8));
+        return true;
+    }
     u64 pa;
     if (!mmu_translate(c, va, ACC_READ, &pa)) return false;
     u64 v = phys_read(c->m, pa, size);
@@ -154,11 +165,39 @@ bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
 }
 
 bool mem_write(CPU *c, u64 va, unsigned size, u64 val) {
+    if (g_vawatch && va < g_vawatch + 8 && va + size > g_vawatch) {
+        static int vn = 0;
+        if (vn++ < 400) {
+            fprintf(stderr, "[vaw] W va=0x%llx size=%u val=0x%llx pc=0x%llx el=%u icount=%llu\n",
+                    (unsigned long long)va, size, (unsigned long long)val,
+                    (unsigned long long)c->cur_insn_pc, c->el, (unsigned long long)c->icount);
+            heaptrack_query(c, va);
+            if (c->el == 0) ring_dump();   /* EL0 writes are the suspect ash overrun */
+        }
+    }
+    u64 off = va & 0xfffULL;
+    if (off + size > 0x1000 && (c->sctlr[1] & 1)) {       /* spans two pages */
+        unsigned first = 0x1000u - (unsigned)off;
+        if (!mem_write(c, va, first, val)) return false;
+        if (!mem_write(c, va + first, size - first, val >> (first * 8))) return false;
+        return true;
+    }
     u64 pa;
     if (!mmu_translate(c, va, ACC_WRITE, &pa)) return false;
     phys_write(c->m, pa, size, val);
     if (c->m->last_bus_status != BUS_OK) return raise_abort(c, va, ACC_WRITE, FSC_EXTERNAL);
     return true;
+}
+
+/* Non-faulting translate+read for diagnostics: returns false if the VA does not
+ * translate (instead of raising an abort). Ignores permissions. */
+bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out) {
+    if ((c->sctlr[1] & 1) == 0) { *out = phys_read(c->m, va, size);
+        return c->m->last_bus_status == BUS_OK; }
+    u64 pa_page; u8 ap, uxn, pxn;
+    if (walk(c, va, &pa_page, &ap, &uxn, &pxn)) return false;
+    *out = phys_read(c->m, pa_page | (va & 0xfff), size);
+    return c->m->last_bus_status == BUS_OK;
 }
 
 /* Return a host pointer to the start of a guest physical page if it is backed

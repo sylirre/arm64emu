@@ -16,6 +16,9 @@ bool mmu_translate(CPU *c, u64 va, AccType acc, u64 *pa_out);
 bool mem_read(CPU *c, u64 va, unsigned size, u64 *out);
 bool mem_write(CPU *c, u64 va, unsigned size, u64 val);
 
+/* Non-faulting translate+read for diagnostics (false if VA doesn't translate). */
+bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out);
+
 /* Instruction-fetch fast path. Caches the host base pointer of the current code
  * page so sequential fetches skip the TLB hash + bus dispatch. Only the page
  * *translation* is cached (a host base pointer), never decoded bytes — the
