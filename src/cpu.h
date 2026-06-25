@@ -171,6 +171,14 @@ extern int g_debug_hooks;  /* OR of all per-step debug facilities (perf guard) *
 extern int g_iabort_log;   /* env AEIABORT: log instruction aborts */
 extern int g_rtclock;      /* env AE_RTCLOCK: drive the generic timer from the host
                               clock instead of the deterministic instruction count */
+extern u64 g_vawatch;      /* env AEVAW: log writes whose range covers this VA */
+extern int g_systrace;     /* env AESYS: trace mm syscalls (mmap/brk/munmap/...) */
+void systrace_svc(CPU *c); /* record an in-flight mm syscall for return logging */
+extern int g_heaptrack;    /* env AEHEAP: musl malloc/free/realloc double-alloc finder */
+extern u64 g_heap_at;      /* env AEHEAP_AT: log every alloc/free touching this VA */
+void heaptrack_init(void); /* allocate the heap-tracker tables (call once at startup) */
+void heaptrack_report(void); /* print heap-tracker stats (call once at exit) */
+void heaptrack_query(CPU *c, u64 va); /* report which live block (if any) contains va */
 void cov_load(const char *path);  /* load QEMU coverage PC set (divergence finder) */
 
 #endif /* A64_CPU_H */

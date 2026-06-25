@@ -85,6 +85,10 @@ int main(int argc, char **argv) {
     if (getenv("AEWATCH")) g_watch = strtoull(getenv("AEWATCH"), 0, 0);
     if (getenv("AEIABORT")) g_iabort_log = atoi(getenv("AEIABORT"));
     if (getenv("AE_RTCLOCK")) g_rtclock = atoi(getenv("AE_RTCLOCK"));
+    if (getenv("AEVAW")) { g_vawatch = strtoull(getenv("AEVAW"), 0, 0); g_ring = 1; }
+    if (getenv("AESYS")) g_systrace = atoi(getenv("AESYS"));
+    if (getenv("AEHEAP")) { g_heaptrack = atoi(getenv("AEHEAP")); g_ring = 1; heaptrack_init(); }
+    if (getenv("AEHEAP_AT")) g_heap_at = strtoull(getenv("AEHEAP_AT"), 0, 0);
     if (getenv("AECOV")) { g_ring = 1; cov_load(getenv("AECOV")); }
     /* Any per-instruction debug facility routes through the single hot-path guard.
      * (g_ring is also set by AECOV, so the coverage finder is covered too.) */
@@ -127,8 +131,10 @@ int main(int argc, char **argv) {
     tty_raw_enable();
 
     unsigned long ticker = 0;
+    unsigned long tick_mask = 0x3ff;     /* AETICK: IRQ-poll granularity (debug) */
+    if (getenv("AETICK")) tick_mask = strtoul(getenv("AETICK"), 0, 0);
     for (;;) {
-        if (machine_tick && (++ticker & 0x3ff) == 0) machine_tick(&m);
+        if (machine_tick && (++ticker & tick_mask) == 0) machine_tick(&m);
         StepResult r = cpu_step(&m.cpu);
         if (r == STEP_HALT) break;
         if (m.cpu.halted) {
@@ -146,6 +152,7 @@ int main(int argc, char **argv) {
 
     tty_raw_disable();
     prof_dump();
+    if (g_heaptrack) heaptrack_report();
     machine_free(&m);
     return 0;
 }

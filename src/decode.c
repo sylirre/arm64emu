@@ -410,28 +410,35 @@ static u64 ldst_extended_offset(CPU *c, u32 insn, unsigned size) {
     return extend_reg(reg_x(c, Rm), option, shift);
 }
 
-static void do_load(CPU *c, unsigned Rt, u64 va, unsigned size, unsigned opc) {
+/* Returns false if the access faulted (an abort was raised); callers MUST then
+ * abort the instruction WITHOUT applying base-register writeback, because the
+ * faulting instruction is re-executed after the abort handler returns and a
+ * writeback applied here would be applied a second time (corrupting the base). */
+static bool do_load(CPU *c, unsigned Rt, u64 va, unsigned size, unsigned opc) {
     unsigned bytes = 1u << size;
-    if (opc == 2 && size == 3) return;   /* PRFM: no register write */
+    if (opc == 2 && size == 3) return true;   /* PRFM: no register write */
     u64 raw;
-    if (!mem_read(c, va, bytes, &raw)) return;
+    if (!mem_read(c, va, bytes, &raw)) return false;
     bool sign = (opc == 2) || (opc == 3);
     bool ext64 = (opc == 2) ? true : (opc == 3) ? false : (size == 3);
     u64 val = sign ? sign_extend(raw, bytes * 8) : raw;
     if (!ext64) val = (u32)val;
     set_x(c, Rt, val);
+    return true;
 }
 
-/* SIMD/FP register memory access of `bytes` (1,2,4,8,16); zero-extends loads. */
-static void vreg_load(CPU *c, unsigned Vt, u64 va, unsigned bytes) {
+/* SIMD/FP register memory access of `bytes` (1,2,4,8,16); zero-extends loads.
+ * Returns false on fault (see do_load on why writeback must then be skipped). */
+static bool vreg_load(CPU *c, unsigned Vt, u64 va, unsigned bytes) {
     V128 val; val.d[0] = 0; val.d[1] = 0;
-    if (bytes == 16) { if (!mem_read128(c, va, &val)) return; }
-    else { u64 t = 0; if (!mem_read(c, va, bytes, &t)) return; val.d[0] = t; }
+    if (bytes == 16) { if (!mem_read128(c, va, &val)) return false; }
+    else { u64 t = 0; if (!mem_read(c, va, bytes, &t)) return false; val.d[0] = t; }
     c->v[Vt] = val;
+    return true;
 }
-static void vreg_store(CPU *c, unsigned Vt, u64 va, unsigned bytes) {
-    if (bytes == 16) { mem_write128(c, va, &c->v[Vt]); }
-    else mem_write(c, va, bytes, c->v[Vt].d[0]);
+static bool vreg_store(CPU *c, unsigned Vt, u64 va, unsigned bytes) {
+    if (bytes == 16) return mem_write128(c, va, &c->v[Vt]);
+    return mem_write(c, va, bytes, c->v[Vt].d[0]);
 }
 
 static void ldst_register(CPU *c, u32 insn) {
@@ -469,8 +476,10 @@ static void ldst_register(CPU *c, u32 insn) {
         if (wb == 1) base = base + imm9;            /* post writeback value */
     }
 
-    if (V) { if (is_store) vreg_store(c, Rt, va, bytes); else vreg_load(c, Rt, va, bytes); }
-    else   { if (is_store) mem_write(c, va, bytes, reg_x(c, Rt)); else do_load(c, Rt, va, size, opc); }
+    bool ok;
+    if (V) ok = is_store ? vreg_store(c, Rt, va, bytes) : vreg_load(c, Rt, va, bytes);
+    else   ok = is_store ? mem_write(c, va, bytes, reg_x(c, Rt)) : do_load(c, Rt, va, size, opc);
+    if (!ok) return;   /* faulted: do NOT write back the base (instruction re-executes) */
 
     if (wb == 1) set_xsp(c, Rn, base);
     else if (wb == 2) set_xsp(c, Rn, va);
@@ -500,8 +509,9 @@ static void ldst_pair(CPU *c, u32 insn) {
         default: undefined(c, insn); return;
     }
     if (V) {
-        if (L) { vreg_load(c, Rt, addr, esz); vreg_load(c, Rt2, addr + esz, esz); }
-        else { vreg_store(c, Rt, addr, esz); vreg_store(c, Rt2, addr + esz, esz); }
+        bool ok = L ? (vreg_load(c, Rt, addr, esz) && vreg_load(c, Rt2, addr + esz, esz))
+                    : (vreg_store(c, Rt, addr, esz) && vreg_store(c, Rt2, addr + esz, esz));
+        if (!ok) return;   /* faulted: skip writeback (instruction re-executes) */
     } else if (L) {
         u64 a, b;
         if (!mem_read(c, addr, esz, &a)) return;
@@ -734,6 +744,7 @@ static void branch_system(CPU *c, u32 insn) {
     if (BITS(31, 24) == 0xd4) {                                           /* exception generation */
         unsigned opc = BITS(23, 21), ll = BITS(1, 0), imm16 = BITS(20, 5);
         if (opc == 0 && ll == 1) {                                        /* SVC */
+            systrace_svc(c);
             exception_take(c, EXC_SYNC, esr_make(EC_SVC64, imm16), 0, c->pc);
         } else if (opc == 0 && ll == 2) {                                 /* HVC */
             if (smccc_conduit && smccc_conduit(c, true)) return;
