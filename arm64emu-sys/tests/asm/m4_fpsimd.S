@@ -102,6 +102,20 @@ _start:
     umov    x0, v5.d[0]
     CKX     x0, 0xff0000ffff000000, 19
 
+    /* FMOV between a GPR and the HIGH 64 bits of a vector (ptype=10, the
+     * 128-bit form: `fmov Vd.D[1], Xn` / `fmov Xd, Vn.D[1]`). */
+    ldr     x4, =0xaabbccddeeff0011
+    fmov    d0, x4                      /* v0.d[0]=x4, v0.d[1]=0 */
+    ldr     x3, =0x1122334455667788
+    fmov    v0.d[1], x3                 /* hi half <- x3, lo half preserved */
+    umov    x0, v0.d[1]
+    CKX     x0, 0x1122334455667788, 20
+    umov    x0, v0.d[0]
+    CKX     x0, 0xaabbccddeeff0011, 21  /* low half untouched by the hi write */
+    fmov    x5, v0.d[1]                 /* hi half -> GPR (opcode=6 direction) */
+    mov     x0, x5
+    CKX     x0, 0x1122334455667788, 22
+
     movz    x0, #0
     hlt     #0
 fail:

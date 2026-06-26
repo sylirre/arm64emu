@@ -193,6 +193,17 @@ static void fp_set_flags(CPU *c, int cmp /* -1 lt, 0 eq, 1 gt, 2 unordered */) {
 static void exec_fp_scalar(CPU *c, u32 insn) {
     unsigned ftype = BITS(23, 22), Rn = BITS(9, 5), Rd = BITS(4, 0);
     bool dbl = (ftype == 1);
+
+    /* FMOV to/from the high 64 bits of a SIMD reg (ptype=10 => 128-bit variant,
+     * NOT half-precision). Lives in the FP<->integer conversion space; must be
+     * caught before the ftype!=0/1 half-precision deferral below. */
+    if (BITS(28, 24) == 0x1e && BIT(21) == 1 && BITS(15, 10) == 0 &&
+        BIT(31) == 1 && ftype == 2 && BITS(20, 19) == 1) {
+        unsigned opcode = BITS(18, 16);
+        if (opcode == 6) { set_x(c, Rd, c->v[Rn].d[1]); return; }   /* FMOV Xd, Vn.D[1] */
+        if (opcode == 7) { c->v[Rd].d[1] = reg_x(c, Rn); return; }  /* FMOV Vd.D[1], Xn */
+    }
+
     if (ftype != 0 && ftype != 1) { fpsimd_undef(c, insn); return; }  /* half: on demand */
 
     /* Floating-point <-> integer / fixed-point conversion (bit21 distinguishes). */
