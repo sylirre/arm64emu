@@ -959,7 +959,7 @@ void exec_fpsimd(CPU *c, u32 insn) {
         crypto_aes(c, insn); return;
     }
     /* Cryptographic 3-register SHA (SHA1C/P/M/SU0, SHA256H/H2/SU1). */
-    if (BITS(31, 24) == 0x5e && BITS(23, 21) == 0 && BIT(15) == 0 && BITS(11, 10) == 0) {
+    if (BITS(31, 24) == 0x5e && BITS(23, 21) == 0 && BIT(15) == 0) {
         crypto_sha3(c, insn); return;
     }
     /* Cryptographic 2-register SHA (SHA1H/SHA1SU1/SHA256SU0). */
