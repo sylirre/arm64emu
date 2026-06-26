@@ -318,8 +318,8 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 case 0x1: if (dbl) fp_wr_d(c, Rd, __builtin_fabs(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, __builtin_fabsf(fp_rd_s(c, Rn))); return; /* FABS */
                 case 0x2: if (dbl) fp_wr_d(c, Rd, -fp_rd_d(c, Rn)); else fp_wr_s(c, Rd, -fp_rd_s(c, Rn)); return; /* FNEG */
                 case 0x3: if (dbl) fp_wr_d(c, Rd, __builtin_sqrt(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, __builtin_sqrtf(fp_rd_s(c, Rn))); return; /* FSQRT */
-                case 0x4: if (!dbl) fp_wr_d(c, Rd, (double)fp_rd_s(c, Rn)); else fpsimd_undef(c, insn); return; /* FCVT S->D */
-                case 0x5: if (dbl) fp_wr_s(c, Rd, (float)fp_rd_d(c, Rn)); else fpsimd_undef(c, insn); return;  /* FCVT D->S */
+                case 0x4: if (ftype == 1) fp_wr_s(c, Rd, (float)fp_rd_d(c, Rn)); else fpsimd_undef(c, insn); return;  /* FCVT to single (from double) */
+                case 0x5: if (ftype == 0) fp_wr_d(c, Rd, (double)fp_rd_s(c, Rn)); else fpsimd_undef(c, insn); return; /* FCVT to double (from single) */
                 case 0x8: if (dbl) fp_wr_d(c, Rd, f_round(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, (float)f_round(fp_rd_s(c, Rn))); return; /* FRINTN ~ */
                 case 0x9: if (dbl) fp_wr_d(c, Rd, f_ceil(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, (float)f_ceil(fp_rd_s(c, Rn))); return;   /* FRINTP */
                 case 0xa: if (dbl) fp_wr_d(c, Rd, f_floor(fp_rd_d(c, Rn))); else fp_wr_s(c, Rd, (float)f_floor(fp_rd_s(c, Rn))); return;  /* FRINTM */
@@ -445,10 +445,21 @@ static void simd_three_same(CPU *c, u32 insn) {
     V128 r; r.d[0] = r.d[1] = 0;
     u64 emask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
 
-    if (opc == 0x17 && U == 0) {               /* ADDP (pairwise add) */
+    /* Pairwise: ADDP (0x17, U=0), S/UMAXP (0x14), S/UMINP (0x15). Output lower
+     * half folds pairs of Rn, upper half folds pairs of Rm. */
+    if ((opc == 0x17 && U == 0) || opc == 0x14 || opc == 0x15) {
         for (unsigned i = 0; i < n / 2; i++) {
-            u64 lo = velem_get(&c->v[Rn], size, 2 * i) + velem_get(&c->v[Rn], size, 2 * i + 1);
-            u64 hi = velem_get(&c->v[Rm], size, 2 * i) + velem_get(&c->v[Rm], size, 2 * i + 1);
+            u64 n0 = velem_get(&c->v[Rn], size, 2*i), n1 = velem_get(&c->v[Rn], size, 2*i + 1);
+            u64 m0 = velem_get(&c->v[Rm], size, 2*i), m1 = velem_get(&c->v[Rm], size, 2*i + 1);
+            u64 lo, hi;
+            if (opc == 0x17)        { lo = n0 + n1; hi = m0 + m1; }                 /* ADDP */
+            else if (opc == 0x14) {                                                /* MAXP */
+                lo = (U ? n0 > n1 : sx(n0,esize) > sx(n1,esize)) ? n0 : n1;
+                hi = (U ? m0 > m1 : sx(m0,esize) > sx(m1,esize)) ? m0 : m1;
+            } else {                                                               /* MINP */
+                lo = (U ? n0 < n1 : sx(n0,esize) < sx(n1,esize)) ? n0 : n1;
+                hi = (U ? m0 < m1 : sx(m0,esize) < sx(m1,esize)) ? m0 : m1;
+            }
             velem_set(&r, size, i, lo & emask);
             velem_set(&r, size, n / 2 + i, hi & emask);
         }
@@ -514,6 +525,20 @@ static void simd_two_misc(CPU *c, u32 insn) {
 
     if (opc == 0x05 && U == 1 && size == 0) {  /* NOT (bitwise, byte) */
         c->v[Rd].d[0] = ~c->v[Rn].d[0]; c->v[Rd].d[1] = Q ? ~c->v[Rn].d[1] : 0; return;
+    }
+    /* REV64/REV32/REV16: reverse esize-bit elements within each container.
+     * opcode 0x00 U=0 -> REV64, U=1 -> REV32; opcode 0x01 U=0 -> REV16. */
+    if (opc == 0x00 || (opc == 0x01 && U == 0)) {
+        unsigned container = (opc == 0x01) ? 16 : (U ? 32 : 64);
+        unsigned resize = 8u << size;                       /* element size in bits */
+        if (resize >= container) { fpsimd_undef(c, insn); return; }   /* arch-UNDEFINED */
+        unsigned cb = container / 8, eb = resize / 8, total = Q ? 16 : 8;
+        V128 rr; rr.d[0] = rr.d[1] = 0;
+        for (unsigned base = 0; base < total; base += cb)
+            for (unsigned e = 0; e < cb / eb; e++)
+                for (unsigned k = 0; k < eb; k++)
+                    rr.b[base + (cb/eb - 1 - e)*eb + k] = c->v[Rn].b[base + e*eb + k];
+        c->v[Rd] = rr; return;
     }
     unsigned esize = 8u << size, n = (Q ? 16 : 8) >> size;
     u64 emask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
@@ -628,6 +653,276 @@ static void simd_scalar_shift(CPU *c, u32 insn) {
     c->v[Rd].d[0] = v; c->v[Rd].d[1] = 0;
 }
 
+/* ===================== ARMv8 Cryptographic Extensions =====================
+ * SHA-1, SHA-256 and AES, transcribed from the ARM ARM shared pseudocode
+ * (cross-checked against QEMU target/arm/tcg/crypto_helper.c).  All work on the
+ * little-endian V128 lane views: pseudocode Elem[X,e,32] == X.s[e]. */
+
+/* ror32() is provided by types.h. */
+static inline u32 rol32(u32 x, unsigned n) { n &= 31; return n ? (x << n) | (x >> (32 - n)) : x; }
+
+static u32 sha_ch(u32 x, u32 y, u32 z)  { return (x & y) ^ (~x & z); }
+static u32 sha_maj(u32 x, u32 y, u32 z) { return (x & y) ^ (x & z) ^ (y & z); }
+static u32 sha_par(u32 x, u32 y, u32 z) { return x ^ y ^ z; }
+static u32 sha256_bsig0(u32 x) { return ror32(x,2)  ^ ror32(x,13) ^ ror32(x,22); }
+static u32 sha256_bsig1(u32 x) { return ror32(x,6)  ^ ror32(x,11) ^ ror32(x,25); }
+static u32 sha256_ssig0(u32 x) { return ror32(x,7)  ^ ror32(x,18) ^ (x >> 3); }
+static u32 sha256_ssig1(u32 x) { return ror32(x,17) ^ ror32(x,19) ^ (x >> 10); }
+
+/* Sha256hash(): 4 rounds with the <y,x> = ROL(y:x,32) one-word rotation. */
+static V128 sha256_hash(V128 x, V128 y, V128 w, int part1) {
+    for (int e = 0; e < 4; e++) {
+        u32 chs = sha_ch(y.s[0], y.s[1], y.s[2]);
+        u32 maj = sha_maj(x.s[0], x.s[1], x.s[2]);
+        u32 t   = y.s[3] + sha256_bsig1(y.s[0]) + chs + w.s[e];
+        x.s[3]  = t + x.s[3];
+        y.s[3]  = t + sha256_bsig0(x.s[0]) + maj;
+        u32 ny0 = x.s[3], ny1 = y.s[0], ny2 = y.s[1], ny3 = y.s[2];
+        u32 nx0 = y.s[3], nx1 = x.s[0], nx2 = x.s[1], nx3 = x.s[2];
+        x.s[0]=nx0; x.s[1]=nx1; x.s[2]=nx2; x.s[3]=nx3;
+        y.s[0]=ny0; y.s[1]=ny1; y.s[2]=ny2; y.s[3]=ny3;
+    }
+    return part1 ? x : y;
+}
+static V128 sha256_su0(V128 x, V128 y) {
+    u32 T[4] = { x.s[1], x.s[2], x.s[3], y.s[0] };
+    V128 r;
+    for (int e = 0; e < 4; e++) r.s[e] = sha256_ssig0(T[e]) + x.s[e];
+    return r;
+}
+static V128 sha256_su1(V128 x, V128 y, V128 z) {
+    u32 T3[4] = { y.s[1], y.s[2], y.s[3], z.s[0] };
+    V128 r;
+    r.s[0] = sha256_ssig1(z.s[2]) + x.s[0] + T3[0];
+    r.s[1] = sha256_ssig1(z.s[3]) + x.s[1] + T3[1];
+    r.s[2] = sha256_ssig1(r.s[0]) + x.s[2] + T3[2];
+    r.s[3] = sha256_ssig1(r.s[1]) + x.s[3] + T3[3];
+    return r;
+}
+
+/* Cryptographic 3-register SHA: SHA1C/P/M/SU0 (op 0-3), SHA256H/H2/SU1 (op 4-6). */
+static void crypto_sha3(CPU *c, u32 insn) {
+    unsigned op = BITS(14, 12), Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    V128 d = c->v[Rd], n = c->v[Rn], m = c->v[Rm];
+    switch (op) {
+        case 0: case 1: case 2: {                /* SHA1C / SHA1P / SHA1M */
+            for (int i = 0; i < 4; i++) {
+                u32 t = (op == 0) ? sha_ch (d.s[1], d.s[2], d.s[3])
+                      : (op == 1) ? sha_par(d.s[1], d.s[2], d.s[3])
+                                  : sha_maj(d.s[1], d.s[2], d.s[3]);
+                t += rol32(d.s[0], 5) + n.s[0] + m.s[i];
+                n.s[0] = d.s[3];
+                d.s[3] = d.s[2];
+                d.s[2] = rol32(d.s[1], 30);
+                d.s[1] = d.s[0];
+                d.s[0] = t;
+            }
+            c->v[Rd] = d; return;
+        }
+        case 3:                                  /* SHA1SU0 Vd,Vn,Vm */
+            d.d[0] ^= d.d[1] ^ m.d[0];
+            d.d[1] ^= n.d[0] ^ m.d[1];
+            c->v[Rd] = d; return;
+        case 4: c->v[Rd] = sha256_hash(d, n, m, 1); return;   /* SHA256H  */
+        case 5: c->v[Rd] = sha256_hash(n, d, m, 0); return;   /* SHA256H2 */
+        case 6: c->v[Rd] = sha256_su1(d, n, m);     return;   /* SHA256SU1 */
+        default: fpsimd_undef(c, insn); return;
+    }
+}
+
+/* Cryptographic 2-register SHA: SHA1H (0), SHA1SU1 (1), SHA256SU0 (2). */
+static void crypto_sha2(CPU *c, u32 insn) {
+    unsigned op = BITS(16, 12), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    V128 d = c->v[Rd], n = c->v[Rn];
+    switch (op) {
+        case 0: {                                /* SHA1H Sd,Sn = ROL(Sn,30) */
+            V128 r; r.d[0] = r.d[1] = 0; r.s[0] = rol32(n.s[0], 30);
+            c->v[Rd] = r; return;
+        }
+        case 1:                                  /* SHA1SU1 Vd,Vn */
+            d.s[0] = rol32(d.s[0] ^ n.s[1], 1);
+            d.s[1] = rol32(d.s[1] ^ n.s[2], 1);
+            d.s[2] = rol32(d.s[2] ^ n.s[3], 1);
+            d.s[3] = rol32(d.s[3] ^ d.s[0], 1);
+            c->v[Rd] = d; return;
+        case 2: c->v[Rd] = sha256_su0(d, n); return;   /* SHA256SU0 Vd,Vn */
+        default: fpsimd_undef(c, insn); return;
+    }
+}
+
+static const u8 aes_sbox[256] = {
+  0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+  0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+  0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+  0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+  0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+  0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+  0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+  0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+  0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+  0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+  0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+  0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+  0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+  0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+  0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+  0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+static const u8 aes_inv_sbox[256] = {
+  0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+  0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+  0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+  0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+  0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+  0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+  0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+  0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+  0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+  0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+  0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+  0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+  0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+  0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+  0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+  0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
+};
+/* ShiftRows / InvShiftRows byte permutations (output[i] = input[idx[i]]). */
+static const u8 aes_shift[16]     = { 0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11 };
+static const u8 aes_inv_shift[16] = { 0,13,10,7,4,1,14,11,8,5,2,15,12,9,6,3 };
+
+static u8 aes_gfmul(u8 a, u8 b) {            /* GF(2^8) multiply, poly 0x11b */
+    u8 p = 0;
+    for (int i = 0; i < 8; i++) {
+        if (b & 1) p ^= a;
+        u8 hi = a & 0x80;
+        a = (u8)(a << 1);
+        if (hi) a ^= 0x1b;
+        b >>= 1;
+    }
+    return p;
+}
+static void aes_mixcols(const V128 *in, V128 *out, int inv) {
+    for (int col = 0; col < 4; col++) {
+        const u8 *a = &in->b[col*4];
+        u8 *o = &out->b[col*4];
+        if (!inv) {
+            o[0] = aes_gfmul(a[0],2) ^ aes_gfmul(a[1],3) ^ a[2] ^ a[3];
+            o[1] = a[0] ^ aes_gfmul(a[1],2) ^ aes_gfmul(a[2],3) ^ a[3];
+            o[2] = a[0] ^ a[1] ^ aes_gfmul(a[2],2) ^ aes_gfmul(a[3],3);
+            o[3] = aes_gfmul(a[0],3) ^ a[1] ^ a[2] ^ aes_gfmul(a[3],2);
+        } else {
+            o[0] = aes_gfmul(a[0],14) ^ aes_gfmul(a[1],11) ^ aes_gfmul(a[2],13) ^ aes_gfmul(a[3],9);
+            o[1] = aes_gfmul(a[0],9)  ^ aes_gfmul(a[1],14) ^ aes_gfmul(a[2],11) ^ aes_gfmul(a[3],13);
+            o[2] = aes_gfmul(a[0],13) ^ aes_gfmul(a[1],9)  ^ aes_gfmul(a[2],14) ^ aes_gfmul(a[3],11);
+            o[3] = aes_gfmul(a[0],11) ^ aes_gfmul(a[1],13) ^ aes_gfmul(a[2],9)  ^ aes_gfmul(a[3],14);
+        }
+    }
+}
+
+/* Cryptographic AES: AESE(4) AESD(5) AESMC(6) AESIMC(7). */
+static void crypto_aes(CPU *c, u32 insn) {
+    unsigned op = BITS(16, 12), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    V128 in = c->v[Rn], r;
+    r.d[0] = r.d[1] = 0;
+    switch (op) {
+        case 4:                                  /* AESE: SubBytes(ShiftRows(Vd^Vn)) */
+            for (int i = 0; i < 16; i++) in.b[i] = (u8)(c->v[Rd].b[i] ^ c->v[Rn].b[i]);
+            for (int i = 0; i < 16; i++) r.b[i] = aes_sbox[in.b[aes_shift[i]]];
+            c->v[Rd] = r; return;
+        case 5:                                  /* AESD: InvSubBytes(InvShiftRows(Vd^Vn)) */
+            for (int i = 0; i < 16; i++) in.b[i] = (u8)(c->v[Rd].b[i] ^ c->v[Rn].b[i]);
+            for (int i = 0; i < 16; i++) r.b[i] = aes_inv_sbox[in.b[aes_inv_shift[i]]];
+            c->v[Rd] = r; return;
+        case 6: aes_mixcols(&in, &r, 0); c->v[Rd] = r; return;   /* AESMC  */
+        case 7: aes_mixcols(&in, &r, 1); c->v[Rd] = r; return;   /* AESIMC */
+        default: fpsimd_undef(c, insn); return;
+    }
+}
+
+/* Carryless (polynomial, GF(2)) multiplies for PMULL/PMULL2. */
+static void pmull64(u64 a, u64 b, u64 *lo, u64 *hi) {
+    u64 rl = 0, rh = 0;
+    for (int i = 0; i < 64; i++)
+        if ((a >> i) & 1) { rl ^= b << i; if (i) rh ^= b >> (64 - i); }
+    *lo = rl; *hi = rh;
+}
+static u16 pmull8(u8 a, u8 b) {
+    u16 r = 0;
+    for (int i = 0; i < 8; i++) if ((a >> i) & 1) r ^= (u16)b << i;
+    return r;
+}
+
+/* PMULL/PMULL2 (AdvSIMD three-different, opcode 0b1110): polynomial multiply
+ * long. size==3 -> 64x64->128 (needs FEAT_PMULL); size==0 -> 8x(8x8->16). Q
+ * selects the low (PMULL) or high (PMULL2) source half. */
+static void crypto_pmull(CPU *c, u32 insn) {
+    unsigned Q = BIT(30), size = BITS(23, 22), Rm = BITS(20, 16);
+    unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
+    V128 r; r.d[0] = r.d[1] = 0;
+    if (size == 3) {                         /* PMULL{2} Vd.1Q, Vn.1D, Vm.1D */
+        u64 lo, hi;
+        pmull64(c->v[Rn].d[Q ? 1 : 0], c->v[Rm].d[Q ? 1 : 0], &lo, &hi);
+        r.d[0] = lo; r.d[1] = hi; c->v[Rd] = r; return;
+    }
+    if (size == 0) {                         /* PMULL{2} Vd.8H, Vn.8B, Vm.8B */
+        unsigned base = Q ? 8 : 0;
+        for (int j = 0; j < 8; j++) r.h[j] = pmull8(c->v[Rn].b[base + j], c->v[Rm].b[base + j]);
+        c->v[Rd] = r; return;
+    }
+    fpsimd_undef(c, insn);
+}
+
+/* AdvSIMD TBL/TBX: byte table lookup across 1-4 consecutive table registers.
+ * For each index byte in Vm: out = table[idx] if idx < 16*nregs, else 0 (TBL)
+ * or the original Vd byte (TBX). */
+static void simd_tbl(CPU *c, u32 insn) {
+    unsigned Q = BIT(30), Rm = BITS(20, 16), nregs = BITS(14, 13) + 1, op = BIT(12);
+    unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
+    unsigned tbytes = nregs * 16, nbyte = Q ? 16 : 8;
+    V128 idx = c->v[Rm], old = c->v[Rd];   /* snapshot (may alias table regs) */
+    u8 table[64];
+    for (unsigned r = 0; r < nregs; r++) {
+        V128 t = c->v[(Rn + r) & 31];
+        for (int b = 0; b < 16; b++) table[r*16 + b] = t.b[b];
+    }
+    V128 res; res.d[0] = res.d[1] = 0;
+    for (unsigned i = 0; i < nbyte; i++) {
+        unsigned ix = idx.b[i];
+        res.b[i] = (ix < tbytes) ? table[ix] : (op ? old.b[i] : 0);
+    }
+    c->v[Rd] = res;
+}
+
+/* AdvSIMD permute: ZIP1/ZIP2 (opc 3/7), UZP1/UZP2 (1/5), TRN1/TRN2 (2/6). */
+static void simd_permute(CPU *c, u32 insn) {
+    unsigned Q = BIT(30), size = BITS(23, 22), Rm = BITS(20, 16), opc = BITS(14, 12);
+    unsigned Rn = BITS(9, 5), Rd = BITS(4, 0);
+    unsigned lanes = (Q ? 16u : 8u) >> size, half = lanes / 2;
+    V128 n = c->v[Rn], m = c->v[Rm], r; r.d[0] = r.d[1] = 0;
+    switch (opc) {
+        case 1: case 5:                          /* UZP1 (even) / UZP2 (odd) */
+            for (unsigned e = 0; e < lanes; e++) {
+                unsigned s = 2*e + (opc == 5);
+                velem_set(&r, size, e, (s < lanes) ? velem_get(&n, size, s)
+                                                   : velem_get(&m, size, s - lanes));
+            } break;
+        case 2: case 6:                          /* TRN1 (even) / TRN2 (odd) */
+            for (unsigned p = 0; p < half; p++) {
+                unsigned s = 2*p + (opc == 6);
+                velem_set(&r, size, 2*p,   velem_get(&n, size, s));
+                velem_set(&r, size, 2*p+1, velem_get(&m, size, s));
+            } break;
+        case 3: case 7:                          /* ZIP1 (low) / ZIP2 (high) */
+            for (unsigned p = 0; p < half; p++) {
+                unsigned s = (opc == 7 ? half : 0) + p;
+                velem_set(&r, size, 2*p,   velem_get(&n, size, s));
+                velem_set(&r, size, 2*p+1, velem_get(&m, size, s));
+            } break;
+        default: fpsimd_undef(c, insn); return;
+    }
+    c->v[Rd] = r;
+}
+
 void exec_fpsimd(CPU *c, u32 insn) {
     /* Scalar floating-point (bit30=0 distinguishes from scalar AdvSIMD). */
     if ((insn & 0x7f000000) == 0x1e000000) { exec_fp_scalar(c, insn); return; }
@@ -644,6 +939,32 @@ void exec_fpsimd(CPU *c, u32 insn) {
     /* AdvSIMD scalar two-register misc (bit30=1): scalar int<->FP converts. */
     if (BITS(28, 24) == 0x1e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
         simd_scalar_cvt(c, insn); return;
+    }
+    /* Cryptographic AES (AESE/AESD/AESMC/AESIMC). */
+    if (BITS(31, 24) == 0x4e && BITS(23, 22) == 0 && BITS(21, 17) == 0x14 && BITS(11, 10) == 2) {
+        crypto_aes(c, insn); return;
+    }
+    /* Cryptographic 3-register SHA (SHA1C/P/M/SU0, SHA256H/H2/SU1). */
+    if (BITS(31, 24) == 0x5e && BITS(23, 21) == 0 && BIT(15) == 0 && BITS(11, 10) == 0) {
+        crypto_sha3(c, insn); return;
+    }
+    /* Cryptographic 2-register SHA (SHA1H/SHA1SU1/SHA256SU0). */
+    if (BITS(31, 24) == 0x5e && BITS(23, 22) == 0 && BITS(21, 17) == 0x14 && BITS(11, 10) == 2) {
+        crypto_sha2(c, insn); return;
+    }
+    /* AdvSIMD three-different PMULL/PMULL2 (opcode 0b1110, U=0). */
+    if (BITS(28, 24) == 0x0e && BIT(29) == 0 && BIT(21) == 1 && BITS(15, 12) == 0xe && BITS(11, 10) == 0) {
+        crypto_pmull(c, insn); return;
+    }
+    /* AdvSIMD TBL/TBX (table vector lookup). */
+    if (BIT(31) == 0 && BIT(29) == 0 && BITS(28, 24) == 0x0e && BITS(23, 21) == 0 &&
+        BIT(15) == 0 && BITS(11, 10) == 0) {
+        simd_tbl(c, insn); return;
+    }
+    /* AdvSIMD permute (ZIP/UZP/TRN). */
+    if (BIT(31) == 0 && BIT(29) == 0 && BITS(28, 24) == 0x0e && BIT(21) == 0 &&
+        BIT(15) == 0 && BITS(11, 10) == 2) {
+        simd_permute(c, insn); return;
     }
     /* AdvSIMD three-same (vector integer): ADD/SUB/CMP/MIN/MAX/MUL/logical. */
     if (BITS(28, 24) == 0x0e && BIT(21) == 1 && BIT(10) == 1) { simd_three_same(c, insn); return; }
