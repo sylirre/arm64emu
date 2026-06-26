@@ -30,8 +30,14 @@
 
 #define VIRTIO_NET_S_LINK_UP  1
 
-/* virtio_net_hdr without MRG_RXBUF: 10 bytes. */
-#define NET_HDR_LEN   10
+/* virtio_net header length. The Linux virtio_net driver (and QEMU) use the
+ * 12-byte struct virtio_net_hdr_mrg_rxbuf whenever VIRTIO_F_VERSION_1 OR
+ * VIRTIO_NET_F_MRG_RXBUF is negotiated — the bare 10-byte struct virtio_net_hdr
+ * is used only by a legacy device that negotiates neither. We are a modern
+ * (version-2 transport) device that negotiates VERSION_1, so the guest prepends
+ * 12 bytes on TX and expects 12 bytes on RX, even though we don't merge buffers.
+ * The extra 2 bytes are num_buffers (set to 1 on RX, ignored on TX). */
+#define NET_HDR_LEN   12
 
 /* Split-virtqueue descriptor flags. */
 #define VIRTQ_DESC_F_NEXT  1
@@ -213,6 +219,7 @@ static slirp_ssize_t slirp_send_pkt(const void *buf, size_t len, void *opaque) {
     v->rx_tail = next_tail;
 
     memset(v->rx_buf[slot], 0, NET_HDR_LEN);          /* zero virtio_net_hdr */
+    v->rx_buf[slot][10] = 1;                           /* num_buffers = 1 (LE) */
     uint32_t pkt_len = len > MAX_ETH_FRAME ? MAX_ETH_FRAME : (uint32_t)len;
     memcpy(v->rx_buf[slot] + NET_HDR_LEN, buf, pkt_len);
     v->rx_len[slot] = NET_HDR_LEN + pkt_len;
