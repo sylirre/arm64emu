@@ -574,6 +574,26 @@ static void simd_shift_imm(CPU *c, u32 insn) {
     c->v[Rd] = r;
 }
 
+/* AdvSIMD scalar shift by immediate — the 64-bit D-form SHL / SSHR / USHR.
+ * Emitted by libc float formatting (e.g. `SHL d,d,#52` to assemble a mantissa).
+ * Only esize=64 is defined for these scalar same-width shifts (immh top bit set). */
+static void simd_scalar_shift(CPU *c, u32 insn) {
+    unsigned U = BIT(29), immh = BITS(22, 19), immb = BITS(18, 16);
+    unsigned opc = BITS(15, 11), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    unsigned immhb = (immh << 3) | immb;
+    if (!(immh & 8)) { fpsimd_undef(c, insn); return; }   /* scalar SHL/SHR are 64-bit */
+    u64 a = c->v[Rn].d[0], v;
+    switch ((U << 5) | opc) {
+        case (0 << 5) | 0x0a: v = a << (immhb - 64); break;                 /* SHL  */
+        case (0 << 5) | 0x00: { unsigned sh = 128 - immhb;                  /* SSHR */
+            v = (u64)((s64)a >> (sh >= 64 ? 63 : sh)); } break;
+        case (1 << 5) | 0x00: { unsigned sh = 128 - immhb;                  /* USHR */
+            v = (sh >= 64) ? 0 : (a >> sh); } break;
+        default: fpsimd_undef(c, insn); return;
+    }
+    c->v[Rd].d[0] = v; c->v[Rd].d[1] = 0;
+}
+
 void exec_fpsimd(CPU *c, u32 insn) {
     /* Scalar floating-point (bit30=0 distinguishes from scalar AdvSIMD). */
     if ((insn & 0x7f000000) == 0x1e000000) { exec_fp_scalar(c, insn); return; }
@@ -598,6 +618,8 @@ void exec_fpsimd(CPU *c, u32 insn) {
     if (BITS(28, 19) == 0x1e0 && BIT(10) == 1) { simd_modified_imm(c, insn); return; }
     /* AdvSIMD shift by immediate (SHL/SSHR/USHR/SSHLL/USHLL): immh != 0. */
     if (BITS(28, 23) == 0x1e && BIT(10) == 1 && BITS(22, 19) != 0) { simd_shift_imm(c, insn); return; }
+    /* AdvSIMD scalar shift by immediate (bit30=1): D-form SHL/SSHR/USHR. */
+    if (BITS(28, 23) == 0x3e && BIT(10) == 1 && BITS(22, 19) != 0) { simd_scalar_shift(c, insn); return; }
     /* AdvSIMD copy (DUP/INS/UMOV/SMOV). */
     if (BITS(28, 21) == 0x70 && BIT(15) == 0 && BIT(10) == 1) { simd_copy(c, insn); return; }
 
