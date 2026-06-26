@@ -18,6 +18,7 @@
 #define INTID_UART       33   /* SPI 1  */
 #define INTID_RTC        34   /* SPI 2  */
 #define INTID_VIRTIO0    48   /* SPI 16 (virtio-mmio slot 0) */
+#define INTID_VIRTIO1    49   /* SPI 17 (virtio-mmio slot 1) */
 
 /* ---- GICv2 ---- */
 #define GIC_NUM_IRQS 256
@@ -70,5 +71,10 @@ void fwcfg_set_legacy_kernel(FwCfg *f, const void *kernel, u32 ksize,
 /* ---- virtio-blk (virtio-mmio slot 0) ---- */
 struct VirtIOBlk;
 struct VirtIOBlk *virtio_blk_create(Machine *m, GIC *gic, const char *path);
+
+/* ---- virtio-net (virtio-mmio slot 1) ---- */
+struct VirtIONet;
+struct VirtIONet *virtio_net_create(Machine *m, GIC *gic);
+void              virtio_net_poll(struct VirtIONet *v);
 
 #endif /* A64_DEVICES_H */
