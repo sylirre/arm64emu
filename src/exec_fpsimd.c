@@ -502,6 +502,41 @@ static void simd_two_misc(CPU *c, u32 insn) {
     c->v[Rd] = r;
 }
 
+/* AdvSIMD scalar two-register misc — FP<->integer convert where the integer
+ * operand/result sits in a SIMD register lane (not a GPR). Emitted by libc
+ * number formatting, e.g. `UCVTF d,d`. Mirrors the GPR-form convert in
+ * exec_fp_scalar (rounding + saturation), sourcing/writing the V128 lane. */
+static void simd_scalar_cvt(CPU *c, u32 insn) {
+    unsigned U = BIT(29), o2 = BIT(23), sz = BIT(22);
+    unsigned opcode = BITS(16, 12), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    bool dbl = (sz == 1);
+
+    if (o2 == 0 && opcode == 0x1d) {                 /* SCVTF / UCVTF: int -> fp */
+        if (dbl) { u64 i = c->v[Rn].d[0]; fp_wr_d(c, Rd, U ? (double)(u64)i : (double)(s64)i); }
+        else     { u32 i = c->v[Rn].s[0]; fp_wr_s(c, Rd, U ? (float)(u32)i  : (float)(s32)i);  }
+        return;
+    }
+    if (opcode == 0x1a || opcode == 0x1b || (opcode == 0x1c && o2 == 0)) { /* FCVT* fp->int */
+        double v = dbl ? fp_rd_d(c, Rn) : (double)fp_rd_s(c, Rn);
+        double r;
+        if      (opcode == 0x1a) r = o2 ? f_ceil(v)  : f_round(v);   /* P : N  */
+        else if (opcode == 0x1b) r = o2 ? f_trunc(v) : f_floor(v);   /* Z : M  */
+        else                     r = f_round(v);                    /* A      */
+        u64 out;
+        if (U == 0) {            /* signed, with saturation (same clamps as SCVTF block) */
+            if (dbl) out = (u64)((r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r);
+            else     out = (u64)(u32)((r >= 2147483647.0) ? INT32_MAX : (r <= -2147483648.0) ? INT32_MIN : (s32)r);
+        } else {                 /* unsigned */
+            if (r < 0) r = 0;
+            if (dbl) out = (r >= 18446744073709551615.0) ? UINT64_MAX : (u64)r;
+            else     out = (r >= 4294967295.0) ? UINT32_MAX : (u32)r;
+        }
+        c->v[Rd].d[0] = out; c->v[Rd].d[1] = 0;
+        return;
+    }
+    fpsimd_undef(c, insn);
+}
+
 /* AdvSIMD shift by immediate: SHL/SSHR/USHR (same width) and SSHLL/USHLL
  * (widening long). Used by musl/busybox string and math routines. */
 static void simd_shift_imm(CPU *c, u32 insn) {
@@ -551,6 +586,10 @@ void exec_fpsimd(CPU *c, u32 insn) {
     /* AdvSIMD two-register misc (NOT/NEG/ABS/compare-with-zero): bits[11:10]=10. */
     if (BITS(28, 24) == 0x0e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
         simd_two_misc(c, insn); return;
+    }
+    /* AdvSIMD scalar two-register misc (bit30=1): scalar int<->FP converts. */
+    if (BITS(28, 24) == 0x1e && BITS(21, 17) == 0x10 && BIT(11) == 1 && BIT(10) == 0) {
+        simd_scalar_cvt(c, insn); return;
     }
     /* AdvSIMD three-same (vector integer): ADD/SUB/CMP/MIN/MAX/MUL/logical. */
     if (BITS(28, 24) == 0x0e && BIT(21) == 1 && BIT(10) == 1) { simd_three_same(c, insn); return; }

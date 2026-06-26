@@ -116,6 +116,31 @@ _start:
     mov     x0, x5
     CKX     x0, 0x1122334455667788, 22
 
+    /* AdvSIMD scalar two-register-misc int<->FP convert (operand in a vector
+     * lane, e.g. `ucvtf d,d`). U=unsigned, sz=0 single / 1 double. */
+    movz    x4, #0x4240                 /* 1000000 = 0xf4240 */
+    movk    x4, #0xf, lsl #16
+    fmov    d0, x4                      /* integer bits into v0.d[0] */
+    ucvtf   d0, d0                      /* d0 = 1000000.0 (double) */
+    fcvtzu  x0, d0                      /* GPR-form back-convert as oracle */
+    CKX     x0, 1000000, 23
+    fcvtzu  d1, d0                      /* scalar-misc fp->uint, result in lane */
+    umov    x0, v1.d[0]
+    CKX     x0, 1000000, 24
+
+    mov     x4, #-5
+    fmov    d2, x4                      /* -5 (two's complement) into the lane */
+    scvtf   d2, d2                      /* signed int -> -5.0 */
+    fcvtzs  d3, d2                      /* round-toward-zero back to integer */
+    umov    x0, v3.d[0]
+    CKX     x0, 0xfffffffffffffffb, 25  /* -5 */
+
+    movz    w4, #0xabcd                 /* single-precision path (sz=0) */
+    fmov    s4, w4
+    ucvtf   s4, s4                      /* 0xabcd -> 43981.0f */
+    fcvtzu  w0, s4
+    CKX     x0, 0xabcd, 26
+
     movz    x0, #0
     hlt     #0
 fail:
