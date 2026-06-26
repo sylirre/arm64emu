@@ -45,12 +45,15 @@ static u8 *read_file(const char *path, size_t *len_out) {
 static void usage(const char *p) {
     fprintf(stderr,
         "usage: %s [-bios FW.fd] [-kernel Image] [-initrd cpio] [-append CMDLINE]\n"
-        "          [-drive IMG] [-m MB] [-bin FLAT@ADDR] [-entry ADDR] [-el N] [-d] [-maxinsn N]\n", p);
+        "          [-drive IMG] [-net] [-netfwd tcp|udp:HOST_PORT:GUEST_PORT]\n"
+        "          [-m MB] [-bin FLAT@ADDR] [-entry ADDR] [-el N] [-d] [-maxinsn N]\n", p);
 }
 
 int main(int argc, char **argv) {
     const char *bios = NULL, *kernel = NULL, *initrd = NULL, *append = "";
     const char *binfile = NULL, *dtbfile = NULL, *drive = NULL;
+    bool net_enabled = false;
+    NetFwd net_fwds[16]; int n_net_fwds = 0;
     u64 ram_mb = 1024;
     u64 entry = 0;
     int reset_el = 1;
@@ -70,7 +73,23 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-maxinsn") && i + 1 < argc) max_insn = strtoull(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "-dtb") && i + 1 < argc) dtbfile = argv[++i];
         else if (!strcmp(argv[i], "-drive") && i + 1 < argc) drive = argv[++i];
-        else if (!strcmp(argv[i], "-bin") && i + 1 < argc) {
+        else if (!strcmp(argv[i], "-net")) net_enabled = true;
+        else if (!strcmp(argv[i], "-netfwd") && i + 1 < argc) {
+            /* Format: tcp:HOST_PORT:GUEST_PORT or udp:HOST_PORT:GUEST_PORT */
+            if (n_net_fwds >= 16) { fprintf(stderr, "too many -netfwd rules\n"); return 1; }
+            char *s = argv[++i];
+            bool is_udp = false;
+            if (!strncmp(s, "tcp:", 4)) { is_udp = false; s += 4; }
+            else if (!strncmp(s, "udp:", 4)) { is_udp = true; s += 4; }
+            else { fprintf(stderr, "-netfwd: expected tcp:HP:GP or udp:HP:GP\n"); return 1; }
+            char *colon = strchr(s, ':');
+            if (!colon) { fprintf(stderr, "-netfwd: missing guest port\n"); return 1; }
+            *colon = '\0';
+            net_fwds[n_net_fwds].is_udp    = is_udp;
+            net_fwds[n_net_fwds].host_port  = atoi(s);
+            net_fwds[n_net_fwds].guest_port = atoi(colon + 1);
+            n_net_fwds++;
+        } else if (!strcmp(argv[i], "-bin") && i + 1 < argc) {
             /* FILE or FILE@ADDR */
             char *s = argv[++i];
             char *at = strchr(s, '@');
@@ -98,6 +117,8 @@ int main(int argc, char **argv) {
     Machine m;
     machine_init(&m, ram_mb << 20);
     m.drive = drive;            /* consumed by platform_build (virtio-blk slot 0) */
+    m.net_enabled = net_enabled;
+    if (n_net_fwds) { memcpy(m.net_fwds, net_fwds, n_net_fwds * sizeof(NetFwd)); m.n_net_fwds = n_net_fwds; }
 
     if (bios) {
         size_t n; u8 *fw = read_file(bios, &n);

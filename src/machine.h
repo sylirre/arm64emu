@@ -34,6 +34,13 @@ struct PL031;
 struct FwCfg;
 struct ARMTimer;
 struct VirtIOBlk;
+struct VirtIONet;
+
+typedef struct NetFwd {
+    bool is_udp;
+    int  host_port;
+    int  guest_port;
+} NetFwd;
 
 typedef struct Machine {
     CPU cpu;
@@ -64,8 +71,12 @@ typedef struct Machine {
     struct PL031    *rtc;
     struct FwCfg    *fwcfg;
     struct VirtIOBlk *blk;
+    struct VirtIONet *net;
 
     const char *drive;            /* -drive image path, or NULL (no block device) */
+    bool net_enabled;             /* -net flag */
+    NetFwd net_fwds[16];          /* -netfwd rules */
+    int    n_net_fwds;
 
     BusStatus last_bus_status;    /* set by phys_* on fault */
 } Machine;
