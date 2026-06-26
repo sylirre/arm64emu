@@ -141,6 +141,22 @@ _start:
     fcvtzu  w0, s4
     CKX     x0, 0xabcd, 26
 
+    /* AdvSIMD scalar shift-by-immediate (D-form): SHL/USHR/SSHR, e.g. the
+     * `shl d,d,#52` libc float formatting uses to assemble a mantissa. */
+    movz    x4, #0x7
+    fmov    d0, x4
+    shl     d0, d0, #52                 /* 7 << 52 */
+    umov    x0, v0.d[0]
+    CKX     x0, 0x0070000000000000, 27
+    ldr     x4, =0xff00000000000000
+    fmov    d1, x4
+    ushr    d2, d1, #4                  /* logical >> 4 */
+    umov    x0, v2.d[0]
+    CKX     x0, 0x0ff0000000000000, 28
+    sshr    d3, d1, #4                  /* arithmetic >> 4 (sign bit set) */
+    umov    x0, v3.d[0]
+    CKX     x0, 0xfff0000000000000, 29
+
     movz    x0, #0
     hlt     #0
 fail:
