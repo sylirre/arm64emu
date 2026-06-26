@@ -149,9 +149,10 @@ int main(int argc, char **argv) {
     cpu_reset(&m.cpu, entry, (unsigned)reset_el);
 
     g_sig_cpu = &m.cpu;
+    tty_raw_enable();
+    /* Register after tty_raw_enable() so these win over tty.c's cleanup-only handlers. */
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    tty_raw_enable();
 
     unsigned long ticker = 0;
     unsigned long tick_mask = 0x3ff;     /* AETICK: IRQ-poll granularity (debug) */

@@ -30,8 +30,10 @@ void tty_raw_enable(void) {
     if (tcgetattr(STDIN_FILENO, &saved_tio) != 0) return;
 
     struct termios t = saved_tio;
-    /* Raw: disable canonical mode, echo, signal chars, CR/LF translation. */
-    t.c_lflag &= ~(ICANON | ECHO | IEXTEN);
+    /* Raw: disable canonical mode, echo, signal generation, CR/LF translation.
+     * ISIG off: CTRL-C/Z/\ become raw bytes forwarded to the guest instead of
+     * generating SIGINT/SIGTSTP/SIGQUIT on the host. */
+    t.c_lflag &= ~(ICANON | ECHO | IEXTEN | ISIG);
     t.c_iflag &= ~(IXON | ICRNL | INLCR | ISTRIP | INPCK | BRKINT);
     t.c_cflag |= CS8;
     t.c_cc[VMIN] = 0;
@@ -43,16 +45,29 @@ void tty_raw_enable(void) {
 
     raw_active = 1;
     atexit(tty_raw_disable);
-    signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGSEGV, on_signal);
 }
 
 int tty_getchar(void) {
+    static int esc_pending = 0;
     unsigned char ch;
-    ssize_t n = read(STDIN_FILENO, &ch, 1);
-    if (n == 1) return ch;
-    return -1;
+    if (read(STDIN_FILENO, &ch, 1) != 1) return -1;
+    if (esc_pending) {
+        esc_pending = 0;
+        if (ch == 'x' || ch == 'X') {
+            static const char msg[] = "\r\n[quit]\r\n";
+            if (write(STDOUT_FILENO, msg, sizeof(msg) - 1) < 0) { /* ignore */ }
+            tty_raw_disable();
+            exit(0);
+        }
+        if (ch == 0x01) return 0x01;  /* CTRL-A CTRL-A: send CTRL-A to guest */
+        static const char hint[] = "\r\n[CTRL-A: x=quit, CTRL-A=send CTRL-A]\r\n";
+        if (write(STDOUT_FILENO, hint, sizeof(hint) - 1) < 0) { /* ignore */ }
+        return -1;
+    }
+    if (ch == 0x01) { esc_pending = 1; return -1; }
+    return ch;
 }
 
 void tty_putchar(int ch) {
