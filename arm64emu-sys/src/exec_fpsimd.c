@@ -548,6 +548,27 @@ static void simd_indexed(CPU *c, u32 insn) {
     c->v[Rd] = r;
 }
 
+/* AdvSIMD three-different widening multiply: S/U MULL/MLAL/MLSL (opcodes
+ * 0xc/0x8/0xa). Each pair of esize source lanes makes a 2*esize product; bit30=Q
+ * picks the SMULL2-style high source half. Poly1305's NEON path multiplies its
+ * 32-bit limbs to 64-bit accumulators here (plus the by-element forms). */
+static void simd_three_diff(CPU *c, u32 insn) {
+    unsigned Q = BIT(30), U = BIT(29), size = BITS(23, 22), opc = BITS(15, 12);
+    unsigned Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    unsigned esize = 8u << size, ndest = 64u / esize, base = Q ? ndest : 0, dsize = size + 1;
+    u64 emask = (1ULL << esize) - 1;               /* esize is 8/16/32 here */
+    u64 dmask = (2 * esize >= 64) ? ~0ULL : ((1ULL << (2 * esize)) - 1);
+    V128 vn = c->v[Rn], vm = c->v[Rm], vd = c->v[Rd], r; r.d[0] = r.d[1] = 0;
+    for (unsigned i = 0; i < ndest; i++) {
+        u64 a = velem_get(&vn, size, base + i) & emask, b = velem_get(&vm, size, base + i) & emask;
+        u64 prod = U ? (a * b) : (u64)(sx(a, esize) * sx(b, esize));
+        u64 d = velem_get(&vd, dsize, i);
+        u64 v = (opc == 0xc) ? prod : (opc == 0x8) ? d + prod : d - prod;
+        velem_set(&r, dsize, i, v & dmask);
+    }
+    c->v[Rd] = r;
+}
+
 /* AdvSIMD across-lanes reductions: ADDV/UMAXV/UMINV/SMAXV/SMINV (horizontal
  * reduce of a vector to a scalar element in Rd). Used by string routines to
  * collapse a per-byte compare mask into a single found/not-found value. */
@@ -594,6 +615,14 @@ static void simd_two_misc(CPU *c, u32 insn) {
                 for (unsigned k = 0; k < eb; k++)
                     rr.b[base + (cb/eb - 1 - e)*eb + k] = c->v[Rn].b[base + e*eb + k];
         c->v[Rd] = rr; return;
+    }
+    /* XTN/XTN2: narrow each source element (2*esize) to esize; Q=1 -> high half. */
+    if (opc == 0x12 && U == 0 && size != 3) {
+        unsigned nd = 64u / (8u << size), base = Q ? nd : 0;
+        V128 r; if (Q) r = c->v[Rd]; else { r.d[0] = r.d[1] = 0; }
+        for (unsigned i = 0; i < nd; i++)
+            velem_set(&r, size, base + i, velem_get(&c->v[Rn], size + 1, i));
+        c->v[Rd] = r; return;
     }
     unsigned esize = 8u << size, n = (Q ? 16 : 8) >> size;
     u64 emask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
@@ -672,6 +701,15 @@ static void simd_shift_imm(CPU *c, u32 insn) {
         return;
     }
 
+    if (opc == 0x10 && U == 0 && (immh & 8) == 0) {   /* SHRN/SHRN2 (narrowing >>) */
+        unsigned shift = 2 * esize - immhb, nd = 64 / esize, base = Q ? nd : 0;
+        V128 r; if (Q) r = c->v[Rd]; else { r.d[0] = r.d[1] = 0; }
+        for (unsigned i = 0; i < nd; i++)
+            velem_set(&r, size, base + i, velem_get(&c->v[Rn], size + 1, i) >> shift);
+        c->v[Rd] = r;
+        return;
+    }
+
     unsigned n = (Q ? 16 : 8) >> size;
     u64 emask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
     V128 r; r.d[0] = r.d[1] = 0;
@@ -681,6 +719,16 @@ static void simd_shift_imm(CPU *c, u32 insn) {
             case (0 << 5) | 0x0a: v = a << (immhb - esize); break;             /* SHL */
             case (0 << 5) | 0x00: v = (u64)(sx(a, esize) >> (2 * esize - immhb)); break; /* SSHR */
             case (1 << 5) | 0x00: v = (a & emask) >> (2 * esize - immhb); break; /* USHR */
+            case (1 << 5) | 0x0a: {                                           /* SLI */
+                unsigned sh = immhb - esize;                                  /* keep low sh bits of Vd */
+                v = (a << sh) | (velem_get(&c->v[Rd], size, i) & (((u64)1 << sh) - 1));
+                break;
+            }
+            case (1 << 5) | 0x08: {                                           /* SRI */
+                unsigned sh = 2 * esize - immhb;                              /* keep high sh bits of Vd */
+                v = ((a & emask) >> sh) | (velem_get(&c->v[Rd], size, i) & ~(emask >> sh));
+                break;
+            }
             default: fpsimd_undef(c, insn); return;
         }
         velem_set(&r, size, i, v & emask);
@@ -1027,6 +1075,11 @@ void exec_fpsimd(CPU *c, u32 insn) {
     /* AdvSIMD three-different PMULL/PMULL2 (opcode 0b1110, U=0). */
     if (BITS(28, 24) == 0x0e && BIT(29) == 0 && BIT(21) == 1 && BITS(15, 12) == 0xe && BITS(11, 10) == 0) {
         crypto_pmull(c, insn); return;
+    }
+    /* AdvSIMD three-different widening multiply (S/U MULL/MLAL/MLSL). */
+    if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BIT(21) == 1 && BITS(11, 10) == 0 &&
+        (BITS(15, 12) == 0x8 || BITS(15, 12) == 0xa || BITS(15, 12) == 0xc)) {
+        simd_three_diff(c, insn); return;
     }
     /* AdvSIMD TBL/TBX (table vector lookup). */
     if (BIT(31) == 0 && BIT(29) == 0 && BITS(28, 24) == 0x0e && BITS(23, 21) == 0 &&
