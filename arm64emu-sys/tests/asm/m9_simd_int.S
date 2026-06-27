@@ -323,6 +323,322 @@ _start:
 	CKX x0, 0xffffffff00000001, 40
 	umov x0, v0.d[1]
 	CKX x0, 0x0000000000000001, 1040
+	/* saddl  v0.8h, v1.8b, v2.8b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	saddl  v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0xff7f0080ff820080, 50
+	umov x0, v0.d[1]
+	CKX x0, 0xffa00030ff800080, 1050
+	/* uaddl  v0.8h, v1.8b, v2.8b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	uaddl  v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0x017f008000820080, 51
+	umov x0, v0.d[1]
+	CKX x0, 0x00a0003001800080, 1051
+	/* ssubl  v0.8h, v1.8b, v2.8b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	ssubl  v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0x007fff82ff7e007e, 52
+	umov x0, v0.d[1]
+	CKX x0, 0xff80fff000000000, 1052
+	/* usubl  v0.8h, v1.8b, v2.8b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	usubl  v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0x007fff82007e007e, 53
+	umov x0, v0.d[1]
+	CKX x0, 0x0080fff000000000, 1053
+	/* saddl2 v0.8h, v1.16b, v2.16b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	saddl2 v0.8h, v1.16b, v2.16b
+	umov x0, v0.d[0]
+	CKX x0, 0x0000008100210077, 54
+	umov x0, v0.d[1]
+	CKX x0, 0x00320044ffcc0066, 1054
+	/* saddw  v0.8h, v1.8h, v2.8b */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	saddw  v0.8h, v1.8h, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0xff7f008080028000, 55
+	umov x0, v0.d[1]
+	CKX x0, 0x7f100120bfc04040, 1055
+	/* usubw  v0.8h, v1.8h, v2.8b */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	usubw  v0.8h, v1.8h, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0xff7fff827ffe7ffe, 56
+	umov x0, v0.d[1]
+	CKX x0, 0x7ef000e0bf403fc0, 1056
+	/* addhn  v0.4h, v1.4s, v2.4s */
+	adr x10, A4s
+	ld1 {v1.16b}, [x10]
+	adr x10, B4s
+	ld1 {v2.16b}, [x10]
+	addhn  v0.4h, v1.4s, v2.4s
+	umov x0, v0.d[0]
+	CKX x0, 0x0000800080008000, 57
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000000000000, 1057
+	/* subhn  v0.4h, v1.4s, v2.4s */
+	adr x10, A4s
+	ld1 {v1.16b}, [x10]
+	adr x10, B4s
+	ld1 {v2.16b}, [x10]
+	subhn  v0.4h, v1.4s, v2.4s
+	umov x0, v0.d[0]
+	CKX x0, 0xffff80007fff7fff, 58
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000000000000, 1058
+	/* raddhn v0.4h, v1.4s, v2.4s */
+	adr x10, A4s
+	ld1 {v1.16b}, [x10]
+	adr x10, B4s
+	ld1 {v2.16b}, [x10]
+	raddhn v0.4h, v1.4s, v2.4s
+	umov x0, v0.d[0]
+	CKX x0, 0x0000800080008000, 59
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000000000000, 1059
+	/* rsubhn v0.4h, v1.4s, v2.4s */
+	adr x10, A4s
+	ld1 {v1.16b}, [x10]
+	adr x10, B4s
+	ld1 {v2.16b}, [x10]
+	rsubhn v0.4h, v1.4s, v2.4s
+	umov x0, v0.d[0]
+	CKX x0, 0x0000800080008000, 60
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000000000000, 1060
+	/* sabdl  v0.8h, v1.8b, v2.8b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	sabdl  v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0x007f007e0082007e, 61
+	umov x0, v0.d[1]
+	CKX x0, 0x0080001000000000, 1061
+	/* uabdl  v0.8h, v1.8b, v2.8b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	uabdl  v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0x007f007e007e007e, 62
+	umov x0, v0.d[1]
+	CKX x0, 0x0080001000000000, 1062
+	/* sabal v0.8h, v1.8b, v2.8b */
+	adr x10, D8h
+	ld1 {v0.16b}, [x10]
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	sabal v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0x00bf00ae00a2008e, 63
+	umov x0, v0.d[1]
+	CKX x0, 0x0100008000600050, 1063
+	/* uabal v0.8h, v1.8b, v2.8b */
+	adr x10, D8h
+	ld1 {v0.16b}, [x10]
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	adr x10, B16b
+	ld1 {v2.16b}, [x10]
+	uabal v0.8h, v1.8b, v2.8b
+	umov x0, v0.d[0]
+	CKX x0, 0x00bf00ae009e008e, 64
+	umov x0, v0.d[1]
+	CKX x0, 0x0100008000600050, 1064
+	/* sqdmull  v0.4s, v1.4h, v2.4h */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	adr x10, B8h
+	ld1 {v2.16b}, [x10]
+	sqdmull  v0.4s, v1.4h, v2.4h
+	umov x0, v0.d[0]
+	CKX x0, 0xffff00000000fffe, 65
+	umov x0, v0.d[1]
+	CKX x0, 0xfffffffc0000fffe, 1065
+	/* sqdmlal v0.4s, v1.4h, v2.4h */
+	adr x10, D4s
+	ld1 {v0.16b}, [x10]
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	adr x10, B8h
+	ld1 {v2.16b}, [x10]
+	sqdmlal v0.4s, v1.4h, v2.4h
+	umov x0, v0.d[0]
+	CKX x0, 0xffff00200001000e, 66
+	umov x0, v0.d[1]
+	CKX x0, 0x0000003c0001002e, 1066
+	/* sqdmlsl v0.4s, v1.4h, v2.4h */
+	adr x10, D4s
+	ld1 {v0.16b}, [x10]
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	adr x10, B8h
+	ld1 {v2.16b}, [x10]
+	sqdmlsl v0.4s, v1.4h, v2.4h
+	umov x0, v0.d[0]
+	CKX x0, 0x00010020ffff0012, 67
+	umov x0, v0.d[1]
+	CKX x0, 0x00000044ffff0032, 1067
+	/* cls v0.8h, v1.8h */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	cls v0.8h, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x000f000e00000000, 70
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000600010000, 1070
+	/* clz v0.8h, v1.8h */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	clz v0.8h, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x0000000f00000001, 71
+	umov x0, v0.d[1]
+	CKX x0, 0x0001000700000001, 1071
+	/* rbit v0.16b, v1.16b */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	rbit v0.16b, v1.16b
+	umov x0, v0.d[0]
+	CKX x0, 0x09080302ff8001fe, 72
+	umov x0, v0.d[1]
+	CKX x0, 0x778855aa407e33cc, 1072
+	/* saddlp v0.4s, v1.8h */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	saddlp v0.4s, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x00000000ffffffff, 73
+	umov x0, v0.d[1]
+	CKX x0, 0x0000800000000000, 1073
+	/* uaddlp v0.4s, v1.8h */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	uaddlp v0.4s, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x000100000000ffff, 74
+	umov x0, v0.d[1]
+	CKX x0, 0x0000800000010000, 1074
+	/* sadalp v0.4s, v1.8h */
+	adr x10, D4s
+	ld1 {v0.16b}, [x10]
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	sadalp v0.4s, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x000000200000000f, 75
+	umov x0, v0.d[1]
+	CKX x0, 0x0000804000000030, 1075
+	/* uadalp v0.4s, v1.8h */
+	adr x10, D4s
+	ld1 {v0.16b}, [x10]
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	uadalp v0.4s, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x000100200001000f, 76
+	umov x0, v0.d[1]
+	CKX x0, 0x0000804000010030, 1076
+	/* suqadd v0.8h, v1.8h */
+	adr x10, D8h
+	ld1 {v0.16b}, [x10]
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	suqadd v0.8h, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x7fff00317fff7fff, 77
+	umov x0, v0.d[1]
+	CKX x0, 0x7f8001707fff4050, 1077
+	/* usqadd v0.8h, v1.8h */
+	adr x10, D8h
+	ld1 {v0.16b}, [x10]
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	usqadd v0.8h, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x003f00310000800f, 78
+	umov x0, v0.d[1]
+	CKX x0, 0x7f80017000004050, 1078
+	/* sqabs v0.8h, v1.8h */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	sqabs v0.8h, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x000100017fff7fff, 79
+	umov x0, v0.d[1]
+	CKX x0, 0x7f00010040004000, 1079
+	/* sqneg v0.8h, v1.8h */
+	adr x10, A8h
+	ld1 {v1.16b}, [x10]
+	sqneg v0.8h, v1.8h
+	umov x0, v0.d[0]
+	CKX x0, 0x0001ffff7fff8001, 80
+	umov x0, v0.d[1]
+	CKX x0, 0x8100ff004000c000, 1080
+	/* sqxtn  v0.4h, v1.4s */
+	adr x10, A4s
+	ld1 {v1.16b}, [x10]
+	sqxtn  v0.4h, v1.4s
+	umov x0, v0.d[0]
+	CKX x0, 0xffff000180007fff, 81
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000000000000, 1081
+	/* uqxtn  v0.4h, v1.4s */
+	adr x10, A4s
+	ld1 {v1.16b}, [x10]
+	uqxtn  v0.4h, v1.4s
+	umov x0, v0.d[0]
+	CKX x0, 0xffff0001ffffffff, 82
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000000000000, 1082
+	/* sqxtun v0.4h, v1.4s */
+	adr x10, A4s
+	ld1 {v1.16b}, [x10]
+	sqxtun v0.4h, v1.4s
+	umov x0, v0.d[0]
+	CKX x0, 0x000000010000ffff, 83
+	umov x0, v0.d[1]
+	CKX x0, 0x0000000000000000, 1083
+	/* shll v0.8h, v1.8b, #8 */
+	adr x10, A16b
+	ld1 {v1.16b}, [x10]
+	shll v0.8h, v1.8b, #8
+	umov x0, v0.d[0]
+	CKX x0, 0xff00010080007f00, 84
+	umov x0, v0.d[1]
+	CKX x0, 0x90001000c0004000, 1084
 	movz x0, #0
 	b done
 fail:
