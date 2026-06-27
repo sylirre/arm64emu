@@ -347,6 +347,65 @@ _start:
     umov    x0, v0.d[1]
     CKX     x0, 0x000fffff12300000, 75
 
+    /* ARMv8.2 SHA3 + SHA512 (FEAT_SHA3 / FEAT_SHA512). Reference values from
+     * qemu-aarch64. .inst words avoid assembler .arch gating; all use fixed
+     * regs v0=dest, v1=vA, v2=vB, v3=vC. */
+    adr     x10, sha3_vA; ld1 {v1.2d}, [x10]
+    adr     x10, sha3_vB; ld1 {v2.2d}, [x10]
+    adr     x10, sha3_vC; ld1 {v3.2d}, [x10]
+
+    .inst   0xce020c20                 /* eor3 v0.16b, v1.16b, v2.16b, v3.16b */
+    umov    x0, v0.d[0]
+    CKX     x0, 0xba98fedc32107654, 76
+    umov    x0, v0.d[1]
+    CKX     x0, 0x89abcdef01234567, 77
+
+    .inst   0xce220c20                 /* bcax v0.16b, v1.16b, v2.16b, v3.16b */
+    umov    x0, v0.d[0]
+    CKX     x0, 0x1032547698badcfe, 78
+    umov    x0, v0.d[1]
+    CKX     x0, 0xdcfe98ba54761032, 79
+
+    .inst   0xce628c20                 /* rax1 v0.2d, v1.2d, v2.2d */
+    umov    x0, v0.d[0]
+    CKX     x0, 0x23016745ab89efcd, 80
+    umov    x0, v0.d[1]
+    CKX     x0, 0xba98fedc32107654, 81
+
+    .inst   0xce825020                 /* xar v0.2d, v1.2d, v2.2d, #20 */
+    umov    x0, v0.d[0]
+    CKX     x0, 0xadcfe1032547698b, 82
+    umov    x0, v0.d[1]
+    CKX     x0, 0x61032dcfe98ba547, 83
+
+    mov     v0.16b, v3.16b             /* Vd = vC (source operand) */
+    .inst   0xcec08020                 /* sha512su0 v0.2d, v1.2d */
+    umov    x0, v0.d[0]
+    CKX     x0, 0xa9ffffffffffffff, 84
+    umov    x0, v0.d[1]
+    CKX     x0, 0xc4e81cd1c1a46ff6, 85
+
+    mov     v0.16b, v3.16b
+    .inst   0xce628820                 /* sha512su1 v0.2d, v1.2d, v2.2d */
+    umov    x0, v0.d[0]
+    CKX     x0, 0x2c5f01c9778fed35, 86
+    umov    x0, v0.d[1]
+    CKX     x0, 0xead43169bba345fc, 87
+
+    mov     v0.16b, v3.16b
+    .inst   0xce628020                 /* sha512h q0, q1, v2.2d */
+    umov    x0, v0.d[0]
+    CKX     x0, 0x1378e216bd2e5b55, 88
+    umov    x0, v0.d[1]
+    CKX     x0, 0x4364ff20badc7698, 89
+
+    mov     v0.16b, v3.16b
+    .inst   0xce628420                 /* sha512h2 q0, q1, v2.2d */
+    umov    x0, v0.d[0]
+    CKX     x0, 0x9dea9dea9dea9de9, 90
+    umov    x0, v0.d[1]
+    CKX     x0, 0xcdefcdefcdefcdef, 91
+
     movz    x0, #0
     hlt     #0
 fail:
@@ -387,6 +446,13 @@ sli_vn:
     .word 0x00100001, 0xabcdef12, 0x00000003, 0xffffffff
 sli_vd:
     .word 0x00000fff, 0x00000abc, 0x12345678, 0x000000ff
+.balign 16
+sha3_vA:
+    .quad 0x0123456789abcdef, 0xfedcba9876543210
+sha3_vB:
+    .quad 0x1111111111111111, 0x2222222222222222
+sha3_vC:
+    .quad 0xaaaaaaaaaaaaaaaa, 0x5555555555555555
 
 .balign 16
 sha_iv:
