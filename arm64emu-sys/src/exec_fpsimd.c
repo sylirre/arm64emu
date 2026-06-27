@@ -761,8 +761,9 @@ static void simd_scalar_shift(CPU *c, u32 insn) {
  * (cross-checked against QEMU target/arm/tcg/crypto_helper.c).  All work on the
  * little-endian V128 lane views: pseudocode Elem[X,e,32] == X.s[e]. */
 
-/* ror32() is provided by types.h. */
+/* ror32()/ror64() are provided by types.h. */
 static inline u32 rol32(u32 x, unsigned n) { n &= 31; return n ? (x << n) | (x >> (32 - n)) : x; }
+static inline u64 rol64(u64 x, unsigned n) { n &= 63; return n ? (x << n) | (x >> (64 - n)) : x; }
 
 static u32 sha_ch(u32 x, u32 y, u32 z)  { return (x & y) ^ (~x & z); }
 static u32 sha_maj(u32 x, u32 y, u32 z) { return (x & y) ^ (x & z) ^ (y & z); }
@@ -975,6 +976,82 @@ static void crypto_pmull(CPU *c, u32 insn) {
     fpsimd_undef(c, insn);
 }
 
+/* ARMv8.2 SHA-512 64-bit round functions (FEAT_SHA512). */
+static u64 sha512_ch (u64 x, u64 y, u64 z) { return (x & y) ^ (~x & z); }
+static u64 sha512_maj(u64 x, u64 y, u64 z) { return (x & y) ^ (x & z) ^ (y & z); }
+static u64 sha512_S0 (u64 x) { return ror64(x, 28) ^ ror64(x, 34) ^ ror64(x, 39); } /* Sigma0 */
+static u64 sha512_S1 (u64 x) { return ror64(x, 14) ^ ror64(x, 18) ^ ror64(x, 41); } /* Sigma1 */
+static u64 sha512_s0 (u64 x) { return ror64(x,  1) ^ ror64(x,  8) ^ (x >> 7); }     /* sigma0 */
+static u64 sha512_s1 (u64 x) { return ror64(x, 19) ^ ror64(x, 61) ^ (x >> 6); }     /* sigma1 */
+
+/* ARMv8.2 cryptographic extensions in the 0xce encoding space: FEAT_SHA3
+ * (EOR3/BCAX/RAX1/XAR) and FEAT_SHA512 (SHA512H/H2/SU0/SU1). Transcribed from
+ * the ARM ARM pseudocode (cross-checked against QEMU crypto_helper.c); SHA-512
+ * lanes use the little-endian view d[0]=low 64, d[1]=high 64. SM3/SM4 (also in
+ * this space) are intentionally left UNDEF/unadvertised. */
+static void crypto_sha3_512(CPU *c, u32 insn) {
+    unsigned Rm = BITS(20, 16), Ra = BITS(14, 10), Rn = BITS(9, 5), Rd = BITS(4, 0);
+    V128 n = c->v[Rn], m = c->v[Rm], r;
+
+    /* Cryptographic four-register (bit23=0, bit15=0): EOR3 / BCAX. */
+    if (BIT(23) == 0 && BIT(15) == 0) {
+        V128 a = c->v[Ra];
+        switch (BITS(22, 21)) {
+            case 0:                              /* EOR3 Vd,Vn,Vm,Va = Vn^Vm^Va */
+                r.d[0] = n.d[0] ^ m.d[0] ^ a.d[0];
+                r.d[1] = n.d[1] ^ m.d[1] ^ a.d[1];
+                c->v[Rd] = r; return;
+            case 1:                              /* BCAX Vd,Vn,Vm,Va = Vn^(Vm&~Va) */
+                r.d[0] = n.d[0] ^ (m.d[0] & ~a.d[0]);
+                r.d[1] = n.d[1] ^ (m.d[1] & ~a.d[1]);
+                c->v[Rd] = r; return;
+            default: fpsimd_undef(c, insn); return;   /* 2=SM3SS1 (unimplemented) */
+        }
+    }
+    /* XAR Vd,Vn,Vm,#imm6 (bits[23:21]=100): per-lane ROR(Vn^Vm, imm6). */
+    if (BITS(23, 21) == 4) {
+        unsigned imm6 = BITS(15, 10);
+        r.d[0] = ror64(n.d[0] ^ m.d[0], imm6);
+        r.d[1] = ror64(n.d[1] ^ m.d[1], imm6);
+        c->v[Rd] = r; return;
+    }
+    /* Cryptographic three-register SHA512 / RAX1 (bits[23:21]=011, bit15=1,
+     * bits[14:12]=000), selected by bits[11:10]. */
+    if (BITS(23, 21) == 3 && BIT(15) == 1 && BITS(14, 12) == 0) {
+        V128 d = c->v[Rd];
+        switch (BITS(11, 10)) {
+            case 0: {                            /* SHA512H Qd,Qn,Vm */
+                u64 d0 = d.d[0], d1 = d.d[1];
+                d1 += sha512_S1(m.d[1]) + sha512_ch(m.d[1], n.d[0], n.d[1]);
+                d0 += sha512_S1(d1 + m.d[0]) + sha512_ch(d1 + m.d[0], m.d[1], n.d[0]);
+                r.d[0] = d0; r.d[1] = d1; c->v[Rd] = r; return;
+            }
+            case 1: {                            /* SHA512H2 Qd,Qn,Vm */
+                u64 d0 = d.d[0], d1 = d.d[1];
+                d1 += sha512_S0(m.d[0]) + sha512_maj(n.d[0], m.d[1], m.d[0]);
+                d0 += sha512_S0(d1) + sha512_maj(d1, m.d[0], m.d[1]);
+                r.d[0] = d0; r.d[1] = d1; c->v[Rd] = r; return;
+            }
+            case 2:                              /* SHA512SU1 Vd,Vn,Vm */
+                r.d[0] = d.d[0] + sha512_s1(n.d[0]) + m.d[0];
+                r.d[1] = d.d[1] + sha512_s1(n.d[1]) + m.d[1];
+                c->v[Rd] = r; return;
+            case 3:                              /* RAX1 Vd,Vn,Vm: Vn ^ ROL(Vm,1) */
+                r.d[0] = n.d[0] ^ rol64(m.d[0], 1);
+                r.d[1] = n.d[1] ^ rol64(m.d[1], 1);
+                c->v[Rd] = r; return;
+        }
+    }
+    /* Cryptographic two-register SHA512: SHA512SU0 Vd,Vn. */
+    if (BITS(23, 21) == 6 && BITS(20, 16) == 0 && BITS(15, 10) == 0x20) {
+        V128 d = c->v[Rd];
+        r.d[0] = d.d[0] + sha512_s0(d.d[1]);
+        r.d[1] = d.d[1] + sha512_s0(n.d[0]);
+        c->v[Rd] = r; return;
+    }
+    fpsimd_undef(c, insn);                       /* SM3/SM4 and any gaps */
+}
+
 /* AdvSIMD TBL/TBX: byte table lookup across 1-4 consecutive table registers.
  * For each index byte in Vm: out = table[idx] if idx < 16*nregs, else 0 (TBL)
  * or the original Vd byte (TBX). */
@@ -1076,6 +1153,9 @@ void exec_fpsimd(CPU *c, u32 insn) {
     if (BITS(28, 24) == 0x0e && BIT(29) == 0 && BIT(21) == 1 && BITS(15, 12) == 0xe && BITS(11, 10) == 0) {
         crypto_pmull(c, insn); return;
     }
+    /* ARMv8.2 crypto extensions (FEAT_SHA3 EOR3/BCAX/RAX1/XAR, FEAT_SHA512
+     * H/H2/SU0/SU1). Nothing else decodes the 0xce top byte. */
+    if (BITS(31, 24) == 0xce) { crypto_sha3_512(c, insn); return; }
     /* AdvSIMD three-different widening multiply (S/U MULL/MLAL/MLSL). */
     if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BIT(21) == 1 && BITS(11, 10) == 0 &&
         (BITS(15, 12) == 0x8 || BITS(15, 12) == 0xa || BITS(15, 12) == 0xc)) {
