@@ -295,6 +295,58 @@ _start:
     umov    x0, v0.d[1]
     CKX     x0, 0x0000001900000014, 63
 
+    /* three-different widening multiply (vector), XTN/XTN2, SHRN. */
+    adr     x10, mbe_vn
+    ld1     {v14.4s}, [x10]            /* {2, -2, 4, 5} */
+    adr     x10, td_vm
+    ld1     {v7.4s}, [x10]             /* {3, 7, 6, 9} */
+    umull   v0.2d, v14.2s, v7.2s
+    umov    x0, v0.d[0]
+    CKX     x0, 0x6, 64
+    umov    x0, v0.d[1]
+    CKX     x0, 0x6fffffff2, 65
+    smull   v0.2d, v14.2s, v7.2s       /* signed: d[1] = -2*7 = -14 */
+    umov    x0, v0.d[1]
+    CKX     x0, 0xfffffffffffffff2, 66
+    umull2  v0.2d, v14.4s, v7.4s       /* high half {4*6, 5*9} */
+    umov    x0, v0.d[1]
+    CKX     x0, 0x2d, 67
+    adr     x10, mbe_accd
+    ld1     {v0.2d}, [x10]             /* {100, 200} */
+    umlal   v0.2d, v14.2s, v7.2s
+    umov    x0, v0.d[1]
+    CKX     x0, 0x7000000ba, 68
+    adr     x10, td_xt
+    ld1     {v2.2d}, [x10]             /* {0x1122334455667788, 0x99aabbccddeeff00} */
+    xtn     v1.2s, v2.2d               /* low 32 of each -> {0x55667788, 0xddeeff00} */
+    umov    x0, v1.d[0]
+    CKX     x0, 0xddeeff0055667788, 69
+    shrn    v3.2s, v2.2d, #8           /* (each >> 8) truncated to 32 */
+    umov    x0, v3.d[0]
+    CKX     x0, 0xccddeeff44556677, 70
+    movi    v4.4s, #0x11
+    xtn2    v4.4s, v2.2d               /* high half := narrowed v2, keep low */
+    umov    x0, v4.d[1]
+    CKX     x0, 0xddeeff0055667788, 71
+
+    /* SLI/SRI .4s #12 (ChaCha20 rotates use ushr+sli). */
+    adr     x10, sli_vn
+    ld1     {v1.4s}, [x10]
+    adr     x10, sli_vd
+    ld1     {v0.4s}, [x10]
+    sli     v0.4s, v1.4s, #12
+    umov    x0, v0.d[0]
+    CKX     x0, 0xdef12abc00001fff, 72
+    umov    x0, v0.d[1]
+    CKX     x0, 0xfffff0ff00003678, 73
+    adr     x10, sli_vd
+    ld1     {v0.4s}, [x10]
+    sri     v0.4s, v1.4s, #12
+    umov    x0, v0.d[0]
+    CKX     x0, 0x000abcde00000100, 74
+    umov    x0, v0.d[1]
+    CKX     x0, 0x000fffff12300000, 75
+
     movz    x0, #0
     hlt     #0
 fail:
@@ -324,9 +376,17 @@ mbe_vn:
     .word 2, 0xfffffffe, 4, 5
 mbe_vm:
     .word 9, 8, 5, 6
+td_vm:
+    .word 3, 7, 6, 9
 .balign 16
 mbe_accd:
     .quad 100, 200
+td_xt:
+    .quad 0x1122334455667788, 0x99aabbccddeeff00
+sli_vn:
+    .word 0x00100001, 0xabcdef12, 0x00000003, 0xffffffff
+sli_vd:
+    .word 0x00000fff, 0x00000abc, 0x12345678, 0x000000ff
 
 .balign 16
 sha_iv:
