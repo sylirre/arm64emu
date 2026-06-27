@@ -849,6 +849,11 @@ static void simd_indexed(CPU *c, u32 insn) {
  * 0xc/0x8/0xa). Each pair of esize source lanes makes a 2*esize product; bit30=Q
  * picks the SMULL2-style high source half. Poly1305's NEON path multiplies its
  * 32-bit limbs to 64-bit accumulators here (plus the by-element forms). */
+static u64 sat_s128(__int128 v, unsigned e) {
+    s64 max = (e >= 64) ? INT64_MAX : (((s64)1 << (e - 1)) - 1);
+    s64 min = (e >= 64) ? INT64_MIN : (-((s64)1 << (e - 1)));
+    if (v > max) return (u64)max; if (v < min) return (u64)min; return (u64)(s64)v;
+}
 static void simd_three_diff(CPU *c, u32 insn) {
     unsigned Q = BIT(30), U = BIT(29), size = BITS(23, 22), opc = BITS(15, 12);
     unsigned Rm = BITS(20, 16), Rn = BITS(9, 5), Rd = BITS(4, 0);
@@ -856,11 +861,49 @@ static void simd_three_diff(CPU *c, u32 insn) {
     u64 emask = (1ULL << esize) - 1;               /* esize is 8/16/32 here */
     u64 dmask = (2 * esize >= 64) ? ~0ULL : ((1ULL << (2 * esize)) - 1);
     V128 vn = c->v[Rn], vm = c->v[Rm], vd = c->v[Rd], r; r.d[0] = r.d[1] = 0;
+
+    if (opc == 0x4 || opc == 0x6) {                /* ADDHN/RADDHN/SUBHN/RSUBHN: narrow high half */
+        V128 res; if (Q) res = vd; else { res.d[0] = res.d[1] = 0; }
+        for (unsigned i = 0; i < ndest; i++) {
+            u64 a = velem_get(&vn, dsize, i), b = velem_get(&vm, dsize, i);
+            u64 wide = (opc == 0x4) ? a + b : a - b;
+            if (U) wide += (u64)1 << (esize - 1);  /* rounding variants */
+            velem_set(&res, size, base + i, (wide >> esize) & emask);
+        }
+        c->v[Rd] = res; return;
+    }
+    if (opc == 0x1 || opc == 0x3) {                /* S/UADDW / S/USUBW: wide ± narrow */
+        for (unsigned i = 0; i < ndest; i++) {
+            u64 wa = velem_get(&vn, dsize, i), nb = velem_get(&vm, size, base + i) & emask;
+            u64 ext = U ? nb : (u64)sx(nb, esize);
+            velem_set(&r, dsize, i, ((opc == 0x1) ? wa + ext : wa - ext) & dmask);
+        }
+        c->v[Rd] = r; return;
+    }
+    /* long forms (esize source -> 2*esize dest) */
     for (unsigned i = 0; i < ndest; i++) {
         u64 a = velem_get(&vn, size, base + i) & emask, b = velem_get(&vm, size, base + i) & emask;
-        u64 prod = U ? (a * b) : (u64)(sx(a, esize) * sx(b, esize));
-        u64 d = velem_get(&vd, dsize, i);
-        u64 v = (opc == 0xc) ? prod : (opc == 0x8) ? d + prod : d - prod;
+        u64 d = velem_get(&vd, dsize, i), v;
+        u64 adiff = U ? (a > b ? a - b : b - a)
+                      : (u64)((sx(a, esize) > sx(b, esize)) ? sx(a, esize) - sx(b, esize)
+                                                            : sx(b, esize) - sx(a, esize));
+        u64 prod  = U ? (a * b) : (u64)(sx(a, esize) * sx(b, esize));
+        switch (opc) {
+            case 0x0: v = U ? a + b : (u64)(sx(a,esize) + sx(b,esize)); break;  /* S/UADDL */
+            case 0x2: v = U ? a - b : (u64)(sx(a,esize) - sx(b,esize)); break;  /* S/USUBL */
+            case 0x5: v = d + adiff; break;                                    /* S/UABAL */
+            case 0x7: v = adiff; break;                                        /* S/UABDL */
+            case 0x8: v = d + prod; break;                                     /* S/UMLAL */
+            case 0xa: v = d - prod; break;                                     /* S/UMLSL */
+            case 0xc: v = prod; break;                                         /* S/UMULL */
+            case 0x9: if (U) { fpsimd_undef(c, insn); return; }                /* SQDMLAL */
+                      v = ssat_add(sx(d, 2*esize), (s64)sat_s128((__int128)2*sx(a,esize)*sx(b,esize), 2*esize), 2*esize); break;
+            case 0xb: if (U) { fpsimd_undef(c, insn); return; }                /* SQDMLSL */
+                      v = ssat_sub(sx(d, 2*esize), (s64)sat_s128((__int128)2*sx(a,esize)*sx(b,esize), 2*esize), 2*esize); break;
+            case 0xd: if (U) { fpsimd_undef(c, insn); return; }                /* SQDMULL */
+                      v = sat_s128((__int128)2*sx(a,esize)*sx(b,esize), 2*esize); break;
+            default: fpsimd_undef(c, insn); return;
+        }
         velem_set(&r, dsize, i, v & dmask);
     }
     c->v[Rd] = r;
@@ -1133,6 +1176,52 @@ static void simd_two_misc(CPU *c, u32 insn) {
             velem_set(&r, size, base + i, velem_get(&c->v[Rn], size + 1, i));
         c->v[Rd] = r; return;
     }
+    /* RBIT (byte bit-reverse): opcode 0x05 U=1 size=01 (NOT is size=00, above). */
+    if (opc == 0x05 && U == 1 && size == 1) {
+        unsigned total = Q ? 16 : 8; V128 r; r.d[0] = r.d[1] = 0;
+        for (unsigned b = 0; b < total; b++) {
+            u8 x = c->v[Rn].b[b], y = 0;
+            for (int k = 0; k < 8; k++) if (x & (1 << k)) y |= 1 << (7 - k);
+            r.b[b] = y;
+        }
+        c->v[Rd] = r; return;
+    }
+    /* SADDLP/UADDLP (0x02) and SADALP/UADALP (0x06): pairwise add long (+acc). */
+    if (opc == 0x02 || opc == 0x06) {
+        unsigned esz = 8u << size, nsrc = (Q ? 16 : 8) >> size, nd = nsrc / 2, dsz = size + 1;
+        u64 dmask = (2 * esz >= 64) ? ~0ULL : ((1ULL << (2 * esz)) - 1);
+        V128 r; r.d[0] = r.d[1] = 0;
+        for (unsigned i = 0; i < nd; i++) {
+            u64 e0 = velem_get(&c->v[Rn], size, 2*i), e1 = velem_get(&c->v[Rn], size, 2*i + 1);
+            u64 sum = U ? (e0 + e1) : (u64)(sx(e0, esz) + sx(e1, esz));
+            if (opc == 0x06) sum += velem_get(&c->v[Rd], dsz, i);   /* ADALP accumulate */
+            velem_set(&r, dsz, i, sum & dmask);
+        }
+        c->v[Rd] = r; return;
+    }
+    /* SQXTN/UQXTN (0x14) and SQXTUN (0x12,U=1): saturating extract narrow. */
+    if (opc == 0x14 || (opc == 0x12 && U == 1)) {
+        unsigned esz = 8u << size, nd = 64u / esz, base = Q ? nd : 0;
+        u64 emask = (1ULL << esz) - 1;
+        V128 r; if (Q) r = c->v[Rd]; else { r.d[0] = r.d[1] = 0; }
+        for (unsigned i = 0; i < nd; i++) {
+            u64 src = velem_get(&c->v[Rn], size + 1, i), nv;
+            if (opc == 0x12)  nv = sat_u(sx(src, 2*esz), esz);          /* SQXTUN: signed->unsigned */
+            else if (U == 0)  nv = sat_s(sx(src, 2*esz), esz);          /* SQXTN: signed */
+            else              nv = (src > emask) ? emask : src;         /* UQXTN: unsigned */
+            velem_set(&r, size, base + i, nv & emask);
+        }
+        c->v[Rd] = r; return;
+    }
+    /* SHLL/SHLL2 (0x13,U=1): shift left long by the element size. */
+    if (opc == 0x13 && U == 1) {
+        unsigned esz = 8u << size, nd = 64u / esz, base = Q ? nd : 0, dsz = size + 1;
+        u64 emask = (1ULL << esz) - 1, dmask = (2 * esz >= 64) ? ~0ULL : ((1ULL << (2 * esz)) - 1);
+        V128 r; r.d[0] = r.d[1] = 0;
+        for (unsigned i = 0; i < nd; i++)
+            velem_set(&r, dsz, i, ((velem_get(&c->v[Rn], size, base + i) & emask) << esz) & dmask);
+        c->v[Rd] = r; return;
+    }
     unsigned esize = 8u << size, n = (Q ? 16 : 8) >> size;
     u64 emask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
     V128 r; r.d[0] = r.d[1] = 0;
@@ -1147,6 +1236,16 @@ static void simd_two_misc(CPU *c, u32 insn) {
             case (0 << 5) | 0x05: v = (u64)__builtin_popcount((unsigned)(a & 0xff)); break; /* CNT */
             case (0 << 5) | 0x0b: { s64 s = sx(a,esize); v = (s < 0) ? (u64)(-s) : a; } break; /* ABS */
             case (1 << 5) | 0x0b: v = (u64)(-(s64)a); break;                   /* NEG */
+            case (1 << 5) | 0x04: { u64 val = a & emask; unsigned cnt = 0;     /* CLZ */
+                for (int bit = esize - 1; bit >= 0; bit--) { if (val & (1ULL << bit)) break; cnt++; } v = cnt; } break;
+            case (0 << 5) | 0x04: { u64 val = a & emask; unsigned msb = (val >> (esize-1)) & 1, cnt = 0; /* CLS */
+                for (int bit = esize - 2; bit >= 0; bit--) { if (((val >> bit) & 1) == msb) cnt++; else break; } v = cnt; } break;
+            case (0 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i);     /* SUQADD: signed acc + unsigned */
+                v = ssat_add(sx(d, esize), (s64)(a & emask), esize); } break;
+            case (1 << 5) | 0x03: { u64 d = velem_get(&c->v[Rd], size, i) & emask; s64 sa = sx(a, esize); /* USQADD */
+                v = (sa >= 0) ? usat_add(d, (u64)sa, esize) : ((d < (u64)(-sa)) ? 0 : d - (u64)(-sa)); } break;
+            case (0 << 5) | 0x07: { s64 s = sx(a, esize); v = sat_s(s < 0 ? -s : s, esize); } break; /* SQABS */
+            case (1 << 5) | 0x07: v = sat_s(-sx(a, esize), esize); break;      /* SQNEG */
             default: fpsimd_undef(c, insn); return;
         }
         velem_set(&r, size, i, v & emask);
@@ -1665,9 +1764,11 @@ void exec_fpsimd(CPU *c, u32 insn) {
     /* ARMv8.2 crypto extensions (FEAT_SHA3 EOR3/BCAX/RAX1/XAR, FEAT_SHA512
      * H/H2/SU0/SU1). Nothing else decodes the 0xce top byte. */
     if (BITS(31, 24) == 0xce) { crypto_sha3_512(c, insn); return; }
-    /* AdvSIMD three-different widening multiply (S/U MULL/MLAL/MLSL). */
+    /* AdvSIMD three-different (whole group: ADDL/SUBL/ADDW/SUBW/ADDHN/SUBHN/
+     * ABAL/ABDL/MULL/MLAL/MLSL/SQDMULL/SQDMLAL/SQDMLSL). PMULL (opcode 0xe) is
+     * decoded above; everything else with bits[11:10]=0, bit21=1 lands here. */
     if (BIT(31) == 0 && BITS(28, 24) == 0x0e && BIT(21) == 1 && BITS(11, 10) == 0 &&
-        (BITS(15, 12) == 0x8 || BITS(15, 12) == 0xa || BITS(15, 12) == 0xc)) {
+        BITS(15, 12) != 0xe) {
         simd_three_diff(c, insn); return;
     }
     /* AdvSIMD TBL/TBX (table vector lookup). */
