@@ -34,9 +34,10 @@ make test                  # runs the assembly self-tests
 
 Useful flags: `-m <MB>` RAM size, `-dtb FILE` supply a device tree,
 `-drive IMG` attach virtio-blk disks, `-share HOSTDIR[,tag=TAG]` expose a host
-directory through virtio-9p, `-bin FILE@ADDR` load a flat binary (bare-metal
-tests), `-d` per-instruction trace, `-rt` register trace, `-maxinsn N` stop
-after N instructions.
+directory through virtio-9p (repeatable; default tags are `hostshare`,
+`hostshare1`, ...), `-bin FILE@ADDR` load a flat binary (bare-metal tests), `-d`
+per-instruction trace, `-rt` register trace, `-maxinsn N` stop after N
+instructions.
 
 Inside Linux, mount a shared host directory with:
 

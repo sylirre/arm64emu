@@ -92,7 +92,7 @@ typedef struct VirtIO9P {
     GIC *gic;
     int irq;
     char root[PATH_MAX];
-    char tag[64];
+    char tag[SHARE_TAG_MAX];
 
     u32 status, isr;
     u32 dev_feat_sel, drv_feat_sel;
@@ -812,7 +812,6 @@ VirtIO9P *virtio_9p_create(Machine *m, GIC *gic, const char *root, const char *t
     for (int i = 0; i < P9_MAX_FIDS; i++) v->fids[i].fd = -1;
     machine_add_device(m, 0x0a000000ULL + (u64)slot * 0x200, 0x200,
                        p9_read, p9_write, v, "virtio-9p");
-    m->fs9p = v;
     fprintf(stderr, "[virtio-9p] slot %d: tag=%s root=%s\n", slot, v->tag, v->root);
     return v;
 }

@@ -26,7 +26,7 @@ void machine_init(Machine *m, u64 ram_size) {
 void machine_free(Machine *m) {
     for (int i = 0; i < m->n_blk; i++) virtio_blk_destroy(m->blk[i]);
     virtio_net_destroy(m->net);
-    virtio_9p_destroy(m->fs9p);
+    for (int i = 0; i < m->n_fs9p; i++) virtio_9p_destroy(m->fs9p[i]);
     fwcfg_destroy(m->fwcfg);
     free(m->gic);
     free(m->timer);

@@ -48,7 +48,9 @@ typedef struct BootConfig {
     const char *binfile, *dtbfile;
     const char *drives[MAX_DRIVES];
     int n_drives;
-    const char *share_path, *share_tag;
+    const char *share_paths[MAX_SHARES];
+    char share_tags[MAX_SHARES][SHARE_TAG_MAX];
+    int n_shares;
     bool net_enabled;
     NetFwd net_fwds[16];
     int n_net_fwds;
@@ -74,6 +76,12 @@ static bool drive_already_attached(const BootConfig *cfg, const char *path) {
     return false;
 }
 
+static bool share_tag_already_used(const BootConfig *cfg, const char *tag) {
+    for (int i = 0; i < cfg->n_shares; i++)
+        if (!strcmp(cfg->share_tags[i], tag)) return true;
+    return false;
+}
+
 static void boot_machine(Machine *m, const BootConfig *cfg) {
     u64 entry = cfg->entry;
 
@@ -87,8 +95,12 @@ static void boot_machine(Machine *m, const BootConfig *cfg) {
         memcpy(m->net_fwds, cfg->net_fwds, cfg->n_net_fwds * sizeof(NetFwd));
         m->n_net_fwds = cfg->n_net_fwds;
     }
-    m->share_path = cfg->share_path;
-    m->share_tag = cfg->share_tag;
+    if (cfg->n_shares) {
+        memcpy(m->share_paths, cfg->share_paths, cfg->n_shares * sizeof(cfg->share_paths[0]));
+        for (int i = 0; i < cfg->n_shares; i++)
+            m->share_tags[i] = cfg->share_tags[i];
+        m->n_shares = cfg->n_shares;
+    }
 
     if (cfg->bios) {
         size_t n; u8 *fw = read_file(cfg->bios, &n);
@@ -120,13 +132,13 @@ static void boot_machine(Machine *m, const BootConfig *cfg) {
 static void usage(const char *p) {
     fprintf(stderr,
         "usage: %s [-bios FW.fd] [-kernel Image] [-initrd cpio] [-append CMDLINE]\n"
-        "          [-drive IMG (repeatable)] [-share HOSTDIR[,tag=TAG]]\n"
+        "          [-drive IMG (repeatable)] [-share HOSTDIR[,tag=TAG] (repeatable)]\n"
         "          [-net] [-netfwd tcp|udp:HOST_PORT:GUEST_PORT]\n"
         "          [-m MB] [-bin FLAT@ADDR] [-entry ADDR] [-el N] [-d] [-maxinsn N]\n", p);
 }
 
 int main(int argc, char **argv) {
-    BootConfig cfg = { .append = "", .share_tag = "hostshare", .ram_mb = 1024,
+    BootConfig cfg = { .append = "", .ram_mb = 1024,
                        .reset_el = 1, .bin_addr = RAM_BASE };
     u64 max_insn = 0;     /* 0 = unlimited */
 
@@ -152,15 +164,38 @@ int main(int argc, char **argv) {
             cfg.drives[cfg.n_drives++] = path;
         }
         else if (!strcmp(argv[i], "-share") && i + 1 < argc) {
+            if (cfg.n_shares >= MAX_SHARES) { fprintf(stderr, "too many -share directories\n"); return 1; }
+            if (cfg.n_drives + cfg.n_shares >= 31) {
+                fprintf(stderr, "too many virtio devices: -drive plus -share is limited to 31\n");
+                return 1;
+            }
             char *s = argv[++i];
+            const char *tag = NULL;
             char *comma = strstr(s, ",tag=");
             if (comma) {
                 *comma = '\0';
-                cfg.share_tag = comma + 5;
-                if (!*cfg.share_tag) { fprintf(stderr, "-share: empty tag\n"); return 1; }
+                tag = comma + 5;
+                if (!*tag) { fprintf(stderr, "-share: empty tag\n"); return 1; }
             }
-            cfg.share_path = s;
-            if (!*cfg.share_path) { fprintf(stderr, "-share: empty host directory\n"); return 1; }
+            if (!*s) { fprintf(stderr, "-share: empty host directory\n"); return 1; }
+            int share_idx = cfg.n_shares;
+            if (tag) {
+                if (strlen(tag) >= SHARE_TAG_MAX) {
+                    fprintf(stderr, "-share: tag too long (max %d bytes)\n", SHARE_TAG_MAX - 1);
+                    return 1;
+                }
+                snprintf(cfg.share_tags[share_idx], SHARE_TAG_MAX, "%s", tag);
+            } else if (share_idx == 0) {
+                snprintf(cfg.share_tags[share_idx], SHARE_TAG_MAX, "hostshare");
+            } else {
+                snprintf(cfg.share_tags[share_idx], SHARE_TAG_MAX, "hostshare%d", share_idx);
+            }
+            if (share_tag_already_used(&cfg, cfg.share_tags[share_idx])) {
+                fprintf(stderr, "-share: duplicate tag %s\n", cfg.share_tags[share_idx]);
+                return 1;
+            }
+            cfg.share_paths[share_idx] = s;
+            cfg.n_shares++;
         }
         else if (!strcmp(argv[i], "-net")) cfg.net_enabled = true;
         else if (!strcmp(argv[i], "-netfwd") && i + 1 < argc) {

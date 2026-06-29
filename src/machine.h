@@ -30,6 +30,8 @@ typedef struct {
 /* Max attachable disks. Ceiling is the 31 non-net virtio-mmio slots (slot 0 is
  * reserved for virtio-net); 8 is plenty and keeps the Machine arrays small. */
 #define MAX_DRIVES 8
+#define MAX_SHARES 16
+#define SHARE_TAG_MAX 64
 
 struct GIC;
 struct PL011;
@@ -77,15 +79,17 @@ typedef struct Machine {
     struct VirtIOBlk *blk[MAX_DRIVES];  /* attached disks, in attach order */
     int    n_blk;
     struct VirtIONet *net;
-    struct VirtIO9P *fs9p;
+    struct VirtIO9P *fs9p[MAX_SHARES];
+    int    n_fs9p;
 
     const char *drives[MAX_DRIVES];  /* -drive image paths */
     int    n_drives;
     bool net_enabled;             /* -net flag */
     NetFwd net_fwds[16];          /* -netfwd rules */
     int    n_net_fwds;
-    const char *share_path;        /* -share host directory */
-    const char *share_tag;         /* virtio-9p mount tag */
+    const char *share_paths[MAX_SHARES]; /* -share host directories */
+    const char *share_tags[MAX_SHARES];  /* virtio-9p mount tags */
+    int    n_shares;
 
     BusStatus last_bus_status;    /* set by phys_* on fault */
 } Machine;

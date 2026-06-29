@@ -62,7 +62,7 @@ void platform_build(Machine *m) {
 
     /* virtio-mmio: 32 slots (0x0a000000–0x0a003fff, stride 0x200).
      * Slot 0 is reserved for virtio-net (-net); disks (-drive) take slots 1,2,3,...
-     * and virtio-9p (-share) follows the disks, so block-device numbering is
+     * and virtio-9p (-share) devices follow the disks, so block-device numbering is
      * deterministic regardless of optional net/share devices.
      * Real devices must be registered before any stub that covers their range
      * because find_dev uses first-match dispatch — so a disk at slot 2+ shadows
@@ -71,9 +71,11 @@ void platform_build(Machine *m) {
     if (m->net_enabled) virtio_net_create(m, m->gic);
     for (int i = 0; i < m->n_drives; i++)
         virtio_blk_create(m, m->gic, m->drives[i], i + 1);   /* slots 1,2,3,... */
-    if (m->share_path)
-        virtio_9p_create(m, m->gic, m->share_path, m->share_tag ? m->share_tag : "hostshare",
-                         m->n_drives + 1);
+    for (int i = 0; i < m->n_shares; i++) {
+        int slot = m->n_drives + i + 1;
+        m->fs9p[m->n_fs9p++] = virtio_9p_create(m, m->gic, m->share_paths[i],
+                                                m->share_tags[i], slot);
+    }
     if (!m->net_enabled) machine_add_device(m, 0x0a000000, 0x200, virtio_mmio_read, stub_write, m, "virtio-mmio");
     if (m->n_drives == 0) machine_add_device(m, 0x0a000200, 0x200, virtio_mmio_read, stub_write, m, "virtio-mmio");
     machine_add_device(m, 0x0a000400, 0x3c00, virtio_mmio_read, stub_write, m, "virtio-mmio");
