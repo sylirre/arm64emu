@@ -48,6 +48,11 @@ typedef struct NetFwd {
     int  guest_port;
 } NetFwd;
 
+typedef struct DriveConfig {
+    const char *path;
+    bool read_only;
+} DriveConfig;
+
 typedef struct Machine {
     CPU cpu;
 
@@ -82,7 +87,7 @@ typedef struct Machine {
     struct VirtIO9P *fs9p[MAX_SHARES];
     int    n_fs9p;
 
-    const char *drives[MAX_DRIVES];  /* -drive image paths */
+    DriveConfig drives[MAX_DRIVES];  /* -drive image paths and options */
     int    n_drives;
     bool net_enabled;             /* -net flag */
     NetFwd net_fwds[16];          /* -netfwd rules */

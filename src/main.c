@@ -46,7 +46,7 @@ static u8 *read_file(const char *path, size_t *len_out) {
 typedef struct BootConfig {
     const char *bios, *kernel, *initrd, *append;
     const char *binfile, *dtbfile;
-    const char *drives[MAX_DRIVES];
+    DriveConfig drives[MAX_DRIVES];
     int n_drives;
     const char *share_paths[MAX_SHARES];
     char share_tags[MAX_SHARES][SHARE_TAG_MAX];
@@ -72,7 +72,7 @@ static bool same_drive_image(const char *a, const char *b) {
 
 static bool drive_already_attached(const BootConfig *cfg, const char *path) {
     for (int i = 0; i < cfg->n_drives; i++)
-        if (same_drive_image(cfg->drives[i], path)) return true;
+        if (same_drive_image(cfg->drives[i].path, path)) return true;
     return false;
 }
 
@@ -132,7 +132,7 @@ static void boot_machine(Machine *m, const BootConfig *cfg) {
 static void usage(const char *p) {
     fprintf(stderr,
         "usage: %s [-bios FW.fd] [-kernel Image] [-initrd cpio] [-append CMDLINE]\n"
-        "          [-drive IMG (repeatable)] [-share HOSTDIR[,tag=TAG] (repeatable)]\n"
+        "          [-drive IMG[,ro] (repeatable)] [-share HOSTDIR[,tag=TAG] (repeatable)]\n"
         "          [-net] [-netfwd tcp|udp:HOST_PORT:GUEST_PORT]\n"
         "          [-m MB] [-bin FLAT@ADDR] [-entry ADDR] [-el N] [-d] [-maxinsn N]\n", p);
 }
@@ -156,12 +156,32 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-dtb") && i + 1 < argc) cfg.dtbfile = argv[++i];
         else if (!strcmp(argv[i], "-drive") && i + 1 < argc) {
             if (cfg.n_drives >= MAX_DRIVES) { fprintf(stderr, "too many -drive disks\n"); return 1; }
-            const char *path = argv[++i];
+            char *spec = argv[++i];
+            char *path = spec;
+            bool read_only = false;
+            for (char *comma = strchr(spec, ','); comma; comma = strchr(comma + 1, ',')) {
+                *comma = '\0';
+                char *opt = comma + 1;
+                char *next = strchr(opt, ',');
+                if (next) *next = '\0';
+                if (!strcmp(opt, "ro") || !strcmp(opt, "readonly=on") ||
+                    !strcmp(opt, "read-only=on")) {
+                    read_only = true;
+                } else if (!strcmp(opt, "rw") || !strcmp(opt, "readonly=off") ||
+                           !strcmp(opt, "read-only=off")) {
+                    read_only = false;
+                } else {
+                    fprintf(stderr, "-drive: unknown option %s\n", opt);
+                    return 1;
+                }
+                if (next) *next = ',';
+            }
+            if (!*path) { fprintf(stderr, "-drive: empty disk image\n"); return 1; }
             if (drive_already_attached(&cfg, path)) {
                 fprintf(stderr, "-drive: duplicate disk image %s\n", path);
                 return 1;
             }
-            cfg.drives[cfg.n_drives++] = path;
+            cfg.drives[cfg.n_drives++] = (DriveConfig){ .path = path, .read_only = read_only };
         }
         else if (!strcmp(argv[i], "-share") && i + 1 < argc) {
             if (cfg.n_shares >= MAX_SHARES) { fprintf(stderr, "too many -share directories\n"); return 1; }

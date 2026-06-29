@@ -70,7 +70,7 @@ void platform_build(Machine *m) {
      * Unoccupied slots get empty-transport stubs (DeviceID=0). */
     if (m->net_enabled) virtio_net_create(m, m->gic);
     for (int i = 0; i < m->n_drives; i++)
-        virtio_blk_create(m, m->gic, m->drives[i], i + 1);   /* slots 1,2,3,... */
+        virtio_blk_create(m, m->gic, &m->drives[i], i + 1);  /* slots 1,2,3,... */
     for (int i = 0; i < m->n_shares; i++) {
         int slot = m->n_drives + i + 1;
         m->fs9p[m->n_fs9p++] = virtio_9p_create(m, m->gic, m->share_paths[i],
