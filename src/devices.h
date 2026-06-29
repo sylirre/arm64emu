@@ -84,7 +84,7 @@ void              virtio_net_destroy(struct VirtIONet *v);
 /* ---- virtio-9p (virtio-mmio slot N) ---- */
 struct VirtIO9P;
 struct VirtIO9P *virtio_9p_create(Machine *m, GIC *gic, const char *root,
-                                  const char *tag, int slot);
+                                  const char *tag, bool read_only, int slot);
 void virtio_9p_destroy(struct VirtIO9P *v);
 
 #endif /* A64_DEVICES_H */

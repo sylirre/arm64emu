@@ -50,6 +50,7 @@ typedef struct BootConfig {
     int n_drives;
     const char *share_paths[MAX_SHARES];
     char share_tags[MAX_SHARES][SHARE_TAG_MAX];
+    bool share_read_only[MAX_SHARES];
     int n_shares;
     bool net_enabled;
     NetFwd net_fwds[16];
@@ -97,8 +98,10 @@ static void boot_machine(Machine *m, const BootConfig *cfg) {
     }
     if (cfg->n_shares) {
         memcpy(m->share_paths, cfg->share_paths, cfg->n_shares * sizeof(cfg->share_paths[0]));
-        for (int i = 0; i < cfg->n_shares; i++)
+        for (int i = 0; i < cfg->n_shares; i++) {
             m->share_tags[i] = cfg->share_tags[i];
+            m->share_read_only[i] = cfg->share_read_only[i];
+        }
         m->n_shares = cfg->n_shares;
     }
 
@@ -132,7 +135,7 @@ static void boot_machine(Machine *m, const BootConfig *cfg) {
 static void usage(const char *p) {
     fprintf(stderr,
         "usage: %s [-bios FW.fd] [-kernel Image] [-initrd cpio] [-append CMDLINE]\n"
-        "          [-drive IMG[,ro] (repeatable)] [-share HOSTDIR[,tag=TAG] (repeatable)]\n"
+        "          [-drive IMG[,ro] (repeatable)] [-share HOSTDIR[,tag=TAG][,ro] (repeatable)]\n"
         "          [-net] [-netfwd tcp|udp:HOST_PORT:GUEST_PORT]\n"
         "          [-m MB] [-bin FLAT@ADDR] [-entry ADDR] [-el N] [-d] [-maxinsn N]\n", p);
 }
@@ -191,19 +194,37 @@ int main(int argc, char **argv) {
             }
             char *s = argv[++i];
             const char *tag = NULL;
-            char *comma = strstr(s, ",tag=");
-            if (comma) {
+            char tag_buf[SHARE_TAG_MAX];
+            bool read_only = false;
+            for (char *comma = strchr(s, ','); comma; comma = strchr(comma + 1, ',')) {
                 *comma = '\0';
-                tag = comma + 5;
-                if (!*tag) { fprintf(stderr, "-share: empty tag\n"); return 1; }
+                char *opt = comma + 1;
+                char *next = strchr(opt, ',');
+                if (next) *next = '\0';
+                if (!strncmp(opt, "tag=", 4)) {
+                    const char *tag_opt = opt + 4;
+                    if (!*tag_opt) { fprintf(stderr, "-share: empty tag\n"); return 1; }
+                    if (strlen(tag_opt) >= SHARE_TAG_MAX) {
+                        fprintf(stderr, "-share: tag too long (max %d bytes)\n", SHARE_TAG_MAX - 1);
+                        return 1;
+                    }
+                    snprintf(tag_buf, sizeof(tag_buf), "%s", tag_opt);
+                    tag = tag_buf;
+                } else if (!strcmp(opt, "ro") || !strcmp(opt, "readonly=on") ||
+                           !strcmp(opt, "read-only=on")) {
+                    read_only = true;
+                } else if (!strcmp(opt, "rw") || !strcmp(opt, "readonly=off") ||
+                           !strcmp(opt, "read-only=off")) {
+                    read_only = false;
+                } else {
+                    fprintf(stderr, "-share: unknown option %s\n", opt);
+                    return 1;
+                }
+                if (next) *next = ',';
             }
             if (!*s) { fprintf(stderr, "-share: empty host directory\n"); return 1; }
             int share_idx = cfg.n_shares;
             if (tag) {
-                if (strlen(tag) >= SHARE_TAG_MAX) {
-                    fprintf(stderr, "-share: tag too long (max %d bytes)\n", SHARE_TAG_MAX - 1);
-                    return 1;
-                }
                 snprintf(cfg.share_tags[share_idx], SHARE_TAG_MAX, "%s", tag);
             } else if (share_idx == 0) {
                 snprintf(cfg.share_tags[share_idx], SHARE_TAG_MAX, "hostshare");
@@ -215,6 +236,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             cfg.share_paths[share_idx] = s;
+            cfg.share_read_only[share_idx] = read_only;
             cfg.n_shares++;
         }
         else if (!strcmp(argv[i], "-net")) cfg.net_enabled = true;

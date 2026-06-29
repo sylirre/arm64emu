@@ -93,6 +93,7 @@ typedef struct VirtIO9P {
     int irq;
     char root[PATH_MAX];
     char tag[SHARE_TAG_MAX];
+    bool read_only;
 
     u32 status, isr;
     u32 dev_feat_sel, drv_feat_sel;
@@ -304,6 +305,11 @@ static int p9_open_flags(u32 flags) {
     return of;
 }
 
+static bool p9_open_write_intent(u32 flags) {
+    int acc = flags & 3;
+    return acc != 0 || (flags & (0100 | 01000)) != 0;
+}
+
 static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) {
     Buf in = { req, req_len, 0 };
     Buf out = { resp, resp_cap, 0 };
@@ -432,6 +438,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         u64 atime_sec = rd64(&in), atime_nsec = rd64(&in);
         u64 mtime_sec = rd64(&in), mtime_nsec = rd64(&in);
         if (!f) return reply_error(&out, tag, EBADF);
+        if (v->read_only && valid) return reply_error(&out, tag, EROFS);
         char abs[PATH_MAX];
         if (!abs_existing(v, f->rel, abs)) return reply_error(&out, tag, errno);
         if ((valid & 0x1) && chmod(abs, mode & 07777) < 0) return reply_error(&out, tag, errno);
@@ -455,6 +462,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         P9Fid *f = fid_get(v, rd32(&in));
         u32 flags = rd32(&in);
         if (!f) return reply_error(&out, tag, EBADF);
+        if (v->read_only && p9_open_write_intent(flags)) return reply_error(&out, tag, EROFS);
         char abs[PATH_MAX];
         if (!abs_existing(v, f->rel, abs)) return reply_error(&out, tag, errno);
         int fd = open(abs, p9_open_flags(flags) | O_CLOEXEC);
@@ -475,6 +483,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         if (!f || !rdstr(&in, name, sizeof(name))) return reply_error(&out, tag, f ? EPROTO : EBADF);
         u32 flags = rd32(&in), mode = rd32(&in);
         (void)rd32(&in); /* gid */
+        if (v->read_only) return reply_error(&out, tag, EROFS);
         char rel[PATH_MAX], abs[PATH_MAX];
         if (!join_rel(f->rel, name, rel) || !abs_create_path(v, rel, abs)) return reply_error(&out, tag, errno);
         int fd = open(abs, p9_open_flags(flags) | O_CREAT | O_CLOEXEC, mode & 07777);
@@ -495,6 +504,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         u64 off = rd64(&in);
         u32 count = rd32(&in);
         if (!f) return reply_error(&out, tag, EBADF);
+        if (v->read_only && type == P9_TWRITE) return reply_error(&out, tag, EROFS);
         if (!f->open) {
             char abs[PATH_MAX];
             if (!abs_existing(v, f->rel, abs)) return reply_error(&out, tag, errno);
@@ -570,6 +580,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         if (!df || !rdstr(&in, name, sizeof(name))) return reply_error(&out, tag, df ? EPROTO : EBADF);
         u32 mode = rd32(&in);
         (void)rd32(&in);
+        if (v->read_only) return reply_error(&out, tag, EROFS);
         char rel[PATH_MAX], abs[PATH_MAX];
         if (!join_rel(df->rel, name, rel) || !abs_create_path(v, rel, abs)) return reply_error(&out, tag, errno);
         if (mkdir(abs, mode & 07777) < 0) return reply_error(&out, tag, errno);
@@ -586,6 +597,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         if (!df || !rdstr(&in, name, sizeof(name)) || !rdstr(&in, symtgt, sizeof(symtgt)))
             return reply_error(&out, tag, df ? EPROTO : EBADF);
         (void)rd32(&in);
+        if (v->read_only) return reply_error(&out, tag, EROFS);
         char rel[PATH_MAX], abs[PATH_MAX];
         if (!join_rel(df->rel, name, rel) || !abs_create_path(v, rel, abs)) return reply_error(&out, tag, errno);
         if (symlink(symtgt, abs) < 0) return reply_error(&out, tag, errno);
@@ -603,6 +615,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         P9Fid *newdf = fid_get(v, rd32(&in));
         char newname[NAME_MAX + 1];
         if (!newdf || !rdstr(&in, newname, sizeof(newname))) return reply_error(&out, tag, newdf ? EPROTO : EBADF);
+        if (v->read_only) return reply_error(&out, tag, EROFS);
         char oldrel[PATH_MAX], newrel[PATH_MAX], oldabs[PATH_MAX], newabs[PATH_MAX];
         if (!join_rel(olddf->rel, oldname, oldrel) || !abs_existing(v, oldrel, oldabs) ||
             !join_rel(newdf->rel, newname, newrel) || !abs_create_path(v, newrel, newabs))
@@ -617,6 +630,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
         char name[NAME_MAX + 1];
         if (!df || !rdstr(&in, name, sizeof(name))) return reply_error(&out, tag, df ? EPROTO : EBADF);
         u32 flags = rd32(&in);
+        if (v->read_only) return reply_error(&out, tag, EROFS);
         char rel[PATH_MAX], abs[PATH_MAX];
         if (!join_rel(df->rel, name, rel) || !abs_existing(v, rel, abs)) return reply_error(&out, tag, errno);
         int rc = (flags & AT_REMOVEDIR) ? rmdir(abs) : unlink(abs);
@@ -628,6 +642,7 @@ static u32 p9_handle(VirtIO9P *v, u8 *req, u32 req_len, u8 *resp, u32 resp_cap) 
     if (type == P9_TREMOVE) {
         P9Fid *f = fid_get(v, rd32(&in));
         if (!f) return reply_error(&out, tag, EBADF);
+        if (v->read_only) return reply_error(&out, tag, EROFS);
         char abs[PATH_MAX];
         struct stat st;
         if (!abs_existing(v, f->rel, abs) || lstat(abs, &st) < 0) return reply_error(&out, tag, errno);
@@ -794,7 +809,8 @@ static void p9_write(void *opaque, u64 off, unsigned size, u64 val) {
     }
 }
 
-VirtIO9P *virtio_9p_create(Machine *m, GIC *gic, const char *root, const char *tag, int slot) {
+VirtIO9P *virtio_9p_create(Machine *m, GIC *gic, const char *root, const char *tag,
+                           bool read_only, int slot) {
     char real[PATH_MAX];
     struct stat st;
     if (!realpath(root, real) || stat(real, &st) < 0 || !S_ISDIR(st.st_mode)) {
@@ -806,13 +822,15 @@ VirtIO9P *virtio_9p_create(Machine *m, GIC *gic, const char *root, const char *t
     v->m = m;
     v->gic = gic;
     v->irq = INTID_VIRTIO0 + slot;
+    v->read_only = read_only;
     snprintf(v->root, sizeof(v->root), "%s", real);
     snprintf(v->tag, sizeof(v->tag), "%s", tag && *tag ? tag : "hostshare");
     v->msize = 8192;
     for (int i = 0; i < P9_MAX_FIDS; i++) v->fids[i].fd = -1;
     machine_add_device(m, 0x0a000000ULL + (u64)slot * 0x200, 0x200,
                        p9_read, p9_write, v, "virtio-9p");
-    fprintf(stderr, "[virtio-9p] slot %d: tag=%s root=%s\n", slot, v->tag, v->root);
+    fprintf(stderr, "[virtio-9p] slot %d: tag=%s root=%s%s\n",
+            slot, v->tag, v->root, v->read_only ? " ro" : "");
     return v;
 }
 

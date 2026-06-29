@@ -74,7 +74,8 @@ void platform_build(Machine *m) {
     for (int i = 0; i < m->n_shares; i++) {
         int slot = m->n_drives + i + 1;
         m->fs9p[m->n_fs9p++] = virtio_9p_create(m, m->gic, m->share_paths[i],
-                                                m->share_tags[i], slot);
+                                                m->share_tags[i],
+                                                m->share_read_only[i], slot);
     }
     if (!m->net_enabled) machine_add_device(m, 0x0a000000, 0x200, virtio_mmio_read, stub_write, m, "virtio-mmio");
     if (m->n_drives == 0) machine_add_device(m, 0x0a000200, 0x200, virtio_mmio_read, stub_write, m, "virtio-mmio");

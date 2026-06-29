@@ -94,6 +94,7 @@ typedef struct Machine {
     int    n_net_fwds;
     const char *share_paths[MAX_SHARES]; /* -share host directories */
     const char *share_tags[MAX_SHARES];  /* virtio-9p mount tags */
+    bool   share_read_only[MAX_SHARES];  /* reject guest-side mutations */
     int    n_shares;
 
     BusStatus last_bus_status;    /* set by phys_* on fault */
