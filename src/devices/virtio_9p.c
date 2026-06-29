@@ -22,7 +22,8 @@
 #include <time.h>
 
 #define VIRTIO_F_VERSION_1  (1ULL << 32)
-#define P9_FEATURES         VIRTIO_F_VERSION_1
+#define VIRTIO_9P_F_MOUNT_TAG (1ULL << 0)
+#define P9_FEATURES         (VIRTIO_F_VERSION_1 | VIRTIO_9P_F_MOUNT_TAG)
 
 #define VIRTQ_DESC_F_NEXT   1
 #define VIRTQ_DESC_F_WRITE  2
