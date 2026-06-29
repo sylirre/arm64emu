@@ -7,6 +7,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 /* On SIGINT/SIGTERM (e.g. a wall-clock `timeout` during a long boot), restore
  * the terminal and flush the diagnostics so a killed run still yields a profile
@@ -56,6 +57,22 @@ typedef struct BootConfig {
     int reset_el;
     u64 bin_addr;
 } BootConfig;
+
+static bool same_drive_image(const char *a, const char *b) {
+    if (!strcmp(a, b)) return true;
+
+    struct stat sa, sb;
+    if (stat(a, &sa) == 0 && stat(b, &sb) == 0)
+        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+
+    return false;
+}
+
+static bool drive_already_attached(const BootConfig *cfg, const char *path) {
+    for (int i = 0; i < cfg->n_drives; i++)
+        if (same_drive_image(cfg->drives[i], path)) return true;
+    return false;
+}
 
 static void boot_machine(Machine *m, const BootConfig *cfg) {
     u64 entry = cfg->entry;
@@ -127,7 +144,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-dtb") && i + 1 < argc) cfg.dtbfile = argv[++i];
         else if (!strcmp(argv[i], "-drive") && i + 1 < argc) {
             if (cfg.n_drives >= MAX_DRIVES) { fprintf(stderr, "too many -drive disks\n"); return 1; }
-            cfg.drives[cfg.n_drives++] = argv[++i];
+            const char *path = argv[++i];
+            if (drive_already_attached(&cfg, path)) {
+                fprintf(stderr, "-drive: duplicate disk image %s\n", path);
+                return 1;
+            }
+            cfg.drives[cfg.n_drives++] = path;
         }
         else if (!strcmp(argv[i], "-share") && i + 1 < argc) {
             char *s = argv[++i];
