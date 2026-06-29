@@ -1,8 +1,9 @@
 /* virtio-blk over a modern (version 2) virtio-mmio transport, slot 0 of QEMU's
  * 'virt' map (0x0a000000, INTID 48 / SPI 16, edge-triggered per the DTB).
  *
- * The device is backed by a host image file opened O_RDWR; guest writes go
- * through to the file via pwrite. Requests are completed synchronously inside
+ * The device is backed by a host image file opened O_RDWR or O_RDONLY for
+ * read-only drives; guest writes go through to the file via pwrite only for
+ * writable drives. Requests are completed synchronously inside
  * the QueueNotify write and the IRQ is raised inline — which fits this
  * single-threaded deterministic interpreter: the guest isn't running while we
  * service the queue, and the kernel's ISR drains the whole used ring per IRQ. */
@@ -13,15 +14,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #define SECTOR_SIZE   512
 #define QUEUE_NUM_MAX 256        /* QueueNumMax for the single requestq */
 #define VIRTQ_MAX     256        /* descriptor-chain walk bound (== QueueNumMax) */
 
 /* Feature bits we advertise: only VIRTIO_F_VERSION_1 (bit 32), mandatory for a
- * modern device. No optional blk features, keeping request handling minimal. */
+ * modern device. Read-only images also advertise VIRTIO_BLK_F_RO. */
 #define VIRTIO_F_VERSION_1 (1ULL << 32)
-#define BLK_FEATURES       VIRTIO_F_VERSION_1
+#define VIRTIO_BLK_F_RO    (1ULL << 5)
 
 /* Split-virtqueue descriptor flags. */
 #define VIRTQ_DESC_F_NEXT  1
@@ -40,6 +42,7 @@ typedef struct VirtIOBlk {
     Machine *m; GIC *gic; int irq;     /* INTID_VIRTIO0 + slot */
     int index;                         /* attach order (0-based); used for the serial */
     int fd; u64 capacity;              /* backing image; capacity in 512B sectors */
+    bool read_only;
 
     u32 status, isr;                   /* Status, InterruptStatus */
     u32 dev_feat_sel, drv_feat_sel; u64 drv_feat;
@@ -119,6 +122,11 @@ static void blk_request(VirtIOBlk *v, u32 head) {
                         phys_write_blk(m, gpa, buf, chunk);
                         used_len += chunk;           /* data written to guest */
                     } else {
+                        if (v->read_only) {
+                            status = VIRTIO_BLK_S_IOERR;
+                            off += chunk; gpa += chunk; rem -= chunk;
+                            continue;
+                        }
                         phys_read_blk(m, gpa, buf, chunk);
                         if (pwrite(v->fd, buf, chunk, (off_t)off) != (ssize_t)chunk)
                             status = VIRTIO_BLK_S_IOERR;
@@ -137,7 +145,7 @@ static void blk_request(VirtIOBlk *v, u32 head) {
             used_len += cap;
         }
     } else if (type == VIRTIO_BLK_T_FLUSH) {
-        fsync(v->fd);
+        if (!v->read_only) fsync(v->fd);
     } else {
         status = VIRTIO_BLK_S_UNSUPP;
     }
@@ -185,9 +193,11 @@ static u64 blk_read(void *opaque, u64 off, unsigned size) {
         case 0x004: return 2;                        /* Version (modern)  */
         case 0x008: return 2;                        /* DeviceID = block  */
         case 0x00c: return 0x554d4551;               /* VendorID "QEMU"   */
-        case 0x010:                                  /* DeviceFeatures    */
-            return v->dev_feat_sel == 1 ? (u32)(BLK_FEATURES >> 32)
-                                        : (u32)(BLK_FEATURES & 0xffffffff);
+        case 0x010: {                                /* DeviceFeatures    */
+            u64 features = VIRTIO_F_VERSION_1 | (v->read_only ? VIRTIO_BLK_F_RO : 0);
+            return v->dev_feat_sel == 1 ? (u32)(features >> 32)
+                                        : (u32)(features & 0xffffffff);
+        }
         case 0x034:                                  /* QueueNumMax       */
             return v->queue_sel == 0 ? QUEUE_NUM_MAX : 0;
         case 0x044: return v->q_ready;               /* QueueReady        */
@@ -231,9 +241,14 @@ static void blk_write(void *opaque, u64 off, unsigned size, u64 val) {
     }
 }
 
-struct VirtIOBlk *virtio_blk_create(Machine *m, GIC *gic, const char *path, int slot) {
-    int fd = open(path, O_RDWR);
-    if (fd < 0) { fprintf(stderr, "virtio-blk: cannot open %s\n", path); exit(1); }
+struct VirtIOBlk *virtio_blk_create(Machine *m, GIC *gic, const DriveConfig *drive, int slot) {
+    const char *path = drive->path;
+    int fd = open(path, drive->read_only ? O_RDONLY : O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "virtio-blk: cannot open %s %s: %s\n",
+                path, drive->read_only ? "read-only" : "read/write", strerror(errno));
+        exit(1);
+    }
     struct stat st;
     if (fstat(fd, &st) != 0) { fprintf(stderr, "virtio-blk: fstat %s\n", path); exit(1); }
 
@@ -242,10 +257,18 @@ struct VirtIOBlk *virtio_blk_create(Machine *m, GIC *gic, const char *path, int 
     v->m = m; v->gic = gic; v->irq = INTID_VIRTIO0 + slot;
     v->index = m->n_blk;
     v->fd = fd;
+    v->read_only = drive->read_only;
     v->capacity = (u64)st.st_size / SECTOR_SIZE;
     machine_add_device(m, base, 0x200, blk_read, blk_write, v, "virtio-blk");
     m->blk[m->n_blk++] = v;
-    fprintf(stderr, "[virtio-blk] slot %d: %s: %llu sectors (%llu MiB)\n", slot, path,
+    fprintf(stderr, "[virtio-blk] slot %d: %s%s: %llu sectors (%llu MiB)\n",
+            slot, path, v->read_only ? " (ro)" : "",
             (unsigned long long)v->capacity, (unsigned long long)((u64)st.st_size >> 20));
     return v;
+}
+
+void virtio_blk_destroy(struct VirtIOBlk *v) {
+    if (!v) return;
+    if (v->fd >= 0) close(v->fd);
+    free(v);
 }
