@@ -57,13 +57,15 @@ u64  timer_next_deadline_ticks(Machine *m);  /* instructions until next fire, or
 typedef struct PL011 {
     Machine *m;                    /* for the input-follows-output active flag */
     GIC *gic;
+    ConsoleEP *ep;                 /* host endpoint this UART speaks through */
     u32 imsc, ris;
     u8  rx_fifo[64]; int rx_head, rx_tail;
     u32 cr, lcr_h, ibrd, fbrd, ifls;
 } PL011;
 PL011 *pl011_create(Machine *m, GIC *gic);
 void pl011_reset(PL011 *p);       /* system reset: clear FIFO/masks/interrupt */
-void pl011_rx_poll(Machine *m);   /* feed host stdin into RX FIFO */
+void pl011_rx_poll(Machine *m);   /* feed host input into RX FIFO, drain output */
+bool pl011_is_stdio(PL011 *p);    /* on the shared process terminal? */
 
 /* ---- PL031 RTC ---- */
 typedef struct PL031 { GIC *gic; u32 mr, lr, cr, imsc, ris; s64 tick_offset; bool armed; u8 irq_line; } PL031;
@@ -101,15 +103,18 @@ struct VirtIO9P *virtio_9p_create(Machine *m, GIC *gic, const char *root,
 
 /* ---- virtio-console (virtio-mmio slot N) ---- */
 /* Non-multiport console (DeviceID 3) advertising VIRTIO_CONSOLE_F_SIZE: the
- * guest's hvc0 terminal geometry tracks the host window (initial size + live
- * SIGWINCH). slot picks the MMIO window / IRQ as for blk. Poll is called from
- * machine_tick to feed stdin and re-read the winsize; reset quiesces the
- * background-polled queues on warm reboot. vcon_driver_ok gates the machine_tick
- * input handover (stdin stays on PL011 until the guest driver is up). */
+ * guest terminal's geometry tracks its host endpoint (initial size + live
+ * resize). slot picks the MMIO window / IRQ as for blk. Each device is one more
+ * guest tty, numbered in creation order: the first is hvc0, the next hvc1, and
+ * so on, and each takes the endpoint bound for that index (m->vcon_ep). Poll is
+ * called from machine_tick to feed host input and re-read the geometry; reset
+ * quiesces the background-polled queues on warm reboot. vcon_driver_ok gates the
+ * machine_tick input handover (input stays on PL011 until the driver is up). */
 struct VirtIOConsole;
 struct VirtIOConsole *virtio_console_create(Machine *m, GIC *gic, int slot);
 void                  virtio_console_poll(struct VirtIOConsole *v);
 void                  virtio_console_reset(struct VirtIOConsole *v);
 bool                  vcon_driver_ok(struct VirtIOConsole *v);
+bool                  vcon_is_stdio(struct VirtIOConsole *v);  /* shared terminal? */
 
 #endif /* A64_DEVICES_H */

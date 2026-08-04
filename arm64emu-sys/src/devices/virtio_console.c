@@ -21,7 +21,7 @@
  * the descriptor-chain walk is bounded, read-only descriptors are skipped, and
  * the used ring reports the bytes actually written (see TODO_BUGS §3.1/§3.2). */
 #include "../devices.h"
-#include "../tty.h"
+#include "../console.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -47,6 +47,8 @@
 
 typedef struct VirtIOConsole {
     Machine *m; GIC *gic; int irq;
+    ConsoleEP *ep;                   /* host endpoint this console speaks through */
+    int index;                       /* which guest tty: 0 = hvc0, 1 = hvc1, ... */
 
     uint16_t cols, rows;             /* config-space geometry (0 = unknown) */
     uint32_t status, isr;
@@ -64,10 +66,10 @@ typedef struct VirtIOConsole {
 
 /* ---- helpers ---- */
 
-/* Refresh cols/rows from the host terminal; returns true if they changed. */
+/* Refresh cols/rows from the host endpoint; returns true if they changed. */
 static bool con_update_winsize(VirtIOConsole *v) {
-    unsigned short c = 0, r = 0;
-    tty_get_winsize(&c, &r);
+    u16 c = 0, r = 0;
+    console_get_winsize(v->ep, &c, &r);
     if (c == v->cols && r == v->rows) return false;
     v->cols = c; v->rows = r;
     return true;
@@ -101,7 +103,8 @@ static void con_sync_size(VirtIOConsole *v) {
     v->isr |= 2;                      /* VIRTIO_MMIO_INT_CONFIG */
     gic_set_irq(v->gic, v->irq, 1);
     if (getenv("AEVCON"))
-        fprintf(stderr, "[vcon] initial size sync: %ux%u\n", v->cols, v->rows);
+        fprintf(stderr, "[vcon] hvc%d initial size sync: %ux%u\n",
+                v->index, v->cols, v->rows);
 }
 
 /* System-reset entry point: identical to a guest-driven STATUS=0 device reset.
@@ -223,7 +226,7 @@ static void con_tx_process(VirtIOConsole *v) {
                 uint32_t c = dlen - off;
                 if (c > sizeof(chunk)) c = sizeof(chunk);
                 phys_read_blk(m, gpa + off, chunk, c);
-                tty_write(chunk, c);
+                console_write(v->ep, chunk, c);
                 off += c;
             }
             n++;
@@ -236,9 +239,11 @@ static void con_tx_process(VirtIOConsole *v) {
     }
 
     if (did) {
-        /* The guest is writing its console output to hvc0 -> host input should
-         * follow it here (rather than to ttyAMA0). See machine_tick. */
-        v->m->console_active_virtio = true;
+        /* The guest is writing its console output here -> host input should
+         * follow it (rather than going to ttyAMA0). Only meaningful while this
+         * console shares the process terminal with the UART: an endpoint of its
+         * own has nothing to arbitrate. See machine_tick. */
+        if (console_is_stdio(v->ep)) v->m->console_active_virtio = true;
         v->isr |= 1;
         gic_set_irq(v->gic, v->irq, 1);
     }
@@ -247,12 +252,13 @@ static void con_tx_process(VirtIOConsole *v) {
 /* ---- background poll (machine_tick): host input + winsize ---- */
 
 void virtio_console_poll(VirtIOConsole *v) {
-    con_sync_size(v);                          /* apply the initial hvc0 size once */
+    con_sync_size(v);                          /* apply the initial size once */
+    console_flush(v->ep);                      /* retry output the peer stalled on */
 
     /* Host terminal resized? Update config geometry and raise a config-change
-     * interrupt (ISR bit 1) so the guest re-reads config, resizes hvc0, and
+     * interrupt (ISR bit 1) so the guest re-reads config, resizes the tty, and
      * delivers SIGWINCH to the foreground process. */
-    if (tty_take_winch() && con_update_winsize(v)) {
+    if (console_take_winch(v->ep) && con_update_winsize(v)) {
         v->isr |= 2;                           /* VIRTIO_MMIO_INT_CONFIG */
         gic_set_irq(v->gic, v->irq, 1);
     }
@@ -261,7 +267,7 @@ void virtio_console_poll(VirtIOConsole *v) {
      * before reading leaves surplus bytes in the host tty buffer (flow
      * control) rather than reading-then-dropping — same contract as PL011. */
     int ch;
-    while (!rx_fifo_full(v) && (ch = tty_getchar()) >= 0)
+    while (!rx_fifo_full(v) && (ch = console_getchar(v->ep)) >= 0)
         rx_fifo_push(v, (uint8_t)ch);
 
     con_flush_rx(v);
@@ -270,6 +276,9 @@ void virtio_console_poll(VirtIOConsole *v) {
 bool vcon_driver_ok(VirtIOConsole *v) {
     return (v->status & VIRTIO_STATUS_DRIVER_OK) && v->q_ready[CON_QUEUE_RX];
 }
+
+/* True while this console is on the shared process terminal (see machine_tick). */
+bool vcon_is_stdio(VirtIOConsole *v) { return v && console_is_stdio(v->ep); }
 
 /* ---- MMIO ---- */
 
@@ -366,17 +375,23 @@ static void con_write(void *opaque, u64 off, unsigned size, u64 val) {
 /* ---- creation ---- */
 
 VirtIOConsole *virtio_console_create(Machine *m, GIC *gic, int slot) {
+    if (m->n_vcon >= MAX_CONSOLES) return NULL;
     u64 base = 0x0a000000ULL + (u64)slot * 0x200;
     VirtIOConsole *v = calloc(1, sizeof(*v));
+    /* Consoles are numbered in creation order, which is the order Linux probes
+     * the virtio-mmio slots in, so device i is the guest's hvc<i>. */
+    v->index = m->n_vcon;
     v->m = m; v->gic = gic; v->irq = INTID_VIRTIO0 + slot;
+    v->ep = m->vcon_ep[v->index] ? m->vcon_ep[v->index] : console_stdio();
 
     /* Seed the initial geometry. The driver reads config after DRIVER_OK, so it
      * picks up the correct size at first login with no config interrupt. */
     con_update_winsize(v);
 
     machine_add_device(m, base, 0x200, con_read, con_write, v, "virtio-console");
-    m->vcon = v;
-    fprintf(stderr, "[virtio-console] slot %d: guest hvc0, host size %ux%u\n",
-            slot, v->cols, v->rows);
+    m->vcon[m->n_vcon++] = v;
+    fprintf(stderr, "[virtio-console] slot %d: guest hvc%d, size %ux%u%s\n",
+            slot, v->index, v->cols, v->rows,
+            console_is_stdio(v->ep) ? " (host terminal)" : " (bound endpoint)");
     return v;
 }
