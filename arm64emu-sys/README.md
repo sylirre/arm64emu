@@ -77,6 +77,15 @@ emulator in and enter it in a `fork()`ed child — no `exec`, which is what
 Android's W^X rule requires. `make test-embed` builds that configuration and
 runs the suite against it.
 
+Build it as its own shared object with `-fvisibility=hidden`: `arm64emu_main`
+is the only symbol marked visible, and it is the whole interface. That matters
+when the host also carries this emulator's user-mode sibling
+([arm64chroot](https://github.com/sylirre/arm64emu-user)) — the two share an
+ancestor and so share around sixty global names (`cpu_step`, `exec_a64`,
+`g_jit`, …), which linked into one object collide, and left visible across two
+objects would let the dynamic linker bind one engine's calls into the other's
+code.
+
 **Host directory sharing (`--virtfs`).** Each `--virtfs DIR` exports a host
 directory to the guest as a 9P2000.L filesystem on its own virtio-mmio slot.
 `tag=` names the mount (default: the directory's basename); `ro` makes it

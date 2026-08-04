@@ -616,8 +616,17 @@ static void add_netfwd(NetFwd *fwds, int *n_fwds, char *spec) {
  * arrangement github.com/sylirre/ghostty-android-terminal uses for its other
  * engines, where Android's W^X rule leaves nothing to exec: the caller forks,
  * enters here, and _exit()s the return value. Nothing else differs; a run
- * driven that way is a run with every console bound (--console-fd). */
+ * driven that way is a run with every console bound (--console-fd).
+ *
+ * It is marked visible on purpose, because such a host is expected to build the
+ * emulator as its own shared object with -fvisibility=hidden. That project also
+ * vendors this emulator's user-mode sibling, which shares an ancestor with it
+ * and so shares around sixty global names (cpu_step, exec_a64, g_jit, ...);
+ * hiding everything but the entry point keeps each copy calling its own code
+ * instead of whichever the dynamic linker reached first. This one symbol is the
+ * whole interface. */
 #ifdef ANDROID_JNI
+__attribute__((visibility("default")))
 int arm64emu_main(int argc, char **argv)
 #else
 int main(int argc, char **argv)
