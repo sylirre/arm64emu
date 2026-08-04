@@ -611,7 +611,18 @@ static void add_netfwd(NetFwd *fwds, int *n_fwds, char *spec) {
     (*n_fwds)++;
 }
 
-int main(int argc, char **argv) {
+/* Entry point. Embedded builds (-DANDROID_JNI) expose it under a name of its
+ * own so a host process can link the emulator in and call it directly — the
+ * arrangement github.com/sylirre/ghostty-android-terminal uses for its other
+ * engines, where Android's W^X rule leaves nothing to exec: the caller forks,
+ * enters here, and _exit()s the return value. Nothing else differs; a run
+ * driven that way is a run with every console bound (--console-fd). */
+#ifdef ANDROID_JNI
+int arm64emu_main(int argc, char **argv)
+#else
+int main(int argc, char **argv)
+#endif
+{
     const char *bios = NULL, *kernel = NULL, *initrd = NULL, *append = "";
     const char *binfile = NULL, *dtbfile = NULL;
     Drive drives[MAX_DRIVES]; int n_drives = 0;

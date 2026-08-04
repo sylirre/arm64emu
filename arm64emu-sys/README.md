@@ -62,6 +62,21 @@ terminal; options are GNU-style (`--long`, `--opt=VAL`, short `-h -v -m -d -j`).
 > now `--max-insn`, `-m` is `--memory` (the `-m` short form still works),
 > `-d` is `--trace` (short `-d` still works), and `-rt` is `--reg-trace`.
 
+**Several guest terminals (`--console ,count=N`, `--console-fd`).** Each
+virtio-console device is one more guest tty — `hvc0`, `hvc1`, … — and each can
+speak through a host channel of its own instead of the shared terminal. Bind
+them with `--console-fd hvc0=<fd>` (and `--console-fd ttyAMA0=<fd>` for the
+UART) to descriptors the process inherited: a socketpair per terminal, plus
+`--ctrl-fd` carrying their window sizes, since a socketpair has no
+`TIOCGWINSZ`. Run a `getty` on each inside the guest and every terminal is an
+independent login. `tests/scripts/console_mux.c` is a working host driver.
+
+**Embedding.** Built with `-DANDROID_JNI`, `main()` becomes `arm64emu_main()`
+and fatal paths leave through `_exit()`, so a host process can link the
+emulator in and enter it in a `fork()`ed child — no `exec`, which is what
+Android's W^X rule requires. `make test-embed` builds that configuration and
+runs the suite against it.
+
 **Host directory sharing (`--virtfs`).** Each `--virtfs DIR` exports a host
 directory to the guest as a 9P2000.L filesystem on its own virtio-mmio slot.
 `tag=` names the mount (default: the directory's basename); `ro` makes it

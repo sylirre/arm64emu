@@ -54,6 +54,22 @@ clean:
 test: $(BIN)
 	@EMU_FLAGS=--no-pd tests/run_tests.sh
 
+# Embedded-build check. An app that links the emulator in builds it with
+# -DANDROID_JNI: main() becomes arm64emu_main() so the host can call it after
+# fork(), and fatal paths leave through _exit() so they never run the host's
+# atexit handlers. Nothing here can break the default build, which is exactly
+# why it rots unnoticed — so compile that configuration and run the asm suite
+# against it, behind the stub main a real embedder replaces with its own caller.
+# Built in a temp directory: these objects carry different flags from the ones
+# `make` leaves in src/.
+.PHONY: test-embed
+test-embed:
+	@tmp=$$(mktemp -d) && \
+	 printf 'extern int arm64emu_main(int, char **);\nint main(int c, char **v) { return arm64emu_main(c, v); }\n' > $$tmp/stub.c && \
+	 $(CC) $(CFLAGS) -DANDROID_JNI -o $$tmp/arm64emu-embed $(SRC) $$tmp/stub.c $(LDFLAGS) $(LDLIBS) && \
+	 AE_EMU=$$tmp/arm64emu-embed tests/run_tests.sh; \
+	 rc=$$?; rm -rf $$tmp; exit $$rc
+
 # JIT suite: the asm tests under --jit, then interpreter-vs-jit consistency
 # on a deterministic firmware+Linux boot (byte-identical state checkpoints).
 test-jit: $(BIN)

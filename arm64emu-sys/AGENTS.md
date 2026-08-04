@@ -219,6 +219,7 @@ Extras:
 * `make test-jit-full`: same as previous but under JIT
 * `make fuzz-engines`: 200 random-block seeds across interpreter/pd/jit/jit-slowmem/nofuse/novra
 * `make test-jit-a64`: cross-builds a static aarch64 binary (clang+lld) and runs the JIT suite under qemu-aarch64
+* `make test-embed`: builds the `-DANDROID_JNI` embedded configuration (`arm64emu_main`, `_exit` on fatal paths) behind a stub main and runs the asm suite against it
 
 **Important**: do not run any of tests above in parallel with each other.
 
