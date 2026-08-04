@@ -71,4 +71,40 @@ void console_set_winsize(ConsoleEP *e, u16 cols, u16 rows);
  * SIGWINCH for stdio, a console_set_winsize for an fd endpoint. */
 bool console_take_winch(ConsoleEP *e);
 
+/* ---- host control channel ----------------------------------------------
+ *
+ * A process that binds console endpoints to descriptors it owns also needs a
+ * way to say things about them while the machine runs — starting with "this
+ * terminal is now 100x30", which no fd endpoint can work out for itself. That
+ * is this channel: one more inherited descriptor carrying fixed 8-byte
+ * little-endian messages,
+ *
+ *     u8 op, u8 dev, u16 cols, u16 rows, u16 reserved
+ *
+ * where dev is CONSOLE_CTRL_UART or an hvc index. Fixed-size messages keep the
+ * reader trivial and self-resynchronising; the reserved field and the unused op
+ * space leave room to say more later without a second channel. Messages may
+ * arrive split across reads, so partial ones are held until complete.
+ */
+typedef struct ConsoleCtrl ConsoleCtrl;
+
+#define CONSOLE_CTRL_MSG_SIZE 8
+#define CONSOLE_CTRL_UART     0xff   /* dev byte naming the PL011 */
+
+enum {
+    CONSOLE_OP_NOP     = 0,   /* liveness / padding; ignored */
+    CONSOLE_OP_WINSIZE = 1,   /* set dev's terminal geometry to cols x rows */
+};
+
+/* Take over `fd` as the control channel. Returns NULL if it is unusable. */
+ConsoleCtrl *console_ctrl_open(int fd);
+
+/* Apply whatever has arrived. `hvc` is indexed by the dev byte; entries may be
+ * NULL (that console is on the shared terminal, whose geometry is the host
+ * window's and not ours to set). Never blocks. */
+void console_ctrl_poll(ConsoleCtrl *c, ConsoleEP *uart, ConsoleEP **hvc, int n_hvc);
+
+/* Descriptor to wait on for control messages, or -1 once the peer is gone. */
+int console_ctrl_fd(const ConsoleCtrl *c);
+
 #endif /* A64_CONSOLE_H */

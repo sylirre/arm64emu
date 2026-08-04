@@ -116,6 +116,7 @@ typedef struct Machine {
      * process gives each guest tty its own channel. */
     ConsoleEP *uart_ep;                 /* PL011 (ttyAMA0) */
     ConsoleEP *vcon_ep[MAX_CONSOLES];   /* hvc0..hvc(n_vcon-1) */
+    ConsoleCtrl *ctrl;                  /* --ctrl-fd: host control channel */
 
     Drive  drives[MAX_DRIVES];   /* -drive disks */
     int    n_drives;

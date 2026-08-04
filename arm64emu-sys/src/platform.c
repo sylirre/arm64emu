@@ -167,6 +167,9 @@ void machine_tick(Machine *m) {
         if (!io_interval) io_interval = 1;
     }
     m->io_poll_due = m->cpu.icount + io_interval;
+    /* Before the consoles, so a geometry change lands on the same tick that
+     * delivers its config-change interrupt. */
+    if (m->ctrl) console_ctrl_poll(m->ctrl, m->uart_ep, m->vcon_ep, m->n_vcon);
     /* A console bound to its own host endpoint is independent of every other:
      * it has its own input stream and its own output buffer to drain, so poll
      * it unconditionally. */
@@ -212,8 +215,40 @@ static void check_wake_source(Machine *m, bool timer_armed, bool has_input) {
         m->deadlock = true;
 }
 
+/* Every host descriptor that could wake a halted CPU: the input side of each
+ * console endpoint, plus the control channel. Deduplicated, since every device
+ * left on the process terminal reports the same stdin — and a poll(2) set that
+ * named it several times would be legal but pointless. An endpoint that can
+ * never produce input (a non-tty stdio, a peer that closed) contributes
+ * nothing, so a run with no reachable host input polls no descriptors at all,
+ * exactly as the single-stdin version did. */
+static int host_wait_fds(Machine *m, struct pollfd *pfd, int max) {
+    int cand[MAX_CONSOLES + 2], nc = 0;
+    if (m->uart)
+        cand[nc++] = console_poll_fd(m->uart_ep ? m->uart_ep : console_stdio());
+    for (int i = 0; i < m->n_vcon; i++)
+        cand[nc++] = console_poll_fd(m->vcon_ep[i] ? m->vcon_ep[i] : console_stdio());
+    if (m->ctrl)
+        cand[nc++] = console_ctrl_fd(m->ctrl);
+
+    int n = 0;
+    for (int i = 0; i < nc && n < max; i++) {
+        if (cand[i] < 0) continue;
+        bool dup = false;
+        for (int j = 0; j < n && !dup; j++) dup = pfd[j].fd == cand[i];
+        if (dup) continue;
+        pfd[n].fd = cand[i];
+        pfd[n].events = POLLIN;
+        pfd[n].revents = 0;
+        n++;
+    }
+    return n;
+}
+
 void machine_wait_for_event(Machine *m) {
     CPU *c = &m->cpu;
+    struct pollfd pfd[MAX_CONSOLES + 2];
+    int nfd = host_wait_fds(m, pfd, (int)(sizeof pfd / sizeof *pfd));
 
     if (!g_rtclock) {
         /* Deterministic timer (AE_RTCLOCK=0 opt-out): the counter only advances as instructions retire,
@@ -222,13 +257,13 @@ void machine_wait_for_event(Machine *m) {
          * armed timer, so the IRQ fires at a fixed, reproducible icount. */
         u64 dl = timer_next_deadline_ticks(m);
 
-        /* Service interactive input without perturbing the guest clock. On a tty
-         * with no timer pending, block briefly so we don't busy-spin a host core;
-         * otherwise just peek. Non-tty stdin (e.g. /dev/null) never has input. */
+        /* Service interactive input without perturbing the guest clock. With a
+         * host channel and no timer pending, block briefly so we don't busy-spin
+         * a host core; otherwise just peek. A run with no reachable input (e.g.
+         * stdin on /dev/null) never has any. */
         int has_input = 0;
-        if (isatty(STDIN_FILENO)) {
-            struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-            has_input = poll(&pfd, 1, (dl == ~0ULL) ? 50 : 0) > 0;
+        if (nfd) {
+            has_input = poll(pfd, (nfds_t)nfd, (dl == ~0ULL) ? 50 : 0) > 0;
         } else if (dl == ~0ULL && !c->irq_line) {
             poll(NULL, 0, 50);   /* truly idle, no timer armed: don't peg a core */
         }
@@ -250,8 +285,8 @@ void machine_wait_for_event(Machine *m) {
     else if (dl == ~0ULL) timeout_ms = 50;
     else { timeout_ms = (int)(dl / 1000000ULL); if (timeout_ms > 50) timeout_ms = 50; if (timeout_ms < 1) timeout_ms = 1; }
 
-    struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-    int r = isatty(STDIN_FILENO) ? poll(&pfd, 1, timeout_ms) : (timeout_ms ? (poll(NULL,0,timeout_ms),0) : 0);
+    int r = nfd ? poll(pfd, (nfds_t)nfd, timeout_ms)
+                : (timeout_ms ? (poll(NULL, 0, timeout_ms), 0) : 0);
 
     m->io_poll_due = 0;              /* idle: keep host-IO latency tick-fine */
     machine_tick(m);
