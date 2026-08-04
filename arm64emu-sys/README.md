@@ -49,7 +49,9 @@ read-only and advertises VIRTIO_BLK_F_RO), `--net` user-mode networking
 `--virtfs DIR[,tag=TAG][,ro]` share a host directory over virtio-9p
 (repeatable), `--console pl011|virtio[,count=N]` pick the console device
 (default `pl011`) and create N virtio-consoles (`hvc0`..`hvcN-1`), each a
-separate guest terminal,
+separate guest terminal, `--console-fd DEV=RFD[:WFD]` bind `ttyAMA0`/`hvcN` to
+inherited descriptors instead of the terminal (with `--ctrl-fd FD` carrying
+their window sizes — see `tests/scripts/console_mux.c`),
 `--bin FILE[@ADDR]` load a flat binary (bare-metal tests), `-d/--trace`
 per-instruction trace, `--reg-trace` register trace, `--max-insn N` stop after N
 instructions. `arm64emu --help` is the full reference, reflowed to your

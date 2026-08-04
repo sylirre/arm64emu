@@ -165,6 +165,9 @@ tests/
     m32_dtbmem.S          the DTB's /memory node tracks --memory (--bios,
                           run with --memory 384)
   scripts/
+    console_mux.c         dev harness / worked example for --console-fd and
+                          --ctrl-fd: a socketpair per guest terminal, output
+                          demultiplexed by tab (run by hand, needs an image)
     fuzz_gen.c            random-block generator for run_fuzz_engines.sh
     diff_qemu.sh          per-instruction PC-stream diff vs QEMU (dev oracle)
     net_smoke.sh          end-to-end usernet test (dhcp/dns/wget/fwd/upload)

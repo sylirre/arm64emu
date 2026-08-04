@@ -204,3 +204,58 @@ bool console_take_winch(ConsoleEP *e) {
     e->winch = false;
     return w;
 }
+
+/* ---- host control channel ---- */
+
+struct ConsoleCtrl {
+    int fd;
+    u8  msg[CONSOLE_CTRL_MSG_SIZE];
+    int have;                    /* bytes of a partial message held over */
+};
+
+ConsoleCtrl *console_ctrl_open(int fd) {
+    if (fd < 0) return NULL;
+    ConsoleCtrl *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->fd = fd;
+    set_nonblock(fd);
+    return c;
+}
+
+int console_ctrl_fd(const ConsoleCtrl *c) { return c ? c->fd : -1; }
+
+static void ctrl_apply(const u8 *m, ConsoleEP *uart, ConsoleEP **hvc, int n_hvc) {
+    u8  op  = m[0], dev = m[1];
+    u16 cols = (u16)(m[2] | (m[3] << 8));
+    u16 rows = (u16)(m[4] | (m[5] << 8));
+    if (op != CONSOLE_OP_WINSIZE) return;        /* NOP, or an op we don't know */
+    if (dev == CONSOLE_CTRL_UART) {
+        /* A serial line has no geometry to carry — real PL011 hardware has no
+         * winsize register and neither does this one — so the endpoint records
+         * it and no device asks. Kept for symmetry, and so a host that resizes
+         * every tab uniformly needs no special case. */
+        console_set_winsize(uart, cols, rows);
+        return;
+    }
+    if (dev < n_hvc) console_set_winsize(hvc[dev], cols, rows);
+}
+
+void console_ctrl_poll(ConsoleCtrl *c, ConsoleEP *uart, ConsoleEP **hvc, int n_hvc) {
+    if (!c || c->fd < 0) return;
+    for (;;) {
+        ssize_t n = read(c->fd, c->msg + c->have,
+                         (size_t)(CONSOLE_CTRL_MSG_SIZE - c->have));
+        if (n > 0) {
+            c->have += (int)n;
+            if (c->have == CONSOLE_CTRL_MSG_SIZE) {
+                ctrl_apply(c->msg, uart, hvc, n_hvc);
+                c->have = 0;
+            }
+            continue;                            /* more may be queued */
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+            c->fd = -1;                          /* peer gone */
+        return;
+    }
+}

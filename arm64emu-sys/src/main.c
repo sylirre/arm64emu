@@ -283,6 +283,19 @@ static void help(void) {
                         "either kind, so the console can stay on ttyAMA0 while "
                         "extra hvc terminals exist alongside it. Default 1 for "
                         "'virtio', 0 for 'pl011'."},
+        {"    --console-fd DEV=RFD[:WFD]", "Bind console device DEV — 'ttyAMA0' "
+                        "or 'hvcN' — to descriptors this process inherited, "
+                        "instead of the shared terminal (repeatable). One "
+                        "descriptor is one bidirectional channel (a socketpair "
+                        "or PTY); two are separate read and write ends. Binding "
+                        "hvcN also creates it, so --console count can be left "
+                        "out. Intended for an embedding process giving each "
+                        "guest terminal its own channel."},
+        {"    --ctrl-fd FD", "Control channel on an inherited descriptor: fixed "
+                        "8-byte little-endian messages (op, dev, cols, rows, "
+                        "reserved) that adjust bound endpoints while the machine "
+                        "runs — currently just the terminal geometry a bound "
+                        "endpoint cannot discover for itself."},
         {"    --bin FILE[@ADDR]", "Load a flat binary at ADDR (default the RAM "
                         "base) and reset there (bare-metal tests)."},
         {"    --entry ADDR", "Override the reset PC."},
@@ -523,6 +536,62 @@ static void parse_console(char *spec, bool *virtio, int *count) {
     }
 }
 
+/* A whole-string non-negative decimal, or -1. Used for descriptor numbers,
+ * where atoi's "0 means both zero and garbage" would silently bind stdin. */
+static int parse_fd(const char *s) {
+    if (!s || !*s) return -1;
+    char *end;
+    long v = strtol(s, &end, 10);
+    return (*end || v < 0 || v > INT_MAX) ? -1 : (int)v;
+}
+
+/* --console-fd DEV=RFD[:WFD]: bind a console device to descriptors this process
+ * inherited, instead of the shared terminal. DEV is "ttyAMA0" or "hvcN". One
+ * descriptor means one bidirectional channel (a socketpair, a PTY); two means
+ * separate read and write ends (a pair of pipes). Binding hvcN implies the
+ * console exists, so it also raises the console count. Split in place. */
+static void parse_console_fd(char *spec, int uart_fd[2], int hvc_fd[][2],
+                             int *n_hvc_seen) {
+    char *eq = strchr(spec, '=');
+    if (!eq) {
+        fprintf(stderr, "arm64emu: --console-fd: expected DEV=RFD[:WFD]\n"); exit(2);
+    }
+    *eq = '\0';
+    char *colon = strchr(eq + 1, ':');
+    if (colon) *colon = '\0';
+    int rfd = parse_fd(eq + 1);
+    int wfd = colon ? parse_fd(colon + 1) : rfd;
+    if (rfd < 0 || wfd < 0) {
+        fprintf(stderr, "arm64emu: --console-fd: '%s' is not a descriptor number\n",
+                eq + 1);
+        exit(2);
+    }
+
+    int *slot;
+    if (!strcmp(spec, "ttyAMA0")) {
+        slot = uart_fd;
+    } else if (!strncmp(spec, "hvc", 3) && spec[3]) {
+        char *end;
+        long idx = strtol(spec + 3, &end, 10);
+        if (*end || idx < 0 || idx >= MAX_CONSOLES) {
+            fprintf(stderr, "arm64emu: --console-fd: hvc index must be 0..%d\n",
+                    MAX_CONSOLES - 1);
+            exit(2);
+        }
+        slot = hvc_fd[idx];
+        if ((int)idx + 1 > *n_hvc_seen) *n_hvc_seen = (int)idx + 1;
+    } else {
+        fprintf(stderr, "arm64emu: --console-fd: unknown device '%s' "
+                        "(expected ttyAMA0 or hvcN)\n", spec);
+        exit(2);
+    }
+    if (slot[0] >= 0) {
+        fprintf(stderr, "arm64emu: --console-fd: '%s' bound twice\n", spec); exit(2);
+    }
+    slot[0] = rfd;
+    slot[1] = wfd;
+}
+
 /* --netfwd tcp:HOST_PORT:GUEST_PORT or udp:HOST_PORT:GUEST_PORT. */
 static void add_netfwd(NetFwd *fwds, int *n_fwds, char *spec) {
     if (*n_fwds >= 16) {
@@ -550,6 +619,11 @@ int main(int argc, char **argv) {
     bool net_enabled = false;
     bool console_virtio = false;         /* --console: false=pl011 (default), true=virtio */
     int  n_consoles = -1;                /* --console ...,count=N; -1 = unset */
+    int  uart_fd[2] = { -1, -1 };        /* --console-fd bindings: {read, write} */
+    int  hvc_fd[MAX_CONSOLES][2];
+    int  n_hvc_bound = 0;                /* highest hvc index bound, plus one */
+    int  ctrl_fd = -1;                   /* --ctrl-fd */
+    for (int c = 0; c < MAX_CONSOLES; c++) hvc_fd[c][0] = hvc_fd[c][1] = -1;
     NetFwd net_fwds[16]; int n_net_fwds = 0;
     u64 ram_mb = 1024;
     u64 entry = 0;
@@ -592,6 +666,16 @@ int main(int argc, char **argv) {
             else if (!strcmp(n, "console"))
                 parse_console(long_value("--console", val, argv, argc, &i),
                               &console_virtio, &n_consoles);
+            else if (!strcmp(n, "console-fd"))
+                parse_console_fd(long_value("--console-fd", val, argv, argc, &i),
+                                 uart_fd, hvc_fd, &n_hvc_bound);
+            else if (!strcmp(n, "ctrl-fd")) {
+                ctrl_fd = parse_fd(long_value("--ctrl-fd", val, argv, argc, &i));
+                if (ctrl_fd < 0) {
+                    fprintf(stderr, "arm64emu: --ctrl-fd: not a descriptor number\n");
+                    exit(2);
+                }
+            }
             else if (!strcmp(n, "bin")) {              /* FILE or FILE@ADDR */
                 char *s = long_value("--bin", val, argv, argc, &i);
                 char *at = strchr(s, '@');
@@ -625,6 +709,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "arm64emu: --console virtio needs count >= 1\n");
         exit(2);
     }
+    /* Binding hvcN says the console exists; no need to also state the count. */
+    if (n_hvc_bound > n_consoles) n_consoles = n_hvc_bound;
 
     if (getenv("AEDBG")) g_dbg = atoi(getenv("AEDBG"));
     if (getenv("AEPROF")) g_prof = atoi(getenv("AEPROF"));
@@ -669,6 +755,21 @@ int main(int argc, char **argv) {
     m.net_enabled = net_enabled;
     m.console_virtio = console_virtio;
     m.n_consoles_req = n_consoles;
+
+    /* Bind the endpoints named by --console-fd. Anything left unbound speaks
+     * through the process terminal, which is what a plain command-line run
+     * wants; a fully bound run never touches stdio at all, so it also leaves
+     * the embedder's own terminal alone (no raw mode, no SIGWINCH handler). */
+    bool uses_stdio = uart_fd[0] < 0;
+    if (uart_fd[0] >= 0) m.uart_ep = console_open_fd(uart_fd[0], uart_fd[1]);
+    for (int c = 0; c < n_consoles; c++) {
+        if (hvc_fd[c][0] < 0) { uses_stdio = true; continue; }
+        m.vcon_ep[c] = console_open_fd(hvc_fd[c][0], hvc_fd[c][1]);
+    }
+    if (ctrl_fd >= 0 && !(m.ctrl = console_ctrl_open(ctrl_fd))) {
+        fprintf(stderr, "arm64emu: --ctrl-fd: cannot use descriptor %d\n", ctrl_fd);
+        exit(2);
+    }
     if (console_virtio) {
         if (kernel) {
             /* We control the cmdline on the --kernel path: make hvc0 the guest
@@ -716,7 +817,7 @@ int main(int argc, char **argv) {
     cpu_reset(&m.cpu, entry, (unsigned)reset_el);
 
     g_sig_cpu = &m.cpu;
-    tty_raw_enable();
+    if (uses_stdio) tty_raw_enable();
     /* Register after tty_raw_enable() so these win over tty.c's cleanup-only handlers. */
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
