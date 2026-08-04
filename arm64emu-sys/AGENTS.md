@@ -72,6 +72,10 @@ src/
                           the DTB, load kernel/initrd via fw_cfg,
                           machine_reset / machine_tick / WFI wait
   tty.h, tty.c            raw-terminal serial console (termios), window size
+  console.h, console.c    host endpoints for the guest's console devices: the
+                          shared process terminal (via tty.c) or an inherited
+                          fd pair with pushed-in geometry and buffered,
+                          never-blocking output
   devices.h               device structs + virt MMIO map and INTID constants
   devices/
     gicv2.c               GICv2 distributor + CPU interface (single CPU)
@@ -84,7 +88,8 @@ src/
     virtio_blk.c          --drive, repeatable (disks take slots 1,2,3…)
     virtio_net.c          --net / --netfwd, backed by src/net/ (slot 0)
     virtio_9p.c           --virtfs host directory share (9P2000.L)
-    virtio_console.c      --console virtio (hvc0) + host window-size tracking
+    virtio_console.c      --console virtio / ,count=N: hvc0..hvcN-1, one guest
+                          terminal per device, each on its own host endpoint
   fdt/
     virt.dts              device tree source (QEMU virt tree)
     virt_dtb.h            dtc output, embedded in the binary — regenerate,

@@ -47,7 +47,9 @@ Useful flags: `-m/--memory MB` RAM size, `--dtb FILE` supply a device tree,
 read-only and advertises VIRTIO_BLK_F_RO), `--net` user-mode networking
 (`--netfwd tcp|udp:HOST_PORT:GUEST_PORT` forwards host ports to the guest),
 `--virtfs DIR[,tag=TAG][,ro]` share a host directory over virtio-9p
-(repeatable), `--console pl011|virtio` pick the console device (default `pl011`),
+(repeatable), `--console pl011|virtio[,count=N]` pick the console device
+(default `pl011`) and create N virtio-consoles (`hvc0`..`hvcN-1`), each a
+separate guest terminal,
 `--bin FILE[@ADDR]` load a flat binary (bare-metal tests), `-d/--trace`
 per-instruction trace, `--reg-trace` register trace, `--max-insn N` stop after N
 instructions. `arm64emu --help` is the full reference, reflowed to your
@@ -142,6 +144,8 @@ src/
   exception.c   exception entry/return (VBAR vectors, ESR/FAR/ELR/SPSR, ERET)
   memory.c      physical bus: RAM + NOR-flash CFI command set + MMIO dispatch
   tty.c         raw-terminal serial console via termios
+  console.c     host endpoints the console devices speak through: the shared
+                process terminal, or an inherited fd pair
   platform.c    device instantiation, DTB placement, kernel load, tick/WFI
   devices/      gicv2, timer, pl011, pl031, psci, fwcfg, virtio_blk (--drive),
                 virtio_net (--net), virtio_9p (--virtfs), virtio_console (--console)

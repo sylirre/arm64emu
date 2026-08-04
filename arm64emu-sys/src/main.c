@@ -275,9 +275,14 @@ static void help(void) {
                         "NAT stack)."},
         {"    --netfwd tcp|udp:HP:GP", "Forward host port HP to guest port GP "
                         "(repeatable, up to 16; needs --net)."},
-        {"    --console pl011|virtio", "Guest console device. Default pl011 "
-                        "(ttyAMA0); 'virtio' adds an hvc0 console whose window "
-                        "size tracks the host terminal."},
+        {"    --console pl011|virtio[,count=N]", "Guest console device. Default "
+                        "pl011 (ttyAMA0); 'virtio' makes hvc0 the console "
+                        "instead. 'count' creates N virtio-console devices "
+                        "(hvc0..hvcN-1), each a separate guest terminal whose "
+                        "window size tracks its host endpoint — allowed with "
+                        "either kind, so the console can stay on ttyAMA0 while "
+                        "extra hvc terminals exist alongside it. Default 1 for "
+                        "'virtio', 0 for 'pl011'."},
         {"    --bin FILE[@ADDR]", "Load a flat binary at ADDR (default the RAM "
                         "base) and reset there (bare-metal tests)."},
         {"    --entry ADDR", "Override the reset PC."},
@@ -492,6 +497,32 @@ static void add_virtfs(VirtFS *shares, int *n_shares, char *spec) {
     (*n_shares)++;
 }
 
+/* --console pl011|virtio[,count=N]: which device the guest console is, and how
+ * many virtio-console devices to create. The two are separate knobs — a run can
+ * keep the console on ttyAMA0 and still ask for hvc terminals alongside it, which
+ * is what a host driving several guest terminals wants. *spec is an argv token,
+ * split in place. count = -1 on entry means "unset". */
+static void parse_console(char *spec, bool *virtio, int *count) {
+    char *opt = strchr(spec, ',');
+    if (opt) *opt = '\0';                /* terminate KIND at the first comma */
+    if      (!strcmp(spec, "pl011"))  *virtio = false;
+    else if (!strcmp(spec, "virtio")) *virtio = true;
+    else { fprintf(stderr, "arm64emu: --console: expected pl011|virtio\n"); exit(2); }
+    while (opt) {                        /* walk the ,opt,opt... suffix */
+        char *cur = opt + 1;
+        char *nxt = strchr(cur, ',');
+        if (nxt) *nxt = '\0';
+        if (!strncmp(cur, "count=", 6)) {
+            *count = atoi(cur + 6);
+            if (*count < 0 || *count > MAX_CONSOLES) {
+                fprintf(stderr, "arm64emu: --console: count must be 0..%d\n", MAX_CONSOLES);
+                exit(2);
+            }
+        } else { fprintf(stderr, "arm64emu: --console: unknown option '%s'\n", cur); exit(2); }
+        opt = nxt;
+    }
+}
+
 /* --netfwd tcp:HOST_PORT:GUEST_PORT or udp:HOST_PORT:GUEST_PORT. */
 static void add_netfwd(NetFwd *fwds, int *n_fwds, char *spec) {
     if (*n_fwds >= 16) {
@@ -518,6 +549,7 @@ int main(int argc, char **argv) {
     VirtFS shares[MAX_SHARES]; int n_shares = 0;
     bool net_enabled = false;
     bool console_virtio = false;         /* --console: false=pl011 (default), true=virtio */
+    int  n_consoles = -1;                /* --console ...,count=N; -1 = unset */
     NetFwd net_fwds[16]; int n_net_fwds = 0;
     u64 ram_mb = 1024;
     u64 entry = 0;
@@ -557,12 +589,9 @@ int main(int argc, char **argv) {
             else if (!strcmp(n, "drive"))    add_drive(drives, &n_drives, long_value("--drive", val, argv, argc, &i));
             else if (!strcmp(n, "virtfs"))   add_virtfs(shares, &n_shares, long_value("--virtfs", val, argv, argc, &i));
             else if (!strcmp(n, "netfwd"))   add_netfwd(net_fwds, &n_net_fwds, long_value("--netfwd", val, argv, argc, &i));
-            else if (!strcmp(n, "console")) {
-                const char *k = long_value("--console", val, argv, argc, &i);
-                if      (!strcmp(k, "pl011"))  console_virtio = false;
-                else if (!strcmp(k, "virtio")) console_virtio = true;
-                else { fprintf(stderr, "arm64emu: --console: expected pl011|virtio\n"); exit(2); }
-            }
+            else if (!strcmp(n, "console"))
+                parse_console(long_value("--console", val, argv, argc, &i),
+                              &console_virtio, &n_consoles);
             else if (!strcmp(n, "bin")) {              /* FILE or FILE@ADDR */
                 char *s = long_value("--bin", val, argv, argc, &i);
                 char *at = strchr(s, '@');
@@ -587,6 +616,15 @@ int main(int argc, char **argv) {
         usage();
     }
     if (ram_mb == 0) { fprintf(stderr, "arm64emu: --memory: invalid size\n"); exit(2); }
+
+    /* Default console count: one for --console virtio (it *is* the console),
+     * none otherwise. An explicit count=0 alongside --console virtio asks for a
+     * guest console on a device that was not created. */
+    if (n_consoles < 0) n_consoles = console_virtio ? 1 : 0;
+    if (console_virtio && n_consoles == 0) {
+        fprintf(stderr, "arm64emu: --console virtio needs count >= 1\n");
+        exit(2);
+    }
 
     if (getenv("AEDBG")) g_dbg = atoi(getenv("AEDBG"));
     if (getenv("AEPROF")) g_prof = atoi(getenv("AEPROF"));
@@ -630,6 +668,7 @@ int main(int argc, char **argv) {
     if (n_shares) { memcpy(m.shares, shares, n_shares * sizeof(shares[0])); m.n_shares = n_shares; }
     m.net_enabled = net_enabled;
     m.console_virtio = console_virtio;
+    m.n_consoles_req = n_consoles;
     if (console_virtio) {
         if (kernel) {
             /* We control the cmdline on the --kernel path: make hvc0 the guest

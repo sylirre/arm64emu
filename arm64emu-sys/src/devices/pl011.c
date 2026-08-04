@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* PL011 UART: TX -> host stdout, RX <- host stdin, with RX/TX interrupts. */
+/* PL011 UART: TX and RX on a host console endpoint (the process terminal unless
+ * bound elsewhere — see console.h), with RX/TX interrupts. */
 #include "../devices.h"
-#include "../tty.h"
+#include "../console.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,10 +36,14 @@ static void update_irq(PL011 *p) {
 void pl011_rx_poll(Machine *m) {
     PL011 *p = m->uart;
     if (!p) return;
+    console_flush(p->ep);            /* retry output a stalled peer refused earlier */
     int ch;
-    while (!rx_full(p) && (ch = tty_getchar()) >= 0) rx_push(p, (u8)ch);
+    while (!rx_full(p) && (ch = console_getchar(p->ep)) >= 0) rx_push(p, (u8)ch);
     update_irq(p);
 }
+
+/* True while this UART is on the shared process terminal (see machine_tick). */
+bool pl011_is_stdio(PL011 *p) { return p && console_is_stdio(p->ep); }
 
 static u64 uart_read(void *opaque, u64 off, unsigned size) {
     PL011 *p = opaque;
@@ -71,7 +76,7 @@ static void uart_write(void *opaque, u64 off, unsigned size, u64 val) {
     PL011 *p = opaque;
     switch (off) {
         case 0x00:                                                        /* DR */
-            tty_putchar((int)(val & 0xff));
+            console_putchar(p->ep, (int)(val & 0xff));
             /* Output on the serial console -> host input follows it back to
              * ttyAMA0 (until the guest next writes to hvc0). See machine_tick. */
             if (p->m->console_virtio) p->m->console_active_virtio = false;
@@ -92,6 +97,7 @@ PL011 *pl011_create(Machine *m, GIC *gic) {
     PL011 *p = calloc(1, sizeof(*p));
     p->m = m;
     p->gic = gic;
+    p->ep = m->uart_ep ? m->uart_ep : console_stdio();
     p->cr = 0x300;     /* TXE|RXE */
     machine_add_device(m, UART_BASE, 0x1000, uart_read, uart_write, p, "pl011");
     m->uart = p;
@@ -103,9 +109,11 @@ PL011 *pl011_create(Machine *m, GIC *gic) {
 void pl011_reset(PL011 *p) {
     Machine *m = p->m;
     GIC *gic = p->gic;
+    ConsoleEP *ep = p->ep;         /* the host endpoint outlives a guest reset */
     memset(p, 0, sizeof(*p));
     p->m = m;
     p->gic = gic;
+    p->ep = ep;
     p->cr = 0x300;     /* TXE|RXE */
     gic_set_irq(gic, INTID_UART, 0);
 }

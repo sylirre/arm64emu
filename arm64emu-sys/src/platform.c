@@ -71,9 +71,10 @@ void platform_build(Machine *m) {
      * because find_dev uses first-match dispatch — so a device at slot 2+ shadows
      * the catch-all stub below for its own 0x200 window.
      * Unoccupied slots get empty-transport stubs (DeviceID=0). */
-    if (m->n_drives + m->n_shares + (m->console_virtio ? 1 : 0) > 31) {   /* net=slot0, then disks, shares, console */
-        fprintf(stderr, "too many virtio-mmio devices (%d disks + %d shares%s > 31 slots)\n",
-                m->n_drives, m->n_shares, m->console_virtio ? " + console" : "");
+    if (m->n_drives + m->n_shares + m->n_consoles_req > 31) {   /* net=slot0, then disks, shares, consoles */
+        fprintf(stderr, "too many virtio-mmio devices (%d disks + %d shares + "
+                        "%d consoles > 31 slots)\n",
+                m->n_drives, m->n_shares, m->n_consoles_req);
         exit(1);
     }
     if (m->net_enabled) virtio_net_create(m, m->gic);
@@ -82,12 +83,12 @@ void platform_build(Machine *m) {
     for (int i = 0; i < m->n_shares; i++)                    /* slots after disks  */
         virtio_9p_create(m, m->gic, m->shares[i].path, m->shares[i].tag,
                          m->shares[i].ro, m->n_drives + 1 + i);
-    if (m->console_virtio)                                   /* slot after disks + shares */
-        virtio_console_create(m, m->gic, 1 + m->n_drives + m->n_shares);
+    for (int i = 0; i < m->n_consoles_req; i++)              /* slots after disks + shares */
+        virtio_console_create(m, m->gic, 1 + m->n_drives + m->n_shares + i);
     if (!m->net_enabled) machine_add_device(m, 0x0a000000, 0x200, virtio_mmio_read, stub_write, m, "virtio-mmio");
     /* Slot 1 (0x0a000200) is stubbed only when nothing real occupies it — no
      * disk, no share, and (when there are neither) no virtio-console either. */
-    if (m->n_drives == 0 && m->n_shares == 0 && !m->console_virtio) machine_add_device(m, 0x0a000200, 0x200, virtio_mmio_read, stub_write, m, "virtio-mmio");
+    if (m->n_drives == 0 && m->n_shares == 0 && m->n_consoles_req == 0) machine_add_device(m, 0x0a000200, 0x200, virtio_mmio_read, stub_write, m, "virtio-mmio");
     machine_add_device(m, 0x0a000400, 0x3c00, virtio_mmio_read, stub_write, m, "virtio-mmio");
     machine_add_device(m, 0x3eff0000, 0x10000,      stub_ones_read, stub_write, m, "pcie-pio");
     machine_add_device(m, 0x10000000, 0x2eff0000,   stub_ones_read, stub_write, m, "pcie-mmio");
@@ -136,7 +137,8 @@ void machine_reset(Machine *m, u64 entry, unsigned reset_el) {
     if (m->rtc)   pl031_reset(m->rtc);
     if (m->fwcfg) fwcfg_reset(m->fwcfg);
     if (m->net)   virtio_net_reset(m->net);
-    if (m->vcon)  virtio_console_reset(m->vcon);   /* background-polled: quiesce explicitly */
+    for (int i = 0; i < m->n_vcon; i++)
+        virtio_console_reset(m->vcon[i]);          /* background-polled: quiesce explicitly */
     flash_cfi_reset(m);
 
     /* Re-place the flattened device tree at the base of RAM (EDK2 reads it from
@@ -165,15 +167,30 @@ void machine_tick(Machine *m) {
         if (!io_interval) io_interval = 1;
     }
     m->io_poll_due = m->cpu.icount + io_interval;
-    /* Route host keyboard input to the console the guest is actually using:
+    /* A console bound to its own host endpoint is independent of every other:
+     * it has its own input stream and its own output buffer to drain, so poll
+     * it unconditionally. */
+    struct VirtIOConsole *shared = NULL;
+    for (int i = 0; i < m->n_vcon; i++) {
+        if (vcon_is_stdio(m->vcon[i])) { if (!shared) shared = m->vcon[i]; continue; }
+        virtio_console_poll(m->vcon[i]);
+    }
+    bool uart_shared = m->uart && pl011_is_stdio(m->uart);
+    if (m->uart && !uart_shared) pl011_rx_poll(m);
+
+    /* The process terminal is the one endpoint that can be shared, and it has a
+     * single stdin, so route it to the console the guest is actually using:
      * "input follows output". console_active_virtio tracks which console last
      * produced output (set on each device's TX). So firmware/GRUB/earlycon and a
      * ttyAMA0 login keep input on the PL011 UART, while once the guest writes its
-     * console to hvc0 (e.g. console=hvc0) input — and host winsize — follow there.
-     * Output needs no routing: both write to the same stdout, guest drives one. */
-    if (m->console_virtio && m->vcon && vcon_driver_ok(m->vcon) && m->console_active_virtio)
-        virtio_console_poll(m->vcon);
-    else if (m->uart)
+     * console to hvc0 (e.g. console=hvc0) input — and the host winsize — follow
+     * there. With the UART bound elsewhere there is nothing to arbitrate and the
+     * terminal is the console's outright. Output needs no routing: everything on
+     * this endpoint writes to the same stdout, and the guest drives one. */
+    if (shared && (!uart_shared || (m->console_virtio && vcon_driver_ok(shared) &&
+                                    m->console_active_virtio)))
+        virtio_console_poll(shared);
+    else if (uart_shared)
         pl011_rx_poll(m);
     if (m->net) virtio_net_poll(m->net);
 }
@@ -191,7 +208,7 @@ void machine_tick(Machine *m) {
  * no armed timer to reach a deadline. */
 static void check_wake_source(Machine *m, bool timer_armed, bool has_input) {
     if (m->cpu.halted && !timer_armed && !has_input && !m->cpu.irq_line &&
-        !m->uart && !m->vcon && !m->net && !m->rtc)
+        !m->uart && !m->n_vcon && !m->net && !m->rtc)
         m->deadlock = true;
 }
 

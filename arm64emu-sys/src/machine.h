@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "cpu.h"
+#include "console.h"
 
 /* Default platform constants (QEMU 'virt', GICv2). */
 #define FLASH_BASE   0x00000000ULL
@@ -35,6 +36,11 @@ typedef struct {
 /* Max host directory shares (virtio-9p). Same 31-slot ceiling shared with disks
  * (net=slot 0, then disks, then shares); 8 keeps the Machine arrays small. */
 #define MAX_SHARES 8
+/* Max virtio-console devices, each a separate guest tty (hvc0, hvc1, ...). The
+ * hard ceilings are elsewhere and higher — the same 31 virtio-mmio slots, and
+ * Linux's MAX_NR_HVC_CONSOLES of 16 — so this is just the point past which an
+ * embedder is asking for more terminals than anyone drives. */
+#define MAX_CONSOLES 8
 
 struct GIC;
 struct PL011;
@@ -100,18 +106,32 @@ typedef struct Machine {
     struct VirtIONet *net;
     struct VirtIO9P  *fs[MAX_SHARES];   /* attached 9p shares, in attach order */
     int    n_fs;
-    struct VirtIOConsole *vcon;         /* -console virtio (hvc0), else NULL */
+    struct VirtIOConsole *vcon[MAX_CONSOLES];  /* hvc0..hvc(n_vcon-1) */
+    int    n_vcon;
+
+    /* Host console endpoints (console.h): where each console device's bytes
+     * actually go. NULL means the process terminal, which is what a plain
+     * command-line run wants and what every console shares there. --console-fd
+     * binds one to an inherited descriptor instead, which is how an embedding
+     * process gives each guest tty its own channel. */
+    ConsoleEP *uart_ep;                 /* PL011 (ttyAMA0) */
+    ConsoleEP *vcon_ep[MAX_CONSOLES];   /* hvc0..hvc(n_vcon-1) */
 
     Drive  drives[MAX_DRIVES];   /* -drive disks */
     int    n_drives;
     VirtFS shares[MAX_SHARES];    /* -virtfs host directory shares */
     int    n_shares;
     bool net_enabled;             /* -net flag */
-    bool console_virtio;          /* -console virtio (default false = pl011) */
+    bool console_virtio;          /* --console virtio: the guest console is hvc0
+                                   * (default false = pl011/ttyAMA0) */
+    int  n_consoles_req;          /* --console ...,count=N: virtio-consoles to
+                                   * create. 0 means the default for the mode */
     bool console_active_virtio;   /* input follows output: true once hvc0 (not
                                    * ttyAMA0) last produced output; routes host
                                    * stdin to the console the guest is actually
-                                   * using. Only consulted when console_virtio. */
+                                   * using. Only consulted when two consoles
+                                   * share the process terminal — an endpoint of
+                                   * its own needs no arbitration. */
     NetFwd net_fwds[16];          /* -netfwd rules */
     int    n_net_fwds;
 
