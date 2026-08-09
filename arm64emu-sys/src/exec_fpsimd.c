@@ -239,21 +239,30 @@ static void fp_wr_h(CPU *c, unsigned d, u16 h) { c->v[d].d[0] = h; c->v[d].d[1] 
  *     subtracts 2^63 unconditionally — inexact, so an exact FCVTZU set IXC.
  * All three are now decided in the source instead of left to codegen: NaN is
  * classified before any relational (fcm_test_*), the flag a NaN arm owes is
- * raised by hand, and the unsigned convert is integer arithmetic
- * (d_to_u64_exact). What is NOT expressible that way is an FP op a compiler
- * speculates out of ANY guard — FPRecipStepFused's 0*inf arm, say. No compiler
- * we build with does that today, m22_fpsr pins it, and the escape hatch if one
- * starts is to compile this file with -ffp-exception-behavior=strict (clang;
- * measured ~7% on the FP path, which is why it is not on by default).
- * Known corners vs the architecture, deliberate: tininess is detected after
- * rounding on x86 (ARM: before) — one boundary ULP of difference in UFC for
- * float/double; f64-input fixed-point converts with 2^1000-scale overflow
- * leak host OFC. Both are far outside anything a guest exercises. NaN
- * *results* used to be a third such corner and are no longer: both which NaN
- * an operation returns and what a generated one looks like are decided here
- * rather than inherited from the host — see the FPProcessNaNs / DefaultNaN
- * block below. FPCR.DN (Default-NaN mode, which would make even a propagated
- * NaN come back as the default) is still not modelled. */
+ * raised by hand, and no FP->int convert is a cast any more — the whole family
+ * goes through d_to_u64_exact / d_to_s64_exact, which is also what stops a
+ * *libgcc* expansion of the same conversion leaking Inexact on armv7 (see
+ * there; that one is not a clang quirk, and gcc has it too). What the source
+ * cannot express is an FP op a compiler speculates out of ANY guard —
+ * FPRecipStepFused's 0*inf arm, say. No compiler we build with does that
+ * today, m22_fpsr pins it, and the escape hatch if one starts is to compile
+ * this file with -ffp-exception-behavior=strict (clang; measured ~7% on the
+ * FP path, which is why it is not on by default).
+ * Known corners vs the architecture, deliberate. All were measured against
+ * qemu by sweeping random FP/SIMD words; the counts are per 30000 words with
+ * NaN and Inf excluded from every lane width:
+ *   - tininess is detected after rounding on x86 (ARM: before) — one boundary
+ *     ULP of difference in UFC for float/double;
+ *   - f64-input fixed-point converts with 2^1000-scale overflow leak host OFC;
+ *   - the FP16 widen-compute-narrow pipeline can miss UFC/IXC on a result
+ *     that is inexact in half but exact in double (6/30000, FCMLA).
+ * These are values a guest only sees if it inspects the sticky flags after an
+ * exceptional operation. NaN *results* used to be a third such corner and are
+ * no longer: both which NaN an operation returns and what a generated one
+ * looks like are decided here rather than inherited from the host — see the
+ * FPProcessNaNs / DefaultNaN block below. FPCR.DN (Default-NaN mode, which
+ * would make even a propagated NaN come back as the default) is still not
+ * modelled; Linux userspace leaves it clear. */
 #define FPSR_IOC 0x01u
 #define FPSR_DZC 0x02u
 #define FPSR_OFC 0x04u
@@ -579,6 +588,7 @@ static double fround_mode(double v, int rmode);        /* defined below */
 static double frint_d(double v, int rmode, int exact);  /* defined below */
 static u64 fcvt_to_int(double r, double orig, int is_signed, int x64); /* defined below */
 static u64 fcvt_fixed(double prod, int is_signed, int x64);   /* defined below */
+static u64 d_to_s64_exact(double r);                          /* defined below */
 
 /* All four are raise-free (bit arithmetic + exact adds): a (s64) cast would
  * raise the host inexact flag, which the sticky FPSR accumulation would then
@@ -726,7 +736,6 @@ static void fsqrt_raise_s(float x) {
     if (x != x) { if (is_snan_s(x)) g_fpexc |= FPSR_IOC; return; }
     if (x < 0.0f) g_fpexc |= FPSR_IOC;
 }
-
 
 /* ---- Fused multiply-add: result AND flags derived by hand on armv7 ----
  *
@@ -1204,7 +1213,7 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                 } else {
                     double t = f_trunc(v);     /* round toward zero, then wrap mod 2^32 */
                     if (__builtin_fabs(t) < 9223372036854775808.0) {
-                        res = (u32)(s64)t;
+                        res = (u32)d_to_s64_exact(t);   /* no cast: see the helper */
                         /* -0.0 is "inexact" for JavaScript: int32 0 round-trips
                          * to +0.0, and engines use Z to detect exactly that. */
                         exact = (t == v && t >= -2147483648.0 && t <= 2147483647.0 &&
@@ -1215,9 +1224,10 @@ static void exec_fp_scalar(CPU *c, u32 insn) {
                         else if (t != v) g_fpexc |= FPSR_IXC;
                     } else {
                         g_fpexc |= FPSR_IOC;   /* far outside int32: wrapped */
-                        /* |t| >= 2^63: (s64)t is UB, so take the low 32 bits from
-                         * the significand directly; they are all zero once the
-                         * unbiased exponent reaches 84. */
+                        /* |t| >= 2^63 is outside what d_to_s64_exact answers for
+                         * (it saturates instead of wrapping), so take the low 32
+                         * bits from the significand directly; they are all zero
+                         * once the unbiased exponent reaches 84. */
                         u64 raw = c->v[Rn].d[0];
                         int e = (int)((raw >> 52) & 0x7ff) - 1023;
                         u64 frac = (raw & 0xfffffffffffffULL) | (1ULL << 52);
@@ -1749,13 +1759,14 @@ static double fop_d_raw(unsigned op, double n, double m, double d) {
              * fused subtract): fold the halving into an operand — fma(-n/2,
              * m, 1.5) — so it stays one rounding. fma-then-divide rounds
              * twice, which shows at the overflow boundary (the fma saturates
-             * to inf where the halved value is still representable) and in
-             * the subnormal range. Halving is exact only above the bottom
-             * exponent, so pick the operand it cannot clip (checked in the
-             * integer domain — an FP probe would raise flags the guest never
-             * asked for); when both sit at the very bottom the product is
-             * far below 3's significance and the old shape is exact, with
-             * the right IXC. */
+             * to inf where the halved value is still representable; found by
+             * the a64 JIT's native replay on real silicon, where frsqrts is
+             * the reference) and in the subnormal range. Halving is exact
+             * only above the bottom exponent, so pick the operand it cannot
+             * clip (checked in the integer domain — an FP probe would raise
+             * flags the guest never asked for); when both sit at the very
+             * bottom the product is far below 3's significance and the old
+             * shape is exact, with the right IXC. */
             u64 nb; memcpy(&nb, &n, 8);
             if (((nb >> 52) & 0x7ff) >= 2)
                 return a64_fma(-(0.5 * n), m, 1.5);
@@ -2477,16 +2488,34 @@ static void simd_across(CPU *c, u32 insn) {
     c->v[Rd].d[0] = acc & emask; c->v[Rd].d[1] = 0;
 }
 
-/* FP -> integer lane convert with saturation (shared clamp logic). x64 selects
- * 64-bit (.2d) vs 32-bit (.4s) result width; is_signed picks the signed form. */
-/* Exact double -> unsigned integer, for a value already known to be integral,
- * non-negative and in range. A plain (u64) cast is not safe here: x86-64 has
- * no double->u64 instruction, so the compiler synthesizes one, and clang's
- * branchless form evaluates `r - 2^63` on EVERY conversion — inexact for small
- * values, which leaves the host IXC set and the guest then sees it on an exact
- * FCVTZU (gcc branches, so it only subtracts when it must). Same raise-free
- * bit arithmetic as the f_trunc family above. */
-static u64 d_to_u64_exact(double r) {
+/* Exact double -> integer, for a value already known to be integral and in
+ * range. Every FP->int convert below goes through these two rather than a host
+ * cast, and raises IXC/IOC by hand from the pre-round operand.
+ *
+ * A cast is not safe for a 64-bit result, because most hosts have no such
+ * instruction — x86-64 lacks the unsigned direction, a 32-bit host lacks both —
+ * so it becomes synthesized code or a libcall whose *internal* rounding lands
+ * in the live status word and is then attributed to the guest's instruction:
+ *   - clang's branchless double->u64 evaluates `r - 2^63` on EVERY conversion,
+ *     inexact for small values, so an exact FCVTZU came back with IXC set (gcc
+ *     branches, and only subtracts when it must);
+ *   - on armv7 both directions are libcalls, and libgcc's __aeabi_d2lz just
+ *     negates into __aeabi_d2ulz, which splits the operand as
+ *     `hi = (u32)(r * 2^-32)` with a *truncating* vcvt — inexact for every r
+ *     that is not a multiple of 2^32. `fcvtzs x0, d0` of 1.0 raised IXC on the
+ *     armhf-glibc tier, and so did FJCVTZS. Which implementation you get is a
+ *     link-time accident and not a property of the compiler: compiler-rt's
+ *     hard-float __fixunsdfdi is the same algorithm, but Android's libm
+ *     exports its own soft-float __aeabi_d2lz/__aeabi_d2ulz (integer-only,
+ *     raise-free) and wins for anything linking -lm, which is why the Termux
+ *     armv7 device never showed this and armhf-glibc did.
+ * A 32- or 16-bit result does lower to one instruction on every host we build
+ * for, but it goes through the same helpers anyway, so that "this file performs
+ * no FP->int cast" is an invariant one can grep for — and check in the object,
+ * where no vcvt from .f32/.f64 to an integer type and no __aeabi_*2*z helper
+ * may survive (the reverse direction, __aeabi_l2d and friends, is expected).
+ * Same raise-free bit arithmetic as the f_trunc family above. */
+static u64 d_to_u64_exact(double r) {     /* magnitude: the sign bit is ignored */
     u64 b; memcpy(&b, &r, 8);
     int e = (int)((b >> 52) & 0x7ff) - 1023;
     if (e < 0)  return 0;                 /* |r| < 1, and r is integral -> 0 */
@@ -2494,7 +2523,17 @@ static u64 d_to_u64_exact(double r) {
     u64 m = (b & 0xfffffffffffffULL) | (1ULL << 52);
     return (e >= 52) ? (m << (e - 52)) : (m >> (52 - e));
 }
+/* The signed companion, delivered as two's-complement bits because every caller
+ * returns the register image anyway. Negating the magnitude in *unsigned*
+ * arithmetic is what keeps -2^63 defined behaviour. */
+static u64 d_to_s64_exact(double r) {
+    u64 m = d_to_u64_exact(r);
+    return __builtin_signbit(r) ? 0ULL - m : m;
+}
 
+/* FP -> integer convert with saturation (shared clamp logic, scalar and lane
+ * alike). x64 selects 64-bit (.2d) vs 32-bit (.4s) result width; is_signed
+ * picks the signed form. */
 static u64 fcvt_to_int(double r, double orig, int is_signed, int x64) {
     if (r != r) {                      /* NaN -> 0 (FPToFixed), not INT_MIN */
         g_fpexc |= FPSR_IOC;
@@ -2510,8 +2549,8 @@ static u64 fcvt_to_int(double r, double orig, int is_signed, int x64) {
     if (sat) g_fpexc |= FPSR_IOC;
     else if (r != orig) g_fpexc |= FPSR_IXC;
     if (is_signed) {
-        if (x64) { s64 m = (r >= 9223372036854775807.0) ? INT64_MAX : (r <= -9223372036854775808.0) ? INT64_MIN : (s64)r; return (u64)m; }
-        s32 m = (r >= 2147483647.0) ? INT32_MAX : (r <= -2147483648.0) ? INT32_MIN : (s32)r; return (u64)(u32)m;
+        if (x64) { u64 m = (r >= 9223372036854775807.0) ? (u64)INT64_MAX : (r <= -9223372036854775808.0) ? (u64)INT64_MIN : d_to_s64_exact(r); return m; }
+        u32 m = (r >= 2147483647.0) ? (u32)INT32_MAX : (r <= -2147483648.0) ? (u32)INT32_MIN : (u32)d_to_s64_exact(r); return m;
     }
     if (r < 0) r = 0;
     if (x64) { u64 m = (r >= 18446744073709551615.0) ? UINT64_MAX : d_to_u64_exact(r); return m; }
@@ -2524,9 +2563,9 @@ static u16 fcvt_to_int16(double r, double orig, int is_signed) {
     int sat = is_signed ? (r > 32767.0 || r < -32768.0) : (r > 65535.0 || r < 0);
     if (sat) g_fpexc |= FPSR_IOC;
     else if (r != orig) g_fpexc |= FPSR_IXC;
-    if (is_signed) { s32 m = (r >= 32767.0) ? 32767 : (r <= -32768.0) ? -32768 : (s32)r; return (u16)(s16)m; }
+    if (is_signed) { u16 m = (r >= 32767.0) ? 0x7fffu : (r <= -32768.0) ? 0x8000u : (u16)d_to_s64_exact(r); return m; }
     if (r < 0) r = 0;
-    return (r >= 65535.0) ? 0xffffu : (u16)r;
+    return (r >= 65535.0) ? 0xffffu : (u16)d_to_u64_exact(r);
 }
 /* Fixed-point FP->int: truncate the (exact) 2^fbits-scaled product, flags per
  * FPToFixed with the product as the pre-round value. */
