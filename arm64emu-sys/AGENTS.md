@@ -164,6 +164,8 @@ tests/
     m31_mmu2.S            MMU corners: TBI, EPD, TxSZ fault, 4-level walk
     m32_dtbmem.S          the DTB's /memory node tracks --memory (--bios,
                           run with --memory 384)
+    m33_simdshift.S       AdvSIMD SLI/SRI shift-insert extremes, every lane
+                          width incl. SRI by the element width (dual-mode)
   scripts/
     console_mux.c         dev harness / worked example for --console-fd and
                           --ctrl-fd: a socketpair per guest terminal, output
