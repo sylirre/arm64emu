@@ -512,6 +512,52 @@ _start:
     RDF
     CKX     x13, 0, 62
 
+    /* ---- scalar half ops must not see the lanes they do not read ----
+     * A host without FEAT_FP16 emulates these by widening to single, and the
+     * widening instruction available on x86-64 converts four halves at a
+     * time. Unless the operand is narrowed to its one live lane first, three
+     * values the instruction never reads reach the arithmetic: a signaling
+     * NaN among them signals Invalid as it is widened, and a packed (rather
+     * than scalar) op computes them as well, so zeros in dead lanes divide
+     * 0/0. Both leaked IOC into these otherwise unremarkable operations. */
+    ldr     x20, =hjunk
+    ldr     q0, [x20, #0]                /* h0 = 1.0, junk above it */
+    ldr     q1, [x20, #16]               /* h0 = 2.0, junk above it */
+    CLRF
+    fdiv    h2, h0, h1
+    RDF
+    fmov    w12, s2
+    and     x12, x12, #0xffff
+    CKX     x12, 0x3800, 63              /* 0.5 */
+    CKX     x13, 0, 64
+    CLRF
+    fadd    h2, h0, h1
+    RDF
+    fmov    w12, s2
+    and     x12, x12, #0xffff
+    CKX     x12, 0x4200, 65              /* 3.0 */
+    CKX     x13, 0, 66
+    CLRF
+    fsqrt   h2, h0
+    RDF
+    fmov    w12, s2
+    and     x12, x12, #0xffff
+    CKX     x12, 0x3C00, 67              /* 1.0 */
+    CKX     x13, 0, 68
+    CLRF
+    fcmp    h0, h1
+    mrs     x12, nzcv
+    RDF
+    lsr     x12, x12, #28
+    CKX     x12, 0x8, 69                 /* 1.0 < 2.0: N */
+    CKX     x13, 0, 70
+    CLRF
+    fcvt    s2, h0
+    RDF
+    fmov    w12, s2
+    CKX     x12, 0x3F800000, 71
+    CKX     x13, 0, 72
+
     mov     x0, #0
 done:
 #ifdef USERMODE
@@ -557,6 +603,11 @@ fdat:
     .hword 0x0001                        /* +236: half min subnormal */
     .hword 0                             /* +238: pad */
     .quad 0x3FF0000000010000             /* +240: 1 + 2^-40 */
+
+.balign 16
+hjunk:                                   /* half operands with hostile lanes */
+    .hword 0x3C00, 0x7C01, 0x7BFF, 0x0001, 0x7E00, 0xFC00, 0x8001, 0x0000
+    .hword 0x4000, 0x7D55, 0x0000, 0x7BFF, 0xFE00, 0x7C00, 0x03FF, 0x0000
 
 .balign 16
 sdat:                                    /* saturation operands */
