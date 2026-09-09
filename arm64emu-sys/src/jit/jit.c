@@ -54,6 +54,13 @@
 int g_jit;                          /* -jit (main.c) */
 JitEnv g_jit_env;
 
+/* The FPCR bits that stop floating point being inlined: flush-to-zero has no
+ * host equivalent the generated code could lean on, so a guest that asks for
+ * it runs its FP through exec_fpsimd.c (ir.h's vop_fpcr_sensitive says which
+ * classes that is). FPCR.RMode is NOT here -- the classes that care about it
+ * carry their own runtime gate. */
+#define JIT_FPCR_NONDEFAULT ((1u << 24) | (1u << 19))   /* FZ | FZ16 */
+
 /* RAM code-page bitmap (1 bit per 4 KB page). mmu.c reads it through the
  * const alias g_jit_code_bitmap (declared in mmu.h) when filling D-TLB write
  * entries; jit.c owns the writable pointer. NULL until the JIT starts. */
@@ -466,6 +473,12 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
     c->icount++;
     if (UNLIKELY(g_jit_stats > 0)) jstat_bump(insn);
     if (UNLIKELY(c->stop || c->halted)) return 1;
+    /* MSR FPCR lands here (the system group is never inlined), and turning
+     * flush-to-zero on invalidates the inline FP in every block already
+     * translated -- including the rest of this one. End the block so
+     * jit_run's loop can drop the cache before anything else runs. */
+    if (UNLIKELY(!g_jit_env.fpnondef && (c->fpcr & JIT_FPCR_NONDEFAULT)))
+        return 1;
     return c->pc != pc + 4;
 }
 
@@ -577,6 +590,7 @@ retry:
         (size_t)(env->end - env->ptr) < JIT_BLOCK_MAX_BYTES)
         jit_flush_all(env);
 
+    g_ir->fpnondef = env->fpnondef;
     u32 n = jit_fe_block(c, pc, g_ir, max_insns);
     if (n == 0) return NULL;        /* entry fetch fault already taken */
 
@@ -755,6 +769,15 @@ StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
         if (UNLIKELY(env->flush_count != flush_seen)) {
             flush_seen = env->flush_count;
             prev = NULL;                /* arena reset: pointer is stale */
+        }
+        /* First sight of a non-default FP mode: blocks translated before it
+         * inline host FP that does not flush to zero. Drop them all; from
+         * here the frontend leaves floating point to exec_fpsimd.c. */
+        if (UNLIKELY(!env->fpnondef && (c->fpcr & JIT_FPCR_NONDEFAULT))) {
+            env->fpnondef = 1;
+            jit_flush_all(env);
+            flush_seen = env->flush_count;
+            prev = NULL;
         }
         if (UNLIKELY(env->jc_gen != g_tlb_gen)) {
             /* TLBI: VA->code bindings may be stale. Every gen-changing path

@@ -170,9 +170,15 @@ Items 4 (FCMPE aliased to quiet FCMP) and 7's flag half (no FPSR cumulative
 flags, no QC) are **fixed** — see the late-batch entry above and `m22_fpsr.S`.
 What remains, all deliberate:
 
-- **FPCR.FZ/DN/AH are ignored and NaN payloads are not bit-guaranteed** — the
-  declared scope limitation (oracle validation runs with FZ=0). FPSR.IDC is
-  therefore never set (correct while nothing flushes).
+- **FPCR.FZ/FZ16 are implemented** (2026-09-10, `m34_fpcrfz.S`): a denormal
+  operand reads as zero of its own sign as it is unpacked, a result below the
+  smallest normal becomes zero as it is rounded, and FPSR.IDC/UFC are raised
+  accordingly — with the architecture's two carve-outs, that FZ16 raises no
+  IDC and that the precision-changing FCVT family ignores FZ16 on its half
+  side (`FPUnpackCV`/`FPRoundCV`). `--jit` drops its code cache and stops
+  inlining floating point for as long as either bit is set, since its recipes
+  are plain host arithmetic. **FPCR.DN/AH are still ignored** and NaN
+  payloads are not bit-guaranteed.
 - **FPCR.RMode is honored by FRINT/converts but not by arithmetic** — FADD &
   co always round-to-nearest-even (host default). Non-RN arithmetic is
   essentially unused by real guests (`fesetround` callers).

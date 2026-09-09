@@ -104,9 +104,12 @@ lazily by `fpsr_sync` (`src/exec_fpsimd.c`) only when the guest reads FPSR.
   page lets the stale tail run to the block end (≤128 insns) —
   architecturally permitted without IC IVAU+ISB.
 - **Host FP semantics** (all engines equally, `docs/todo/TODO_OPCODES.md` §6):
-  FPCR.FZ/DN/AH ignored, NaN payloads not bit-guaranteed, FPCR.RMode honored
+  FPCR.DN/AH ignored, NaN payloads not bit-guaranteed, FPCR.RMode honored
   by FRINT/converts but not arithmetic, x86 tininess-after-rounding (one-ULP
-  UFC boundary).
+  UFC boundary — which under FPCR.FZ, implemented since 2026-09-10, shows in
+  the *value*: a single/double result whose exact magnitude sat inside that
+  ULP below the smallest normal is kept where the architecture flushes it).
+  `--jit` leaves floating point to the interpreter while FZ or FZ16 is set.
 - **Debug facilities force the interpreter** (`--trace`, `--reg-trace`, watchpoints,
   AE* per-instruction hooks).
 
@@ -114,7 +117,7 @@ lazily by `fpsr_sync` (`src/exec_fpsimd.c`) only when the guest reads FPSR.
 
 | Gate | Command | What it proves |
 |------|---------|----------------|
-| asm suite ×3 | `make test` / `make test-pd` / `make test-jit` | m1–m23 pass (`x0=0`) under every engine; values oracle-validated once via qemu-aarch64 (`-DUSERMODE` dual-mode files: m13, m19–m22) |
+| asm suite ×3 | `make test` / `make test-pd` / `make test-jit` | m1–m34 pass (`x0=0`) under every engine; values oracle-validated once via qemu-aarch64 (`-DUSERMODE` dual-mode files: m13, m19–m22, m34) |
 | consistency checkpoints | inside `test-pd` / `test-jit` | deterministic firmware+Linux boot (harness pins `AE_RTCLOCK=0`; runtime default is the host clock), byte-identical serial + final CPU state at 1M/4M/16M/64M/300M |
 | full-boot log gate | `make test-jit-full` / `make test-pd-full` (`tests/run_bootlog_gate.sh`) | 1.6B-insn boot log identical after timestamp normalization — covers the whole boot, not just the UEFI phase the checkpoints sit in; **mandatory for frontend changes** |
 | cross-engine fuzzing | `make fuzz-engines` (`tests/run_fuzz_engines.sh` + `tests/scripts/fuzz_gen.c`) | random blocks over the inlined surface, interpreter (`--no-pd`) vs the predecoded tier vs `--jit` vs `--jit`+SLOWMEM/NOFUSE/NOVRA; phase 1 compares the HLT line natively-executed, phase 2 stops at the exact pre-HLT icount and compares the full register dump |

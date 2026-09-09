@@ -106,6 +106,13 @@ typedef struct JitEnv {
     u32 slowmem;                /* every mem op takes the helper path; wired
                                  * on until Stage 2b adapts the inline probe
                                  * (then AEJIT_SLOWMEM=1 forces, bisection) */
+    /* Sticky: the guest has asked for a non-default FP mode (FPCR.FZ or
+     * FZ16) at least once, so no block translated from here on inlines
+     * floating point (ir.h's vop_fpcr_sensitive). Sticky rather than
+     * tracking the live bit because clearing it back would have to discard
+     * the cache again, and a guest that toggles the mode would then flush on
+     * every toggle; one that sets flush-to-zero and leaves it pays one. */
+    u8 fpnondef;
     u64 ctx;                    /* current 5-bit block ctx (EL0 | MMU<<1 |
                                  * spx<<2 | fp_trapped<<4); jcache probes OR
                                  * it into pc<<3 */
