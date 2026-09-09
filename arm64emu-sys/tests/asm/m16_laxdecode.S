@@ -7,8 +7,9 @@
  * for TODO_BUGS §4: 3-source multiplies with sf=0, add/sub extended-register
  * shift>4, add/sub shifted-register ROR and 32-bit imm6>=32, logical shifted
  * 32-bit imm6>=32, AdvSIMD copy reserved imm5/imm4/Q (imm5==0, SMOV/UMOV bad
- * size/Q), PMUL with size!=0, the vector LDR Q-form with size!=0, and
- * add/sub-with-carry with bits[15:10]!=0 (the RMIF/SETF neighbourhood).
+ * size/Q), PMUL with size!=0, the vector LDR Q-form with size!=0,
+ * add/sub-with-carry with bits[15:10]!=0 (the RMIF/SETF neighbourhood), and
+ * the sizes the AdvSIMD three-different group does not allocate.
  *
  * Each unallocated .inst is preceded by a sentinel in x21 (0xffff); the sync
  * handler overwrites x21 with the ESR EC, so after the trap x21 must read 0
@@ -242,6 +243,62 @@ _start:
     movz    x11, #38
     cbnz    x21, fail
 
+    /* Every form in the AdvSIMD three-different group reads elements of one
+     * size and writes elements of twice it, so size==0b11 -- 64-bit sources,
+     * 128-bit destination elements -- is allocated nowhere in it. The three
+     * doubling saturating forms (SQDMLAL/SQDMLSL/SQDMULL, opcodes 9/b/d)
+     * need twice the source width for the doubled product and so have no
+     * 8-bit source form either. Executing size==0b11 was not merely a wrong
+     * answer: the element size became 64 and the narrowing opcodes took the
+     * high half of their sum with a shift of a 64-bit value by 64. PMULL
+     * (opcode 0xe) is the one member with a real size==0b11 form and is
+     * decoded before the group, so it is unaffected -- the neighbours below
+     * check that. */
+    movz    x21, #0xffff
+    .inst   0x0ee00020                  /* SADDL size=3 */
+    movz    x11, #39
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x2ee01020                  /* UADDW size=3 */
+    movz    x11, #40
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x0ee04020                  /* ADDHN size=3 (the shift-by-64 one) */
+    movz    x11, #41
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x2ee04020                  /* RADDHN size=3 */
+    movz    x11, #42
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x2ee0c020                  /* UMULL size=3 */
+    movz    x11, #43
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x0ee0d020                  /* SQDMULL size=3 */
+    movz    x11, #44
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x0e209020                  /* SQDMLAL size=0 (no 8-bit source) */
+    movz    x11, #45
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x0e20b020                  /* SQDMLSL size=0 */
+    movz    x11, #46
+    cbnz    x21, fail
+
+    movz    x21, #0xffff
+    .inst   0x0e20d020                  /* SQDMULL size=0 */
+    movz    x11, #47
+    cbnz    x21, fail
+
     /* ================= valid neighbours: must NOT trap (x21 stays 0xffff) === */
 
     movz    x21, #0xffff
@@ -286,6 +343,11 @@ _start:
     .inst   0xf8218002                  /* swp   x1, x2, [x0] */
     .inst   0xf8211002                  /* ldclr x1, x2, [x0] */
     .inst   0xf8bfc002                  /* ldapr x2, [x0] */
+    saddl   v0.2d, v1.2s, v0.2s         /* three-different size=2: valid */
+    addhn   v0.2s, v1.2d, v0.2d         /* narrowing at its widest: valid */
+    sqdmull v0.4s, v1.4h, v0.4h         /* doubling forms: size=1 and size=2 */
+    sqdmull v0.2d, v1.2s, v0.2s
+    .inst   0x0ee0e020                  /* PMULL v0.1q,v1.1d,v0.1d: size=3, valid */
     .inst   0x990000a0                  /* stlur w0,[x5]: valid (LRCPC2) */
     .inst   0xd94000a0                  /* ldapur x0,[x5]: valid (LRCPC2) */
     movz    x11, #100
