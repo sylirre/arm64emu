@@ -142,6 +142,23 @@ and found one more corruption case, which is the reason to keep treating
   SHA3/SHA512 page shares those bits. BCAX with Rm in {0,1} and Ra % 4 == 2
   executed as REV64 of Vn. See `m7_crypto.S` checks 92-99.
 
+A 2026-09-09 sweep, again against arm64chroot, found one more — and the same
+severity point: it was a shift of a 64-bit value by 64, not merely a wrong
+answer.
+
+- **AdvSIMD three-different, the sizes the group does not allocate.** Every
+  form in the group reads elements of one size and writes elements of twice
+  it, so `size==0b11` is allocated nowhere in it; the dispatcher matched the
+  group's fixed bits and never looked at `size`, so all fourteen opcodes ran
+  where the architecture says UNDEFINED. With `size==0b11` the element size
+  became 64 and the narrowing opcodes (ADDHN/RADDHN/SUBHN/RSUBHN) took the
+  high half of their sum with `wide >> esize` — undefined behaviour in C,
+  reachable from one guest word. The three doubling saturating forms
+  (SQDMLAL/SQDMLSL/SQDMULL) also have no 8-bit source, so `size==0b00` is
+  UNDEFINED for those. PMULL is the one member with a real `size==0b11` form
+  and is dispatched before the group, so it is untouched. `m16_laxdecode.S`
+  checks 39-47, with five allocated neighbours including the PMULL one.
+
 Every probe was cross-checked against qemu-aarch64 with a valid neighbour to
 catch over-tightening.
 
