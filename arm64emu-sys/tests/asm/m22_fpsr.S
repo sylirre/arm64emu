@@ -558,6 +558,59 @@ _start:
     CKX     x12, 0x3F800000, 71
     CKX     x13, 0, 72
 
+    /* ---- FABS/FNEG rewrite a sign bit and nothing else ----
+     * FPAbs and FPNeg are defined on the bits: no unpack, so a signaling
+     * NaN comes back still signaling and FPSR stays clear. The half and
+     * single forms are the ones that get this wrong, because widening a
+     * lane to double to negate it there is a CONVERSION -- it quiets the
+     * NaN and raises IOC for it. */
+    ldr     x20, =absdat
+    ldr     q0, [x20, #0]                /* .4s: sNaN, -sNaN, qNaN, -1.0 */
+    CLRF
+    fabs    v2.4s, v0.4s
+    RDF
+    mov     x12, v2.d[0]
+    CKX     x12, 0x7fa000017fa00000, 73
+    CKX     x13, 0, 74
+    CLRF
+    fneg    v2.4s, v0.4s
+    RDF
+    mov     x12, v2.d[0]
+    CKX     x12, 0x7fa00001ffa00000, 75
+    CKX     x13, 0, 76
+    CLRF
+    fabs    s2, s0
+    RDF
+    fmov    w12, s2
+    CKX     x12, 0x7fa00000, 77
+    CKX     x13, 0, 78
+    CLRF
+    fabs    d2, d0                       /* the .2d path was already right */
+    RDF
+    fmov    x12, d2
+    CKX     x12, 0x7fa000017fa00000, 79
+    CKX     x13, 0, 80
+    ldr     q0, [x20, #16]               /* .8h: sNaN, -sNaN, qNaN, denormal */
+    CLRF
+    fabs    v2.8h, v0.8h
+    RDF
+    mov     x12, v2.d[0]
+    CKX     x12, 0x00017e037d017d00, 81
+    CKX     x13, 0, 82
+    CLRF
+    fneg    v2.8h, v0.8h
+    RDF
+    mov     x12, v2.d[0]
+    CKX     x12, 0x8001fe037d01fd00, 83
+    CKX     x13, 0, 84
+    CLRF
+    fabs    h2, h0
+    RDF
+    fmov    w12, s2
+    and     x12, x12, #0xffff
+    CKX     x12, 0x7d00, 85
+    CKX     x13, 0, 86
+
     mov     x0, #0
 done:
 #ifdef USERMODE
@@ -603,6 +656,11 @@ fdat:
     .hword 0x0001                        /* +236: half min subnormal */
     .hword 0                             /* +238: pad */
     .quad 0x3FF0000000010000             /* +240: 1 + 2^-40 */
+
+.balign 16
+absdat:                                  /* sign-bit operands */
+    .word 0x7FA00000, 0xFFA00001, 0x7FC00003, 0xBF800000
+    .hword 0x7D00, 0xFD01, 0x7E03, 0x0001, 0x8001, 0x8000, 0xFC00, 0x3C00
 
 .balign 16
 hjunk:                                   /* half operands with hostile lanes */
