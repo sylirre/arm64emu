@@ -105,15 +105,14 @@ lazily by `fpsr_sync` (`src/exec_fpsimd.c`) only when the guest reads FPSR.
   architecturally permitted without IC IVAU+ISB.
 - **Host FP semantics** (all engines equally, `docs/todo/TODO_OPCODES.md` §6):
   FPCR.DN/AH ignored, NaN payloads not bit-guaranteed, FPCR.RMode honored
-  by FRINT/converts but not arithmetic, x86 tininess-after-rounding (one-ULP
-  UFC boundary — which under FPCR.FZ, implemented since 2026-09-10, shows in
-  the *value*: a single/double result whose exact magnitude sat inside that
-  ULP below the smallest normal is kept where the architecture flushes it).
-  None of the flush-to-zero half applies on an **AArch64 host**, where the
-  guest's FZ/FZ16 are mirrored into the host's own FPCR: the hardware does
-  the flushing, it tests the exponent before rounding as the architecture
-  says, and `--jit` keeps inlining floating point. On any other host `--jit`
-  leaves floating point to the interpreter while FZ or FZ16 is set.
+  by FRINT/converts but not arithmetic. FPCR.FZ/FZ16 are implemented since
+  2026-09-10, boundary included — the architecture judges tininess before
+  rounding, and `FE_UNDERFLOW` reports exactly that on every host this builds
+  for, so a result that rounding carried up onto the smallest normal is
+  flushed and one that rounded down onto it is kept. On an **AArch64 host**
+  the two bits are mirrored into the host's own FPCR and `--jit` keeps
+  inlining floating point; on any other host `--jit` leaves floating point to
+  the interpreter while FZ or FZ16 is set.
 - **Debug facilities force the interpreter** (`--trace`, `--reg-trace`, watchpoints,
   AE* per-instruction hooks).
 

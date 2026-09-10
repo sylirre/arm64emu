@@ -214,6 +214,70 @@ _start:
     CKX     x12, 0x0000000000000001, 32  /* untouched */
     CKX     x13, 0, 33
 
+    /* ---- the boundary: tininess is judged BEFORE rounding ----
+     * An exact result inside the last ULP below the smallest normal is
+     * carried UP onto it by round-to-nearest and comes back looking normal;
+     * one just above can round DOWN onto it and must be kept. The result
+     * cannot tell them apart -- only whether the operation underflowed can.
+     * FADD/FSUB cannot reach the corner at all: a subnormal difference of
+     * two normals is exact, so it rounds to itself. */
+    ldr     x21, =bdat
+    ldr     d0, [x21, #0]                /* 2^-1022 */
+    ldr     d1, [x21, #8]                /* 1 - 2^-53 */
+    MODE_FZ
+    fmul    d2, d0, d1                   /* exact: just BELOW the boundary */
+    RDF
+    fmov    x12, d2
+    CKX     x12, 0x0000000000000000, 35
+    CKX     x13, 0x8, 36                 /* UFC: flushed, and nothing else */
+    ldr     d0, [x21, #16]               /* 2^-1022 + 2^-1074 */
+    MODE_FZ
+    fmul    d2, d0, d1                   /* exact: just ABOVE it */
+    RDF
+    fmov    x12, d2
+    CKX     x12, 0x0010000000000000, 37  /* rounded down onto it, and kept */
+    CKX     x13, 0x10, 38                /* IXC alone: not tiny */
+    ldr     d0, [x21, #0]
+    ldr     d1, [x21, #24]               /* 1.0 */
+    MODE_FZ
+    fmul    d2, d0, d1                   /* exact: ON the boundary */
+    RDF
+    fmov    x12, d2
+    CKX     x12, 0x0010000000000000, 39
+    CKX     x13, 0, 40
+    ldr     d0, [x21, #8]                /* 1 - 2^-53 */
+    ldr     d1, [x21, #32]               /* 2^1022 */
+    MODE_FZ
+    fdiv    d2, d0, d1
+    RDF
+    fmov    x12, d2
+    CKX     x12, 0x0000000000000000, 41
+    CKX     x13, 0x8, 42
+    ldr     d0, [x21, #0]
+    ldr     d1, [x21, #8]
+    movi    d3, #0
+    MODE_FZ
+    fmadd   d2, d0, d1, d3               /* the fused path reaches it too */
+    RDF
+    fmov    x12, d2
+    CKX     x12, 0x0000000000000000, 43
+    CKX     x13, 0x8, 44
+    ldr     s0, [x21, #40]               /* 2^-126 */
+    ldr     s1, [x21, #44]               /* 1 - 2^-24 */
+    MODE_FZ
+    fmul    s2, s0, s1
+    RDF
+    fmov    w12, s2
+    CKX     x12, 0x00000000, 45
+    CKX     x13, 0x8, 46
+    ldr     s0, [x21, #48]               /* 2^-126 + 2^-149 */
+    MODE_FZ
+    fmul    s2, s0, s1
+    RDF
+    fmov    w12, s2
+    CKX     x12, 0x00800000, 47
+    CKX     x13, 0x10, 48
+
     /* ---- both bits read back ---- */
     movz    x22, #0x0108, lsl #16
     msr     fpcr, x22
@@ -247,6 +311,18 @@ ddat:
     .quad 0x000FFFFFFFFFFFFF             /* +48: largest subnormal */
     .quad 0x7FE0000000000000             /* +56: 2^1023 */
     .quad 0x3800000000000000             /* +64: 2^-127 */
+
+.balign 16
+bdat:                                    /* operands that land on the boundary */
+    .quad 0x0010000000000000             /* +0:  2^-1022 */
+    .quad 0x3FEFFFFFFFFFFFFF             /* +8:  1 - 2^-53 */
+    .quad 0x0010000000000001             /* +16: 2^-1022 + 2^-1074 */
+    .quad 0x3FF0000000000000             /* +24: 1.0 */
+    .quad 0x7FD0000000000000             /* +32: 2^1022 */
+    .word 0x00800000                     /* +40: 2^-126f */
+    .word 0x3F7FFFFF                     /* +44: 1 - 2^-24 */
+    .word 0x00800001                     /* +48: 2^-126f + 2^-149f */
+    .word 0                              /* +52: pad */
 
 .balign 16
 sdat:

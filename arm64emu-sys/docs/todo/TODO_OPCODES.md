@@ -185,11 +185,14 @@ What remains, all deliberate:
 - **FPCR.RMode is honored by FRINT/converts but not by arithmetic** — FADD &
   co always round-to-nearest-even (host default). Non-RN arithmetic is
   essentially unused by real guests (`fesetround` callers).
-- **Tininess is detected after rounding** for float/double on x86 hosts (ARM:
-  before rounding): UFC can differ at exactly one boundary ULP, and under
-  FPCR.FZ so can the value. The manual f16 narrows use ARM's before-rounding
-  rule, and an AArch64 host does too — the flush is the hardware's there, so
-  this corner does not exist on it.
+- ~~**Tininess is detected after rounding** for float/double on x86 hosts~~ —
+  **not true** for the SSE math this builds with (2026-09-10). 1.6M operations
+  biased into the tiny range agree with qemu flag for flag, on the underflow
+  boundary and either side of it, so `FE_UNDERFLOW` reports before-rounding
+  tininess exactly as VFP does. FPCR.FZ's boundary test is built on that: a
+  result that is exactly the smallest normal is flushed precisely when the
+  operation underflowed, which separates an exact value carried UP onto the
+  boundary from one that rounded DOWN onto it.
 
 ---
 
