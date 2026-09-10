@@ -54,12 +54,15 @@
 int g_jit;                          /* -jit (main.c) */
 JitEnv g_jit_env;
 
-/* The FPCR bits that stop floating point being inlined: flush-to-zero has no
- * host equivalent the generated code could lean on, so a guest that asks for
- * it runs its FP through exec_fpsimd.c (ir.h's vop_fpcr_sensitive says which
- * classes that is). FPCR.RMode is NOT here -- the classes that care about it
- * carry their own runtime gate. */
-#define JIT_FPCR_NONDEFAULT ((1u << 24) | (1u << 19))   /* FZ | FZ16 */
+/* The guest's flush-to-zero modes, as the IR spells them. What they cost the
+ * inline FP surface is ir.h's vop_fpcr_blocked: nothing at all on a host that
+ * can carry them in its own FPCR, the whole sensitive surface elsewhere.
+ * FPCR.RMode is NOT here -- the classes that care about it carry their own
+ * runtime gate. */
+static inline u8 jit_fpmode(const CPU *c) {
+    return (u8)(((c->fpcr >> 24) & 1u) * FPMODE_FZ |
+                ((c->fpcr >> 19) & 1u) * FPMODE_FZ16);
+}
 
 /* RAM code-page bitmap (1 bit per 4 KB page). mmu.c reads it through the
  * const alias g_jit_code_bitmap (declared in mmu.h) when filling D-TLB write
@@ -473,11 +476,15 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
     c->icount++;
     if (UNLIKELY(g_jit_stats > 0)) jstat_bump(insn);
     if (UNLIKELY(c->stop || c->halted)) return 1;
-    /* MSR FPCR lands here (the system group is never inlined), and turning
-     * flush-to-zero on invalidates the inline FP in every block already
-     * translated -- including the rest of this one. End the block so
-     * jit_run's loop can drop the cache before anything else runs. */
-    if (UNLIKELY(!g_jit_env.fpnondef && (c->fpcr & JIT_FPCR_NONDEFAULT)))
+    /* MSR FPCR lands here (the system group is never inlined). Where the host
+     * carries the mode, follow it immediately -- generated code chained after
+     * this one must flush as the guest now asks. Where it does not, a mode
+     * that newly matters invalidates the inline FP in every block already
+     * translated, including the rest of this one, so end the block and let
+     * jit_run's loop drop the cache before anything else runs. */
+    fpcr_host_sync(c->fpcr);
+    if (UNLIKELY((jit_fpmode(c) & JIT_FPMODE_XLATE_MASK) &&
+                 !(g_jit_env.fpmode_seen & JIT_FPMODE_XLATE_MASK)))
         return 1;
     return c->pc != pc + 4;
 }
@@ -590,7 +597,7 @@ retry:
         (size_t)(env->end - env->ptr) < JIT_BLOCK_MAX_BYTES)
         jit_flush_all(env);
 
-    g_ir->fpnondef = env->fpnondef;
+    g_ir->fpmode = env->fpmode_seen;
     u32 n = jit_fe_block(c, pc, g_ir, max_insns);
     if (n == 0) return NULL;        /* entry fetch fault already taken */
 
@@ -770,14 +777,22 @@ StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
             flush_seen = env->flush_count;
             prev = NULL;                /* arena reset: pointer is stale */
         }
-        /* First sight of a non-default FP mode: blocks translated before it
-         * inline host FP that does not flush to zero. Drop them all; from
-         * here the frontend leaves floating point to exec_fpsimd.c. */
-        if (UNLIKELY(!env->fpnondef && (c->fpcr & JIT_FPCR_NONDEFAULT))) {
-            env->fpnondef = 1;
+        /* Keep the host's own FZ/FZ16 on the guest's (a no-op where the host
+         * has none): this covers what jit_exec1 cannot -- a CPU that came up
+         * with a non-default FPCR, and an exception return that restored one. */
+        fpcr_host_sync(c->fpcr);
+        /* First sight of a mode that changes what may be emitted: blocks
+         * translated before it inlined FP that cannot honor it. Drop them
+         * all; from here the frontend withdraws whatever this host cannot
+         * do (ir.h's vop_fpcr_blocked). */
+        if (UNLIKELY((jit_fpmode(c) & JIT_FPMODE_XLATE_MASK) &&
+                     !(env->fpmode_seen & JIT_FPMODE_XLATE_MASK))) {
+            env->fpmode_seen |= jit_fpmode(c);
             jit_flush_all(env);
             flush_seen = env->flush_count;
             prev = NULL;
+        } else {
+            env->fpmode_seen |= jit_fpmode(c);
         }
         if (UNLIKELY(env->jc_gen != g_tlb_gen)) {
             /* TLBI: VA->code bindings may be stale. Every gen-changing path

@@ -106,13 +106,13 @@ typedef struct JitEnv {
     u32 slowmem;                /* every mem op takes the helper path; wired
                                  * on until Stage 2b adapts the inline probe
                                  * (then AEJIT_SLOWMEM=1 forces, bisection) */
-    /* Sticky: the guest has asked for a non-default FP mode (FPCR.FZ or
-     * FZ16) at least once, so no block translated from here on inlines
-     * floating point (ir.h's vop_fpcr_sensitive). Sticky rather than
-     * tracking the live bit because clearing it back would have to discard
-     * the cache again, and a guest that toggles the mode would then flush on
-     * every toggle; one that sets flush-to-zero and leaves it pays one. */
-    u8 fpnondef;
+    /* Sticky union of the FP modes (FPMODE_*) the guest has asked for; what
+     * it costs the inline FP surface is ir.h's vop_fpcr_blocked. Sticky
+     * rather than tracking the live bits because clearing them back would
+     * have to discard the cache again, and a guest that toggles the mode
+     * would then flush on every toggle; one that sets flush-to-zero and
+     * leaves it pays a single flush. */
+    u8 fpmode_seen;
     u64 ctx;                    /* current 5-bit block ctx (EL0 | MMU<<1 |
                                  * spx<<2 | fp_trapped<<4); jcache probes OR
                                  * it into pc<<3 */
@@ -232,6 +232,11 @@ int  be_vop_ok(unsigned vclass, u32 insn);
 void be_flush_icache(const u8 *rx, const u8 *rw, size_t len);
 
 /* ---- helpers called from generated code (jit.c) ---- */
+
+/* exec_fpsimd.c: mirror the guest's FZ/FZ16 into the host's own FPCR where
+ * the host has them, so generated code flushes to zero as the guest asked.
+ * A no-op on every other host. See the block comment there. */
+void fpcr_host_sync(u32 fpcr);
 
 u32 jit_exec1(CPU *c, u64 pc, u32 insn);
 u32 jit_exec1_ic(CPU *c, u64 pc, u32 insn);

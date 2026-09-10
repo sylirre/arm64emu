@@ -252,6 +252,9 @@ enum {
                              * self-counting. */
 };
 
+#define FPMODE_FZ    1u                 /* FPCR.FZ:   single and double */
+#define FPMODE_FZ16  2u                 /* FPCR.FZ16: half */
+
 /* Which classes stop being emittable once the guest sets FPCR.FZ or FZ16.
  *
  * The inline recipes are plain host FP: correct because the interpreter is
@@ -281,6 +284,37 @@ static inline int vop_fpcr_sensitive(unsigned vclass) {
             return 0;
     }
 }
+
+/* ... and what that actually costs, which depends on the host.
+ *
+ * Where exec_fpsimd.c can mirror the guest's FZ/FZ16 into the host's own
+ * FPCR -- an AArch64 host, whose modes ARE the ones being emulated -- the
+ * native instructions these recipes are built from flush exactly as the guest
+ * asked, and the whole surface stays inline. The exception is the one recipe
+ * that does not replay the guest instruction: VC_H3 (scalar half FMADD)
+ * mirrors the interpreter by widening to double, doing a double FMA and
+ * narrowing, and FCVT ignores FZ16 by architecture (FPUnpackCV/FPRoundCV
+ * clear it), so neither its operands nor its result would flush. It goes back
+ * to the helper, and only when FZ16 is actually set.
+ *
+ * Everywhere else there is no host equivalent to lean on and the sensitive
+ * classes above are withdrawn wholesale. */
+static inline int vop_fpcr_blocked(unsigned vclass, unsigned fpmode) {
+    if (!fpmode) return 0;
+#if defined(__aarch64__)
+    return (fpmode & FPMODE_FZ16) && vclass == VC_H3;
+#else
+    return vop_fpcr_sensitive(vclass);
+#endif
+}
+
+/* The mode bits that change what gets emitted, and so force the code cache
+ * out when they are first seen. */
+#if defined(__aarch64__)
+#define JIT_FPMODE_XLATE_MASK FPMODE_FZ16
+#else
+#define JIT_FPMODE_XLATE_MASK (FPMODE_FZ | FPMODE_FZ16)
+#endif
 
 /* The NaN-gated vector classes follow a "self-counting" discipline: the
  * frontend leaves them OUT of IRBlock.ninsns and the backend's fast path
@@ -364,11 +398,11 @@ typedef struct IRBlock {
     u32  ninsns;            /* NATIVE-retired guest insn count (icount delta
                              * added by exit stubs; CALL1 insns not included
                              * — jit_exec1 counts those itself) */
-    /* Set by the caller before translating: the guest has asked for a
-     * non-default FP mode (FPCR.FZ or FZ16), so the inline FP recipes below
-     * -- which are plain host arithmetic, and know nothing of flush-to-zero
-     * -- must not be emitted. See vop_fpcr_sensitive(). */
-    u8   fpnondef;
+    /* Set by the caller before translating: the FP modes this thread's guest
+     * has asked for (FPMODE_*, sticky). vop_fpcr_blocked() says what that
+     * costs the inline FP surface, which is everything on most hosts and
+     * almost nothing on one that carries the mode in its own FPCR. */
+    u8   fpmode;
     u8   ctx_spx;           /* block's SP bank ((tag>>2)&3): 0 = the live SP
                              * is sp_el[0], so SP_EL0 moves must not bypass
                              * the backend's SP register cache */

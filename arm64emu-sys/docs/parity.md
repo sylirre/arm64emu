@@ -109,7 +109,11 @@ lazily by `fpsr_sync` (`src/exec_fpsimd.c`) only when the guest reads FPSR.
   UFC boundary — which under FPCR.FZ, implemented since 2026-09-10, shows in
   the *value*: a single/double result whose exact magnitude sat inside that
   ULP below the smallest normal is kept where the architecture flushes it).
-  `--jit` leaves floating point to the interpreter while FZ or FZ16 is set.
+  None of the flush-to-zero half applies on an **AArch64 host**, where the
+  guest's FZ/FZ16 are mirrored into the host's own FPCR: the hardware does
+  the flushing, it tests the exponent before rounding as the architecture
+  says, and `--jit` keeps inlining floating point. On any other host `--jit`
+  leaves floating point to the interpreter while FZ or FZ16 is set.
 - **Debug facilities force the interpreter** (`--trace`, `--reg-trace`, watchpoints,
   AE* per-instruction hooks).
 

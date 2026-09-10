@@ -175,16 +175,21 @@ What remains, all deliberate:
   smallest normal becomes zero as it is rounded, and FPSR.IDC/UFC are raised
   accordingly — with the architecture's two carve-outs, that FZ16 raises no
   IDC and that the precision-changing FCVT family ignores FZ16 on its half
-  side (`FPUnpackCV`/`FPRoundCV`). `--jit` drops its code cache and stops
-  inlining floating point for as long as either bit is set, since its recipes
-  are plain host arithmetic. **FPCR.DN/AH are still ignored** and NaN
+  side (`FPUnpackCV`/`FPRoundCV`). On an **AArch64 host** the two bits are
+  mirrored into the host's own FPCR, so the hardware does the flushing and
+  `--jit` goes on inlining floating point (all but `VC_H3`, the one recipe
+  that does not replay the guest instruction); on any other host `--jit`
+  drops its code cache and leaves floating point to the interpreter for as
+  long as either bit is set. **FPCR.DN/AH are still ignored** and NaN
   payloads are not bit-guaranteed.
 - **FPCR.RMode is honored by FRINT/converts but not by arithmetic** — FADD &
   co always round-to-nearest-even (host default). Non-RN arithmetic is
   essentially unused by real guests (`fesetround` callers).
 - **Tininess is detected after rounding** for float/double on x86 hosts (ARM:
-  before rounding): UFC can differ at exactly one boundary ULP. The manual
-  f16 narrows use ARM's before-rounding rule.
+  before rounding): UFC can differ at exactly one boundary ULP, and under
+  FPCR.FZ so can the value. The manual f16 narrows use ARM's before-rounding
+  rule, and an AArch64 host does too — the flush is the hardware's there, so
+  this corner does not exist on it.
 
 ---
 
