@@ -47,7 +47,7 @@ _start:
     b.ne    fail
 
     mrs     x1, id_aa64pfr0_el1
-    ldr     x9, =0x110022
+    ldr     x9, =0x110011
     movz    x11, #343
     cmp     x1, x9
     b.ne    fail

@@ -8,7 +8,7 @@ references. Companion doc: `TODO_OPTIMIZATIONS.md` (performance);
 `TODO_BUGS.md` was deleted when its last item closed (see git history).
 
 **Advertised feature contract** (`sysreg.c`): ARMv8.0 FP+AdvSIMD **plus
-FEAT_FP16** (`ID_AA64PFR0=0x110022`), AES+PMULL, SHA1, SHA256+SHA512, SHA3,
+FEAT_FP16** (`ID_AA64PFR0=0x110011`: AArch64 only at EL0 and EL1), AES+PMULL, SHA1, SHA256+SHA512, SHA3,
 CRC32, **FEAT_LSE**, **FEAT_RDM**, **FEAT_DotProd**, **FEAT_FHM**,
 **FEAT_FLAGM+FLAGM2** (`ID_AA64ISAR0=0x21100110212120`), **FEAT_JSCVT**,
 **FEAT_FCMA**, **FEAT_LRCPC+LRCPC2** (`ID_AA64ISAR1=0x211000`), and
