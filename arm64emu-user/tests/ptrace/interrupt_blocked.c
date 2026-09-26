@@ -43,6 +43,28 @@ static void nap(int ms) {
     while (nanosleep(&t, &t) && errno == EINTR) ;
 }
 
+/* Until `k` sleeps -- in the call it has just said it is about to make, the
+ * only one on its way that blocks. A fixed nap is no promise of that on a
+ * loaded host (qemu-user running the ARM32 tier alongside a build took longer
+ * than any of them), and a stop that lands before the call is entered
+ * interrupts nothing: the tracee makes the call afresh once resumed, as a
+ * kernel's does, and a 3 s epoll_wait runs out. Twenty seconds, then on
+ * regardless: the verdict says what went wrong. */
+static void asleep(pid_t k) {
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)k);
+    for (int i = 0; i < 2000; i++) {
+        FILE *f = fopen(path, "r");
+        if (!f) return;
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        char *r = strrchr(buf, ')');
+        if (r && r[1] == ' ' && r[2] == 'S') return;
+        nap(10);
+    }
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     for (int i = 0; i < 24; i++) {
@@ -73,7 +95,8 @@ int main(void) {
         }
         char b;
         if (read(ready[0], &b, 1) != 1) return 1;
-        nap(5 + i % 7);                   /* in the call, at varying depth */
+        asleep(k);                        /* in the call */
+        nap(5 + i % 7);                   /* ...at varying depth */
         if (ptrace(PTRACE_SEIZE, k, 0, 0) || ptrace(PTRACE_INTERRUPT, k, 0, 0)) {
             printf("FAIL round %d: seize\n", i);
             return 1;
