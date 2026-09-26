@@ -113,6 +113,10 @@ typedef struct JitEnv {
      * would then flush on every toggle; one that sets flush-to-zero and
      * leaves it pays a single flush. */
     u8 fpmode_seen;
+    /* The EL1 configuration EL0 blocks were judged under (jit_el0cfg): what
+     * SCTLR_EL1 and CNTKCTL_EL1 open to EL0. Blocks translated under another
+     * inline what EL0 may no longer execute, or trap what it now may. */
+    u64 el0cfg;
     u64 ctx;                    /* current 5-bit block ctx (EL0 | MMU<<1 |
                                  * spx<<2 | fp_trapped<<4); jcache probes OR
                                  * it into pc<<3 */

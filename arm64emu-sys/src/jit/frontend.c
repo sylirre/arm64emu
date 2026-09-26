@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #include "machine.h"
+#include "sysreg.h"
 #include "predecode.h"
 #include "ir.h"
 
@@ -1073,6 +1074,24 @@ static int fe_bitfield(IRBlock *ir, u32 insn, u64 pc) {
  * once, and generated code is then identical to the ungated build. */
 static bool g_fe_fptrap;
 
+/* The CPU of the block being translated, and whether that block runs at EL0
+ * (bit 0 of its ctx, so a per-block constant like g_fe_fptrap). At EL0 the
+ * EL1 configuration -- SCTLR_EL1 and CNTKCTL_EL1 -- decides which system
+ * instructions the program may execute at all; the inline forms below would
+ * carry out one it may not, so such a one goes to the helper, which raises
+ * the UNDEFINED. Judged here, at translation; a change to those bits flushes
+ * the cache (jit_el0cfg, jit.c). */
+static CPU *g_fe_c;
+static bool g_fe_el0;
+
+static bool fe_sys_el0_refused(u32 insn) {
+    unsigned L = (insn >> 21) & 1, op0 = (insn >> 19) & 3, op1 = (insn >> 16) & 7;
+    unsigned CRn = (insn >> 12) & 0xf, Rt = insn & 31;
+    if (!L && op0 == 0 && op1 == 3 && (CRn == 2 || CRn == 3) && Rt == 31)
+        return false;                /* hints and barriers: decode.c's own */
+    return sysreg_el0_ok && !sysreg_el0_ok(g_fe_c, insn);
+}
+
 /* True if the instruction is FP/SIMD for CPACR.FPEN purposes: a specialized
  * vector load/store PD id, or a GENERIC word in the FP/SIMD data-processing
  * groups (0x7/0xf) or a V=1 load/store family ((grp&5)==4 covers 4/6/c/e —
@@ -1746,8 +1765,15 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                  * (none touch translation state); everything else — sysreg
                  * moves, TLBI, cache ops — may flush the TLB or change the
                  * EL/MMU context, so it runs via exec_a64 and ENDS the block
-                 * (full-system delta vs the donor, which keeps going). */
+                 * (full-system delta vs the donor, which keeps going). One
+                 * EL0 may not execute takes the second road too, where
+                 * sysreg.c raises its UNDEFINED (g_fe_el0 above). */
                 unsigned rt = insn & 31;
+                if (g_fe_el0 && fe_sys_el0_refused(insn)) {
+                    put_call1(ir, pc, insn);
+                    ir_put(ir, IRO_JMP, 0, 0, 0, 0, 0, next, 0);
+                    return FE_END;
+                }
                 if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {   /* MRS Xt, TPIDR_EL0 */
                     if (rt != 31)
                         ir_put(ir, IRO_CPULD, 1, (u8)rt, VREG_ZERO, 0, 0,
@@ -2080,6 +2106,8 @@ u32 jit_fe_block(CPU *c, u64 pc, IRBlock *ir, u32 max_insns) {
     ir->ninsns = 0;
     ir->ctx_spx = (u8)(c->sp_sel ? c->el : 0);
     g_fe_fptrap = c->fp_trapped;    /* ctx bit 4: see fe_insn's FP gate */
+    g_fe_c = c;                     /* ctx bit 0: see fe_sys_el0_refused */
+    g_fe_el0 = c->el == 0;
     u32 guest_n = 0;
     u64 p = pc;
     if (max_insns == 0 || max_insns > JIT_MAX_BLOCK_INSNS)

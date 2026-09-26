@@ -3,6 +3,7 @@
 /* System registers: MSR/MRS/SYS/MSR-immediate, ID registers, generic-timer
  * register plumbing. */
 #include "sysreg.h"
+#include "esr.h"
 #include "mmu.h"
 #include <stdio.h>
 #include <string.h>
@@ -24,6 +25,80 @@ static u64 timer_count(CPU *c, bool virt) {
 
 #define KEY(op0, op1, crn, crm, op2) \
     (((op0) << 16) | ((op1) << 13) | ((crn) << 9) | ((crm) << 5) | (op2))
+
+/* The SCTLR_EL1 and CNTKCTL_EL1 bits by which EL1 opens system instructions
+ * to EL0. */
+#define SCTLR_UMA       (1ULL << 9)    /* DAIF, DAIFSet, DAIFClr */
+#define SCTLR_DZE       (1ULL << 14)   /* DC ZVA */
+#define SCTLR_UCT       (1ULL << 15)   /* CTR_EL0 */
+#define SCTLR_UCI       (1ULL << 26)   /* DC CVAC/CVAU/CIVAC, IC IVAU */
+#define CNTK_EL0PCTEN   (1ULL << 0)    /* CNTPCT_EL0 (and CNTFRQ_EL0) */
+#define CNTK_EL0VCTEN   (1ULL << 1)    /* CNTVCT_EL0 (and CNTFRQ_EL0) */
+#define CNTK_EL0VTEN    (1ULL << 8)    /* CNTV_TVAL/CTL/CVAL_EL0 */
+#define CNTK_EL0PTEN    (1ULL << 9)    /* CNTP_TVAL/CTL/CVAL_EL0 */
+
+/* Whether EL0 may execute this system instruction on this CPU, under the EL1
+ * configuration in SCTLR_EL1 and CNTKCTL_EL1. Everything else is UNDEFINED
+ * at EL0 and taken to EL1 (EC 0x00): EL1's own registers, TLB and
+ * address-translation maintenance, set/way and invalidate-only cache
+ * operations, SPSel/PAN/UAO, SYSL, the debug registers, the counter and
+ * timers CNTKCTL_EL1 keeps from it, the registers of features this CPU does
+ * not implement (DIT, SSBS, TCO, RNDR, ...) -- and the ID registers: without
+ * FEAT_IDST (ID_AA64MMFR2_EL1.IDS is 0 here) an EL0 read of one is UNDEFINED,
+ * which is what a guest kernel's MRS emulation (Linux's emulate_mrs) is for.
+ * Kept in step with the user-mode copy in arm64chroot, whose sole difference
+ * is that last rule: there the emulator itself plays that kernel. */
+static bool el0_allowed(CPU *c, unsigned L, unsigned op0, unsigned op1,
+                        unsigned CRn, unsigned CRm, unsigned op2, unsigned Rt) {
+    u64 sctlr = c->sctlr[1], kctl = c->cntkctl_el1;
+    switch (op0) {
+    case 0:                                  /* MSR (immediate) */
+        if (L || CRn != 4 || Rt != 31) return false;
+        if (op1 == 0 && CRm == 0 && op2 <= 2) return true;  /* CFINV, XAFLAG, AXFLAG */
+        if (op1 == 3 && (op2 == 6 || op2 == 7))             /* DAIFSet, DAIFClr */
+            return (sctlr & SCTLR_UMA) != 0;
+        return false;
+    case 1:                                  /* SYS (SYSL has no EL0 form) */
+        if (L || op1 != 3 || CRn != 7 || op2 != 1) return false;
+        if (CRm == 4) return (sctlr & SCTLR_DZE) != 0;      /* DC ZVA */
+        if (CRm == 5 || CRm == 10 || CRm == 11 || CRm == 14) /* IC IVAU, DC CVAC/CVAU/CIVAC */
+            return (sctlr & SCTLR_UCI) != 0;
+        return false;
+    case 2:                                  /* debug: none at EL0 */
+        return false;
+    }
+    switch (KEY(3, op1, CRn, CRm, op2)) {
+    case KEY(3,3,4,2,0):                     /* NZCV */
+    case KEY(3,3,4,4,0):                     /* FPCR */
+    case KEY(3,3,4,4,1):                     /* FPSR */
+    case KEY(3,3,13,0,2):                    /* TPIDR_EL0 */
+        return true;
+    case KEY(3,3,13,0,3):                    /* TPIDRRO_EL0 */
+    case KEY(3,3,0,0,7):                     /* DCZID_EL0 */
+        return L;
+    case KEY(3,3,0,0,1):                     /* CTR_EL0 */
+        return L && (sctlr & SCTLR_UCT);
+    case KEY(3,3,4,2,1):                     /* DAIF */
+        return (sctlr & SCTLR_UMA) != 0;
+    case KEY(3,3,14,0,0):                    /* CNTFRQ_EL0 */
+        return L && (kctl & (CNTK_EL0PCTEN | CNTK_EL0VCTEN));
+    case KEY(3,3,14,0,1):                    /* CNTPCT_EL0 */
+        return L && (kctl & CNTK_EL0PCTEN);
+    case KEY(3,3,14,0,2):                    /* CNTVCT_EL0 */
+        return L && (kctl & CNTK_EL0VCTEN);
+    case KEY(3,3,14,2,0): case KEY(3,3,14,2,1): case KEY(3,3,14,2,2):  /* CNTP_* */
+        return (kctl & CNTK_EL0PTEN) != 0;
+    case KEY(3,3,14,3,0): case KEY(3,3,14,3,1): case KEY(3,3,14,3,2):  /* CNTV_* */
+        return (kctl & CNTK_EL0VTEN) != 0;
+    }
+    return false;
+}
+
+bool sysreg_el0_ok(CPU *c, u32 insn) {
+    return el0_allowed(c, (insn >> 21) & 1, (insn >> 19) & 3, (insn >> 16) & 7,
+                       (insn >> 12) & 0xf, (insn >> 8) & 0xf, (insn >> 5) & 7,
+                       insn & 0x1f);
+}
 
 static void msr_immediate(CPU *c, u32 insn) {
     unsigned op1 = (insn >> 16) & 7, op2 = (insn >> 5) & 7, crm = (insn >> 8) & 0xf;
@@ -246,6 +321,10 @@ void sysreg_exec(CPU *c, u32 insn) {
     unsigned CRn = (insn >> 12) & 0xf, CRm = (insn >> 8) & 0xf, op2 = (insn >> 5) & 7;
     unsigned Rt = insn & 0x1f;
 
+    if (c->el == 0 && !el0_allowed(c, L, op0, op1, CRn, CRm, op2, Rt)) {
+        cpu_raise_sync(c, esr_make(EC_UNKNOWN, 0), 0);      /* UNDEFINED */
+        return;
+    }
     if (op0 == 0) { msr_immediate(c, insn); return; }       /* MSR (immediate) */
     if (op0 == 1) {                                          /* SYS / SYSL */
         if (L == 0) sys_op(c, insn, op1, CRn, CRm, op2, Rt);

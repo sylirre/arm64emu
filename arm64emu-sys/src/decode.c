@@ -12,6 +12,16 @@
 /* FP/SIMD group hook (M4). Weak so M1 links standalone. */
 void exec_fpsimd(CPU *c, u32 insn) __attribute__((weak));
 
+/* SCTLR_EL1.nTWI/nTWE: 0 traps an EL0 WFI/WFE that would wait. */
+#define SCTLR_nTWI (1ULL << 16)
+#define SCTLR_nTWE (1ULL << 18)
+
+/* The trap of an EL0 WFI (ti 0) or WFE (ti 1) to EL1: EC 0x01, with
+ * CV=1 and COND=0b1110 (unconditional) and TI in ISS[1:0]. */
+__attribute__((cold)) static void wfx_trap(CPU *c, unsigned ti) {
+    cpu_raise_sync(c, esr_make(EC_WFx, (1u << 24) | (0xEu << 20) | ti), 0);
+}
+
 __attribute__((cold)) static void undefined(CPU *c, u32 insn) {
     /* Architecturally an UNDEFINED instruction takes a synchronous exception
      * with EC_UNKNOWN. During bring-up we also log it. */
@@ -1330,7 +1340,7 @@ static void branch_system(CPU *c, u32 insn) {
             undefined(c, insn);
         } else if (opc == 1 && ll == 0) {                                 /* BRK */
             cpu_raise_sync(c, esr_make(EC_BRK64, imm16), 0);
-        } else if (opc == 2 && ll == 0) {                                 /* HLT: stop machine (test exit) */
+        } else if (opc == 2 && ll == 0 && c->el != 0) {                   /* HLT: stop machine (test exit); EL0 may not halt */
             fprintf(stderr, "[HLT #%u] x0=0x%llx icount=%llu\n", imm16,
                     (unsigned long long)c->x[0], (unsigned long long)c->icount);
             c->stop = true;
@@ -1345,6 +1355,7 @@ static void branch_system(CPU *c, u32 insn) {
             case 1: set_x(c, 30, c->cur_insn_pc + 4); c->pc = tgt; return;/* BLR */
             case 2: c->pc = reg_x(c, Rn); return;                         /* RET */
             case 4: {                                                     /* ERET */
+                if (c->el == 0) { undefined(c, insn); return; }           /* EL1+ only */
                 u32 spsr = (u32)c->spsr[c->el];
                 u64 elr = c->elr[c->el];
                 cpu_unpack_spsr(c, spsr);
@@ -1361,11 +1372,20 @@ static void branch_system(CPU *c, u32 insn) {
             if (CRm == 0 && op2 == 2) {                       /* WFE */
                 /* A pending event completes WFE immediately (and clears it);
                  * otherwise halt until an event/interrupt. Without this an
-                 * SEVL/WFE pair only made progress when the timer tick fired. */
+                 * SEVL/WFE pair only made progress when the timer tick fired.
+                 * At EL0 a WFE that would wait traps to EL1 unless
+                 * SCTLR_EL1.nTWE lets it (Linux does). */
                 if (c->event) c->event = false;
+                else if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWE)) wfx_trap(c, 1);
                 else c->halted = true;
             }
-            else if (CRm == 0 && op2 == 3) c->halted = true;  /* WFI */
+            else if (CRm == 0 && op2 == 3) {                  /* WFI */
+                /* ...and a WFI unless SCTLR_EL1.nTWI does: Linux leaves it
+                 * clear and skips the instruction, so a user program cannot
+                 * idle the CPU. */
+                if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWI)) wfx_trap(c, 0);
+                else c->halted = true;
+            }
             else if (CRm == 0 && (op2 == 4 || op2 == 5)) c->event = true;  /* SEV / SEVL */
             /* NOP/YIELD/DGH/etc -> no-op */
             return;

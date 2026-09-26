@@ -10,6 +10,12 @@
 /* Execute a System-instruction-group encoding (MSR/MRS/SYS/MSR-imm). */
 void sysreg_exec(CPU *c, u32 insn) __attribute__((weak));
 
+/* May EL0 execute this System-instruction-group encoding, under the EL1
+ * configuration now in SCTLR_EL1 and CNTKCTL_EL1? Anything else is UNDEFINED
+ * there (sysreg_exec raises it). The JIT asks it before inlining one into an
+ * EL0 block. */
+bool sysreg_el0_ok(CPU *c, u32 insn) __attribute__((weak));
+
 /* Initialise ID/feature registers at reset. */
 void sysreg_init(CPU *c) __attribute__((weak));
 

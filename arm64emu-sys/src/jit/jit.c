@@ -696,6 +696,13 @@ static inline u64 jit_ctx(const CPU *c) {
                  ((u64)spx << 2) | (c->fp_trapped ? 16u : 0u));
 }
 
+/* What SCTLR_EL1 and CNTKCTL_EL1 open to EL0 (sysreg.c el0_allowed): UMA,
+ * DZE, UCT, UCI; EL0PCTEN, EL0VCTEN, EL0VTEN, EL0PTEN. */
+static inline u64 jit_el0cfg(const CPU *c) {
+    return (c->sctlr[1] & ((1ULL << 9) | (1ULL << 14) | (1ULL << 15) | (1ULL << 26))) |
+           ((c->cntkctl_el1 & 0x303) << 32);
+}
+
 static inline u64 jit_tag(u64 pc, u64 ctx) {
     /* pc bits 1:0 are zero -> 5 ctx bits fit under pc << 3; the 3 dropped
      * pc top bits are redundant sign-extension for canonical VAs. */
@@ -793,6 +800,17 @@ StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
             prev = NULL;
         } else {
             env->fpmode_seen |= jit_fpmode(c);
+        }
+        /* The EL1 configuration that decides what EL0 may execute changed:
+         * EL0 blocks were judged under the old one (frontend.c,
+         * fe_sys_el0_refused). A guest kernel sets it once per CPU, so this
+         * flushes at boot and hardly ever after. The MSR that changes it ends
+         * its block, so the check always runs before the next EL0 block. */
+        if (UNLIKELY(jit_el0cfg(c) != env->el0cfg)) {
+            env->el0cfg = jit_el0cfg(c);
+            jit_flush_all(env);
+            flush_seen = env->flush_count;
+            prev = NULL;
         }
         if (UNLIKELY(env->jc_gen != g_tlb_gen)) {
             /* TLBI: VA->code bindings may be stale. Every gen-changing path

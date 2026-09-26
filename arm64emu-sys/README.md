@@ -198,7 +198,10 @@ tests/          self-checking assembly tests + QEMU differential helpers
   (CFINV/RMIF/SETF8/SETF16/AXFLAG/XAFLAG), and **FEAT_MOPS** memory
   copy/set (CPYx/CPYFx/SETx, Option A, incl. the unprivileged forms and
   the EC 0x27 mismatch exception).
-- **System level**: EL0/EL1, MSR/MRS with a large system-register file, ID
+- **System level**: EL0/EL1 — what EL0 may execute decided by `SCTLR_EL1` and
+  `CNTKCTL_EL1`, everything else UNDEFINED there (ID registers included, for the
+  guest kernel to emulate), and an EL0 `WFI`/`WFE` that would wait trapped
+  unless `nTWI`/`nTWE` allow it — MSR/MRS with a large system-register file, ID
   registers matched to QEMU's cortex-a57 plus the advertised extensions, MMU
   (48-bit VA, 4 KB granule, blocks & pages, AP/XN/AF) with a software TLB and
   an instruction-fetch fast path, exception entry/return (incl. CPACR_EL1.FPEN

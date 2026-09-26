@@ -133,6 +133,16 @@ the block by definition (context synchronization = re-dispatch). SVC/
 HVC/BRK/ERET run through `exec_a64` and end the block; the exception has
 already vectored when the helper returns.
 
+In an **EL0 block** an inline form is emitted only for an instruction EL0
+may execute under the EL1 configuration of the moment — what `SCTLR_EL1`
+(`UCT`, `DZE`, `UCI`, `UMA`) and `CNTKCTL_EL1` (`EL0PCTEN`, `EL0VCTEN`, ...)
+open to it (`sysreg_el0_ok`, the same rule `sysreg_exec` applies). Anything
+else — `TPIDR_EL1`, `DAIF` without `UMA`, a counter `CNTKCTL_EL1` keeps, `DC
+ZVA` without `DZE` — goes to the helper, which raises the UNDEFINED; inlined,
+it was carried out. The answer is baked into the block, so the dispatcher
+flushes the cache when those bits change (`jit_el0cfg`): a guest kernel sets
+them once per CPU, and the `MSR` that does ends its block.
+
 **Exclusives.** The donor's value-CAS emitters were discarded (its CPU
 has `excl_val`; this emulator's monitor is address-match) and replaced
 with a direct lowering of `decode.c ldst_exclusive`, quirks included:
