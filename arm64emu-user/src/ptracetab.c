@@ -2034,6 +2034,13 @@ int ptrace_reap_dead(PtWaitSel sel, int keep, int *status, s32 *outpid, PtRusage
         /* A stopped/exited tracee is alive-and-parked / handled by ptrace_collect. */
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
         if (!pt_task_dead(t)) continue;
+        /* Dead -- but an exit may have been published between the look above
+         * and this one: a tracee resumed just before its _exit is in exit_group
+         * as its tracer's wait comes here, and was told of as SIGKILLed with
+         * its real status sitting in the link. Death is final, and a tracee
+         * publishes its exit before it dies, so a second look is conclusive;
+         * the publisher's wake (global_gen) sends the wait back to collect. */
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) continue;
         *status = SIGKILL;            /* WIFSIGNALED(SIGKILL) */
         *outpid = t;
         /* Killed outright: no guest code ran to stamp a fresh snapshot, so this
