@@ -153,7 +153,15 @@ for every synchronous fault.
 
 At each loop boundary, if `g_sig_npend` is set, `sig_deliver_pending` delivers one
 deliverable (unblocked) queued signal by building an arm64 kernel `rt_sigframe`
-on the guest stack (or the guest `sigaltstack`):
+on the guest stack (or the guest `sigaltstack`). The flag is also the lever the
+emulator's own call-outs pull to bring a thread to the boundary — a tracer's
+kick, `execve`'s `de_thread` — so the delivery, which lowers it once the queue
+is empty, leaves it raised while one of those is still unserved
+(`sig_callout_waiting`): lowered, a kick that arrived between the boundary's
+service and the delivery went unseen by the check at the next `SVC`, and a
+tracee went back into its `pause()` with a `PTRACE_INTERRUPT` its tracer then
+waited for forever (a quarter of `tests/ptrace/execstopped.c`'s runs under
+qemu-user). The frame:
 
 - 128-byte guest `siginfo`,
 - `ucontext` with `uc_stack`, `uc_sigmask`, and a `sigcontext` holding `x0..x30`,

@@ -462,6 +462,19 @@ static int sigq_push_local(const PendSig *p) {
     return r;
 }
 
+/* The flag is the lever the emulator's own call-outs pull as well -- a
+ * tracer's kick (g_ptrace_kick), execve's de_thread (stop_gen) -- and an
+ * empty queue says nothing about those: one that came after the run loop
+ * served kicks and before the delivery lowered the flag was left with the
+ * flag down, so the check at the next SVC did not see it, and a tracee went
+ * back into its pause() with a PTRACE_INTERRUPT unserved -- its tracer
+ * waiting for a stop that never came (a quarter of the runs of
+ * tests/ptrace/execstopped.c under qemu-user, whose signals arrive late). */
+static int sig_callout_waiting(void) {
+    return g_ptrace_kick ||
+           __atomic_load_n(&g_machine.stop_gen, __ATOMIC_ACQUIRE) != g_tls.stop_gen;
+}
+
 /* Lower g_sig_npend for a queue the consumer has just seen empty -- but
  * lower it FIRST and look again after. The capture handler lands anywhere in
  * the consumer; it writes the entry, moves the head and then raises the flag,
@@ -475,7 +488,7 @@ static int sigq_push_local(const PendSig *p) {
 static void sigq_lower_npend(void) {
     g_sig_npend = 0;
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (sigq_tail != sigq_head) g_sig_npend = 1;
+    if (sigq_tail != sigq_head || sig_callout_waiting()) g_sig_npend = 1;
 }
 
 /* Remove queue slot `t`, keeping the rest in arrival order: the entries older
