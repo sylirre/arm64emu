@@ -821,6 +821,7 @@ void sig_tls_prewarm(void) {
     (void)*(volatile timer_t *)&g_kick_timer;
     (void)*(volatile s32 *)&g_tls.tid;                /* handlers read g_tls */
     bus_tls_prewarm();   /* mem.c: bus_catcher's g_bus_jb/g_bus_armed/g_bus_cpu */
+    proctab_tls_prewarm();   /* proctab.c: the slot a reap's charge publishes to */
     jit_tls_prewarm();   /* jit.c: g_jit_env, jit_signal_interrupt's target */
 }
 
@@ -1234,9 +1235,16 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
         } else if (sig_chld_emulating()) {
             /* An ordinary child the kernel would have reaped at its death
              * (sig_chld_host): reaped now, and never waited for. Raw, and
-             * WNOHANG: a signal handler, and a wait may have beaten us. */
+             * WNOHANG: a signal handler, and a wait may have beaten us. The
+             * kernel's own reaping folds nothing into RUSAGE_CHILDREN, where
+             * this reap folded the child in whole: charged back out, as the
+             * emulator's own children are (proctab.c). */
             siginfo_t x;
-            syscall(SYS_waitid, P_PID, (id_t)p->pid, &x, WEXITED | WNOHANG, NULL);
+            KRusage kru;
+            memset(&x, 0, sizeof x);
+            if (syscall(SYS_waitid, P_PID, (id_t)p->pid, &x, WEXITED | WNOHANG, &kru) == 0 &&
+                x.si_pid == p->pid)
+                proctab_helper_charge_k(&kru);
         }
     }
     /* A stop or continue notice is never sent to a parent that set

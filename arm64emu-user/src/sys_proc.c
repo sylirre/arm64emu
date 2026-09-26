@@ -229,17 +229,34 @@ void task_locks_reinit(void) { pthread_mutex_init(&task_lock_, NULL); }
  * figure the kernel keeps minus the helpers: a child that only stopped or
  * continued is not folded, nor is one reaped WNOWAIT, nor one the guest's
  * SIG_IGN for SIGCHLD had the kernel discard. Per process, as the kernel's
- * is: zeroed in a fork child, kept across exec. */
+ * is: zeroed in a fork child, kept across exec.
+ *
+ * The same waits keep the reaped children's CPU time, each child's as its
+ * reaping wait reported it, and their count: the window the kernel's own
+ * total lies in, to which the host's figure less the helpers' is held
+ * (proctab.c, proctab_children_adjust). */
 static s64 g_cmaxrss;
+static s64 g_cut_us, g_cst_us, g_creaped;
 
-static void children_reaped(s64 maxrss) {
+static void children_reaped(s64 maxrss, s64 ut_us, s64 st_us) {
     s64 cur = __atomic_load_n(&g_cmaxrss, __ATOMIC_RELAXED);
     while (maxrss > cur &&
            !__atomic_compare_exchange_n(&g_cmaxrss, &cur, maxrss, 1,
                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED))
         ;
+    __atomic_fetch_add(&g_cut_us, ut_us, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_cst_us, st_us, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_creaped, 1, __ATOMIC_RELEASE);
     proctab_ctime_republish();   /* no-op unless a helper was ever charged */
 }
+
+void children_cpu_window(s64 *ut_us, s64 *st_us, s64 *n) {
+    *n = __atomic_load_n(&g_creaped, __ATOMIC_ACQUIRE);
+    *ut_us = __atomic_load_n(&g_cut_us, __ATOMIC_RELAXED);
+    *st_us = __atomic_load_n(&g_cst_us, __ATOMIC_RELAXED);
+}
+
+static s64 tv_us(struct timeval tv) { return (s64)tv.tv_sec * 1000000 + tv.tv_usec; }
 
 SYSDEF(getpid)  { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; return (u64)getpid(); }
 /* The parent as the guest may see it: a kernel answers 0 for a parent
@@ -1262,13 +1279,21 @@ static void clonekid_wait_note(struct Machine *m, u32 opts) {
  * reap it itself -- a clone child about keeps it from that, and a host that
  * ignores SA_NOCLDWAIT never did (signal.c, sig_chld_reap_emulated). The
  * capture reaps such a child when its SIGCHLD arrives; a wait that gets to it
- * first must not report it -- and reaps it, if it only looked (WNOWAIT). */
+ * first must not report it -- and reaps it, if it only looked (WNOWAIT). A
+ * reap of such a child is the emulator's, not the guest's: the kernel's own
+ * reaping folds nothing into RUSAGE_CHILDREN, so what the host's wait folded
+ * in is charged back out -- here for the reap this does, by the caller for
+ * the one its wait did. */
 static int chld_autoreaped(struct Machine *m, s32 pid, int looked) {
     if (!sig_chld_reaps(m) || !sig_chld_reap_emulated() || clonekid_live(m, pid))
         return 0;
     if (looked) {
         siginfo_t x;
-        syscall(SYS_waitid, P_PID, (id_t)pid, &x, WEXITED | WNOHANG, NULL);
+        KRusage kru;
+        memset(&x, 0, sizeof x);
+        if (syscall(SYS_waitid, P_PID, (id_t)pid, &x, WEXITED | WNOHANG, &kru) == 0 &&
+            x.si_pid == pid)
+            proctab_helper_charge_k(&kru);
     }
     return 1;
 }
@@ -1657,6 +1682,7 @@ SYSDEF(clone) {
         m->leader_parked = 0;
         m->group_exit_code = 0;
         g_cmaxrss = 0;                    /* a new process has reaped nothing */
+        g_cut_us = g_cst_us = g_creaped = 0;
         jit_fork_child();                 /* fork discipline for the JIT state */
         /* What the parent asked fork to leave out of this child, or to hand it
          * empty (madvise MADV_DONTFORK / MADV_WIPEONFORK): the host fork copied
@@ -3129,22 +3155,6 @@ static void rusage_out(GRusage *g, const struct rusage *h) {
     g->ru_nvcsw = h->ru_nvcsw;     g->ru_nivcsw = h->ru_nivcsw;
 }
 
-/* The rusage layout the *kernel* fills, which is not always the libc's: a
- * 32-bit host built with 64-bit time_t (-D_TIME_BITS=64 here, and 32-bit musl
- * unconditionally) has 64-bit timevals in its struct rusage, and its
- * wait4/getrusage wrappers convert on the way out. A raw syscall gets no such
- * conversion -- the kernel's rusage always carries __kernel_old_timeval, a pair
- * of longs -- so the one raw wait in this file (waitid, whose fifth argument no
- * libc exposes) decodes this instead. On LP64 it is the same 144 bytes the libc
- * struct has, which is why reading the wrong one is an ILP32-only bug: it
- * surfaced as a *sometimes* absurd guest rusage, since a small tv_usec landing
- * in the high half of a 64-bit tv_sec still looks plausible. */
-typedef struct {
-    long utime_sec, utime_usec, stime_sec, stime_usec;
-    long maxrss, ixrss, idrss, isrss, minflt, majflt, nswap, inblock, oublock,
-         msgsnd, msgrcv, nsignals, nvcsw, nivcsw;
-} KRusage;
-
 static void rusage_out_k(GRusage *g, const KRusage *k) {
     memset(g, 0, sizeof *g);
     g->ru_utime.tv_sec = k->utime_sec;   g->ru_utime.tv_usec = k->utime_usec;
@@ -3248,10 +3258,13 @@ SYSDEF(wait4) {
              * appear in a race window (TRACEME after the gate check); drop it
              * with the child, so it cannot go stale. No-op otherwise. */
             if (pid > 0 && (WIFEXITED(status) || WIFSIGNALED(status))) {
-                if (chld_autoreaped(c->m, (s32)pid, 0)) continue;
+                if (chld_autoreaped(c->m, (s32)pid, 0)) {
+                    proctab_helper_charge(&ru);
+                    continue;
+                }
                 if (ptrace_any_trace()) ptrace_note_reaped((s32)pid);
                 clonekid_reaped(c->m, (s32)pid);
-                children_reaped((s64)ru.ru_maxrss);
+                children_reaped((s64)ru.ru_maxrss, tv_us(ru.ru_utime), tv_us(ru.ru_stime));
             }
             if (a1) {
                 s32 gs = status;
@@ -3289,10 +3302,13 @@ SYSDEF(wait4) {
             /* A reaped child's link goes with it; a stop or a continue
              * reported leaves the child, and its link, where they are. */
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                if (chld_autoreaped(c->m, (s32)pid, 0)) continue;
+                if (chld_autoreaped(c->m, (s32)pid, 0)) {
+                    proctab_helper_charge(&ru);
+                    continue;
+                }
                 ptrace_note_reaped((s32)pid);
                 clonekid_reaped(c->m, (s32)pid);
-                children_reaped((s64)ru.ru_maxrss);
+                children_reaped((s64)ru.ru_maxrss, tv_us(ru.ru_utime), tv_us(ru.ru_stime));
             }
             if (a1) {
                 s32 gs = status;
@@ -3436,15 +3452,18 @@ SYSDEF(waitid) {
             if (si.si_pid != 0 &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
                  si.si_code == CLD_DUMPED) &&
-                chld_autoreaped(c->m, (s32)si.si_pid, (options & WNOWAIT) != 0))
+                chld_autoreaped(c->m, (s32)si.si_pid, (options & WNOWAIT) != 0)) {
+                if (!(options & WNOWAIT)) proctab_helper_charge_k(&ru);
                 continue;
+            }
             /* Defensive: see the matching wait4 comment. */
             if (si.si_pid != 0 && !(options & WNOWAIT) &&
                 (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
                  si.si_code == CLD_DUMPED)) {
                 if (ptrace_any_trace()) ptrace_note_reaped((s32)si.si_pid);
                 clonekid_reaped(c->m, (s32)si.si_pid);
-                children_reaped((s64)ru.maxrss);
+                children_reaped((s64)ru.maxrss, (s64)ru.utime_sec * 1000000 + ru.utime_usec,
+                                (s64)ru.stime_sec * 1000000 + ru.stime_usec);
             }
             /* Only a wait that found a child writes rusage (the kernel copies it
              * out under `err > 0`), so a WNOHANG that found nothing must not. */
@@ -3490,8 +3509,10 @@ SYSDEF(waitid) {
         if (r == 0 && si.si_pid != 0 &&
             (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
              si.si_code == CLD_DUMPED) &&
-            chld_autoreaped(c->m, (s32)si.si_pid, (options & WNOWAIT) != 0))
+            chld_autoreaped(c->m, (s32)si.si_pid, (options & WNOWAIT) != 0)) {
+            if (!(options & WNOWAIT)) proctab_helper_charge_k(&ru);
             continue;
+        }
         if (r == 0 && si.si_pid != 0) {
             /* As in wait4: only a reap takes the child's link with it. */
             if (!(options & WNOWAIT) &&
@@ -3499,7 +3520,8 @@ SYSDEF(waitid) {
                  si.si_code == CLD_DUMPED)) {
                 ptrace_note_reaped((s32)si.si_pid);
                 clonekid_reaped(c->m, (s32)si.si_pid);
-                children_reaped((s64)ru.maxrss);
+                children_reaped((s64)ru.maxrss, (s64)ru.utime_sec * 1000000 + ru.utime_usec,
+                                (s64)ru.stime_sec * 1000000 + ru.stime_usec);
             }
             if (a4) {
                 GRusage g;

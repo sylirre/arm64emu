@@ -2244,13 +2244,18 @@ static void proctab_close_inherited(void) {
  * guest that never forked read a child's worth of usage there after its
  * first shmget: in getrusage, in times(2), in its own /proc/<pid>/stat. The
  * middle child's usage is recorded here at the reap and taken back out of
- * every face that reports children's usage (proctab_children_adjust). The
- * high-water mark is a maximum, which no subtraction undoes: sys_proc.c
+ * every face that reports children's usage (proctab_children_adjust). So is
+ * that of every other child the emulator reaps for itself: the SA_NOCLDWAIT
+ * probe's (signal.c), and a child of the guest's that a kernel would have
+ * reaped at its death -- folding nothing in -- where the emulator had to do
+ * the reaping, with a wait that folded it in whole (sig_chld_reap_emulated).
+ * The high-water mark is a maximum, which no subtraction undoes: sys_proc.c
  * keeps its own over the guest's reaped children instead, at the wait calls
  * that are the only place the kernel folds one in. Per process, exactly as
  * the kernel's figure is: a fork child starts from nothing
  * (proctab_fork_child), an exec keeps it. Plain atomics, so a fork under a
- * sibling's charge inherits no lock. */
+ * sibling's charge inherits no lock, and the capture handler may charge a
+ * reap of its own. */
 static struct {
     s64 utime_us, stime_us, minflt, majflt, nswap, inblock, oublock,
         msgsnd, msgrcv, nsignals, nvcsw, nivcsw;
@@ -2275,13 +2280,47 @@ static void helper_charge(const struct rusage *ru) {
 
 void proctab_helper_charge(const struct rusage *ru) { helper_charge(ru); }
 
+void proctab_helper_charge_k(const KRusage *k) {
+    struct rusage ru;
+    memset(&ru, 0, sizeof ru);
+    ru.ru_utime.tv_sec = k->utime_sec; ru.ru_utime.tv_usec = k->utime_usec;
+    ru.ru_stime.tv_sec = k->stime_sec; ru.ru_stime.tv_usec = k->stime_usec;
+    ru.ru_minflt = k->minflt;   ru.ru_majflt = k->majflt;
+    ru.ru_nswap = k->nswap;     ru.ru_inblock = k->inblock;
+    ru.ru_oublock = k->oublock; ru.ru_msgsnd = k->msgsnd;
+    ru.ru_msgrcv = k->msgrcv;   ru.ru_nsignals = k->nsignals;
+    ru.ru_nvcsw = k->nvcsw;     ru.ru_nivcsw = k->nivcsw;
+    helper_charge(&ru);
+}
+
+/* The counters come out exact: each is a plain sum, the kernel's and the
+ * charges' alike. CPU time does not. The kernel sums its children's time in
+ * nanoseconds and truncates the total to microseconds; a charge is one
+ * child's time truncated on its own, so the host's figure less the charges
+ * lies anywhere from the guest's true total to that plus one microsecond per
+ * charge -- and with nothing of the guest's reaped at all, a kernel's figure
+ * is exactly zero, where two charges left a microsecond standing half the
+ * time. What bounds it is the guest's own reaps, each also reported by its
+ * wait truncated to microseconds (children_cpu_window): the kernel's total
+ * of n children is at least the sum of those and less than that plus n. So
+ * the figure is held to that window -- exact for none or one, and for more
+ * never a total a kernel could not give; and with none, the whole rusage is
+ * the kernel's zero. */
 int proctab_children_adjust(struct rusage *ru) {
     if (!__atomic_load_n(&g_helper_any, __ATOMIC_ACQUIRE)) return 0;
+    s64 lo_ut, lo_st, n;
+    children_cpu_window(&lo_ut, &lo_st, &n);
+    if (n == 0) {
+        memset(ru, 0, sizeof *ru);
+        return 1;
+    }
 #define HSUB(f) __atomic_load_n(&g_helper.f, __ATOMIC_RELAXED)
     s64 ut = (s64)ru->ru_utime.tv_sec * 1000000 + ru->ru_utime.tv_usec - HSUB(utime_us);
     s64 st = (s64)ru->ru_stime.tv_sec * 1000000 + ru->ru_stime.tv_usec - HSUB(stime_us);
-    if (ut < 0) ut = 0;
-    if (st < 0) st = 0;
+    if (ut < lo_ut) ut = lo_ut;
+    if (ut > lo_ut + n - 1) ut = lo_ut + n - 1;
+    if (st < lo_st) st = lo_st;
+    if (st > lo_st + n - 1) st = lo_st + n - 1;
     ru->ru_utime.tv_sec = (time_t)(ut / 1000000); ru->ru_utime.tv_usec = (suseconds_t)(ut % 1000000);
     ru->ru_stime.tv_sec = (time_t)(st / 1000000); ru->ru_stime.tv_usec = (suseconds_t)(st % 1000000);
 #define HTAKE(rf, f) do { s64 v_ = (s64)ru->rf - HSUB(f); ru->rf = v_ < 0 ? 0 : (long)v_; } while (0)
@@ -2910,6 +2949,10 @@ static struct ProcEnt *entry_of(s32 pid) {
  * search by pid can miss it. Reaching it anyway is the point of the
  * reservation: a process that unshares the moment it starts can still record
  * the namespace where its parent will look to write its maps. */
+/* sig_tls_prewarm's share (signal.c): the capture handler charges a reap of
+ * its own (helper_charge), whose publication looks our slot up. */
+void proctab_tls_prewarm(void) { (void)*(volatile int *)&g_own_slot; }
+
 static struct ProcEnt *own_entry(void) {
     s32 me = (s32)getpid();
     if (g_own_slot >= 0 && g_own_slot < g_tab_n) {

@@ -10,20 +10,34 @@
  * cost and takes it back out, and keeps the children's high-water mark
  * itself over the guest's reaped children.
  *
+ * The emulator reaps children of the guest's too: those a kernel reaps at
+ * their death (SIGCHLD ignored, or SA_NOCLDWAIT) where the host cannot be
+ * left to -- a clone child about, whose death the host would not tell apart,
+ * or a host that ignores SA_NOCLDWAIT. The kernel folds such a child into
+ * nothing (only a wait's reap does, wait_task_zombie); reaped by a wait of
+ * the emulator's, it was folded into RUSAGE_CHILDREN whole.
+ *
  * Rows: children's usage is nothing before and after the shmget that spawns
- * the broker; a real child's is seen afterwards (its CPU time, its resident
+ * the broker, and after a child reaped at its death with a clone child about
+ * (every field of it: two reaps of the emulator's own now stand to be taken
+ * back out, and CPU time comes back from the host per child in whole
+ * microseconds, so what is left of their sum must still be exactly
+ * nothing); a real child's is seen afterwards (its CPU time, its resident
  * set), and getrusage, times and the stat file agree on it; a fork child
  * starts from nothing; another process reading this one's stat file sees the
  * same children's time. Every row is a relation a kernel keeps true, so the
  * same program prints the same block natively. Run as
  *   arm64chroot / tests/fixtures/helperusage.bin */
 #define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
 #include <sys/resource.h>
 #include <sys/shm.h>
+#include <sys/syscall.h>
 #include <sys/times.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -83,6 +97,40 @@ int main(void) {
     printf("after_shmget=%d times=%d stat=%d\n", zero(&ru),
            tm.tms_cutime == 0 && tm.tms_cstime == 0,
            stat_ctimes(getpid(), &cut, &cst) && cut == 0 && cst == 0);
+
+    /* A child the kernel reaps at its death folds nothing in -- with a clone
+     * child (no exit signal) alive meanwhile, which keeps the host from that
+     * reaping. Waited for, such a child is waited out and then ECHILD: by
+     * wait4, by waitid, by a waitid that would only have looked. */
+    pid_t ck = (pid_t)syscall(SYS_clone, 0UL, 0UL, 0UL, 0UL, 0UL);
+    if (ck == 0) for (;;) pause();
+    struct sigaction sa, osa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
+    sa.sa_flags = SA_NOCLDWAIT;
+    sigaction(SIGCHLD, &sa, &osa);
+    int gone = ck > 0;
+    for (int how = 0; how < 3; how++) {
+        pid_t k = fork();
+        if (k == 0) {
+            spin(20);
+            _exit(0);
+        }
+        siginfo_t si;
+        int r = how == 0 ? (int)waitpid(k, NULL, 0)
+              : waitid(P_PID, (id_t)k, &si, WEXITED | (how == 2 ? WNOWAIT : 0));
+        gone &= r < 0 && errno == ECHILD;
+    }
+    getrusage(RUSAGE_CHILDREN, &ru);
+    times(&tm);
+    printf("autoreap: gone=%d zero=%d times=%d stat=%d\n", gone, zero(&ru),
+           tm.tms_cutime == 0 && tm.tms_cstime == 0,
+           stat_ctimes(getpid(), &cut, &cst) && cut == 0 && cst == 0);
+    sigaction(SIGCHLD, &osa, NULL);
+    if (ck > 0) {
+        kill(ck, SIGKILL);
+        waitpid(ck, NULL, __WCLONE);
+    }
 
     /* A real child: 8 MB resident, 60 ms of CPU. */
     pid_t k = fork();

@@ -1563,6 +1563,32 @@ process reading this one's stat file gets the net children's time from the
 registry slot, published at each reap once anything was charged
 (`proctab_ctime_republish`), so an unaffected process costs its reaps nothing
 extra and the host's fields stand exactly (`tests/fixtures/helperusage.c`).
+
+Every other child the emulator reaps is charged the same way: the
+`SA_NOCLDWAIT` probe's, on a host that leaves it to be reaped, and — the one
+that is the guest's — a child a kernel reaps at its death (`SIGCHLD` ignored,
+or `SA_NOCLDWAIT`) where the emulator has to do that reaping itself
+(`sig_chld_reap_emulated`: a clone child about, or a host that ignores the
+flag). The kernel's own reaping folds nothing in; the capture handler's
+`waitid`, or a guest wait that got to the child first and passed it by
+(`chld_autoreaped`), folded it in whole, so a guest that ignored its
+children read their CPU time as its own children's. The handler charges from
+the raw wait's kernel rusage (`KRusage`, `proctab_helper_charge_k`), and its
+publication's thread-local is warmed with the rest (`proctab_tls_prewarm`).
+
+The counters come out of the subtraction exact, being plain sums. CPU time
+does not: the kernel sums its children's time in nanoseconds and truncates
+the total to microseconds, while each charge is one child's time truncated
+on its own, so the host's figure less the charges lies anywhere from the
+guest's true total to that plus a microsecond per charge. Two charges — the
+broker's middle child and the probe's, under qemu-user — left a microsecond
+of children's time standing half the time in a process that had reaped
+nothing. So the wait calls also keep the guest's own reaped children's CPU
+time, each as its reaping wait reported it, and their count
+(`children_cpu_window`): a kernel's total of n children is at least the sum
+of those and less than that plus n microseconds, and the adjusted figure is
+held to that window — exact for none (the whole rusage is then the kernel's
+zero) or one, and for more never a total a kernel could not give.
 The reap of the middle child itself now loops on `EINTR`: interrupted, it
 left a zombie for the guest's next `wait(-1)` to collect under a pid the
 guest never forked.

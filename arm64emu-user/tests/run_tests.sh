@@ -3040,15 +3040,22 @@ check_fixture reflinkobj $'reopen=1\nmaps<-zero=EXDEV/EXDEV\nmaps<-exe=EXDEV/EXD
 # from getrusage, times(2) and its own /proc/<pid>/stat. Self-checking: every
 # row is a relation a kernel keeps true, and the same program prints the
 # same block natively. The registry-broker spawn of --shared-proc is the same
-# double fork, made before the guest runs at all.
+# double fork, made before the guest runs at all. So is a child of the
+# guest's that a kernel reaps at its death (SA_NOCLDWAIT) and the emulator
+# had to reap itself -- a clone child about bars the host from it, as does a
+# host that ignores the flag (the nocld tier, qemu-user) -- folded in whole
+# where the kernel folds nothing; and with two such reaps to take back out,
+# the CPU time per child truncated to microseconds left one standing.
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o tests/fixtures/helperusage.bin \
             tests/fixtures/helperusage.c 2>/dev/null; then
-        expect=$'before=1\nafter_shmget=1 times=1 stat=1\nchild: maxrss=1 cpu=1 times_agree=1 stat_agree=1\nfork_child: zero=1 times=1 stat=1 parent_agrees=1\ndone'
+        expect=$'before=1\nafter_shmget=1 times=1 stat=1\nautoreap: gone=1 zero=1 times=1 stat=1\nchild: maxrss=1 cpu=1 times_agree=1 stat_agree=1\nfork_child: zero=1 times=1 stat=1 parent_agrees=1\ndone'
         got=$(timeout -k 5 60 "$EMU" / tests/fixtures/helperusage.bin 2>/dev/null)
         fixture_verdict "helperusage" "$expect" "$got"
         got=$(timeout -k 5 60 "$EMU" --shared-proc / tests/fixtures/helperusage.bin 2>/dev/null)
         fixture_verdict "helperusage (--shared-proc)" "$expect" "$got"
+        got=$(A64_NOCLDWAIT_FORCE_EMULATE=1 timeout -k 5 60 "$EMU" / tests/fixtures/helperusage.bin 2>/dev/null)
+        fixture_verdict "helperusage (nocld-tier)" "$expect" "$got"
         fx_rm tests/fixtures/helperusage.bin
     else
         skip_build "fixtures/helperusage"

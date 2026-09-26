@@ -1384,12 +1384,35 @@ void proctab_mem_publish(const ProcMem *pm);          /* the owner, on change */
 void proctab_mem_seed(int slot, const ProcMem *pm);   /* pre-fork, as seccomp */
 int  proctab_mem_get(s32 pid, ProcMem *out);          /* a reader; 0 = unknown */
 
+/* The rusage layout the *kernel* fills, which is not always the libc's: a
+ * 32-bit host built with 64-bit time_t (-D_TIME_BITS=64 here, and 32-bit musl
+ * unconditionally) has 64-bit timevals in its struct rusage, and its
+ * wait4/getrusage wrappers convert on the way out. A raw syscall gets no such
+ * conversion -- the kernel's rusage always carries __kernel_old_timeval, a pair
+ * of longs -- so a raw wait decodes this instead: waitid, whose fifth argument
+ * no libc exposes (sys_proc.c), and the capture handler's reap of a child the
+ * guest has reaped at its death (signal.c). On LP64 it is the same 144 bytes
+ * the libc struct has, which is why reading the wrong one is an ILP32-only
+ * bug: it surfaced as a *sometimes* absurd guest rusage, since a small
+ * tv_usec landing in the high half of a 64-bit tv_sec still looks plausible. */
+typedef struct {
+    long utime_sec, utime_usec, stime_sec, stime_usec;
+    long maxrss, ixrss, idrss, isrss, minflt, majflt, nswap, inblock, oublock,
+         msgsnd, msgrcv, nsignals, nvcsw, nivcsw;
+} KRusage;
+
 /* What the emulator's own reaped children (the broker spawn's middle child,
- * the SA_NOCLDWAIT probe's child on a host that leaves it to be reaped) cost
- * this process, taken back out of RUSAGE_CHILDREN (proctab.c):
- *   proctab_helper_charge     record one such child's usage, from its reap
- *   proctab_children_adjust   subtract it from a host RUSAGE_CHILDREN figure;
- *                             0 when nothing was ever charged (figure exact)
+ * the SA_NOCLDWAIT probe's child on a host that leaves it to be reaped, and
+ * each child of the guest's that a kernel would have reaped at its death but
+ * the emulator had to: sig_chld_reap_emulated) cost this process, taken back
+ * out of RUSAGE_CHILDREN (proctab.c):
+ *   proctab_helper_charge     record one such child's usage, from its reap;
+ *                             async-signal-safe (the capture handler reaps)
+ *   proctab_helper_charge_k   the same, from a raw wait's kernel rusage
+ *   proctab_children_adjust   subtract it from a host RUSAGE_CHILDREN figure
+ *                             and bound the CPU time by the guest's own reaps
+ *                             (children_cpu_window); 0 when nothing was ever
+ *                             charged (figure exact)
  *   proctab_ctime_republish   publish the net children's CPU time to our
  *                             registry slot, for another process's reader of
  *                             our /proc/<pid>/stat; a no-op until something
@@ -1397,7 +1420,13 @@ int  proctab_mem_get(s32 pid, ProcMem *out);          /* a reader; 0 = unknown *
  *   proctab_ctime_get         that publication, 1 when there is one */
 struct rusage;
 void proctab_helper_charge(const struct rusage *ru);
+void proctab_helper_charge_k(const KRusage *k);
 int  proctab_children_adjust(struct rusage *ru);
+/* The guest's own reaped children as the waits that reaped them reported
+ * each (sys_proc.c): their CPU time summed in microseconds, and how many. */
+void children_cpu_window(s64 *ut_us, s64 *st_us, s64 *n);
+/* sig_tls_prewarm's share of the registry's thread-locals (proctab.c). */
+void proctab_tls_prewarm(void);
 void proctab_ctime_republish(void);
 int  proctab_ctime_get(s32 pid, s64 *ut_us, s64 *st_us);
 /* Drop the publisher's cached slot: a fork child inherits its parent's. */
