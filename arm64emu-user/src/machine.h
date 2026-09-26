@@ -644,6 +644,9 @@ extern __thread volatile sig_atomic_t g_sig_in_syscall;
 void sig_kick_timer_init(void);     /* before a thread runs guest code */
 void sig_kick_timer_fini(void);     /* as it ends */
 void sig_kick_timer_disarm(void);   /* the run loop's delivery point */
+/* ...which it calls only with this raised: the timer is armed. Tested inline
+ * there, as the single-step engine passes that point once per instruction. */
+extern __thread volatile sig_atomic_t g_kick_armed;
 /* (Re)mirror a guest disposition onto the host (install/remove catcher). */
 void sig_host_update(struct Machine *m, int sig);
 /* do_sigaction: swap the disposition of `sig` under the siglock stand-in, so a

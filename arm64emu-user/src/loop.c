@@ -325,32 +325,40 @@ int emu_loop(CPU *c) {
             }
         }
 
-        /* Adopt a pending PTRACE_ATTACH/SEIZE or service a PTRACE_INTERRUPT
-         * (the kick signal set g_ptrace_kick and reused g_sig_npend to exit the
-         * fast path above). Near-always-zero, like the signal check. Before
-         * the signals, as the kernel's get_signal takes a ptrace trap before
-         * it dequeues one: a tracer's ptrace(SEIZE) has returned by the time
-         * its kill(2) sends the next signal, and a standard signal is taken
-         * ahead of the real-time kick, so the two arrive together and the
-         * signal must find the thread traced already. */
         /* The boundary has been reached: a kick timer armed inside a syscall
          * handler (by a capture, or by one of the emulator's own call-outs)
          * has done its job, or was never needed. Disarmed before anything is
          * serviced: a stop taken below parks the thread, and a timer still
          * firing through it re-flagged the call it had interrupted as ours
-         * to restart -- after the stop had settled that it answers EINTR. */
-        sig_kick_timer_disarm();
+         * to restart -- after the stop had settled that it answers EINTR.
+         *
+         * Everything from here to the single-step trap is near-always idle,
+         * and the single-step engine (-nopd) comes through once per
+         * instruction: so each flag is tested inline, and the three services
+         * below sit behind one test of the two that call for them. */
+        if (UNLIKELY(g_kick_armed)) sig_kick_timer_disarm();
 
-        /* Something is due, and the thread may be sitting at an SVC we
-         * rewound (syscall_restart_internal), not yet dispatched again: that
-         * call is still in progress to the guest, and what is due finds it
-         * interrupted, as it would inside the host syscall (syscall.c). */
-        if (UNLIKELY(g_sig_npend)) syscall_unrewind(c);
+        if (UNLIKELY(g_sig_npend | g_ptrace_kick)) {
+            /* Something is due, and the thread may be sitting at an SVC we
+             * rewound (syscall_restart_internal), not yet dispatched again:
+             * that call is still in progress to the guest, and what is due
+             * finds it interrupted, as it would inside the host syscall
+             * (syscall.c). */
+            if (g_sig_npend) syscall_unrewind(c);
 
-        if (UNLIKELY(g_ptrace_kick)) ptrace_service_kick(c);
+            /* Adopt a pending PTRACE_ATTACH/SEIZE or service a
+             * PTRACE_INTERRUPT (the kick signal set g_ptrace_kick and reused
+             * g_sig_npend to exit the fast path above). Before the signals,
+             * as the kernel's get_signal takes a ptrace trap before it
+             * dequeues one: a tracer's ptrace(SEIZE) has returned by the time
+             * its kill(2) sends the next signal, and a standard signal is
+             * taken ahead of the real-time kick, so the two arrive together
+             * and the signal must find the thread traced already. */
+            if (g_ptrace_kick) ptrace_service_kick(c);
 
-        /* Deliver any host-caught guest signal at this safe boundary. */
-        if (UNLIKELY(g_sig_npend)) sig_deliver_pending(c);
+            /* Deliver any host-caught guest signal at this safe boundary. */
+            if (g_sig_npend) sig_deliver_pending(c);
+        }
 
         /* Our own control signal interrupted a host syscall to get this thread
          * here (the attach kick above, a tracee's wake of its tracer, execve's

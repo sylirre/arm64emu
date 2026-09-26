@@ -642,7 +642,7 @@ static inline void sig_selfintr(void) {
 }
 static __thread timer_t g_kick_timer;
 static __thread int g_kick_timer_ok;
-static __thread volatile sig_atomic_t g_kick_armed;
+__thread volatile sig_atomic_t g_kick_armed;   /* machine.h */
 
 void sig_kick_timer_init(void) {
     struct sigevent sev;
@@ -683,7 +683,7 @@ static void sig_kick_timer_arm(void) {
     timer_settime(g_kick_timer, 0, &its, NULL);
 }
 
-/* From the run loop, at its delivery point. */
+/* From the run loop, at its delivery point, when g_kick_armed is up. */
 void sig_kick_timer_disarm(void) {
     if (!g_kick_armed) return;
     g_kick_armed = 0;
