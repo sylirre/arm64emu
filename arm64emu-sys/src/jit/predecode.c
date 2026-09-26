@@ -186,8 +186,11 @@ static void fill_branch(PDEnt *e, u32 insn) {
     if (BITS(31, 24) == 0xd5) {                      /* hints: NOP and friends */
         unsigned L = BIT(21), op0 = BITS(20, 19), op1 = BITS(18, 16);
         unsigned CRn = BITS(15, 12), CRm = BITS(11, 8), op2 = BITS(7, 5), Rt = BITS(4, 0);
+        /* WFE/WFI stay GENERIC, and so do SEV/SEVL, which set the event
+         * register a WFE consumes: as NOPs they left a SEVL; WFE pair to
+         * wait here where the reference interpreter runs straight through. */
         if (L == 0 && op0 == 0 && op1 == 3 && CRn == 2 && Rt == 31 &&
-            !(CRm == 0 && (op2 == 2 || op2 == 3)))   /* WFE/WFI stay GENERIC */
+            !(CRm == 0 && op2 >= 2 && op2 <= 5))
             e->op = PD_NOP;
         return;
     }
