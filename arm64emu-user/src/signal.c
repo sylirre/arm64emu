@@ -741,6 +741,8 @@ static int sig_deliverable(int sig) {
     return ok;
 }
 
+static void sig_probe_host(void);
+
 void sig_probe_reserved(void) {
     int *slot[3] = { &g_sig_kicksig, &g_sig_remap_host[0], &g_sig_remap_host[1] };
     g_sig_kicksig = SIGRTMAX;                 /* the defaults, in case the host */
@@ -760,6 +762,7 @@ void sig_probe_reserved(void) {
     }
     /* Fewer than three usable numbers leaves the rest at their defaults: there
      * is nothing better to pick, and it is what this code did before. */
+    sig_probe_host();
 }
 
 /* Touch, from ordinary context, every __thread variable a signal handler can
@@ -808,6 +811,15 @@ void sig_host_catch(int sig, siginfo_t *si, void *uctx) { host_catcher(sig, si, 
  * from the kernel. */
 static int rq_claim(int sig, const siginfo_t *si, PendSig *out);
 
+/* What the host can carry of a siginfo and do with SIGCHLD's flags, as
+ * measured once at startup (sig_probe_host). 1 on every kernel; qemu-user,
+ * the host of the ARM32 test tier, fails both. Plain ints: written before
+ * the first handler and the first thread, read from handlers after. */
+static int g_sig_sicode_ok = 1;   /* a private si_code, si_errno and si_value
+                                   * go out and come back as they were */
+static int g_sig_nocld_ok = 1;    /* SA_NOCLDWAIT reaps and SA_NOCLDSTOP
+                                   * spares the notices */
+
 /* rt_tgsigqueueinfo's mark on the host siginfo it sends (sys_sig.c). The
  * kernel queues such a signal on the one thread's own list, and a signal on
  * that list is that thread's alone -- it is not handed to a sibling when the
@@ -828,6 +840,9 @@ static int rq_claim(int sig, const siginfo_t *si, PendSig *out);
 #define SIG_THR_SPAN 127
 
 int sig_thread_code(int code) {
+    /* Not on a host that cannot carry the mark (sig_probe_host): there the
+     * signal goes as the sender gave it, and is taken for the process's. */
+    if (!g_sig_sicode_ok) return code;
     return (code < 0 && code >= -SIG_THR_SPAN) ? code - SIG_THR_BIAS : code;
 }
 
@@ -867,6 +882,32 @@ static int sig_jc_uncode(int *code, int *sig, int *thr) {
     return 1;
 }
 
+/* ...and on a host that cannot carry a private si_code (sig_probe_host),
+ * the same as SI_QUEUE -- the one kind every host passes along -- with what
+ * the code carried packed into si_value instead: a tag, the signal, the kind
+ * and the sender's code. The payload of a sigqueue'd one is lost there, the
+ * one thing that host leaves no room for (it zeroes si_errno besides, for
+ * every signal it hands on). Only a process on such a host sends one, and
+ * only there is one looked for: anywhere else, a guest's own SI_QUEUE of the
+ * kick's number with such a value is its own. */
+#define SIG_JC_TAG 0x4a43u   /* 'JC' */
+static u32 sig_jc_desc(int idx, int thr, int code) {
+    return SIG_JC_TAG << 16 | (u32)idx << 12 | (u32)thr << 8 | ((u32)-code & 0xff);
+}
+
+static int sig_jc_undesc(const siginfo_t *si, int *code, int *sig, int *thr) {
+    if (g_sig_sicode_ok || si->si_code != SI_QUEUE) return 0;
+    uintptr_t v = (uintptr_t)si->si_value.sival_ptr;
+    if (v > 0xffffffffu) return 0;
+    u32 d = (u32)v;
+    int idx = (int)(d >> 12 & 0xf);
+    if (d >> 16 != SIG_JC_TAG || idx > 4 || (d & 0xe00)) return 0;
+    *sig = sig_jc_nr[idx];
+    *thr = (int)(d >> 8 & 1);
+    *code = -(int)(d & 0xff);
+    return 1;
+}
+
 s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 uid,
                 s32 err, u64 value) {
     int idx = -1;
@@ -882,6 +923,10 @@ s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 ui
     si.si_pid = (pid_t)pid;
     si.si_uid = (uid_t)uid;
     si.si_value.sival_ptr = (void *)(uintptr_t)value;
+    if (!g_sig_sicode_ok) {
+        si.si_code = SI_QUEUE;
+        si.si_value.sival_ptr = (void *)(uintptr_t)sig_jc_desc(idx, tid != 0, code);
+    }
     long r = -1;
     errno = ENOSYS;
 #ifdef SYS_pidfd_send_signal
@@ -894,6 +939,108 @@ s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 ui
         r = tid ? syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, PTRACE_KICKSIG, &si)
                 : syscall(SYS_rt_sigqueueinfo, (pid_t)tgid, PTRACE_KICKSIG, &si);
     return r < 0 ? -errno : 0;
+}
+
+/* ---- what the host carries: the siginfo tier -----------------------------
+ *
+ * The emulator's own signals between its processes say more than a kernel's
+ * ever need to: a job-control signal for a traced process rides the kick with
+ * the signal, its kind and its sender's code packed into si_code
+ * (sig_send_jc), and rt_tgsigqueueinfo marks a thread-directed signal in its
+ * code (sig_thread_code). Every kernel carries a private negative si_code,
+ * with si_errno and si_value, from sender to receiver as it is. qemu-user --
+ * the host of the ARM32 test tier -- does not: sending, it builds the host
+ * siginfo on its own stack with only the named fields filled, so a code of a
+ * layout the kernel does not know fails at random with E2BIG (the kernel
+ * wants the rest zero); receiving, it keeps si_code's low sixteen bits and
+ * zeroes si_errno. Every job-control signal to a traced process failed there,
+ * and with it the ptrace tests that stop a tracee.
+ *
+ * So the host is asked, once: a signal queued to ourselves with such a code,
+ * an si_errno and a payload, taken straight back with sigtimedwait. One that
+ * does not come back as it went -- refused, or changed -- puts the process on
+ * the known-layout tier: the job-control carrier goes as SI_QUEUE with a
+ * descriptor in si_value (sig_jc_desc), and a thread-directed signal goes
+ * unmarked, taken for the process's. A host that refuses the probe's calls
+ * outright (a seccomp filter's ENOSYS) cannot be told apart and keeps the
+ * full encoding, which such a host could not carry any other way either.
+ * A64_SICODE_FORCE_KNOWN selects the tier anywhere.
+ *
+ * And the same host does not pass the guest's SIGCHLD flags on: it installs a
+ * handler of its own with flags of its own, so SA_NOCLDWAIT reaps nothing and
+ * SA_NOCLDSTOP spares no notice. A child forked with SA_NOCLDWAIT set and
+ * waited for says which: a kernel answers ECHILD once it has reaped it. Where
+ * the host does not, the emulator does both itself, as it does whenever a
+ * clone child bars the host from it (sig_chld_reap_emulated, host_catcher).
+ * A64_NOCLDWAIT_FORCE_EMULATE selects that anywhere. Both are asked before
+ * the first handler, thread and fork, and every process of the session
+ * inherits the answers. */
+static int sig_probe_sicode(void) {
+    if (getenv("A64_SICODE_FORCE_KNOWN")) return 0;
+    int sig = g_sig_kicksig;
+    struct sigaction ign, old;
+    memset(&ign, 0, sizeof ign);
+    ign.sa_handler = SIG_IGN;   /* nothing left over can ever act */
+    if (sigaction(sig, &ign, &old) != 0) return 1;
+    sigset_t one, prev;
+    sigemptyset(&one);
+    sigaddset(&one, sig);
+    sigprocmask(SIG_BLOCK, &one, &prev);   /* blocked: queued, ignored or not */
+
+    siginfo_t si, got;
+    memset(&si, 0, sizeof si);
+    si.si_signo = sig;
+    si.si_errno = 0x5a5a;
+    si.si_code = -(SIG_JC_BIAS + 0x123);   /* a carrier's, past sixteen bits */
+    si.si_pid = getpid();
+    si.si_uid = getuid();
+    si.si_value.sival_int = 0x1234567;
+    int ok = 1;
+    if (syscall(SYS_rt_sigqueueinfo, (pid_t)getpid(), sig, &si) != 0) {
+        ok = errno == ENOSYS || errno == EPERM;   /* refused: cannot tell */
+    } else {
+        struct timespec zero = { 0, 0 };
+        memset(&got, 0, sizeof got);
+        long r = syscall(SYS_rt_sigtimedwait, &one, &got, &zero, (size_t)8);
+        if (r < 0) ok = errno == ENOSYS || errno == EPERM;
+        else
+            ok = r == sig && got.si_code == si.si_code &&
+                 got.si_errno == si.si_errno &&
+                 got.si_value.sival_int == si.si_value.sival_int;
+    }
+    sigprocmask(SIG_SETMASK, &prev, NULL);   /* anything left is discarded */
+    sigaction(sig, &old, NULL);
+    return ok;
+}
+
+static int sig_probe_nocld(void) {
+    if (getenv("A64_NOCLDWAIT_FORCE_EMULATE")) return 0;
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
+    sa.sa_flags = SA_NOCLDWAIT;
+    if (sigaction(SIGCHLD, &sa, &old) != 0) return 1;
+    int ok = 1;
+    pid_t k = fork();
+    if (k == 0) _exit(0);
+    if (k > 0) {
+        int st;
+        pid_t w;
+        struct rusage ru;
+        do w = wait4(k, &st, 0, &ru); while (w < 0 && errno == EINTR);
+        ok = w < 0 && errno == ECHILD;   /* reaped at its death */
+        /* Reaped here instead, its usage went into RUSAGE_CHILDREN, which
+         * is the guest's to read -- taken back out, as for the broker's
+         * middle child (proctab.c). A kernel's own reaping folds nothing. */
+        if (w == k) proctab_helper_charge(&ru);
+    }
+    sigaction(SIGCHLD, &old, NULL);
+    return ok;
+}
+
+static void sig_probe_host(void) {
+    g_sig_sicode_ok = sig_probe_sicode();
+    g_sig_nocld_ok = sig_probe_nocld();
 }
 
 /* ---- group stop ----------------------------------------------------------
@@ -1064,6 +1211,15 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
             siginfo_t x;
             syscall(SYS_waitid, P_PID, (id_t)p->pid, &x, WEXITED | WNOHANG, NULL);
         }
+    }
+    /* A stop or continue notice is never sent to a parent that set
+     * SA_NOCLDSTOP (do_notify_parent_cldstop): a host that ignores the flag
+     * sends it all the same, and it goes no further. */
+    if (p->signo == SIGCHLD && (p->code == CLD_STOPPED || p->code == CLD_CONTINUED) &&
+        !g_sig_nocld_ok &&
+        (*(volatile u64 *)&g_machine.sigact[SIGCHLD].flags & G_SA_NOCLDSTOP)) {
+        g_sig_selfintr = 1;   /* never sent: it interrupted nothing */
+        return;
     }
     /* A child's notice (do_notify_parent and _cldstop) is never sent to a
      * parent that ignores SIGCHLD: caught all the same when the host may not
@@ -1459,7 +1615,8 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         return;
     }
     int code = si->si_code, jsig, thr;
-    if (sig_jc_uncode(&code, &jsig, &thr)) {
+    int desc = sig_jc_undesc(si, &code, &jsig, &thr);
+    if (desc || sig_jc_uncode(&code, &jsig, &thr)) {
         /* A guest's job-control signal (sig_send_jc): the one it stands for,
          * sent as the sender's siginfo says. It interrupts what it lands on
          * as that signal would. */
@@ -1470,7 +1627,7 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         p.err = si->si_errno;
         p.pid = (int)si->si_pid;
         p.uid = (int)si->si_uid;
-        p.value = (s64)(uintptr_t)si->si_value.sival_ptr;
+        p.value = desc ? 0 : (s64)(uintptr_t)si->si_value.sival_ptr;
         p.thr = thr;
         jc_stamp(&p);
         sig_capture_push(&p, uctx);
@@ -1672,7 +1829,8 @@ static int rq_put(const PendSig *p) {
                  >> RQ_IDX_BITS) & 0xfffffu;
         tok = (nonce << RQ_IDX_BITS) | idx;
     } while (!nonce || tok == PT_KICK_MAGIC || tok == PT_WAKE_MAGIC ||
-             tok == DETHREAD_MAGIC || tok == PT_STOPWAKE_MAGIC);
+             tok == DETHREAD_MAGIC || tok == PT_STOPWAKE_MAGIC ||
+             tok >> 16 == SIG_JC_TAG);   /* a job-control descriptor's shape */
     slot->nonce = nonce;
     slot->p = *p;
     __atomic_store_n(&slot->state, 2, __ATOMIC_RELEASE);
@@ -1950,9 +2108,14 @@ int sig_chld_reaps(struct Machine *m) {
 }
 
 /* ...and is the emulator doing that reaping itself, the host being barred
- * from it by a clone child (sig_chld_host)? Async-signal-safe. */
+ * from it by a clone child (sig_chld_host), or not doing it at all
+ * (sig_probe_host)? Async-signal-safe. */
+int sig_chld_reap_emulated(void) {
+    return clonekids_any() || !g_sig_nocld_ok;
+}
+
 static int sig_chld_emulating(void) {
-    return sig_chld_reaps(&g_machine) && clonekids_any();
+    return sig_chld_reaps(&g_machine) && sig_chld_reap_emulated();
 }
 
 /* SIGCHLD's host disposition. The kernel acts on the parent's as it sends:
@@ -1975,7 +2138,8 @@ static void sig_chld_host(struct Machine *m) {
     u64 h = m->sigact[SIGCHLD].handler;
     u64 f = m->sigact[SIGCHLD].flags;
     int reap = h == GSIG_IGN || (f & G_SA_NOCLDWAIT);
-    int any = clonekids_any();
+    int any = sig_chld_reap_emulated();   /* a clone child, or a host that
+                                           * ignores the flag */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     if (h > GSIG_IGN || clonekids_signalling() || (reap && any) || ptrace_traced()) {

@@ -42,7 +42,13 @@ flags used to be dropped: an `SA_NOCLDWAIT` parent's children stayed zombies
 its waits found, and an `SA_NOCLDSTOP` one's handler ran for every stop and
 continue (`tests/fixtures/sigchldflags.c`). The one part the host cannot always
 be given is the reaping, which the kernel does only for a child whose death
-signal is `SIGCHLD` — see *Clone children, and pidfds*.
+signal is `SIGCHLD` — see *Clone children, and pidfds*. And a host may ignore
+both flags outright — qemu-user installs a handler of its own with flags of
+its own — which a child forked at startup with `SA_NOCLDWAIT` set, and
+waited for, tells apart (`sig_probe_host`): there the emulator reaps and drops
+the notices itself, as it does for a clone child (`sig_chld_reap_emulated`;
+`A64_NOCLDWAIT_FORCE_EMULATE` forces it, and the fixture runs a second time
+over it).
 
 Synchronous guest faults (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGTRAP`) never
 come through the host catcher — they arrive from the interpreter as pending
@@ -647,6 +653,37 @@ a word past `si_value` — where the mark first rode — never reached a 32-bit
 emulator on a 64-bit host, which is every 32-bit Termux on a current phone.
 The guest's own siginfo is rebuilt from the fields and never shows the
 carried code.
+
+#### A host that cannot carry a private `si_code`
+
+The thread mark and the job-control carrier below both ride `si_code`, and
+every kernel carries a private negative code, with `si_errno` and `si_value`,
+from sender to receiver as it is. qemu-user — the host of the ARM32 test tier
+— does not. Sending, it builds the host siginfo on its own stack with only the
+fields it knows filled in, so a code of a layout the kernel does not know is
+refused with `E2BIG` whenever that stack is not zero past them (the kernel
+wants the rest zero); receiving, it keeps `si_code`'s low sixteen bits and
+zeroes `si_errno`. Every job-control signal to a traced process failed there,
+and with it every ptrace test whose tracee stops, and a thread-directed
+`sigqueue` never arrived.
+
+So the host is asked once, at startup, before the first handler, thread or
+fork (`sig_probe_host`): a signal queued to the process itself with such a
+code, an `si_errno` and a payload, taken straight back. One that does not
+come back as it went puts the process — and every process of the session,
+which inherits the answer — on the **known-layout tier**: the job-control
+carrier goes as `SI_QUEUE` with a tagged descriptor of the signal, its kind
+and its sender's code in `si_value` (`sig_jc_desc`), and a thread-directed
+signal goes unmarked. What that tier cannot give is what the host leaves no
+room for: a job-control signal sent to a traced process with `sigqueue` loses
+its payload there, a thread-directed one is taken for the process's (so it
+may go to a sibling when its thread blocks it), and `si_errno` is gone for
+every signal, which is qemu's own doing. A host that refuses the probe's
+calls outright — a seccomp filter's `ENOSYS` — cannot be told apart and keeps
+the full encoding. `A64_SICODE_FORCE_KNOWN` forces the tier; the suite runs
+the stopping ptrace tests over it (`(known-layout-tier)`), and a fixture that
+needs a queued siginfo delivered as it was sent says so with the
+`sigqueue-siginfo` probe (`tests/hostenv.sh`), which skips it under qemu-user.
 The held-out numbers are not handed back while the thread lives — the host
 would deliver them straight to it again — only when it exits, having blocked
 everything first. An exiting thread also no longer opens the pending-signal
@@ -1756,7 +1793,8 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   resumes the tracee with it. A guest's `SIGSTOP`, which cannot be caught, and
   with it the other four job-control signals, reach a traced process on the
   kick signal instead, in the order sent (`sig_send_jc`; `jc_route` in
-  `sys_sig.c`): the kernel's `prepare_signal` has a `SIGCONT` take back every
+  `sys_sig.c`; on a host that cannot carry the code that says which, as a
+  descriptor instead — *A host that cannot carry a private `si_code`*): the kernel's `prepare_signal` has a `SIGCONT` take back every
   stop signal sent before it, and a stop signal every `SIGCONT`, and on their
   own numbers a `SIGSTOP` and the `SIGCONT` sent right after it reached a
   parked tracee together, the lower number first. What is queued carries the

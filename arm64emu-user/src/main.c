@@ -379,6 +379,18 @@ static void help(void) {
                         "(exercises the back-pressure gate: a queue with no "
                         "room leaves the rest of a flood in the host kernel's "
                         "own queue until it drains)."},
+        {"A64_SICODE_FORCE_KNOWN", "Send the emulator's own signals between "
+                        "processes with si_codes of a layout the kernel knows "
+                        "only (the tier a host that cannot carry a private "
+                        "si_code, qemu-user, is served by): a job-control "
+                        "signal to a traced process then loses a sigqueue "
+                        "payload, and a thread-directed one is taken for the "
+                        "process's."},
+        {"A64_NOCLDWAIT_FORCE_EMULATE", "Reap an SA_NOCLDWAIT parent's "
+                        "children and drop an SA_NOCLDSTOP parent's stop "
+                        "notices in the emulator instead of leaving it to the "
+                        "host (the tier a host that ignores the two flags, "
+                        "qemu-user, is served by)."},
         {"A64_STACKGROW_FORCE_MOVE", "Reserve no host room below a stack and "
                         "never extend its backing downward, so a stack that "
                         "grows is moved to new backing (the tier a host whose "

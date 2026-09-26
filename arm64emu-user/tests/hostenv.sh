@@ -551,6 +551,13 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   qemu-user copies it back only on success. (With no
 #                   filesystem at hand that has an extent map there is
 #                   nothing to ask, and the fixture steps aside by itself.)
+#   sigqueue-siginfo  rt_sigqueueinfo hands on the siginfo it was given: an
+#                   si_code of a layout the kernel does not know (with the
+#                   rest zero) and an si_errno. qemu-user fills a siginfo of
+#                   its own with the fields it knows, so such a code is E2BIG
+#                   at random, and zeroes si_errno on the way back. (The
+#                   emulator's own messages step around it: signal.c,
+#                   sig_probe_host.)
 #
 # A fourth names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -773,6 +780,33 @@ int main(void) {
     while (f && fgets(l, sizeof l, f))
         if (!strncmp(l, "SigPnd:", 7)) v = strtoull(l + 7, NULL, 16);
     return (v >> (SIGUSR1 - 1)) & 1 ? 0 : 1;
+}
+EOF
+        ;;
+    sigqueue-siginfo) cat <<'EOF'
+#define _GNU_SOURCE
+#include <signal.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+int main(void) {
+    sigset_t one;
+    sigemptyset(&one);
+    sigaddset(&one, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &one, NULL);
+    siginfo_t si, got;
+    memset(&si, 0, sizeof si);
+    si.si_signo = SIGUSR1;
+    si.si_code = -100;           /* no layout the kernel knows */
+    si.si_errno = 7;
+    si.si_pid = getpid();
+    si.si_uid = getuid();
+    if (syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &si) != 0) return 1;
+    struct timespec zero = { 0, 0 };
+    memset(&got, 0, sizeof got);
+    if (sigtimedwait(&one, &got, &zero) != SIGUSR1) return 1;
+    return got.si_code == -100 && got.si_errno == 7 ? 0 : 1;
 }
 EOF
         ;;

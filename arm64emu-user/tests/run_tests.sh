@@ -2876,7 +2876,8 @@ check_fixture clonepidfd $'pidfd_open a thread: EINVAL\nclone pidfd: ok\nwaitid 
 # notice the kernel would never have sent, caught all the same, interrupts
 # nothing (sig_taken_quietly). Self-checking: qemu-user forks for a clone child, which then signals with
 # SIGCHLD; the block is the kernel's.
-check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone'
+check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone' \
+    "A64_NOCLDWAIT_FORCE_EMULATE=1" "nocld-tier"
 # The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
 # managed addresses untagged always, dereferenced ones EFAULT until the thread
 # enables it (before the file is asked anything, even an empty pipe), the
@@ -3355,6 +3356,36 @@ for pt in tests/ptrace/*.c; do
     [ "$pt" = tests/ptrace/basic.c ] || fx_rm "$ptbin"
 done
 rm -f "$ptout"
+
+# ---- the known-layout siginfo tier ----
+# A host that cannot carry a private si_code from one process to another --
+# qemu-user, the ARM32 tier's: E2BIG for a code of no layout the kernel knows,
+# si_code cut to sixteen bits and si_errno zeroed on the way back -- gets the
+# emulator's job-control signals for a traced process as SI_QUEUE with a
+# descriptor in si_value instead (signal.c, sig_probe_host).
+# A64_SICODE_FORCE_KNOWN forces that tier on a host that could do better: the
+# ptrace tests whose tracees stop and continue, over it.
+kltout=$(mktemp)
+for t in stopsig stopsig_detach jobctl mtjobctl listen killed_stop; do
+    pt=tests/ptrace/$t.c
+    ptbin=tests/ptrace/$t.bin
+    [ -e "$pt" ] || continue
+    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" $A64_TESTLIBS 2>/dev/null; then
+        skip_build "$pt(known-layout-tier)"; continue
+    fi
+    lbl="ptrace: $t(known-layout-tier)"
+    A64_SICODE_FORCE_KNOWN=1 timeout -k 5 30 "$EMU" / "$PWD/$ptbin" > "$kltout" 2>/dev/null
+    rc=$?
+    out=$(cat "$kltout")
+    if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
+        pass=$((pass+1)); echo "PASS $lbl"
+    else
+        fail=$((fail+1)); echo "FAIL $lbl (rc=$rc, out='$out')"
+        reap_bin "$PWD/$ptbin"
+    fi
+    fx_rm "$ptbin"
+done
+rm -f "$kltout"
 
 # ---- reserved host signals: the low-RT fallback tier ----
 # The emulator keeps three host signal numbers for itself -- the control-channel

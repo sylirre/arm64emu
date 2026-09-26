@@ -1258,12 +1258,14 @@ static void clonekid_wait_note(struct Machine *m, u32 opts) {
 }
 
 /* A child the kernel would have reaped at its death, which no wait ever
- * sees: the guest ignores SIGCHLD or set SA_NOCLDWAIT, and a clone child
- * about kept the host from reaping it itself (signal.c, sig_chld_host). The
+ * sees: the guest ignores SIGCHLD or set SA_NOCLDWAIT, and the host does not
+ * reap it itself -- a clone child about keeps it from that, and a host that
+ * ignores SA_NOCLDWAIT never did (signal.c, sig_chld_reap_emulated). The
  * capture reaps such a child when its SIGCHLD arrives; a wait that gets to it
  * first must not report it -- and reaps it, if it only looked (WNOWAIT). */
 static int chld_autoreaped(struct Machine *m, s32 pid, int looked) {
-    if (!sig_chld_reaps(m) || !clonekids_any() || clonekid_live(m, pid)) return 0;
+    if (!sig_chld_reaps(m) || !sig_chld_reap_emulated() || clonekid_live(m, pid))
+        return 0;
     if (looked) {
         siginfo_t x;
         syscall(SYS_waitid, P_PID, (id_t)pid, &x, WEXITED | WNOHANG, NULL);

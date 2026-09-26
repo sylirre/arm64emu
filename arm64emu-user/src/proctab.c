@@ -2273,6 +2273,8 @@ static void helper_charge(const struct rusage *ru) {
     proctab_ctime_republish();
 }
 
+void proctab_helper_charge(const struct rusage *ru) { helper_charge(ru); }
+
 int proctab_children_adjust(struct rusage *ru) {
     if (!__atomic_load_n(&g_helper_any, __ATOMIC_ACQUIRE)) return 0;
 #define HSUB(f) __atomic_load_n(&g_helper.f, __ATOMIC_RELAXED)

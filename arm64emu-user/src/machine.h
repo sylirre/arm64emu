@@ -703,6 +703,10 @@ int  clonekids_any(void);
 /* Does the guest have its children reaped at their death -- SIGCHLD ignored,
  * or SA_NOCLDWAIT (signal.c)? */
 int  sig_chld_reaps(struct Machine *m);
+/* ...and is it the emulator that reaps them, not the host? When a clone child
+ * is about (the host would reap it as an ordinary child), and on a host that
+ * ignores SA_NOCLDWAIT (signal.c, sig_probe_host). Async-signal-safe. */
+int  sig_chld_reap_emulated(void);
 /* A host syscall the emulator issues knowing a sandbox may refuse it, where
  * the ENOSYS the SIGSYS net answers IS the guest's answer (the pidfd calls,
  * which the Android app filter blocks): no notice when it is trapped. */
@@ -1377,8 +1381,10 @@ void proctab_mem_publish(const ProcMem *pm);          /* the owner, on change */
 void proctab_mem_seed(int slot, const ProcMem *pm);   /* pre-fork, as seccomp */
 int  proctab_mem_get(s32 pid, ProcMem *out);          /* a reader; 0 = unknown */
 
-/* What the emulator's own reaped children (the broker spawn's middle child)
- * cost this process, taken back out of RUSAGE_CHILDREN (proctab.c):
+/* What the emulator's own reaped children (the broker spawn's middle child,
+ * the SA_NOCLDWAIT probe's child on a host that leaves it to be reaped) cost
+ * this process, taken back out of RUSAGE_CHILDREN (proctab.c):
+ *   proctab_helper_charge     record one such child's usage, from its reap
  *   proctab_children_adjust   subtract it from a host RUSAGE_CHILDREN figure;
  *                             0 when nothing was ever charged (figure exact)
  *   proctab_ctime_republish   publish the net children's CPU time to our
@@ -1387,6 +1393,7 @@ int  proctab_mem_get(s32 pid, ProcMem *out);          /* a reader; 0 = unknown *
  *                             was charged, so a reap costs nothing extra
  *   proctab_ctime_get         that publication, 1 when there is one */
 struct rusage;
+void proctab_helper_charge(const struct rusage *ru);
 int  proctab_children_adjust(struct rusage *ru);
 void proctab_ctime_republish(void);
 int  proctab_ctime_get(s32 pid, s64 *ut_us, s64 *st_us);
