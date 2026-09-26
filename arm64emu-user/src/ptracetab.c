@@ -1201,8 +1201,14 @@ void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
         /* Not followed: a fresh untraced pid -- but one clone(2) has already
          * returned to the parent, which may have SEIZEd it (or handed it to a
          * tracer) before this thread got here, its kick landing in the flag
-         * just cleared. Re-flag it, or the attach waits for another kick. */
-        PtLink *e = pt_find(getpid());
+         * just cleared. Re-flag it, or the attach waits for another kick.
+         * Looked for only once anyone in the session has traced: an attach
+         * raises any_trace before it kicks, so a kick that landed before the
+         * clear above finds it raised here. Not for every fork: the table is
+         * shared memory, which a fork child's page tables do not bring
+         * along, and a look through it was a fault per page it crossed. */
+        PtLink *e = g_tab && __atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)
+                  ? pt_find(getpid()) : NULL;
         if (e && __atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE)) {
             g_ptrace_kick = 1;
             g_sig_npend = 1;               /* out of the fast path to adopt it */

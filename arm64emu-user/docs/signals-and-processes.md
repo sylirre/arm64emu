@@ -1675,6 +1675,11 @@ be claimed before it has run at all: `clone(2)` returns a fork child's pid to
 the parent while the child is still on its way out of the emulator's fork path,
 which clears the flag it inherited (a kick aimed at the parent's link) — so the
 child then looks for an attach already pending on its own and flags it again.
+It looks only once anyone in the session has traced (`any_trace`, which an
+attach raises before it kicks): the table is shared memory, which a fork
+child's page tables do not bring along, and a look through it on every fork was
+a fault for each page it crossed — some 5 per fork, a few percent of a
+fork-heavy run.
 Cleared with the rest, the kick of a `SEIZE` that won that race was lost: the
 attach succeeded, and the child ran untraced, a fault killing it that should
 have stopped it (`tests/ptrace/seize_newborn.c`). The syscall
