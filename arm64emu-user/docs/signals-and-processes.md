@@ -244,6 +244,20 @@ which the `SVC` then made anew and ran to its timeout — where the kernel,
 whose `SEIZE` interrupts nothing, answers the `INTERRUPT`'s stop with `EINTR`
 (`tests/ptrace/interrupt_blocked.c`, `tests/ptrace/attachorder.c`).
 
+The mark itself (`g_sig_selfintr`) is claimed only while a syscall dispatch is
+on the thread (`sig_selfintr`): one of the emulator's own signals handled
+anywhere else — parked in a stop, at the boundary, in guest code —
+interrupted no call of the guest's. Claimed there all the same, it outlived
+the moment and restarted the next call the boundary found interrupted, one a
+signal's disposition had just settled otherwise; and a signal taken with no
+handler because its tracer suppressed it (or a stop's) settles the call by the
+no-handler rule outright (`sig_taken_quietly`), whatever mark of ours its
+`EINTR` came with. A traced thread's `epoll_wait`, cut short by a signal its
+tracer then suppressed, ran on to its timeout when a kick — or the capture
+kick's timer — reached the thread around that stop: rarely on a kernel, every
+time under qemu-user, which hands signals on late
+(`tests/ptrace/suppressed_eintr.c`).
+
 ##### A signal caught on the way into a syscall
 
 A guest signal reaches a thread as a host signal, and the host handler queues

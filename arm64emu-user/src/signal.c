@@ -613,6 +613,20 @@ int g_sig_kicksig;
  * says so once. */
 #define SIGQ_KICK_MAGIC 0x6b49434b   /* 'kICK': si_value of the timer's signal */
 __thread volatile sig_atomic_t g_sig_in_syscall;
+
+/* An EINTR of ours, for the boundary to undo (syscall_restart_internal):
+ * claimed only while a syscall dispatch is on this thread. One of our own
+ * signals, or one the guest is never to have, handled anywhere else --
+ * parked in a stop, at the boundary itself, in guest code -- interrupted no
+ * call of the guest's. Claimed all the same, the mark outlived the moment and
+ * restarted the next call the boundary found interrupted, whose fate a
+ * signal's own disposition had just settled otherwise: a traced thread's
+ * epoll_wait, cut short by a signal its tracer suppressed, ran on to its
+ * timeout where a kernel answers EINTR, whenever a kick reached the thread
+ * during that stop -- every time under qemu-user, which hands signals on late. */
+static inline void sig_selfintr(void) {
+    if (g_sig_in_syscall) g_sig_selfintr = 1;
+}
 static __thread timer_t g_kick_timer;
 static __thread int g_kick_timer_ok;
 static __thread volatile sig_atomic_t g_kick_armed;
@@ -1187,7 +1201,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
      * kernel's attach sends no SIGCONT. */
     if (sig == SIGCONT && si->si_code == SI_QUEUE &&
         si->si_value.sival_int == PT_STOPWAKE_MAGIC) {
-        g_sig_selfintr = 1;
+        sig_selfintr();
         return;
     }
     PendSig ps, *p = &ps;
@@ -1200,7 +1214,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
         int es = clonekid_exit_signal(p->pid);
         if (es >= 0) {
             if (es == 0 || es > 64) {   /* dies with no signal at all */
-                g_sig_selfintr = 1;     /* ...so it interrupted nothing */
+                sig_selfintr();     /* ...so it interrupted nothing */
                 return;
             }
             p->signo = es;
@@ -1218,7 +1232,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
     if (p->signo == SIGCHLD && (p->code == CLD_STOPPED || p->code == CLD_CONTINUED) &&
         !g_sig_nocld_ok &&
         (*(volatile u64 *)&g_machine.sigact[SIGCHLD].flags & G_SA_NOCLDSTOP)) {
-        g_sig_selfintr = 1;   /* never sent: it interrupted nothing */
+        sig_selfintr();   /* never sent: it interrupted nothing */
         return;
     }
     /* A child's notice (do_notify_parent and _cldstop) is never sent to a
@@ -1227,7 +1241,7 @@ static void host_catcher(int sig, siginfo_t *si, void *uctx) {
      * matter -- delivered, and discarded there, as the kernel's would be. */
     if (p->signo == SIGCHLD && p->code >= CLD_EXITED && p->code <= CLD_CONTINUED &&
         *(volatile u64 *)&g_machine.sigact[SIGCHLD].handler == GSIG_IGN) {
-        g_sig_selfintr = 1;   /* never sent: it interrupted nothing */
+        sig_selfintr();   /* never sent: it interrupted nothing */
         return;
     }
     sig_capture_push(p, uctx);
@@ -1240,7 +1254,7 @@ static void sig_capture_push(PendSig *p, void *uctx) {
      * sig_set_to_host): it waits in the ring until the unblock, and the
      * EINTR it just inflicted on a host syscall is one a kernel would not
      * have -- ours to undo, like the kick's (syscall_restart_internal). */
-    if (g_tls.sigmask & (1ULL << (p->signo - 1))) g_sig_selfintr = 1;
+    if (g_tls.sigmask & (1ULL << (p->signo - 1))) sig_selfintr();
     if (!sigq_push(p, uctx)) return;
     jit_signal_interrupt();   /* make generated code exit at its next entry */
     if (g_sig_in_syscall) sig_kick_timer_arm();   /* see the kick timer above */
@@ -1574,14 +1588,14 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
      * arms the kick timer there, as a capture does ("the capture kick"). */
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_KICK_MAGIC) {
         g_ptrace_kick = 1;
-        g_sig_selfintr = 1;         /* ours: the guest must not see this EINTR */
+        sig_selfintr();         /* ours: the guest must not see this EINTR */
         g_sig_npend = 1;            /* make the run loop exit its fast path */
         jit_signal_interrupt();
         if (g_sig_in_syscall) sig_kick_timer_arm();
         return;
     }
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_WAKE_MAGIC) {
-        g_sig_selfintr = 1;
+        sig_selfintr();
         if (g_sig_in_syscall) sig_kick_timer_arm();
         return;   /* tracee->tracer wake: the EINTR on a blocked host
                      wait4/waitid is the whole effect; no other flags, and
@@ -1596,7 +1610,7 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
          * the boundary disarmed the timer is late for all of that, and
          * interrupts nothing of ours. */
         if (!g_kick_armed) return;
-        g_sig_selfintr = 1;
+        sig_selfintr();
         g_sig_npend = 1;
         jit_signal_interrupt();
         return;
@@ -1608,7 +1622,7 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
          * parked thread back to the loop to see it. The lever below is only
          * how a thread running guest code leaves the interpreter/JIT fast
          * path, which never returns for the counter's sake alone. */
-        g_sig_selfintr = 1;
+        sig_selfintr();
         g_sig_npend = 1;
         jit_signal_interrupt();
         if (g_sig_in_syscall) sig_kick_timer_arm();
@@ -2476,7 +2490,9 @@ static int sc_restart_nohandler(CPU *c) {
  * a notice that needs reaping, a number one of its nets owns -- and it
  * interrupted nothing. */
 static void sig_taken_quietly(CPU *c, int traced) {
-    if (!traced || sc_restart_nohandler(c)) g_sig_selfintr = 1;
+    /* A traced one, or a stop: the kernel did take it, and its rule settles
+     * the call outright -- whatever mark of ours an EINTR came with. */
+    g_sig_selfintr = !traced || sc_restart_nohandler(c);
 }
 
 /* A ptrace trap a tracer's request caused (PTRACE_INTERRUPT's): the call its
