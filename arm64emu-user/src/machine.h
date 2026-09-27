@@ -756,6 +756,12 @@ s64  sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 u
  * sends it itself. */
 int  sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
                     int code, s32 err, s32 pid, u32 uid, u64 value, s64 *ret);
+/* Does /proc's SigPnd/ShdPnd name host signal `hs` at its own bit? Measured
+ * at startup on the known-layout tier (sig_probe_host): qemu-user shows the
+ * host kernel's numbers, which for its real-time signals are not the ones
+ * the process under it uses. The inbox reclaims nothing on an answer that
+ * cannot be read. */
+int  sig_procpnd_trusted(int hs);
 /* The group stop (signal.c, "group stop"): an untraced thread's part in one
  * (parked until SIGCONT), and its hand-over to the host when the last traced
  * thread is gone. */
@@ -1479,8 +1485,11 @@ int  proctab_foreign_tasks(s32 pid, s32 *out, int max);     /* count written */
 typedef struct {
     s64 value;                    /* the sender's sigval, the guest's full width */
     s64 posted_ms;                /* CLOCK_MONOTONIC at the post (stale guard) */
-    u32 state;                    /* 0 free, 1 being filled, 2 posted, 3 taking */
-    u32 nonce;
+    s64 idle_ms;                  /* when a sender first saw that post undelivered */
+    u32 word;                     /* nonce << 2 | state: 0 free, 1 being filled,
+                                   * 2 posted, 3 taking -- one word, so every CAS
+                                   * names the post it means */
+    u32 idle_word;                /* the post idle_ms was seen for (0: none) */
     s32 tid;                      /* aimed at this thread; 0 = the process */
     s32 hsig;                     /* the host number it was sent on */
     s32 signo;                    /* the guest number it stands for */

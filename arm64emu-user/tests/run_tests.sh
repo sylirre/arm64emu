@@ -886,7 +886,7 @@ PTDIRS="/dev/shm ${XDG_RUNTIME_DIR:-} ${TMPDIR:-} /data/local/tmp /tmp"
 pt_registry() {   # the registry file this host's shared_dir() picked, if any
     for d in $PTDIRS; do
         [ -n "$d" ] || continue
-        for f in "$d"/arm64chroot-proctab.v9."$(id -u)".*; do
+        for f in "$d"/arm64chroot-proctab.v10."$(id -u)".*; do
             [ -f "$f" ] && { echo "$f"; return 0; }
         done
     done
@@ -894,7 +894,7 @@ pt_registry() {   # the registry file this host's shared_dir() picked, if any
 }
 if [ -x "$ALPINE/bin/busybox" ]; then
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v9."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v10."$(id -u)".* 2>/dev/null
     done
     rm -f "$ALPINE/tmp/apid"
     A64_PROCTAB_FORCE_FILE=1 timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" \
@@ -936,7 +936,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         rm -f "$reg" "$victim"
     fi
     for d in $PTDIRS; do
-        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v9."$(id -u)".* 2>/dev/null
+        [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v10."$(id -u)".* 2>/dev/null
     done
 fi
 
@@ -2893,6 +2893,12 @@ check_fixture tagged $'initial: 0\nwrite tagged, off: EFAULT\nread tagged, off, 
 # row forces that tier on any host, so the inbox is checked where it is not
 # otherwise needed.
 check_fixture sqiread $'sigqueueinfo errno 7: 0\nsigqueueinfo errno 7: took 10 errno=7 val=1\ntgsigqueueinfo errno 11: 0\ntgsigqueueinfo errno 11: took 10 errno=11 val=2\n48 readable, SI_QUEUE: 0\n48 readable, SI_QUEUE: took 10 errno=0 val=3\n48 readable, unknown layout: EFAULT\n47 readable, SI_QUEUE: EFAULT\nunknown layout, zero tail: 0\nunknown layout, zero tail: took 10 errno=0\nunknown layout, byte 100 set: E2BIG\nunknown layout, byte 100 set, other pid: E2BIG\nSI_QUEUE, byte 100 set: 0\nSI_QUEUE, byte 100 set: took 10 errno=0 val=6\ndone' \
+    A64_SICODE_FORCE_KNOWN=1 known-layout-tier
+# ...and the inbox's slots are taken back only from a signal that is gone,
+# never from one that still waits (a receiver blocking it past the stale age,
+# a sender queueing past the inbox): every instance arrives with its own
+# value. Self-checking; ~5 s.
+check_fixture carrystale $'real-time: received 80, wrong value 0, errno lost in the inbox 0\nstandard: received 1, wrong value 0, errno lost in the inbox 0\ndone' \
     A64_SICODE_FORCE_KNOWN=1 known-layout-tier
 # vm.mmap_min_addr: a fixed mapping below it is EPERM (ahead of NOREPLACE's
 # EEXIST and of the MAP_TYPE check), a hint below it is raised to it (it lands

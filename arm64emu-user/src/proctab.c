@@ -142,17 +142,21 @@ struct ProcEnt {
     /* The owner's siginfo inbox (signal.c, "the siginfo carrier"): written by
      * whoever signals the owner on a host that cannot carry the siginfo
      * itself, taken by the owner as the signal naming a slot comes off its
-     * queue. Per-slot protocol on `state`: the sender claims a free slot
-     * (CAS 0->1), fills it and publishes it (store 2, release); the owner
-     * claims a posted one (CAS 2->3), checks its nonce, copies it out and
-     * frees it (store 0). Cleared with the rest of the entry for a new
-     * process. */
+     * queue. Per-slot protocol on `word`, the post's nonce and its state in
+     * one: the sender claims a free slot (CAS state 0->1), fills it and
+     * publishes it under a new nonce (store nonce|2, release); the owner
+     * claims the post its token names (CAS nonce|2 -> nonce|3), copies it out
+     * and frees it (store nonce|0). A CAS on the whole word can only ever
+     * take the post it looked at, never one posted in the slot since.
+     * Cleared with the rest of the entry for a new process. */
     SigCarry carry[PROCTAB_CARRY];
 };
 
 static void carry_clear(struct ProcEnt *e) {
-    for (int i = 0; i < PROCTAB_CARRY; i++)
-        __atomic_store_n(&e->carry[i].state, 0, __ATOMIC_RELAXED);
+    for (int i = 0; i < PROCTAB_CARRY; i++) {
+        __atomic_store_n(&e->carry[i].idle_word, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->carry[i].word, 0, __ATOMIC_RELAXED);
+    }
 }
 
 /* Store a process's non-guest host tasks into its entry: tids first, count
@@ -263,14 +267,15 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * a full-length dir; a pathological dir near PATH_MAX just yields an overlong
      * name that open() rejects -> degrade. */
     char path[PATH_MAX + 64];
-    /* v9 tags the on-disk layout: bump if struct ProcEnt ever changes so a
+    /* v10 tags the on-disk layout: bump if struct ProcEnt ever changes so a
      * stale file from an older build is never reinterpreted. (v2 added the
      * exe/cwd/environ fields to v1's cmdline-only entry; v3 added auxv; v4 the
      * faked user namespace's id maps; v5 the owner's seccomp state; v6 its
      * non-guest host tasks; v7 holds the id maps as extents, all 340 of the
      * kernel's ceiling, where v6 held 256 bytes of their text; v8 the owner's
-     * personality; v9 its siginfo inbox.) */
-    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v9.%u.%08x",
+     * personality; v9 its siginfo inbox; v10 that inbox with its nonce in
+     * the state word.) */
+    snprintf(path, sizeof path, "%s/arm64chroot-proctab.v10.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -337,9 +342,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v9.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v10.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v9.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v10.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -3218,30 +3223,65 @@ int proctab_foreign_tasks(s32 pid, s32 *out, int max) {
  * receiver's queue. But the host may never deliver it: a standard signal
  * already pending coalesces with it, an ignored one is dropped, a receiver
  * dies or execs past it. So a sender that finds the inbox full reclaims a
- * slot posted more than CARRY_STALE_MS ago whose host number is no longer
- * pending where it was sent -- whatever still names it is gone, and a token
- * that turns up later finds its nonce changed and is left as it came. */
+ * slot posted more than CARRY_STALE_MS ago whose host number it has seen no
+ * longer pending where it was sent twice, CARRY_IDLE_MS apart, with the same
+ * post in the slot both times -- whatever still names it is gone, and a token
+ * that turns up later finds its nonce changed and is left as it came. One
+ * look would not do: "not pending" is also what a signal is between the host
+ * dequeuing it and its receiver taking the slot (a capture handler's entry,
+ * a signalfd read's return), and on qemu-user the host may hold one in a
+ * queue of its own for a moment. */
 #define CARRY_STALE_MS 2000
+#define CARRY_IDLE_MS  100
 
-/* Is host signal `hsig` still pending for `tid` of `tgid` (0: the process)?
- * 1 when that cannot be told, so nothing is reclaimed on a guess. */
-static int carry_pending(s32 tgid, s32 tid, int hsig) {
+#define CARRY_ST(w)    ((w) & 3u)
+#define CARRY_NONCE(w) ((w) >> 2)
+
+/* The host's pending set of `tid` of `tgid` (0: the process's shared one),
+ * as /proc tells it: 1 and *set, 0 when the task is gone, -1 when it cannot
+ * be read. */
+static int carry_pnd_read(s32 tgid, s32 tid, u64 *set) {
     char path[64], line[128];
     snprintf(path, sizeof path, "/proc/%d/task/%d/status", (int)tgid,
              (int)(tid ? tid : tgid));
     const char *key = tid ? "SigPnd:" : "ShdPnd:";
     fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     FILE *f = fopen(path, "re");
-    if (!f) { int gone = errno == ENOENT || errno == ESRCH; fdwin_leave(); return !gone; }
-    int pend = 1;
+    if (!f) { int gone = errno == ENOENT || errno == ESRCH; fdwin_leave(); return gone ? 0 : -1; }
+    int r = -1;
     while (fgets(line, sizeof line, f))
         if (!strncmp(line, key, 7)) {
-            pend = (int)(strtoull(line + 7, NULL, 16) >> (hsig - 1) & 1);
+            *set = strtoull(line + 7, NULL, 16);
+            r = 1;
             break;
         }
     fclose(f);
     fdwin_leave();
-    return pend;
+    return r;
+}
+
+/* One post call's reads, each task's status file read once however many of
+ * its slots are looked at -- a full inbox would otherwise cost a read per
+ * slot on every send. */
+typedef struct { s32 tid; int r; u64 set; } CarryPnd;
+
+/* Is host signal `hsig` still pending for `tid` of `tgid`? 1 when that
+ * cannot be told -- a status file that cannot be read, a host whose /proc
+ * does not number that signal as we do (sig_procpnd_trusted) -- so nothing
+ * is reclaimed on a guess. */
+static int carry_pending(s32 tgid, s32 tid, int hsig, CarryPnd *cache, int *ncache) {
+    CarryPnd *p = NULL;
+    for (int i = 0; i < *ncache; i++) if (cache[i].tid == tid) p = &cache[i];
+    CarryPnd tmp;
+    if (!p) {
+        p = *ncache < 8 ? &cache[(*ncache)++] : &tmp;
+        p->tid = tid;
+        p->set = 0;
+        p->r = carry_pnd_read(tgid, tid, &p->set);
+    }
+    if (p->r == 0) return 0;   /* gone, and whatever it had with it */
+    if (p->r < 0 || hsig < 1 || hsig > 64 || !sig_procpnd_trusted(hsig)) return 1;
+    return (int)(p->set >> (hsig - 1) & 1);
 }
 
 static u32 g_carry_ctr;
@@ -3250,21 +3290,44 @@ int proctab_carry_post(s32 tgid, const SigCarry *in, u32 *slot, u32 *nonce) {
     struct ProcEnt *e = resolve_entry(tgid);
     if (!e) return -1;
     s64 now = mono_ms();
+    CarryPnd cache[8];
+    int ncache = 0;
     SigCarry *c = NULL;
-    for (int pass = 0; pass < 2 && !c; pass++)
-        for (int i = 0; i < PROCTAB_CARRY && !c; i++) {
-            SigCarry *s = &e->carry[i];
-            u32 want = pass ? 2 : 0;
-            if (pass && (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != 2 ||
-                         now - s->posted_ms < CARRY_STALE_MS ||
-                         carry_pending(tgid, s->tid, s->hsig)))
-                continue;
-            if (__atomic_compare_exchange_n(&s->state, &want, 1, false,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-                c = s;
+    u32 old = 0;
+    for (int i = 0; i < PROCTAB_CARRY && !c; i++) {
+        SigCarry *s = &e->carry[i];
+        u32 w = __atomic_load_n(&s->word, __ATOMIC_ACQUIRE);
+        if (CARRY_ST(w) == 0 &&
+            __atomic_compare_exchange_n(&s->word, &w, w | 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            c = s;
+            old = CARRY_NONCE(w);
         }
+    }
+    for (int i = 0; i < PROCTAB_CARRY && !c; i++) {   /* full: the stale ones */
+        SigCarry *s = &e->carry[i];
+        u32 w = __atomic_load_n(&s->word, __ATOMIC_ACQUIRE);
+        if (CARRY_ST(w) != 2 || now - s->posted_ms < CARRY_STALE_MS ||
+            carry_pending(tgid, s->tid, s->hsig, cache, &ncache))
+            continue;
+        /* Undelivered: the first sighting only marks it (idle_ms first, the
+         * word it is for last -- a reader that sees the word sees a time no
+         * older than its own sighting's) ... */
+        if (__atomic_load_n(&s->idle_word, __ATOMIC_ACQUIRE) != w) {
+            __atomic_store_n(&s->idle_ms, now, __ATOMIC_RELAXED);
+            __atomic_store_n(&s->idle_word, w, __ATOMIC_RELEASE);
+            continue;
+        }
+        /* ...a later one, of the same post, reclaims it. */
+        if (now - __atomic_load_n(&s->idle_ms, __ATOMIC_RELAXED) < CARRY_IDLE_MS) continue;
+        if (__atomic_compare_exchange_n(&s->word, &w, (w & ~3u) | 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            c = s;
+            old = CARRY_NONCE(w);
+        }
+    }
     if (!c) return -1;
-    u32 old = c->nonce, n;
+    u32 n;
     do {   /* 18 bits, never 0, never the one the slot last carried */
         u32 x = __atomic_add_fetch(&g_carry_ctr, 0x9e3779b1u, __ATOMIC_RELAXED) ^
                 ((u32)getpid() * 0x85ebca6bu) ^ (u32)now;
@@ -3272,7 +3335,6 @@ int proctab_carry_post(s32 tgid, const SigCarry *in, u32 *slot, u32 *nonce) {
     } while (!n || n == old);
     c->value = in->value;
     c->posted_ms = now;
-    c->nonce = n;
     c->tid = in->tid;
     c->hsig = in->hsig;
     c->signo = in->signo;
@@ -3281,7 +3343,8 @@ int proctab_carry_post(s32 tgid, const SigCarry *in, u32 *slot, u32 *nonce) {
     c->pid = in->pid;
     c->uid = in->uid;
     c->jc = in->jc;
-    __atomic_store_n(&c->state, 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&c->idle_word, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&c->word, n << 2 | 2, __ATOMIC_RELEASE);
     *slot = (u32)(c - e->carry);
     *nonce = n;
     return 0;
@@ -3290,35 +3353,29 @@ int proctab_carry_post(s32 tgid, const SigCarry *in, u32 *slot, u32 *nonce) {
 void proctab_carry_cancel(s32 tgid, u32 slot, u32 nonce) {
     struct ProcEnt *e = resolve_entry(tgid);
     if (!e || slot >= PROCTAB_CARRY) return;
-    SigCarry *c = &e->carry[slot];
-    u32 two = 2;
-    if (c->nonce == nonce)
-        __atomic_compare_exchange_n(&c->state, &two, 0, false,
-                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    u32 w = nonce << 2 | 2;
+    __atomic_compare_exchange_n(&e->carry[slot].word, &w, nonce << 2, false,
+                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
 }
 
-/* Async-signal-safe: the capture handler takes its slots. Looked at before it
- * is claimed, so a token that names nothing of ours -- a guest's own SI_QUEUE
- * of that shape -- leaves a slot that is posted for a real signal alone; and
- * looked at again after, for a slot reclaimed and posted anew between. */
+/* Async-signal-safe: the capture handler takes its slots. A token that names
+ * nothing of ours -- a guest's own SI_QUEUE of that shape -- leaves a slot
+ * posted for a real signal alone: its nonce, host number and kind must all
+ * be the post's, and the CAS on the whole word takes that post or nothing. */
 int proctab_carry_take(u32 slot, u32 nonce, int hsig, int jc, SigCarry *out) {
     if (slot >= PROCTAB_CARRY) return 0;
     struct ProcEnt *e = own_entry();
     if (!e) return 0;
     SigCarry *c = &e->carry[slot];
-    if (__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) != 2 || c->nonce != nonce ||
-        c->hsig != hsig || (jc >= 0 && (c->jc != 0) != jc))
+    u32 w = nonce << 2 | 2;
+    if (__atomic_load_n(&c->word, __ATOMIC_ACQUIRE) != w || c->hsig != hsig ||
+        (jc >= 0 && (c->jc != 0) != jc))
         return 0;
-    u32 two = 2;
-    if (!__atomic_compare_exchange_n(&c->state, &two, 3, false,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    if (!__atomic_compare_exchange_n(&c->word, &w, nonce << 2 | 3, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
         return 0;
-    if (c->nonce != nonce || c->hsig != hsig) {
-        __atomic_store_n(&c->state, 2, __ATOMIC_RELEASE);
-        return 0;
-    }
     *out = *c;
-    __atomic_store_n(&c->state, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&c->word, nonce << 2, __ATOMIC_RELEASE);
     return 1;
 }
 

@@ -206,7 +206,9 @@ socket calls, `openat` of a FIFO, `wait4`/`waitid`, `ioctl`, `fcntl`'s
 `FUTEX_WAIT`) and the SysV IPC waits are `EINTR` to a handler whatever the
 flag; and a socket with a timeout of its own (`SO_RCVTIMEO` on the receive
 side, `SO_SNDTIMEO` on the send side — `read`/`write` on a socket included)
-answers `EINTR` and is never restarted, which is `sock_intr_errno`. The PI
+answers `EINTR` and is never restarted, which is `sock_intr_errno`. (The
+timeout is read into a zeroed struct: qemu-user answers the option without
+writing it, and what the host leaves unwritten counts as no timeout.) The PI
 futex ops are `ERESTARTNOINTR`, restarted whatever the flags; the host kernel
 does that one itself, before the emulator ever sees an `EINTR`. The list used
 to be sixteen syscall numbers with no rule at all: `accept4`, `flock`,
@@ -714,13 +716,27 @@ receiver — `pendsig_from_host`, the kick net, a `signalfd` read — trades the
 token back for the siginfo it stands for, and a token that names nothing
 posted (a guest's own `SI_QUEUE` of that shape) is left as it came. A slot
 goes free → being filled → posted (`0 → 1 → 2`, the sender) and posted →
-being taken → free (`2 → 3 → 0`, the receiver), and the inbox is cleared for
-every new process in the entry (an `execve` keeps it, as the kernel keeps what
-is pending across one). The host may never deliver a posted slot — a standard
-signal coalesces with one already pending, an ignored one is dropped — so a
-sender that finds the inbox full reclaims a slot posted more than two seconds
-ago whose host number is no longer pending where it was sent (`ShdPnd`, or the
-thread's `SigPnd`). The remaining job-control carriers go as `SI_QUEUE` with a
+being taken → free (`2 → 3 → 0`, the receiver); the state shares one word
+with the post's nonce, so every compare-and-swap names the post it means and
+none can take one posted in the slot since it looked. The inbox is cleared
+for every new process in the entry (an `execve` keeps it, as the kernel keeps
+what is pending across one). The host may never deliver a posted slot — a
+standard signal coalesces with one already pending, an ignored one is dropped
+— so a sender that finds the inbox full reclaims a slot posted more than two
+seconds ago whose host number it has seen no longer pending where it was sent
+(`ShdPnd`, or the thread's `SigPnd`) twice, 100 ms apart, with the same post
+in the slot both times: "not pending" is also what a signal is between the
+host dequeuing it and its receiver taking the slot. Each status file is read
+once per send, however many of its slots are looked at. /proc is trusted only
+where it numbers a signal as the process does, which the same startup probe
+asks (`sig_procpnd_trusted`: a standard and a real-time signal queued to
+ourselves, blocked, and looked for): qemu-user shows the host kernel's
+numbers, and shifts its real-time signals past the ones it keeps — the
+process under it queues 34 and /proc shows 37 — so there a real-time slot is
+reclaimed only when its receiver is gone. A sender that finds no slot at all
+sends what the host can carry, as for a receiver with no inbox, so what the
+host loses returns past 64 undelivered posts
+(`tests/fixtures/carrystale.c`). The remaining job-control carriers go as `SI_QUEUE` with a
 tagged descriptor of the signal, its kind and its sender's code in `si_value`
 (`sig_jc_desc`), which loses nothing for a `kill`'s or a `tgkill`'s. A
 receiver with no registry entry is sent what the host can carry, and loses
@@ -728,7 +744,7 @@ what it lost before: the payload of a sigqueue'd job-control signal, the
 thread of a thread-directed one, and `si_errno`, which is qemu's own doing.
 `A64_SICODE_FORCE_KNOWN` forces the tier; the suite runs the stopping ptrace
 tests over it (`(known-layout-tier)`), with `tests/ptrace/jcqueue.c`'s queued
-job-control signals, and `tests/fixtures/sqiread.c`.
+job-control signals, `tests/fixtures/sqiread.c` and `carrystale.c`.
 
 The held-out numbers are not handed back while the thread lives — the host
 would deliver them straight to it again — only when it exits, having blocked

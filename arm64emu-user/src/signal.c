@@ -1193,9 +1193,67 @@ static int sig_probe_nocld(void) {
     return ok;
 }
 
+/* Where /proc's pending sets put a signal, on that tier: the inbox's stale
+ * reclaim (proctab.c, carry_pending) reads another process's SigPnd/ShdPnd
+ * to tell an undelivered post from a pending one. qemu-user shows there the
+ * host kernel's own numbers, and hands its real-time signals out shifted
+ * past the ones it keeps for itself -- the process under it queues 34 and
+ * /proc shows 37 -- so a real-time signal would read as never pending, and
+ * its slot be taken back while it waits. Asked once, beside the probe above:
+ * one standard and one real-time signal queued to ourselves, blocked, and
+ * /proc asked where it sees them. A range it does not show at its own bit
+ * is never reclaimed from (only a slot whose receiver is gone is). Bit 0:
+ * the standard numbers, bit 1: the real-time ones. */
+static int g_sig_pnd_trust = 3;
+static u64 host_shared_pending(void);
+
+int sig_procpnd_trusted(int hs) {
+    return hs < 32 ? (g_sig_pnd_trust & 1) : (g_sig_pnd_trust & 2) != 0;
+}
+
+static int sig_probe_procpnd(void) {
+    int nr[2] = { SIGUSR2, g_sig_kicksig };
+    struct sigaction ign, old[2];
+    memset(&ign, 0, sizeof ign);
+    ign.sa_handler = SIG_IGN;   /* nothing left over can ever act */
+    if (sigaction(nr[0], &ign, &old[0]) != 0) return 0;
+    if (sigaction(nr[1], &ign, &old[1]) != 0) {
+        sigaction(nr[0], &old[0], NULL);
+        return 0;
+    }
+    sigset_t both, prev;
+    sigemptyset(&both);
+    sigaddset(&both, nr[0]);
+    sigaddset(&both, nr[1]);
+    sigprocmask(SIG_BLOCK, &both, &prev);   /* blocked: queued, ignored or not */
+    int queued = 0;
+    for (int i = 0; i < 2; i++) {
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        si.si_signo = nr[i];
+        si.si_code = SI_QUEUE;
+        si.si_pid = getpid();
+        si.si_uid = getuid();
+        if (syscall(SYS_rt_sigqueueinfo, (pid_t)getpid(), nr[i], &si) == 0)
+            queued |= 1 << i;
+    }
+    u64 set = host_shared_pending();
+    int trust = 0;
+    for (int i = 0; i < 2; i++)
+        if ((queued >> i & 1) && (set >> (nr[i] - 1) & 1)) trust |= 1 << i;
+    struct timespec zero = { 0, 0 };
+    siginfo_t got;
+    while (syscall(SYS_rt_sigtimedwait, &both, &got, &zero, (size_t)8) > 0) ;
+    sigprocmask(SIG_SETMASK, &prev, NULL);
+    sigaction(nr[1], &old[1], NULL);
+    sigaction(nr[0], &old[0], NULL);
+    return trust;
+}
+
 static void sig_probe_host(void) {
     g_sig_sicode_ok = sig_probe_sicode();
     g_sig_nocld_ok = sig_probe_nocld();
+    if (!g_sig_sicode_ok) g_sig_pnd_trust = sig_probe_procpnd();
 }
 
 /* ---- group stop ----------------------------------------------------------
@@ -2543,7 +2601,14 @@ static void wr32(u8 *fr, u64 off, u32 v) { memcpy(fr + off, &v, 4); }
 /* Does the socket behind `fd` have a timeout of its own in this direction?
  * Not a socket, or no timeout: 0. */
 static int sock_timeo_set(int fd, int opt) {
+    /* Zeroed first: qemu-user answers this option without writing a byte
+     * (sys_net.c, getsockopt), and the timeout judged was then whatever an
+     * earlier call left in this frame -- accept4 and connect under an
+     * SA_RESTART handler came back EINTR or restarted by the stack's
+     * history (tests/fixtures/sarestart.c). What the host did not write
+     * reads as no timeout. */
     struct timeval tv;
+    memset(&tv, 0, sizeof tv);
     socklen_t len = sizeof tv;
     if (getsockopt(fd, SOL_SOCKET, opt, &tv, &len) != 0) return 0;
     return tv.tv_sec != 0 || tv.tv_usec != 0;
