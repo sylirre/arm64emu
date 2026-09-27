@@ -382,10 +382,11 @@ static void help(void) {
         {"A64_SICODE_FORCE_KNOWN", "Send the emulator's own signals between "
                         "processes with si_codes of a layout the kernel knows "
                         "only (the tier a host that cannot carry a private "
-                        "si_code, qemu-user, is served by): a job-control "
-                        "signal to a traced process then loses a sigqueue "
-                        "payload, and a thread-directed one is taken for the "
-                        "process's."},
+                        "si_code, qemu-user, is served by): a queued siginfo "
+                        "the host would not carry whole goes through the "
+                        "receiver's registry inbox instead, and a job-control "
+                        "signal to a traced process rides the kick as "
+                        "SI_QUEUE."},
         {"A64_NOCLDWAIT_FORCE_EMULATE", "Reap an SA_NOCLDWAIT parent's "
                         "children and drop an SA_NOCLDSTOP parent's stop "
                         "notices in the emulator instead of leaving it to the "

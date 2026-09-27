@@ -693,19 +693,43 @@ So the host is asked once, at startup, before the first handler, thread or
 fork (`sig_probe_host`): a signal queued to the process itself with such a
 code, an `si_errno` and a payload, taken straight back. One that does not
 come back as it went puts the process — and every process of the session,
-which inherits the answer — on the **known-layout tier**: the job-control
-carrier goes as `SI_QUEUE` with a tagged descriptor of the signal, its kind
-and its sender's code in `si_value` (`sig_jc_desc`), and a thread-directed
-signal goes unmarked. What that tier cannot give is what the host leaves no
-room for: a job-control signal sent to a traced process with `sigqueue` loses
-its payload there, a thread-directed one is taken for the process's (so it
-may go to a sibling when its thread blocks it), and `si_errno` is gone for
-every signal, which is qemu's own doing. A host that refuses the probe's
-calls outright — a seccomp filter's `ENOSYS` — cannot be told apart and keeps
-the full encoding. `A64_SICODE_FORCE_KNOWN` forces the tier; the suite runs
-the stopping ptrace tests over it (`(known-layout-tier)`), and a fixture that
-needs a queued siginfo delivered as it was sent says so with the
-`sigqueue-siginfo` probe (`tests/hostenv.sh`), which skips it under qemu-user.
+which inherits the answer — on the **known-layout tier**, where nothing the
+emulator sends between processes relies on more than the kernel's own
+layouts. A host that refuses the probe's calls outright — a seccomp filter's
+`ENOSYS` — cannot be told apart and keeps the full encoding, which such a
+host could not carry any other way either.
+
+On that tier a queued siginfo the host would not hand on whole — a
+thread-directed one (`rt_tgsigqueueinfo`, whose mark has no code to ride), one
+with an `si_errno` or a code of its own, a job-control signal to a traced
+process sent with a payload — goes through the **receiver's inbox** instead
+(`sig_carry_send`). Every registry entry (`proctab.c`, `ProcEnt.carry`) holds
+64 slots; the sender posts the whole siginfo — the guest signal, the host
+number it rides, the thread it is aimed at, code, `si_errno`, pid, uid and the
+guest's full 64-bit value — into a slot of the receiver's entry, and the host
+signal is only an `SI_QUEUE` whose value names it: a tag byte, the slot and an
+18-bit nonce in the low 32 bits, and `"CARY"` in the high half on an LP64
+host. qemu passes an `SI_QUEUE`'s pid, uid and 32-bit value on intact. Every
+receiver — `pendsig_from_host`, the kick net, a `signalfd` read — trades the
+token back for the siginfo it stands for, and a token that names nothing
+posted (a guest's own `SI_QUEUE` of that shape) is left as it came. A slot
+goes free → being filled → posted (`0 → 1 → 2`, the sender) and posted →
+being taken → free (`2 → 3 → 0`, the receiver), and the inbox is cleared for
+every new process in the entry (an `execve` keeps it, as the kernel keeps what
+is pending across one). The host may never deliver a posted slot — a standard
+signal coalesces with one already pending, an ignored one is dropped — so a
+sender that finds the inbox full reclaims a slot posted more than two seconds
+ago whose host number is no longer pending where it was sent (`ShdPnd`, or the
+thread's `SigPnd`). The remaining job-control carriers go as `SI_QUEUE` with a
+tagged descriptor of the signal, its kind and its sender's code in `si_value`
+(`sig_jc_desc`), which loses nothing for a `kill`'s or a `tgkill`'s. A
+receiver with no registry entry is sent what the host can carry, and loses
+what it lost before: the payload of a sigqueue'd job-control signal, the
+thread of a thread-directed one, and `si_errno`, which is qemu's own doing.
+`A64_SICODE_FORCE_KNOWN` forces the tier; the suite runs the stopping ptrace
+tests over it (`(known-layout-tier)`), with `tests/ptrace/jcqueue.c`'s queued
+job-control signals, and `tests/fixtures/sqiread.c`.
+
 The held-out numbers are not handed back while the thread lives — the host
 would deliver them straight to it again — only when it exits, having blocked
 everything first. An exiting thread also no longer opens the pending-signal

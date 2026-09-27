@@ -19,9 +19,9 @@
  * instances of a real-time signal, which must reach the main thread in the
  * order they were sent, payloads and all.
  *
- * The pthread_sigqueue row is sigretarget_tq.c's, built from this file with
- * SIGRETARGET_TQ: it needs a host that carries the emulator's mark of a
- * thread-directed SI_QUEUE, which qemu-user (the ARM32 tier's) does not. */
+ * The pthread_sigqueue row needs the emulator's mark of a thread-directed
+ * SI_QUEUE to reach the receiver: in its si_code, or on qemu-user through the
+ * receiver's inbox (signal.c, sig_carry_send). */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <signal.h>
@@ -164,16 +164,13 @@ static void one(const char *label, int handler_mode, int sig2, int to_thread) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifdef SIGRETARGET_TQ
-    one("exit, thread-directed sigqueue", 0, SIGUSR2, 2);
-#else
     one("exit, process-directed", 0, SIGUSR2, 0);
     one("wait, process-directed", 1, SIGUSR2, 0);
     one("exit, thread-directed", 0, SIGUSR2, 1);
+    one("exit, thread-directed sigqueue", 0, SIGUSR2, 2);
     one("exit, SIGCHLD", 0, SIGCHLD, 0);
     one("wait, SIGCHLD", 1, SIGCHLD, 0);
     one("wait, rt x3", 1, SIGRTMIN + 1, 0);
-#endif
     printf("done\n");
     return 0;
 }

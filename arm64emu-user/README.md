@@ -393,8 +393,9 @@ src/
                 the id maps of a faked user namespace, so a parent can write
                 its child's, each process's seccomp state, which its status is
                 read for, the host tasks in its thread group that are not
-                guest threads, which the guest must not be shown, and its
-                threads' personalities)
+                guest threads, which the guest must not be shown, its
+                threads' personalities, and a siginfo inbox for a host that
+                cannot carry a queued siginfo whole)
                 + unified IPC broker: portable System V IPC
                 — memfd-backed shared memory, semaphores (blocking semop,
                 SEM_UNDO), message queues — and any thread personality that

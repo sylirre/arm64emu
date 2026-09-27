@@ -869,7 +869,9 @@ static int g_sig_nocld_ok = 1;    /* SA_NOCLDWAIT reaps and SA_NOCLDSTOP
 
 int sig_thread_code(int code) {
     /* Not on a host that cannot carry the mark (sig_probe_host): there the
-     * signal goes as the sender gave it, and is taken for the process's. */
+     * signal goes through the receiver's inbox, whose slot names the thread
+     * (sig_carry_send) -- or, with no inbox, as the sender gave it, taken
+     * for the process's. */
     if (!g_sig_sicode_ok) return code;
     return (code < 0 && code >= -SIG_THR_SPAN) ? code - SIG_THR_BIAS : code;
 }
@@ -878,6 +880,123 @@ int sig_thread_uncode(int *code) {
     if (*code > -(SIG_THR_BIAS + 1) || *code < -(SIG_THR_BIAS + SIG_THR_SPAN))
         return 0;
     *code += SIG_THR_BIAS;
+    return 1;
+}
+
+/* ---- the siginfo carrier ------------------------------------------------
+ *
+ * What the known-layout host (sig_probe_host) cannot carry from one process
+ * to another -- a private si_code, an si_errno, a payload wider than its own
+ * sigval -- it can carry as an SI_QUEUE, whose pid, uid and 32-bit value
+ * every host passes on intact. So the siginfo goes in the receiver's inbox,
+ * its registry entry (proctab.c, proctab_carry_post), and the host signal is
+ * an SI_QUEUE whose value names the slot: a tag byte, the slot and a nonce in
+ * the low 32 bits, and SIG_CARRY_HI in the high half on an LP64 host. Every
+ * receiver -- pendsig_from_host, the kick net, a signalfd read -- trades the
+ * token back for the siginfo it stands for. Used only on that tier, and only
+ * when the host would not hand the siginfo on as it is; a receiver with no
+ * registry entry is sent what the host can carry, as before. Three things
+ * come through that way that did not: a thread-directed rt_tgsigqueueinfo
+ * (the slot names the thread), the si_errno and code of every queued
+ * siginfo, and the payload of a sigqueue'd job-control signal to a traced
+ * process. */
+#define SIG_CARRY_TAG 0xc5u        /* the token's top byte */
+#define SIG_CARRY_HI  0x43415259u  /* "CARY": the high half of a 64-bit sigval */
+
+static int sig_carry_untoken(const siginfo_t *si, u32 *slot, u32 *nonce) {
+    if (si->si_code != SI_QUEUE) return 0;
+    uintptr_t v = (uintptr_t)si->si_value.sival_ptr;
+#if UINTPTR_MAX > 0xffffffffu
+    if ((u32)((u64)v >> 32) != SIG_CARRY_HI) return 0;
+#endif
+    u32 t = (u32)v;
+    if (t >> 24 != SIG_CARRY_TAG) return 0;
+    *slot = t & (PROCTAB_CARRY - 1);
+    *nonce = t >> 6 & 0x3ffffu;
+    return 1;
+}
+
+/* A host siginfo that names a slot of our inbox, as the PendSig it carried:
+ * the fields the host would have handed on, had it carried the guest's
+ * siginfo whole -- si_addr the sender's pid and uid words, si_status the low
+ * half of its value, as the guest's own 128 bytes overlay them. `jc` as for
+ * proctab_carry_take. Async-signal-safe. */
+static int sig_carry_claim(int hs, const siginfo_t *si, int jc, PendSig *p) {
+    u32 slot, nonce;
+    SigCarry c;
+    if (!sig_carry_untoken(si, &slot, &nonce) ||
+        !proctab_carry_take(slot, nonce, hs, jc, &c))
+        return 0;
+    p->signo = c.signo;
+    p->code = c.code;
+    p->err = c.err;
+    p->pid = c.pid;
+    p->uid = (int)c.uid;
+    p->status = (int)c.value;
+    p->addr = (u64)(u32)c.pid | (u64)c.uid << 32;
+    p->value = c.value;
+    p->thr = c.tid != 0 || c.code == SI_TKILL;
+    p->ptraced = 0;
+    p->gen = 0;
+    return 1;
+}
+
+/* Send guest signal `gsig`, on host number `hs`, to `tgid` -- through `pidfd`
+ * if it is one (>= 0), or to its thread `tid` when nonzero -- with the siginfo
+ * the other arguments say, through the receiver's inbox (`jc`: as a
+ * job-control carrier, sig_send_jc). Only on the known-layout tier, and only
+ * when the host would not carry it as it is: anything but a plain SI_QUEUE
+ * with no si_errno and a value the host's sigval holds, to the process. 1 when
+ * it went that way (*ret the send's 0 or -errno), 0 when the caller is to send
+ * what the host can carry. */
+int sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
+                   int code, s32 err, s32 pid, u32 uid, u64 value, s64 *ret) {
+    if (g_sig_sicode_ok || hs <= 0) return 0;   /* a null signal carries nothing */
+    if (!jc && !tid && code == SI_QUEUE && !err && (u64)(uintptr_t)value == value)
+        return 0;
+    SigCarry c;
+    memset(&c, 0, sizeof c);
+    c.value = (s64)value;
+    c.tid = tid;
+    c.hsig = hs;
+    c.signo = gsig;
+    c.code = code;
+    c.err = err;
+    c.pid = pid;
+    c.uid = uid;
+    c.jc = jc;
+    u32 slot, nonce;
+    if (proctab_carry_post(tgid, &c, &slot, &nonce) < 0) return 0;
+    u32 tok = SIG_CARRY_TAG << 24 | nonce << 6 | slot;
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = hs;
+    si.si_code = SI_QUEUE;
+    si.si_pid = (pid_t)pid;   /* what a receiver that lost the slot shows */
+    si.si_uid = (uid_t)uid;
+#if UINTPTR_MAX > 0xffffffffu
+    si.si_value.sival_ptr = (void *)(uintptr_t)(((u64)SIG_CARRY_HI << 32) | tok);
+#else
+    si.si_value.sival_int = (int)tok;
+#endif
+    long r = -1;
+    errno = ENOSYS;
+#ifdef SYS_pidfd_send_signal
+    if (pidfd >= 0) {   /* through the pidfd, as the guest sent it: no reuse */
+        sig_sigsys_expected(SYS_pidfd_send_signal);
+        r = syscall(SYS_pidfd_send_signal, pidfd, hs, &si, 0);
+    }
+#endif
+    if (r < 0 && errno == ENOSYS)
+        r = tid ? syscall(SYS_rt_tgsigqueueinfo, (pid_t)tgid, (pid_t)tid, hs, &si)
+                : syscall(SYS_rt_sigqueueinfo, (pid_t)tgid, hs, &si);
+    if (r < 0) {
+        int e = errno;
+        proctab_carry_cancel(tgid, slot, nonce);
+        *ret = -e;
+    } else {
+        *ret = 0;
+    }
     return 1;
 }
 
@@ -913,9 +1032,10 @@ static int sig_jc_uncode(int *code, int *sig, int *thr) {
 /* ...and on a host that cannot carry a private si_code (sig_probe_host),
  * the same as SI_QUEUE -- the one kind every host passes along -- with what
  * the code carried packed into si_value instead: a tag, the signal, the kind
- * and the sender's code. The payload of a sigqueue'd one is lost there, the
- * one thing that host leaves no room for (it zeroes si_errno besides, for
- * every signal it hands on). Only a process on such a host sends one, and
+ * and the sender's code. The descriptor leaves no room for a sigqueue'd
+ * one's payload, nor for the si_errno that host zeroes, so such a one goes
+ * through the receiver's inbox instead (sig_carry_send); the descriptor is
+ * for the rest, and for a receiver with no inbox. Only a process on such a host sends one, and
  * only there is one looked for: anywhere else, a guest's own SI_QUEUE of the
  * kick's number with such a value is its own. */
 #define SIG_JC_TAG 0x4a43u   /* 'JC' */
@@ -942,6 +1062,11 @@ s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 ui
     for (int i = 0; i < 5; i++) if (sig_jc_nr[i] == sig) idx = i;
     if (idx < 0) return -EINVAL;
     if (code > 0) code = 0;
+    s64 cr;
+    if ((err || value || code < -SIG_JC_SPAN) &&
+        sig_carry_send(tgid, tid, pidfd, PTRACE_KICKSIG, sig, 1, code, err, pid, uid,
+                       value, &cr))
+        return cr;
     if (code < -SIG_JC_SPAN) code = -SIG_JC_SPAN;   /* no sender uses one */
     siginfo_t si;
     memset(&si, 0, sizeof si);
@@ -987,9 +1112,11 @@ s64 sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 ui
  * So the host is asked, once: a signal queued to ourselves with such a code,
  * an si_errno and a payload, taken straight back with sigtimedwait. One that
  * does not come back as it went -- refused, or changed -- puts the process on
- * the known-layout tier: the job-control carrier goes as SI_QUEUE with a
- * descriptor in si_value (sig_jc_desc), and a thread-directed signal goes
- * unmarked, taken for the process's. A host that refuses the probe's calls
+ * the known-layout tier: a queued siginfo the host would not hand on whole --
+ * thread-directed, with an si_errno or a code of its own, a job-control
+ * carrier with a payload -- goes through the receiver's inbox
+ * (sig_carry_send), and the rest of the job-control carriers as SI_QUEUE
+ * with a descriptor in si_value (sig_jc_desc). A host that refuses the probe's calls
  * outright (a seccomp filter's ENOSYS) cannot be told apart and keeps the
  * full encoding, which such a host could not carry any other way either.
  * A64_SICODE_FORCE_KNOWN selects the tier anywhere.
@@ -1172,6 +1299,10 @@ void sig_jc_untraced(struct Machine *m) {
 static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
     if (rq_claim(sig, si, p)) {   /* one this process handed back */
         p->ptraced = 0;           /* ...arriving anew: no stop is behind it */
+        return;
+    }
+    if (sig_carry_claim(sig, si, -1, p)) {   /* one our inbox holds the siginfo of */
+        jc_stamp(p);
         return;
     }
     p->ptraced = 0;   /* nor behind one that just arrived (host_catcher's
@@ -1649,6 +1780,14 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
         if (g_sig_in_syscall) sig_kick_timer_arm();
         return;
     }
+    PendSig cp;
+    if (sig_carry_claim(sig, si, 1, &cp)) {
+        /* A guest's job-control signal whose siginfo our inbox holds
+         * (sig_send_jc, sig_carry_send): as below, all of it. */
+        jc_stamp(&cp);
+        sig_capture_push(&cp, uctx);
+        return;
+    }
     int code = si->si_code, jsig, thr;
     int desc = sig_jc_undesc(si, &code, &jsig, &thr);
     if (desc || sig_jc_uncode(&code, &jsig, &thr)) {
@@ -1865,7 +2004,8 @@ static int rq_put(const PendSig *p) {
         tok = (nonce << RQ_IDX_BITS) | idx;
     } while (!nonce || tok == PT_KICK_MAGIC || tok == PT_WAKE_MAGIC ||
              tok == DETHREAD_MAGIC || tok == PT_STOPWAKE_MAGIC ||
-             tok >> 16 == SIG_JC_TAG);   /* a job-control descriptor's shape */
+             tok >> 16 == SIG_JC_TAG ||   /* a job-control descriptor's shape */
+             tok >> 24 == SIG_CARRY_TAG);   /* ...or a carrier token's */
     slot->nonce = nonce;
     slot->p = *p;
     __atomic_store_n(&slot->state, 2, __ATOMIC_RELEASE);
@@ -1888,7 +2028,8 @@ static int rq_put(const PendSig *p) {
     return 0;
 }
 
-/* A signalfd record of a handed-back signal, as the signal it stands for:
+/* A signalfd record of a handed-back signal, or of one whose siginfo came
+ * through our inbox (sig_carry_send), as the signal it stands for:
  * the fields signalfd_copyinfo fills for that kind of siginfo. Called with
  * the record's host signal number still in ssi_signo. 1 = rewritten. */
 int sig_sfd_requeued(GSignalfdSiginfo *r) {
@@ -1899,7 +2040,9 @@ int sig_sfd_requeued(GSignalfdSiginfo *r) {
     si.si_pid = (pid_t)r->ssi_pid;
     si.si_value.sival_ptr = (void *)(uintptr_t)r->ssi_ptr;
     PendSig p;
-    if (!rq_claim((int)r->ssi_signo, &si, &p)) return 0;
+    if (!rq_claim((int)r->ssi_signo, &si, &p) &&
+        !sig_carry_claim((int)r->ssi_signo, &si, 0, &p))   /* our inbox's */
+        return 0;
     GSignalfdSiginfo n;
     memset(&n, 0, sizeof n);
     n.ssi_signo = (u32)p.signo;

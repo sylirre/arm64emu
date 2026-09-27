@@ -722,7 +722,8 @@ void sig_sigsys_expected(int host_nr);
  * (SIGEV_THREAD_ID). Async-signal-safe (plain loads); 1 = live slot. */
 int  ptimer_siginfo(s32 slot, u64 *val, int *thread);
 /* signal.c: a signalfd record of a signal a thread handed back to the process
- * (sig_retarget), rewritten as the signal it stands for. Called before the
+ * (sig_retarget), or one whose siginfo came through this process's inbox
+ * (sig_carry_send), rewritten as the signal it stands for. Called before the
  * record's signal number is translated; 1 = rewritten, guest number and all. */
 int  sig_sfd_requeued(GSignalfdSiginfo *r);
 /* Synchronous fault: deliver to the guest handler or die with host default. */
@@ -748,6 +749,13 @@ void sig_after_trap(CPU *c);
  * signal, in the order sent, never on its own number. 0 or -errno. */
 s64  sig_send_jc(s32 tgid, s32 tid, int pidfd, int sig, int code, s32 pid, u32 uid,
                  s32 err, u64 value);
+/* On a host that cannot carry a siginfo between processes as it was given
+ * (signal.c, "the siginfo carrier"): send guest signal `gsig` on host number
+ * `hs` with that siginfo through the receiver's registry inbox, when the host
+ * would lose some of it. 1 = sent that way (*ret 0 or -errno), 0 = the caller
+ * sends it itself. */
+int  sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
+                    int code, s32 err, s32 pid, u32 uid, u64 value, s64 *ret);
 /* The group stop (signal.c, "group stop"): an untraced thread's part in one
  * (parked until SIGCONT), and its hand-over to the host when the last traced
  * thread is gone. */
@@ -1453,6 +1461,36 @@ int  proctab_pers_get(struct Machine *m, s32 pid, s32 tid, u32 *out);
  * sees of this one, and it cannot reach its Machine. Only the owner writes. */
 void proctab_foreign_publish(const s32 *tids, int n);
 int  proctab_foreign_tasks(s32 pid, s32 *out, int max);     /* count written */
+
+/* The siginfo inbox of every registered process, for a host that cannot
+ * carry a siginfo from one process to another as it was given (signal.c,
+ * "the siginfo carrier"): the sender posts the siginfo into the receiver's
+ * entry and sends only an SI_QUEUE naming the slot, which every host passes
+ * on; the receiver takes the slot back when the signal comes off its queue.
+ *   proctab_carry_post    claim a slot of `tgid`'s inbox and fill it; 0 and
+ *                         the slot and nonce to name, or -1 (no entry, a full
+ *                         inbox: the caller sends what the host can carry)
+ *   proctab_carry_cancel  the send failed: give the slot back
+ *   proctab_carry_take    the slot one of our signals names, if it is still
+ *                         posted with that nonce, for that host number and of
+ *                         that kind (`jc`: 1 a job-control carrier only, 0 any
+ *                         other, -1 either); 1 = taken. Async-signal-safe. */
+#define PROCTAB_CARRY 64          /* per-entry inbox slots: the token's low 6 bits */
+typedef struct {
+    s64 value;                    /* the sender's sigval, the guest's full width */
+    s64 posted_ms;                /* CLOCK_MONOTONIC at the post (stale guard) */
+    u32 state;                    /* 0 free, 1 being filled, 2 posted, 3 taking */
+    u32 nonce;
+    s32 tid;                      /* aimed at this thread; 0 = the process */
+    s32 hsig;                     /* the host number it was sent on */
+    s32 signo;                    /* the guest number it stands for */
+    s32 code, err, pid;           /* the sender's siginfo */
+    u32 uid;
+    s32 jc;                       /* a job-control carrier (sig_send_jc) */
+} SigCarry;
+int  proctab_carry_post(s32 tgid, const SigCarry *in, u32 *slot, u32 *nonce);
+void proctab_carry_cancel(s32 tgid, u32 slot, u32 nonce);
+int  proctab_carry_take(u32 slot, u32 nonce, int hsig, int jc, SigCarry *out);
 
 /* proctab.c: System V shared-memory broker (client side). The unified IPC
  * daemon (an extension of the proctab broker) is the authoritative registry:

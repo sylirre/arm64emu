@@ -7,9 +7,10 @@
  *
  * Self-checking (the expected block in run_tests.sh is the native kernel's):
  * qemu-user locks the full 128 bytes and copies only the fields it knows, so
- * it answers neither the boundary nor E2BIG, and drops si_errno -- and under
- * it, the emulator's own queueing does the same (the ARM32 tier's host):
- * NEEDS-HOST-SYSCALL: sigqueue-siginfo */
+ * it answers neither the boundary nor E2BIG, and drops si_errno -- but under
+ * it (the ARM32 tier's host) the emulator sends such a siginfo through the
+ * receiver's inbox instead (signal.c, sig_carry_send), so the answers are
+ * the kernel's on that tier too. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
