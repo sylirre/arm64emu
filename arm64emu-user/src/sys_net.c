@@ -1425,6 +1425,19 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
     if (zc && mi->x.stage && !mi->x.guarded) return -ENOBUFS;
     h->msg_iov = mi->x.iov;
     h->msg_iovlen = (size_t)mi->x.n;
+    /* An empty vector goes to the host as one empty segment. The kernel
+     * cannot tell the two apart -- either imports to an iov_iter of no
+     * bytes, and nothing on the socket path looks at the segment count --
+     * but an interposer can: qemu-user translates the payload of a netlink
+     * socket through msg_iov[0] without checking there is one, so the
+     * ILP32 build under qemu-arm took a NULL dereference inside qemu for
+     * a guest's sendmsg of no segments (tests/fixtures/netns_ack.c). */
+    if (!h->msg_iovlen) {
+        mi->iov[0].iov_base = NULL;
+        mi->iov[0].iov_len = 0;
+        h->msg_iov = mi->iov;
+        h->msg_iovlen = 1;
+    }
     h->msg_flags = g->msg_flags;
     return 0;
 }

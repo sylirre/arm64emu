@@ -22,7 +22,11 @@
  * Rows: a buffer with room for one of three descriptors; one with room for
  * the header alone; a SCM_CREDENTIALS element ahead of the rights (SO_PASSCRED)
  * that leaves the rights element no room at all, and one that leaves it less
- * than a header; and a buffer with room for everything, as the control. */
+ * than a header; and a buffer with room for everything, as the control.
+ *
+ * The emulator receives through its own host, and the descriptors qemu-arm
+ * leaves open never reach it, so its ILP32 build cannot run this there.
+ * NEEDS-HOST-SYSCALL: scm-trunc */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

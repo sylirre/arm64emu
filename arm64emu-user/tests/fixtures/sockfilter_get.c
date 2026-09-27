@@ -13,7 +13,11 @@
  * 600 is deliberately on the far side of that.
  *
  * A socketpair is used rather than a UDP socket so the test needs no network
- * of any kind, and its second end doubles as the "no filter attached" case. */
+ * of any kind, and its second end doubles as the "no filter attached" case.
+ *
+ * The emulator reads the program back through its own host, so the ILP32
+ * build under qemu-arm cannot run this either.
+ * NEEDS-HOST-SYSCALL: sockopt-getfilter */
 #include <errno.h>
 #include <linux/filter.h>
 #include <stdio.h>

@@ -18,7 +18,13 @@
  * Prints one line per check so a failure names itself. Skips silently (with
  * the expected output) where the host hands out no netlink socket at all —
  * then the AF_UNIX fallback is in charge and synthesises its own acks, which
- * the af_unix tier of this same test covers. */
+ * the af_unix tier of this same test covers.
+ *
+ * The real tier hands a send the guest can back only in part to the host with
+ * the fault in place (split_send's bad tail), which qemu-user answers by
+ * sending the rest, so that tier -- only that one: the substitute judges the
+ * guest's memory itself -- cannot run under qemu-arm.
+ * NEEDS-HOST-SYSCALL: iov-fault */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* unshare(2), CLONE_NEWNET */
 #endif

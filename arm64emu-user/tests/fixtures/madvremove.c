@@ -10,7 +10,9 @@
  * of it and do nothing. Self-checking: qemu-user passes neither advice
  * through (0 for everything); the expected block is what this program prints
  * built for the host and run on a real kernel. Every observation is made
- * after the call it observes, in its own statement. */
+ * after the call it observes, in its own statement. The punching is the
+ * host's own MADV_REMOVE, so the ILP32 build under qemu-arm cannot run this.
+ * NEEDS-HOST-SYSCALL: madv-remove */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

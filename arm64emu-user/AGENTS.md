@@ -49,11 +49,15 @@ only a real armv7 device checks that the silicon agrees with what it emits.
 **Both tiers gate at zero failures in either engine** — the qemu-arm one used to
 be read against a ~44-failure baseline, but every one of those turned out to be
 an emulator bug rather than the tier's slowness (see docs/jit.md). The rows
-qemu-arm itself cannot run — it asserts on `mremap(old_size=0)` (two rows: the
+qemu-arm itself cannot run — it asserts on `mremap(old_size=0)` (the
 emulator's own use of it, and the guest's), writes nothing for
-`getsockopt(SO_RCVTIMEO)`, and ignores `waitid`'s rusage argument — carry a
-`NEEDS-HOST-SYSCALL:` marker (in a C test or a fixture alike) and skip there,
-naming what is missing; they run in full on real armv7 silicon.
+`getsockopt(SO_RCVTIMEO)`, ignores `waitid`'s rusage argument, drops an iovec
+segment it cannot lock, caps POSIX timers at 32, mistakes `SO_GET_FILTER` for
+an int option, refuses the subreaper/THP prctls, installs every SCM_RIGHTS
+descriptor into a short control buffer, and ignores `MADV_REMOVE` (the full
+list is in tests/hostenv.sh) — carry a `NEEDS-HOST-SYSCALL:` marker (in a C
+test or a fixture alike) and skip there, naming what is missing; they run in
+full on real armv7 silicon.
 
 ## Project structure
 

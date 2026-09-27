@@ -3720,15 +3720,24 @@ SYSDEF(prctl) {
         }
         case PR_SET_TIMING:
             return prctl(PR_SET_TIMING, (unsigned long)a1) < 0 ? host_err() : 0;
+        /* The speculation controls past the argument checks answer a state,
+         * or ENODEV for a misfeature the arm64 kernel does not know -- never
+         * EINVAL, which is what a host whose architecture has no controls at
+         * all answers (the generic arch_prctl_spec_ctrl_get/set: ARM32, and
+         * qemu-user for every host). That is the guest's ENODEV: nothing it
+         * could name is controllable here. */
         case PR_GET_SPECULATION_CTRL: {
             if (a2 || a3 || a4) return (u64)(s64)-EINVAL;
             long r = prctl(PR_GET_SPECULATION_CTRL, (unsigned long)a1, 0, 0, 0);
+            if (r < 0 && errno == EINVAL) return (u64)(s64)-ENODEV;
             return r < 0 ? host_err() : (u64)r;
         }
         case PR_SET_SPECULATION_CTRL:
             if (a3 || a4) return (u64)(s64)-EINVAL;
-            return prctl(PR_SET_SPECULATION_CTRL, (unsigned long)a1,
-                         (unsigned long)a2, 0, 0) < 0 ? host_err() : 0;
+            if (prctl(PR_SET_SPECULATION_CTRL, (unsigned long)a1,
+                      (unsigned long)a2, 0, 0) < 0)
+                return errno == EINVAL ? (u64)(s64)-ENODEV : host_err();
+            return 0;
         case PR_GET_SECUREBITS: {
             long r = prctl(PR_GET_SECUREBITS);
             return r < 0 ? host_err() : (u64)r;
@@ -4234,7 +4243,15 @@ SYSDEF(sched_setaffinity) {
     size_t len = glen > SCHED_MASK_MAX ? SCHED_MASK_MAX : (size_t)glen;
     u8 mask[SCHED_MASK_MAX];
     if (len && copy_from_guest(c, mask, a2, len) < 0) return (u64)(s64)-EFAULT;
-    long r = syscall(SYS_sched_setaffinity, (pid_t)(s32)a0, len, mask);
+    /* Handed to the host padded with zeroes to whole longs. The kernel
+     * clears the CPUs a short mask does not reach before it copies it in
+     * (get_user_cpu_mask), so the padding says what the guest said -- but
+     * qemu-user refuses a length that is not a multiple of its long with
+     * EINVAL, which made the ILP32 build under qemu-arm answer a guest's
+     * one-byte mask with an error a kernel never gives. */
+    size_t hlen = (len + sizeof(u64) - 1) & ~(sizeof(u64) - 1);
+    memset(mask + len, 0, hlen - len);
+    long r = syscall(SYS_sched_setaffinity, (pid_t)(s32)a0, hlen, mask);
     return r < 0 ? host_err() : 0;
 }
 

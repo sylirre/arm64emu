@@ -12,7 +12,9 @@
  * Self-checking: qemu-user answers EINVAL for several of these too; the
  * expected block is what this program prints built for the host and run on
  * a real kernel. Every step is its own statement: an argument list is
- * evaluated in an order the ABI decides. */
+ * evaluated in an order the ABI decides. The subreaper and THP state are the
+ * host task's, so the ILP32 build under qemu-arm cannot run this.
+ * NEEDS-HOST-SYSCALL: prctl-task */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/prctl.h>

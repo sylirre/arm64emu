@@ -717,21 +717,29 @@ rather than against an oracle.
 
 ### What the tier genuinely cannot check
 
-The 44 were all ours, and so were the three FP rows. Three others are not, and
-they are gated rather than chased, because the thing that fails is `qemu-arm`
-itself and no emulator change can route around it. Each is reproducible in a
-few lines that never touch the emulator:
+The 44 were all ours, and so were the three FP rows. The rows below are not,
+and they are gated rather than chased, because the thing that fails is
+`qemu-arm` itself and no emulator change can route around it. Each is
+reproducible in a few lines that never touch the emulator:
 
 | what | `qemu-arm` | a kernel |
 |---|---|---|
 | `mremap(old_size=0)` on a shareable mapping (`man 2 mremap`) | `page_set_flags: Assertion 'start <= last' failed`, SIGABRT | duplicates the mapping |
 | `getsockopt(SO_RCVTIMEO)` | reports `optlen=4`, writes nothing | returns the full `struct timeval` |
 | `waitid(2)`'s fifth rusage argument | ignored; the buffer comes back untouched | filled |
+| an iovec segment it cannot lock | dropped; the rest is transferred | faults where the memory stops |
+| `timer_create` past 32 live timers | `EAGAIN` (a fixed table) | bounded by `RLIMIT_SIGPENDING` |
+| `getsockopt(SO_GET_FILTER)` | an int option: four bytes, `EINVAL` past one instruction | the program, its length in instructions |
+| `PR_GET/SET_CHILD_SUBREAPER`, `PR_GET/SET_THP_DISABLE` | `EINVAL` | the task's state |
+| `SCM_RIGHTS` into a control buffer too small for them | installs every descriptor, no `MSG_CTRUNC` | installs what it can report, `MSG_CTRUNC` |
+| `madvise(MADV_REMOVE)` | 0, nothing punched | punches the hole |
 
 `tests/c/mremapsem.c`, `tests/fixtures/mremapdup.c` (the guest's own
 `mremap(old_size=0)`, which the emulator serves by duplicating the host
-mapping the same way), `tests/c/socktimeo.c` and `tests/ptrace/wait_rusage.c`
-declare what they need with a `NEEDS-HOST-SYSCALL:` marker, and `hostenv.sh`
+mapping the same way), `tests/fixtures/dontunmap.c` (whose shared rows are
+served the same way), `tests/c/socktimeo.c`, `tests/ptrace/wait_rusage.c`,
+`timers_many`, `sockfilter_get`, `prctlset`, `scmfit`, `madvremove` and the
+real-socket tier of `netns_ack` (its bad-tail send) declare what they need with a `NEEDS-HOST-SYSCALL:` marker, and `hostenv.sh`
 answers it by **building and running a probe the way the emulator itself was
 built** — same compiler, same ABI flags, so the same interpreter picks it up.
 The question is what the emulator's own process can do, not what this machine
@@ -750,3 +758,16 @@ a short struct handed the guest whatever was on the emulator's stack — the sam
 disclosure shape as the ioctl table's `memset`. A kernel never writes short
 here, so nothing on an ordinary host could show it; `qemu-arm` writes nothing
 at all, and the guest read back a `tv_usec` of 2^32. Fixed separately.
+
+So did three others that looked like `qemu-arm` rows and were not, or not
+only. A `sched_setaffinity` mask of one byte is what a kernel takes (it clears
+the CPUs a short mask does not reach) and what `qemu-arm` refuses unless it is
+a whole number of its longs, so the emulator now hands its host the mask
+zero-padded to whole longs, which says the same thing to a kernel. A
+`sendmsg` of no segments on a netlink socket crashed `qemu-arm` outright,
+since it translates the payload through `msg_iov[0]` without checking there is
+one; the emulator now passes an empty vector on as one empty segment, which a
+kernel cannot tell apart. And `PR_GET_SPECULATION_CTRL` is `EINVAL` from any
+host whose architecture has no speculation controls (real ARM32 as well as
+`qemu-arm`), where an arm64 kernel never answers that for valid arguments; the
+emulator now answers such a host's refusal with the arm64 kernel's `ENODEV`.

@@ -9,7 +9,9 @@
  * private file row is served with the host kernel's own MREMAP_DONTUNMAP,
  * which a host before 5.13 refuses for a file mapping; the emulator then
  * answers the guest as that host would, and the fixture cannot run there.
- * NEEDS-HOST-SYSCALL: mremap-dontunmap-file */
+ * The shared rows leave the old range mapped with a second host mapping of
+ * the same pages (mremap of old length 0), which qemu-user aborts on.
+ * NEEDS-HOST-SYSCALL: mremap-dontunmap-file mremap-dup */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

@@ -3164,7 +3164,19 @@ fi
 if "$AGCC" -static -O2 -o tests/fixtures/netns_ack.bin \
         tests/fixtures/netns_ack.c 2>/dev/null; then
     nl_common=$'empty=eagain\nself=own\npeer=kernel\nNO_NETNS\nunshare=1\nafter_netns=ack\nsrc=kernel\nquery=data\nwrdump=data\nready=ok\nframe=ok\nmmsg=data\nfault=efault\nsendfault=ok\naddrfault=ok\nzerolen=ok\nsplit=ok\nsplitack=ack\nwrack=ack\nwvack=ack\ndup=ok'
+    # The real tier's marker (the substitute's tier needs nothing of the
+    # host's, so it runs everywhere): as in check_fixture.
+    nl_lacks=
+    for ns in $(grep -m1 -o 'NEEDS-HOST-SYSCALL:[^*]*' tests/fixtures/netns_ack.c |
+                sed 's/^NEEDS-HOST-SYSCALL: *//'); do
+        a64_emu_syscall_ok "$ns" || nl_lacks="$nl_lacks $ns"
+    done
     for tier in real af_unix; do
+        if [ "$tier" = real ] && [ -n "$nl_lacks" ]; then
+            skip=$((skip+1))
+            echo "SKIP fixture: netns_ack (real) (the emulator's host cannot:$nl_lacks)"
+            continue
+        fi
         if [ "$tier" = af_unix ]; then
             # The substituted socket has no kernel behind it, so it acks every
             # non-dump request whether or not a namespace was faked.

@@ -13,7 +13,10 @@
  * Self-checking rather than qemu-diffed: qemu-user keeps a fixed table of 32
  * timers of its own and answers EAGAIN to the 33rd, so it cannot run this.
  * The expected block is what a real kernel prints (every create succeeds,
- * SI_TIMER is -2, a deleted id is EINVAL). */
+ * SI_TIMER is -2, a deleted id is EINVAL). A guest's timer is a host timer,
+ * so the emulator can hold no more of them than its own host can -- which
+ * under qemu-arm is the same 32.
+ * NEEDS-HOST-SYSCALL: timer-many */
 #include <errno.h>
 #include <signal.h>
 #include <stdint.h>

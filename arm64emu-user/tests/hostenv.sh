@@ -518,9 +518,9 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # A test can be blocked by what the environment the EMULATOR runs in can do,
 # which is not always the same thing as what this machine can do. The ARM32
 # build has no CI runner of its own, so it is exercised under qemu-user
-# (docs/jit.md), and qemu-user is an interposer with defects of its own. Seven
-# of them stop correct tests dead, each reproducible in a few lines that never
-# touch the emulator:
+# (docs/jit.md), and qemu-user is an interposer with defects of its own.
+# Twelve of them stop correct tests dead, each reproducible in a few lines that
+# never touch the emulator:
 #
 #   mremap-dup      mremap(old_size=0) on a shareable mapping duplicates it
 #                   (man 2 mremap). qemu-user aborts the process instead --
@@ -551,8 +551,24 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   qemu-user copies it back only on success. (With no
 #                   filesystem at hand that has an extent map there is
 #                   nothing to ask, and the fixture steps aside by itself.)
+#   timer-many      timer_create past 32 live timers is EAGAIN: qemu-user keeps
+#                   a fixed table of its own, where a kernel is bounded only by
+#                   RLIMIT_SIGPENDING. A guest's timer is a host timer.
+#   sockopt-getfilter  getsockopt(SO_GET_FILTER) answers in instructions and
+#                   an optlen of 0 asks for the count; qemu-user takes it for
+#                   an int option and hands the kernel four bytes of its own,
+#                   EINVAL for any program longer than that.
+#   prctl-task      PR_GET/SET_CHILD_SUBREAPER and PR_GET/SET_THP_DISABLE are
+#                   EINVAL from qemu-user, which passes neither through.
+#   scm-trunc       SCM_RIGHTS into a control buffer with room for fewer
+#                   descriptors than were sent installs only those and raises
+#                   MSG_CTRUNC; qemu-user receives into a buffer of its own,
+#                   installs every one and trims the element afterwards, so
+#                   the rest stay open where nobody is told their numbers.
+#   madv-remove     madvise(MADV_REMOVE) punches a hole in the object behind a
+#                   shared mapping; qemu-user answers 0 and does nothing.
 #
-# A fourth names not an interposer's defect but a host kernel's vintage, since
+# One more names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
 #
 #   mremap-dontunmap-file   mremap(MREMAP_MAYMOVE|MREMAP_DONTUNMAP) of a
@@ -738,6 +754,104 @@ int main(void) {
         if (r < 0 && e == EBADR) return m.f.fm_flags != 0x40000000u;
     }
     return 0;
+}
+EOF
+        ;;
+    timer-many) cat <<'EOF'
+#include <signal.h>
+#include <string.h>
+#include <time.h>
+int main(void) {
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGRTMIN;
+    for (int i = 0; i < 320; i++) {
+        timer_t t;
+        if (timer_create(CLOCK_MONOTONIC, &sev, &t)) return 1;
+    }
+    return 0;
+}
+EOF
+        ;;
+    sockopt-getfilter) cat <<'EOF'
+#include <linux/filter.h>
+#include <sys/socket.h>
+int main(void) {
+    struct sock_filter f[8];
+    for (int i = 0; i < 8; i++) {
+        struct sock_filter ret = BPF_STMT(BPF_RET | BPF_K, 0xffff);
+        f[i] = ret;
+    }
+    struct sock_fprog p = { 8, f };
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (s < 0 || setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &p, sizeof p)) return 1;
+    socklen_t l = 0;
+    if (getsockopt(s, SOL_SOCKET, SO_GET_FILTER, f, &l)) return 1;
+    return l != 8;
+}
+EOF
+        ;;
+    prctl-task) cat <<'EOF'
+#include <sys/prctl.h>
+int main(void) {
+    int v = -1;
+    if (prctl(PR_GET_CHILD_SUBREAPER, &v) || v != 0) return 1;
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1) || prctl(PR_SET_CHILD_SUBREAPER, 0)) return 1;
+    return prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0) < 0;
+}
+EOF
+        ;;
+    scm-trunc) cat <<'EOF'
+#include <dirent.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+static int nfd(void) {
+    DIR *d = opendir("/proc/self/fd");
+    int n = 0;
+    if (!d) return -1;
+    while (readdir(d)) n++;
+    closedir(d);
+    return n;
+}
+int main(void) {
+    int sv[2], fds[3];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) return 1;
+    for (int i = 0; i < 3; i++) fds[i] = open("/dev/null", O_RDONLY);
+    char cb[CMSG_SPACE(sizeof fds)], b = 'x';
+    memset(cb, 0, sizeof cb);
+    struct iovec io = { &b, 1 };
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &io;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cb;
+    mh.msg_controllen = sizeof cb;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof fds);
+    memcpy(CMSG_DATA(c), fds, sizeof fds);
+    if (sendmsg(sv[0], &mh, 0) != 1) return 1;
+    for (int i = 0; i < 3; i++) close(fds[i]);
+    int before = nfd();
+    mh.msg_controllen = CMSG_LEN(sizeof(int));
+    if (recvmsg(sv[1], &mh, 0) != 1) return 1;
+    return !(mh.msg_flags & MSG_CTRUNC) || nfd() - before != 1;
+}
+EOF
+        ;;
+    madv-remove) cat <<'EOF'
+#include <string.h>
+#include <sys/mman.h>
+int main(void) {
+    char *a = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED) return 1;
+    memset(a, 7, 8192);
+    if (madvise(a, 4096, MADV_REMOVE)) return 1;
+    return a[0] != 0 || a[4096] != 7;
 }
 EOF
         ;;

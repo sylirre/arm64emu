@@ -523,7 +523,8 @@ descriptor, which nothing keeps (guest fd == host fd). The guest used to be told
 `tests/fixtures/dontunmap.c` (qemu passes the call to its host with its own
 address bookkeeping and fails it) carries `NEEDS-HOST-SYSCALL:
 mremap-dontunmap-file` for the file row, so a host older than 5.13 skips it by
-name (`tests/hostenv.sh`).
+name (`tests/hostenv.sh`), and `mremap-dup` for the shared rows, which
+`qemu-arm` aborts on.
 
 ### The page table gives its second level back
 
