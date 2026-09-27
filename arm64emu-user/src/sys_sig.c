@@ -580,11 +580,10 @@ static s64 sqi_read(CPU *c, u64 uinfo, int sig, u8 gsi[48]) {
 
 /* The host siginfo that carries it: si_errno and si_code as the sender gave
  * them, and the SI_QUEUE payload -- pid@16, uid@20, value@24 -- which is what
- * the receiving emulator's capture hands on to the guest (an ILP32 host keeps
- * the low 32 bits of a pointer-sized value; the int payloads sigqueue sends
- * survive everywhere). `thread`: aimed at one thread, which the code carries
- * (sig_thread_code). A host that can carry none of this past its own layouts
- * is sent it through the receiver's inbox instead (sqi_carry). */
+ * the receiving emulator's capture hands on to the guest. `thread`: aimed at
+ * one thread, which the code carries (sig_thread_code). A host that can carry
+ * none of this past its own layouts, and an ILP32 host a value wider than its
+ * 4-byte sigval, is sent it through the receiver's inbox instead (sqi_carry). */
 static void sqi_host(siginfo_t *si, int hs, const u8 gsi[48], int thread) {
     s32 err, code, pid;
     u32 uid;

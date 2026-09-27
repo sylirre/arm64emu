@@ -893,13 +893,14 @@ int sig_thread_uncode(int *code) {
  * an SI_QUEUE whose value names the slot: a tag byte, the slot and a nonce in
  * the low 32 bits, and SIG_CARRY_HI in the high half on an LP64 host. Every
  * receiver -- pendsig_from_host, the kick net, a signalfd read -- trades the
- * token back for the siginfo it stands for. Used only on that tier, and only
- * when the host would not hand the siginfo on as it is; a receiver with no
- * registry entry is sent what the host can carry, as before. Three things
- * come through that way that did not: a thread-directed rt_tgsigqueueinfo
- * (the slot names the thread), the si_errno and code of every queued
- * siginfo, and the payload of a sigqueue'd job-control signal to a traced
- * process. */
+ * token back for the siginfo it stands for. Used only when the host would not
+ * hand the siginfo on as it is; a receiver with no registry entry is sent
+ * what the host can carry, as before. Three things come through that way on
+ * that tier that did not: a thread-directed rt_tgsigqueueinfo (the slot names
+ * the thread), the si_errno and code of every queued siginfo, and the payload
+ * of a sigqueue'd job-control signal to a traced process. And one on every
+ * ILP32 host, the known-layout one or not: a queued value wider than the
+ * host's 4-byte sigval, whose high half no 32-bit kernel carries. */
 #define SIG_CARRY_TAG 0xc5u        /* the token's top byte */
 #define SIG_CARRY_HI  0x43415259u  /* "CARY": the high half of a 64-bit sigval */
 
@@ -944,15 +945,19 @@ static int sig_carry_claim(int hs, const siginfo_t *si, int jc, PendSig *p) {
 /* Send guest signal `gsig`, on host number `hs`, to `tgid` -- through `pidfd`
  * if it is one (>= 0), or to its thread `tid` when nonzero -- with the siginfo
  * the other arguments say, through the receiver's inbox (`jc`: as a
- * job-control carrier, sig_send_jc). Only on the known-layout tier, and only
- * when the host would not carry it as it is: anything but a plain SI_QUEUE
- * with no si_errno and a value the host's sigval holds, to the process. 1 when
- * it went that way (*ret the send's 0 or -errno), 0 when the caller is to send
- * what the host can carry. */
+ * job-control carrier, sig_send_jc). Only when the host would not carry it as
+ * it is: on the known-layout tier, anything but a plain SI_QUEUE with no
+ * si_errno and a value the host's sigval holds, to the process; on every
+ * tier, a value the host's sigval does not hold -- an ILP32 host's is 4
+ * bytes, the guest's 8, and a real 32-bit device, whose kernel carries
+ * everything else, would hand on the low half alone. 1 when it went that way
+ * (*ret the send's 0 or -errno), 0 when the caller is to send what the host
+ * can carry. */
 int sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
                    int code, s32 err, s32 pid, u32 uid, u64 value, s64 *ret) {
-    if (g_sig_sicode_ok || hs <= 0) return 0;   /* a null signal carries nothing */
-    if (!jc && !tid && code == SI_QUEUE && !err && (u64)(uintptr_t)value == value)
+    if (hs <= 0) return 0;   /* a null signal carries nothing */
+    if ((u64)(uintptr_t)value == value &&
+        (g_sig_sicode_ok || (!jc && !tid && code == SI_QUEUE && !err)))
         return 0;
     SigCarry c;
     memset(&c, 0, sizeof c);
@@ -2043,11 +2048,18 @@ static int rq_put(const PendSig *p) {
     if (!slot) {
         /* A full table. A negative si_code any thread may queue as it is,
          * payload and all (a timer's through its slot, as the timer itself
-         * sends it); anything else has no way back. */
+         * sends it; one the host would not carry whole, through our own
+         * inbox); anything else has no way back. */
         if (p->code >= 0 || p->code == SI_TKILL) return -EAGAIN;
+        s64 cr;
+        if (p->code != SI_TIMER &&
+            sig_carry_send(rq_pid, 0, -1, hs, p->signo, 0, p->code, p->err, p->pid,
+                           (u32)p->uid, (u64)p->value, &cr))
+            return (int)cr;
         siginfo_t si;
         memset(&si, 0, sizeof si);
         si.si_signo = hs;
+        si.si_errno = p->err;
         si.si_code = p->code;
         si.si_pid = (pid_t)p->pid;
         si.si_uid = (uid_t)p->uid;

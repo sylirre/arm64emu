@@ -746,6 +746,14 @@ thread of a thread-directed one, and `si_errno`, which is qemu's own doing.
 tests over it (`(known-layout-tier)`), with `tests/ptrace/jcqueue.c`'s queued
 job-control signals, `tests/fixtures/sqiread.c` and `carrystale.c`.
 
+One siginfo goes through the inbox on every tier: on an ILP32 host, one whose
+value is wider than the host's 4-byte sigval. A 32-bit kernel carries the
+code, the `si_errno` and the thread as they are, but only the low half of the
+guest's 8-byte value, so a real 32-bit device used to hand a `sigqueue`'d
+pointer — to itself, a thread, another process or a `signalfd` — on without
+its high half. The slot holds the value whole (`tests/c/sigqwide.c`, whose
+rows the i386 build of `make test32` failed before).
+
 The held-out numbers are not handed back while the thread lives — the host
 would deliver them straight to it again — only when it exits, having blocked
 everything first. An exiting thread also no longer opens the pending-signal
