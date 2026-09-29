@@ -35,19 +35,27 @@ static void nap(int ms) {
  * loaded host (qemu-user running the ARM32 tier alongside a build took longer
  * than any of them), and a stop that lands before the call is entered
  * interrupts nothing: the tracee makes the call afresh once resumed, as a
- * kernel's does, and a 3 s epoll_wait runs out. Twenty seconds, then on
- * regardless: the verdict says what went wrong. */
+ * kernel's does, and a 2 s epoll_wait runs out. Nor is one look at its state:
+ * the process an emulator runs the tracee in sleeps now and then on work of
+ * its own -- under qemu-arm with the ARM32 JIT it was seen asleep before it
+ * had even made the epoll_create1 ahead of the wait -- so it must be found
+ * asleep on SETTLE looks in a row, 10 ms apart, which a pause of the
+ * emulator's own does not last and the call, blocked for seconds, always
+ * does. Twenty seconds, then on regardless: the verdict says what went
+ * wrong. */
+#define SETTLE 5
 static void asleep(pid_t k) {
     char path[64], buf[512];
     snprintf(path, sizeof path, "/proc/%d/stat", (int)k);
-    for (int i = 0; i < 2000; i++) {
+    for (int i = 0, run = 0; i < 2000; i++) {
         FILE *f = fopen(path, "r");
         if (!f) return;
         size_t n = fread(buf, 1, sizeof buf - 1, f);
         fclose(f);
         buf[n] = 0;
         char *r = strrchr(buf, ')');
-        if (r && r[1] == ' ' && r[2] == 'S') return;
+        run = r && r[1] == ' ' && r[2] == 'S' ? run + 1 : 0;
+        if (run == SETTLE) return;
         nap(10);
     }
 }
