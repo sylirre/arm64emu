@@ -53,6 +53,26 @@ static void chld_action(void *h, int flags) {
     sigaction(SIGCHLD, &sa, NULL);
     nchld = 0;
 }
+/* An ordinary child the parent does not wait for, once it has died: a WNOHANG
+ * wait answers 0 while it still runs, and asking again then is the only way
+ * not to guess how long its exit takes (under qemu-user, now and then more
+ * than 100 ms) -- a zombie the parent was meant never to see, or ECHILD once
+ * it is reaped, ends the wait. Bounded, so a child that never dies does. */
+static int wait_dead(pid_t k, int *st) {
+    int r = 0;
+    for (int i = 0; i < 500 && (r = waitpid(k, st, WNOHANG)) == 0; i++) nap(10);
+    return r;
+}
+static int look_dead(pid_t k, siginfo_t *si) {
+    int r = 0;
+    for (int i = 0; i < 500; i++) {
+        memset(si, 0, sizeof *si);
+        r = waitid(P_PID, (id_t)k, si, WEXITED | WNOWAIT | WNOHANG);
+        if (r != 0 || si->si_pid != 0) break;
+        nap(10);
+    }
+    return r;
+}
 static const char *err(int r) {
     static char b[32];
     if (r >= 0) return "ok";
@@ -102,7 +122,7 @@ int main(void) {
     k = fork();
     if (k == 0) _exit(3);
     nap(150);
-    r = waitpid(k, &st, WNOHANG);
+    r = wait_dead(k, &st);
     printf("nocldwait handler: notices=%d code=%d wait=%s\n", nchld, codes[0], err(r));
 
     /* ...and at SIG_DFL: reaped all the same. */
@@ -150,9 +170,7 @@ int main(void) {
     ck = clone_kid(SIGUSR1, 1, 300);
     k = fork();
     if (k == 0) _exit(4);
-    nap(100);
-    memset(&si, 0, sizeof si);
-    r = waitid(P_PID, (id_t)k, &si, WEXITED | WNOWAIT | WNOHANG);
+    r = look_dead(k, &si);
     printf("ignored, ordinary looked at: wait=%s pid=%d\n", err(r), si.si_pid == k);
     r = waitpid(ck, &st, __WCLONE);
     printf("ignored, second clone child: wait=%s status=%d\n", err(r), WEXITSTATUS(st));
@@ -179,7 +197,7 @@ int main(void) {
     k = fork();
     if (k == 0) _exit(5);
     nap(200);
-    r = waitpid(k, &st, WNOHANG);
+    r = wait_dead(k, &st);
     printf("nocldwait with a clone child: notices=%d code=%d wait=%s\n",
            nchld, codes[0], err(r));
     r = waitpid(ck, &st, __WCLONE);
