@@ -52,7 +52,15 @@ static void show(const char *what, long r) {
 static volatile sig_atomic_t chld, usr2;
 static void on_chld(int s) { (void)s; chld++; }
 static void on_usr2(int s) { (void)s; usr2++; }
-static void *idle(void *a) { (void)a; for (;;) pause(); return NULL; }
+/* The thread says its own tid: guessing it from the numbers after the pid
+ * found nothing on a busy host, and pidfd_open(0) is EINVAL too. */
+static volatile pid_t thread_tid;
+static void *idle(void *a) {
+    (void)a;
+    __atomic_store_n(&thread_tid, (pid_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
+    for (;;) pause();
+    return NULL;
+}
 
 static char stk[64 * 1024], tstk[64 * 1024];
 static int vchild(void *a) { (void)a; return 0; }
@@ -65,9 +73,8 @@ int main(void) {
 
     pthread_t t;
     pthread_create(&t, NULL, idle, NULL);
-    pid_t tid = 0;
-    for (pid_t x = getpid() + 1; x < getpid() + 1000; x++)
-        if (syscall(SYS_tgkill, getpid(), x, 0) == 0) { tid = x; break; }
+    pid_t tid;
+    while ((tid = __atomic_load_n(&thread_tid, __ATOMIC_ACQUIRE)) == 0) usleep(1000);
     show("pidfd_open a thread", syscall(SYS_pidfd_open, tid, 0));
 
     /* Fork-shaped: the descriptor is the child's, and waitid takes it. */

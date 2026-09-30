@@ -2869,6 +2869,12 @@ check_fixture execsigs $'pending: USR1 USR2\nblocked: HUP INT USR1 USR2 TERM\ndo
 # exit signals into its own. The block is the kernel's (6.17), but for the two
 # thread rows, which are the 6.1 the emulator advertises (see the fixture).
 check_fixture clonepidfd $'pidfd_open a thread: EINVAL\nclone pidfd: ok\nwaitid clone pidfd: ok\nclone child: pid_ok=1 status=3\nclone pidfd|parent_settid: EINVAL\nclone pidfd|thread: EINVAL\nclone pidfd|detached: EINVAL\nclone pidfd, null parent_tid: EFAULT\nvfork pidfd: ok\nwaitid exit-0 child without __WCLONE: ECHILD\nwait4 exit-0 child without __WCLONE: ECHILD\nwaitid exit-0 child with __WCLONE: ok\nexit-0 child: pid_ok=1 status=0\nSIGCHLD for the exit-0 child: 0\nwait4 SIGUSR2 child plain: ECHILD\nwait4 SIGUSR2 child with __WALL: ok\nSIGUSR2 child: status=0 SIGCHLD=0 SIGUSR2=1\nwait4 ordinary child with __WCLONE: ECHILD\nwait4 ordinary child: ok\nordinary child: status=5 SIGCHLD=1\ndone'
+# A wait for any child or a process group with a clone child about, which
+# the host would answer with whichever child is ready first: answered a child
+# at a time over the kind the kernel's rule selects (sys_proc.c,
+# ck_waitid_any). Self-checking: qemu-user gives a clone child SIGCHLD; the
+# block is the kernel's.
+check_fixture waitany $'wait4(-1): ordinary child status=4\nwait4(-1) with only the clone child: ECHILD\nwait4(-1, __WCLONE): clone child status=9\nwaitid(P_ALL, WNOHANG): none ready\nwaitid(P_ALL): ordinary child status=5\nwaitid(P_ALL, __WCLONE): clone child status=8\nwait4(0, __WCLONE): clone child status=6\nwait4(0): ordinary child status=3\nwait4(-1) at once: ordinary child status=1\nwait4(-1, __WALL): clone child status=2\nwait4(-1, __WALL) again: ordinary child\nthen: ECHILD\ndone'
 # SIGCHLD's SA_NOCLDSTOP and SA_NOCLDWAIT, and SIG_IGN's reaping, which spares
 # a clone child (signal.c, sig_chld_host): the host acts on what it is given
 # of the guest's disposition, and a clone child about keeps it from reaping

@@ -116,6 +116,11 @@ typedef struct {
                           * a main thread's tid is its pid) */
     s32 tgid;            /* tracee's thread group (process) id */
     s32 tracer;          /* tracer pid, 0 once detached */
+    s32 tracer_tid;      /* the tracing thread itself -- the kernel's tracer is
+                          * a task, not a process (pt_is_tracer) -- or 0 where
+                          * that thread cannot be known (a TRACEME whose
+                          * forking thread is gone), when any thread of
+                          * `tracer` is taken for it */
     u64 tracer_start;    /* its start time as it attached (0: unknown): a pid
                           * reused since is not the tracer (pt_tracer_gone) */
     u32 options;         /* PTRACE_O_* */
@@ -254,6 +259,7 @@ static PtLink *pt_find(s32 tracee) {
 
 static int pt_tracer_gone(const PtLink *e);
 static void pt_link_init(PtLink *e, s32 tgid, s32 tracee);
+static void pt_sweep(void);
 
 /* This process's own start time, as a tracer stamps it on its links. */
 static u64 pt_self_start(void) {
@@ -299,34 +305,44 @@ static PtLink *pt_claim(s32 tracee, s32 tgid) {
                 e = &g_tab->links[i];
         }
         if (e) { pt_link_init(e, tgid, tracee); return e; }
-        /* Full: free the links of tasks gone with their tracers (above), and
-         * look once more. */
-        for (int i = 0; i < PTRACE_MAX; i++) {
-            PtLink *l = &g_tab->links[i];
-            s32 t = __atomic_load_n(&l->tracee, __ATOMIC_ACQUIRE);
-            if (t > 0 && pt_tracer_gone(l) && kill((pid_t)t, 0) != 0 && errno == ESRCH) {
-                s32 x = t;
-                __atomic_compare_exchange_n(&l->tracee, &x, 0, false,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
-            }
-        }
+        pt_sweep();   /* full: free what is abandoned, and look once more */
     }
     return NULL;
 }
 
+/* The links of tasks gone with their tracers (pt_claim above): nobody will
+ * ever collect them. */
+static void pt_sweep(void) {
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *l = &g_tab->links[i];
+        s32 t = __atomic_load_n(&l->tracee, __ATOMIC_ACQUIRE);
+        if (t > 0 && pt_tracer_gone(l) && kill((pid_t)t, 0) != 0 && errno == ESRCH) {
+            s32 x = t;
+            __atomic_compare_exchange_n(&l->tracee, &x, 0, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        }
+    }
+}
+
 /* Fill a link claimed with the -1 sentinel, and publish it under `tracee`. */
+static void pt_link_fill(PtLink *e, s32 tgid);
 static void pt_link_init(PtLink *e, s32 tgid, s32 tracee) {
+    pt_link_fill(e, tgid);
+    e->pgid = (s32)getpgid((pid_t)tracee);   /* ours or the target's */
+    __atomic_store_n(&e->tracee, tracee, __ATOMIC_RELEASE);
+}
+
+static void pt_link_fill(PtLink *e, s32 tgid) {
     e->tgid = tgid;
-    e->tracer = 0; e->tracer_start = 0; e->options = 0; e->state = PT_ST_RUNNING;
+    e->tracer = 0; e->tracer_tid = 0; e->tracer_start = 0;
+    e->options = 0; e->state = PT_ST_RUNNING;
     e->reported = 0; e->stop_sig = 0; e->event = 0; e->syscall_stop = 0;
     e->eventmsg = 0; e->has_siginfo = 0;
     e->attach_pending = e->interrupt_pending = 0;
     e->attach_stopped = 0;
     e->trap_notify = 0; e->seize = 0; e->listening = 0;
-    e->pgid = (s32)getpgid((pid_t)tracee);   /* ours or the target's */
     memset(&e->ru, 0, sizeof e->ru);   /* never inherit a recycled slot's */
     e->cmd_seq = e->done_seq = 0; e->cmd = PT_CMD_NONE;
-    __atomic_store_n(&e->tracee, tracee, __ATOMIC_RELEASE);
 }
 
 /* Stamp the calling tracee's own accounting into its link, next to the other
@@ -373,6 +389,26 @@ static void pt_free(PtLink *e) {
     if (!e) return;
     __atomic_store_n(&e->tracer, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);   /* slot free */
+}
+
+/* Is the calling thread link `e`'s tracer? The kernel's tracer is the task
+ * that attached (ptrace_check_attach: child->parent == current), so a request
+ * from any other thread of its process is ESRCH -- only the waits are the
+ * whole thread group's (do_wait walks every thread's ptraced list). A link
+ * whose tracing thread is not known (tracer_tid 0) takes any thread of the
+ * tracer process. */
+static int pt_is_tracer(const PtLink *e) {
+    if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getpid()) return 0;
+    s32 tt = __atomic_load_n(&e->tracer_tid, __ATOMIC_ACQUIRE);
+    return tt == 0 || tt == (s32)g_tls.tid;
+}
+
+/* Who the tracer is to a tracee's siginfo and to /proc's TracerPid: the
+ * tracing thread (task_pid_vnr of the tracer task), its process where that
+ * thread is not known. */
+static s32 pt_tracer_task(const PtLink *e) {
+    s32 tt = __atomic_load_n(&e->tracer_tid, __ATOMIC_ACQUIRE);
+    return tt > 0 ? tt : __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
 }
 
 /* ---- regset marshalling (runs in the tracee, has the live CPU) ---- */
@@ -740,6 +776,7 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
     if (si) memcpy(e->siginfo, si, 128);
     e->has_siginfo = si != NULL;
     s32 tracer = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+    s32 tracer_task = pt_tracer_task(e);   /* read now: a detach frees e */
     pt_ru_stamp(e);
     __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
@@ -765,7 +802,7 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
             memset(si, 0, 128);
             pt_w32(si, 0, (u32)ns);
             pt_w32(si, 8, (u32)SI_USER);
-            pt_w32(si, 16, (u32)tracer);
+            pt_w32(si, 16, (u32)tracer_task);   /* task_pid_vnr(parent) */
             pt_w32(si, 20, (u32)getuid());
         }
     }
@@ -1126,6 +1163,10 @@ s32 ptrace_self_tracer(void) {
     return g_self_link ? __atomic_load_n(&g_self_link->tracer, __ATOMIC_ACQUIRE) : 0;
 }
 
+s32 ptrace_self_tracer_tid(void) {
+    return g_self_link ? __atomic_load_n(&g_self_link->tracer_tid, __ATOMIC_ACQUIRE) : 0;
+}
+
 u32 ptrace_self_seize(void) {
     return g_self_link ? g_self_link->seize : 0;
 }
@@ -1148,7 +1189,8 @@ s32 ptrace_tracer_of(s32 tid) {
         if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) != tid) continue;
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED)
             continue;                    /* dead, awaiting its tracer's wait */
-        return __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0) return 0;
+        return pt_tracer_task(e);        /* the tracing thread, as the kernel's */
     }
     return 0;
 }
@@ -1161,23 +1203,81 @@ void ptrace_report_event(CPU *c, int event, u64 msg) {
     pt_event_stop(c, event);
 }
 
-/* Child side of a clone/fork. `event` is nonzero when the parent's tracer is
- * following this creation (PTRACE_O_TRACE{FORK,VFORK,CLONE}); the child then
- * auto-attaches to the same tracer and reports an initial (SIGSTOP) stop.
- * Otherwise it runs untraced.
+/* ---- followed fork: the child's link, made by the parent ----
  *
- * What it inherits -- tracer, options, attach flavor -- arrives as arguments,
- * sampled by the parent before the fork, and NOT read here out of the inherited
- * g_self_link pointer. The pointer itself stays valid (the registry is shared at
- * the same address), but what it points at does not: by the time the child runs,
- * the parent has published its own fork event stop, and a tracer that answers it
- * with PTRACE_DETACH frees that link. Reading it then yields tracer 0 at best --
- * a followed fork silently losing its child, where the kernel fixes the child's
- * tracer atomically at clone time -- and, once the freed slot is re-claimed (a
- * strace -f session recycles low slots constantly), a *stranger's* tracer and
- * options, under which this child parks in an initial stop nobody will resume.
- * The thread path has always sampled these in the creator for the same reason. */
-void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
+ * The kernel attaches a followed child at clone time, so by the time the
+ * tracer hears of the fork (PTRACE_EVENT_FORK, the pid in GETEVENTMSG) the
+ * child is its tracee, and a wait for that pid -- gdb's, which waits for the
+ * new child's initial stop by pid, __WALL -- finds it. The child used to
+ * claim its link itself, once it ran: a tracer quicker than it asked the
+ * registry about a pid that was nobody's tracee yet, and the host about a
+ * child that is not the tracer's, and was told ECHILD.
+ *
+ * So the parent takes the slot before the fork, filled with everything the
+ * child inherits and published nowhere (the -1 sentinel every scan skips),
+ * and publishes it under the child's pid the moment fork returns it -- before
+ * the event stop can be reported. The child, which knows the slot by the copy
+ * of the pointer fork gave it, waits for that publication and adopts the link
+ * as its own. Neither side guesses a pid, and only one of them claims. */
+void *ptrace_fork_reserve(s32 tracer, s32 tracer_tid, u32 options, u32 seize) {
+    if (!g_tab || tracer <= 0) return NULL;
+    PtLink *e = NULL;
+    for (int pass = 0; pass < 2 && !e; pass++) {
+        for (int i = 0; i < PTRACE_MAX && !e; i++) {
+            s32 expect = 0;
+            if (__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect, -1,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                e = &g_tab->links[i];
+        }
+        if (!e) pt_sweep();       /* nothing free: sweep the abandoned links */
+    }
+    if (!e) return NULL;                     /* registry full: untraced child */
+    /* The parent's own pid stands in `tgid` until the publication: the child
+     * reads it to tell whether the parent it is waiting on is still there. */
+    pt_link_fill(e, (s32)getpid());
+    e->pgid = (s32)getpgid(0);               /* the child is born into ours */
+    __atomic_store_n(&e->options, options, __ATOMIC_RELAXED);
+    e->seize = seize;
+    e->tracer_start = proctab_starttime(tracer);
+    __atomic_store_n(&e->tracer_tid, tracer_tid, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
+    return e;
+}
+
+void ptrace_fork_publish(void *slot, s32 pid) {
+    PtLink *e = slot;
+    if (!e) return;
+    if (pid <= 0) {                          /* no child: the slot goes back */
+        __atomic_store_n(&e->tracer, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    e->tgid = pid;
+    s32 x = -1;   /* the child publishes it itself if we were too slow to */
+    __atomic_compare_exchange_n(&e->tracee, &x, pid, false,
+                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    fx_wake((volatile u32 *)&e->tracee);
+}
+
+/* Child side of a clone/fork. `slot` is the link the parent reserved when its
+ * tracer is following this creation (PTRACE_O_TRACE{FORK,VFORK,CLONE},
+ * ptrace_fork_reserve); the child then auto-attaches to the same tracer and
+ * reports an initial (SIGSTOP) stop. NULL leaves it untraced.
+ *
+ * What it inherits -- tracer, options, attach flavor -- was written into the
+ * slot by the parent before the fork, and is NOT read here out of the
+ * inherited g_self_link pointer. The pointer itself stays valid (the registry
+ * is shared at the same address), but what it points at does not: by the
+ * time the child runs, the parent has published its own fork event stop, and
+ * a tracer that answers it with PTRACE_DETACH frees that link. Reading it then
+ * yields tracer 0 at best -- a followed fork silently losing its child, where
+ * the kernel fixes the child's tracer atomically at clone time -- and, once
+ * the freed slot is re-claimed (a strace -f session recycles low slots
+ * constantly), a *stranger's* tracer and options, under which this child parks
+ * in an initial stop nobody will resume. The thread path has always sampled
+ * these in the creator for the same reason. */
+void ptrace_fork_child(CPU *c, void *slot) {
     /* The inherited traced-thread count describes the parent's threads; only
      * the forking thread exists here, untraced until the adopt below. If the
      * parent had traced threads, re-mirror the (also inherited) catcher
@@ -1196,7 +1296,7 @@ void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
      * kick (the queued signal itself) is not inherited across fork anyway --
      * though a kick of our own may have landed in this flag already (below). */
     g_ptrace_kick = 0;
-    if (!event || tracer <= 0) {
+    if (!slot) {
         if (inherited) sig_trace_update_all(c->m);
         /* Not followed: a fresh untraced pid -- but one clone(2) has already
          * returned to the parent, which may have SEIZEd it (or handed it to a
@@ -1215,23 +1315,27 @@ void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
         }
         return;
     }
-    PtLink *e = pt_claim(getpid(), getpid());
-    if (!e) {
-        if (inherited) sig_trace_update_all(c->m);
-        return;                            /* registry full: degrade to untraced */
+    /* The parent publishes the slot under our pid as soon as fork returns it
+     * (ptrace_fork_publish); nothing it does first can block. Should it die
+     * before that, nobody else will: publish it ourselves. */
+    PtLink *e = slot;
+    s32 me = (s32)getpid(), parent = e->tgid;
+    while (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) == -1) {
+        fx_wait((volatile u32 *)&e->tracee, (u32)-1, 20);
+        if ((s32)getppid() != parent) {
+            e->tgid = me;
+            s32 x = -1;
+            __atomic_compare_exchange_n(&e->tracee, &x, me, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        }
     }
-    __atomic_store_n(&e->options, options, __ATOMIC_RELAXED);  /* options are inherited */
-    e->seize = seize;
-    e->tracer_start = proctab_starttime(tracer);
-    __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
     g_self_link = e;
     g_ptrace_active = 1;
     pt_traced_inc(c->m);   /* catch default-fatal signals to report them */
     /* Initial attach stop: an auto-attached child of a SEIZE'd tracee stops
      * with PTRACE_EVENT_STOP, of an ATTACH'd one with SIGSTOP (kernel
      * behavior). The tracer sees it, (re)sets options and resumes us. */
-    if (seize) {   /* ptrace_init_task's JOBCTL_TRAP_STOP: listenable */
+    if (e->seize) {   /* ptrace_init_task's JOBCTL_TRAP_STOP: listenable */
         __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
         pt_jobctl_trap(c, 0);
     } else {
@@ -1248,14 +1352,15 @@ void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize) {
  * handshake wake: once the creator can report PTRACE_EVENT_CLONE the new tid
  * is already registry-visible, so a tracer's wait4 poll on it never sees a
  * not-a-tracee window. `tracer` <= 0 (creator untraced or not followed)
- * leaves the thread untraced. */
-void ptrace_thread_child_claim(s32 tracer, u32 options, u32 seize) {
+ * leaves the thread untraced; `tracer_tid` is the tracing thread of it. */
+void ptrace_thread_child_claim(s32 tracer, s32 tracer_tid, u32 options, u32 seize) {
     if (tracer <= 0 || !g_tab) return;
     PtLink *e = pt_claim((s32)g_tls.tid, (s32)getpid());
     if (!e) return;                        /* registry full: degrade to untraced */
     __atomic_store_n(&e->options, options, __ATOMIC_RELAXED);
     e->seize = seize;
     e->tracer_start = proctab_starttime(tracer);
+    __atomic_store_n(&e->tracer_tid, tracer_tid, __ATOMIC_RELAXED);
     __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
     __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
     g_self_link = e;
@@ -1294,11 +1399,20 @@ static long ptrace_traceme(CPU *c) {
      * established, and it matches the rest of the containment: to this guest
      * that pid does not exist (kill(2) says ESRCH, /proc hides it). The tracer
      * side (ATTACH/SEIZE) has always checked the registry this way. */
-    if (!proctab_has((s32)getppid())) return -EPERM;
+    s32 pp = (s32)getppid();
+    if (!proctab_has(pp)) return -EPERM;
     PtLink *e = pt_claim((s32)g_tls.tid, (s32)getpid());
     if (!e) return -ENOMEM;
-    e->tracer_start = proctab_starttime((s32)getppid());
-    __atomic_store_n(&e->tracer, (s32)getppid(), __ATOMIC_RELEASE);
+    e->tracer_start = proctab_starttime(pp);
+    /* The tracer is real_parent, a task: the parent's thread that forked us,
+     * while it lives -- one gone since was succeeded by some other thread of
+     * that process (find_new_reaper), which we cannot name, so any is taken
+     * for it. */
+    s32 ptid = proc_fork_parent_tid();
+    if (ptid > 0 && ptid != pp && syscall(SYS_tgkill, (pid_t)pp, (pid_t)ptid, 0) != 0)
+        ptid = 0;
+    __atomic_store_n(&e->tracer_tid, ptid > 0 ? ptid : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->tracer, pp, __ATOMIC_RELEASE);
     /* Flip the session-wide "someone is tracing" flag so every wait4 switches to
      * the polling path (a blocked host wait4 can't see a cooperative stop). */
     __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
@@ -1513,6 +1627,10 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         if (!__atomic_compare_exchange_n(&e->tracer, &zero, (s32)getpid(), false,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             return -EPERM;                       /* already traced by someone */
+        /* The tracer is this thread, not its process (pt_is_tracer). The
+         * tracee cannot be in a stop to be asked about yet, so the moment the
+         * link names only the process asks nothing of it. */
+        __atomic_store_n(&e->tracer_tid, (s32)g_tls.tid, __ATOMIC_RELEASE);
         e->seize = (req == G_PTRACE_SEIZE);
         e->tracer_start = pt_self_start();
         __atomic_store_n(&e->options,
@@ -1553,8 +1671,10 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         return 0;
     }
 
+    /* ptrace_check_attach: the caller must be the tracee's tracer -- the
+     * thread that attached, not merely one of its process's. */
     PtLink *e = pt_find(pid);
-    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)getpid())
+    if (!e || !pt_is_tracer(e))
         return -ESRCH;
 
     /* KILL and INTERRUPT are the two requests the kernel takes whatever the
@@ -1706,6 +1826,12 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
  * died or last stopped once it is not: a death published and reaped by its
  * real parent, or a SIGKILL nobody saw. */
 static int pt_selects(const PtLink *e, s32 t, PtWaitSel sel) {
+    /* __WNOTHREAD: only the calling thread's own tracees (do_wait stops at
+     * current's ptraced list). */
+    if (sel.thread) {
+        s32 tt = __atomic_load_n(&e->tracer_tid, __ATOMIC_ACQUIRE);
+        if (tt && tt != sel.thread) return 0;
+    }
     switch (sel.type) {
     case PT_SEL_PID:
         return t == sel.id;
@@ -1815,8 +1941,13 @@ void ptrace_note_reaped(s32 pid) {
  * cleared and it woken (a parked one leaves its stop with what the stop
  * leaves it, a running one leaves the trace at its next boundary), or, under
  * PTRACE_O_EXITKILL, killed. A tracer killed outright gets here never; its
- * tracees' watchdogs find out instead. */
-void ptrace_tracer_exit(void) {
+ * tracees' watchdogs find out instead.
+ *
+ * The kernel runs exit_ptrace for every task that exits, and a tracer is a
+ * task: a thread that ends while its process lives on (ptrace_tracer_thread_
+ * exit) releases the tracees it attached, and only those. `thread` 0 is the
+ * whole process. */
+static void pt_tracer_release(s32 thread) {
     if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE)) return;
     s32 me = (s32)getpid();
     for (int i = 0; i < PTRACE_MAX; i++) {
@@ -1825,6 +1956,8 @@ void ptrace_tracer_exit(void) {
         if (t <= 0) continue;
         s32 tr = me;
         if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
+        if (thread && __atomic_load_n(&e->tracer_tid, __ATOMIC_ACQUIRE) != thread)
+            continue;
         if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) {
             /* A death nobody will collect now: the real parent's reap frees
              * it (ptrace_note_reaped). */
@@ -1839,6 +1972,33 @@ void ptrace_tracer_exit(void) {
             fx_wake(&e->cmd_seq);
             pt_send_kick(e->tgid, t);
         }
+    }
+}
+
+void ptrace_tracer_exit(void) { pt_tracer_release(0); }
+
+void ptrace_tracer_thread_exit(void) {
+    if (g_tls.tid > 0) pt_tracer_release((s32)g_tls.tid);
+}
+
+/* A secondary thread's execve (do_execve). The kernel's de_thread kills the
+ * old leader -- which releases whatever it traced -- and renumbers the
+ * exec'ing thread to the pid, as whose tracer it goes on. Here the main
+ * thread carries the new image on, so the tracees are moved over to its tid
+ * instead: the leader's own released first, the exec'ing thread's then made
+ * the pid's. */
+void ptrace_tracer_exec_rename(s32 old_tid) {
+    s32 me = (s32)getpid();
+    if (!g_tab || old_tid == me || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return;
+    pt_tracer_release(me);
+    for (int i = 0; i < PTRACE_MAX; i++) {
+        PtLink *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0) continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me) continue;
+        s32 x = old_tid;
+        __atomic_compare_exchange_n(&e->tracer_tid, &x, me, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
     }
 }
 
@@ -1935,6 +2095,13 @@ static int pt_tracer_gone(const PtLink *e) {
         u64 now = proctab_starttime(tr);
         if (now && now != st) return 1;
     }
+    /* ...or the process is there and the tracing thread is not. Its exit
+     * releases its tracees itself (ptrace_tracer_thread_exit); this is the
+     * net under a thread that ended before it got there. */
+    s32 tt = __atomic_load_n(&e->tracer_tid, __ATOMIC_ACQUIRE);
+    if (tt > 0 && tt != tr &&
+        syscall(SYS_tgkill, (pid_t)tr, (pid_t)tt, 0) != 0 && errno == ESRCH)
+        return 1;
     return 0;
 }
 

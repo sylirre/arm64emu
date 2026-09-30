@@ -695,6 +695,9 @@ int  sig_thread_uncode(int *code);
  * what its death is reported to us with instead of the host's SIGCHLD.
  * Async-signal-safe (sys_proc.c). */
 int  clonekid_exit_signal(s32 pid);
+/* The tid of the parent's thread that forked this process (its real_parent,
+ * the tracer a PTRACE_TRACEME names), 0 when not known (sys_proc.c). */
+s32  proc_fork_parent_tid(void);
 /* Is a live clone child of this process to report its death with a signal
  * other than none and SIGCHLD -- so SIGCHLD must be caught (signal.c)? */
 int  clonekids_signalling(void);

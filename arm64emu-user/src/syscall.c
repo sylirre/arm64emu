@@ -72,7 +72,7 @@ SYSDEF(rt_sigaction); SYSDEF(rt_sigprocmask); SYSDEF(rt_sigreturn);
 SYSDEF(sigaltstack); SYSDEF(kill); SYSDEF(tkill); SYSDEF(tgkill);
 SYSDEF(rt_sigpending); SYSDEF(rt_sigsuspend); SYSDEF(rt_sigtimedwait);
 SYSDEF(rt_sigqueueinfo); SYSDEF(rt_tgsigqueueinfo); SYSDEF(pidfd_send_signal);
-SYSDEF(pidfd_open); SYSDEF(signalfd4);
+SYSDEF(pidfd_open); SYSDEF(pidfd_getfd); SYSDEF(signalfd4);
 
 /* sys_time.c */
 SYSDEF(clock_gettime); SYSDEF(clock_getres); SYSDEF(clock_nanosleep);
@@ -284,6 +284,7 @@ static const struct {
     { G_NR_rt_tgsigqueueinfo, sys_rt_tgsigqueueinfo, "rt_tgsigqueueinfo" },
     { G_NR_pidfd_send_signal, sys_pidfd_send_signal, "pidfd_send_signal" },
     { G_NR_pidfd_open, sys_pidfd_open, "pidfd_open" },
+    { G_NR_pidfd_getfd, sys_pidfd_getfd, "pidfd_getfd" },
     { G_NR_signalfd4, sys_signalfd4, "signalfd4" },
 
     { G_NR_clock_gettime, sys_clock_gettime, "clock_gettime" },
@@ -370,7 +371,7 @@ static const u16 quiet_enosys[] = {
     G_NR_clock_settime, G_NR_settimeofday, G_NR_adjtimex, G_NR_clock_adjtime,
     /* security / introspection */
     G_NR_kcmp, G_NR_bpf, G_NR_pkey_mprotect,
-    G_NR_io_pgetevents, G_NR_pidfd_getfd,
+    G_NR_io_pgetevents,
     G_NR_landlock_create_ruleset, G_NR_memfd_secret, G_NR_process_mrelease,
     G_NR_map_shadow_stack, G_NR_lsm_get_self_attr, G_NR_lsm_set_self_attr,
     G_NR_lsm_list_modules,
@@ -410,7 +411,7 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_move_mount, "move_mount" }, { G_NR_mq_open, "mq_open" },
     { G_NR_mseal, "mseal" },
     { G_NR_name_to_handle_at, "name_to_handle_at" }, { G_NR_openat2, "openat2" },
-    { G_NR_open_tree, "open_tree" }, { G_NR_pidfd_getfd, "pidfd_getfd" },
+    { G_NR_open_tree, "open_tree" },
     { G_NR_pkey_mprotect, "pkey_mprotect" }, { G_NR_process_madvise, "process_madvise" },
     { G_NR_process_mrelease, "process_mrelease" },
     { G_NR_quotactl, "quotactl" }, { G_NR_reboot, "reboot" },

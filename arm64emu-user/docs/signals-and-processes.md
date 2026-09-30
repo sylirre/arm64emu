@@ -1162,7 +1162,8 @@ and a child whose signal is not `SIGCHLD` — `0`, none at all, included — is 
 only under `__WCLONE` (or `__WALL`), while a wait without either finds only the
 others (`eligible_child`). A guest process is a host fork, whose exit signal is
 always `SIGCHLD`, so the host knows none of it. The parent keeps a table of its
-clone children (`sys_proc.c`, "clone children"), in a shared page each child
+children — every one, clone children and ordinary ones alike (`sys_proc.c`,
+"clone children") — in a shared page made at its first fork, which each child
 enters *itself* into before it runs a guest instruction — so its death, and
 its `SIGCHLD`, cannot come before its entry — and consults it where the
 difference shows: the capture handler turns the host's `SIGCHLD` for a clone
@@ -1170,12 +1171,24 @@ child into the child's own signal, or drops it (`clonekid_exit_signal`, with
 `SIGCHLD` kept caught while such a child is to signal, since a `SIGCHLD` at its
 default is discarded as it is sent); and a wait that *names* the child —
 `wait4(pid)`, `waitid(P_PID)`, a pidfd — finds it only where the kernel's rule
-would, asking the host without `__WCLONE`. A reaped child's entry stays, marked,
-until its pid comes back, since its `SIGCHLD` may still be on its way to a
-thread when the wait reaps it. What is not kept: a wait for *any* child, or for
-a process group, still finds a clone child without `__WCLONE` and misses it with
-one — keeping that would take enumerating the other children — and it says so,
-once, if such a wait ever meets a live clone child. Nor may the host reap a
+would, asking the host without `__WCLONE`. A wait for *any* child, or for a
+process group, is the one the host cannot answer while a clone child is live:
+its answer is the first child ready, whichever kind — a clone child without
+`__WCLONE`, and nothing at all with it. So such a wait (without `__WALL`) is
+answered from the table instead (`ck_waitid_any`): each child of the kind the
+kernel's rule selects, and of the group, is asked of the host by pid, `WNOHANG`,
+and the first with something to report is the answer; none of that kind at
+all — counting one forked and not yet entered — is `ECHILD`. To block it asks
+the host for any child's state change without taking it (`WNOWAIT`), so it
+sleeps in the kernel and a signal ends it as it would, and goes round again;
+a ready child of the other kind makes that return at once, and the wait then
+naps between rounds (10 ms, up to 50) rather than spin on it. A reaped clone
+child's entry stays, marked, until its pid comes back, since its `SIGCHLD` may
+still be on its way to a thread when the wait reaps it; an ordinary child's
+goes at its reap, or — reaped where no wait saw it — when a wait next finds it
+no child any more, or a new child finds its pid gone. Only a table so full of
+live children that an ordinary one found no slot leaves such a wait to the
+host as before, and it says so, once (`tests/fixtures/waitany.c`). Nor may the host reap a
 clone child: a parent that ignores `SIGCHLD` or set `SA_NOCLDWAIT` has its
 children reaped at their death — by the kernel, only those whose death signal
 is `SIGCHLD`, and by the host, which knows every child as one of those, all of
@@ -1227,7 +1240,15 @@ hit. Where the host refuses the pidfd calls — a kernel before 5.3, the Android
 app sandbox's seccomp filter — the guest's `pidfd_open` answers `ENOSYS`, which
 every user of it probes for and falls back from (the SIGSYS net's notice is
 not wanted for it, `sig_sigsys_expected`), and `pidfd_send_signal` on a
-`/proc` directory is sent by pid instead. `pidfd_getfd` stays `ENOSYS`.
+`/proc` directory is sent by pid instead. `pidfd_getfd` is the host's too —
+guest fd is host fd in the target as here, so the host's call duplicates the
+right open file description, `O_CLOEXEC` — after the kernel's refusals up to the
+task (flags `EINVAL`, no pidfd `EBADF`, a reaped process `ESRCH`) and
+containment: only a guest process is reached, and in it only a number a guest
+can hold, below every descriptor the emulator keeps for itself
+(`guest_fd_ceiling`; `EBADF` above). The permission is the host's
+`ptrace_may_access`, so a host whose Yama scope refuses a non-descendant says
+`EPERM`, and one without the call says `ENOSYS` (`tests/c/pidfdgetfd.c`).
 `tests/c/pidfd.c` (differential) and `tests/fixtures/clonepidfd.c`
 (self-checking: qemu-user writes no descriptor for a vfork child and turns exit
 signals into its own).
@@ -1395,6 +1416,19 @@ requests about itself**, the same way it already mediates every other syscall:
   a small **futex mailbox**. Tracing is per-thread, as in the kernel: each
   thread of a multithreaded tracee has its own link and its own thread-local
   self state, reports its own stops, and services requests about itself.
+- The **tracer** is per-thread too: a link names the tracer's process and the
+  thread that attached (`tracer_tid`). Only that thread's requests are taken
+  — any other thread of its process is told `ESRCH`, as `ptrace_check_attach`
+  tells it — while a wait is the whole thread group's (`do_wait` walks every
+  thread's tracees), or the calling thread's own under `__WNOTHREAD`.
+  `TracerPid` and a substituted signal's `si_pid` name that thread. When it
+  exits while its process goes on, what it traced is released as the kernel's
+  `exit_ptrace` releases it (`ptrace_tracer_thread_exit`, from the thread's
+  exit and a main thread's parking); a secondary thread's `execve` releases
+  the old leader's tracees and moves its own to the pid it is renumbered to.
+  A `PTRACE_TRACEME` names the parent's thread that forked the child — the
+  kernel's `real_parent` — or, that thread gone, any thread of the parent
+  (`tests/ptrace/tracer_thread.c`).
 - When a tracee reaches a stop point it publishes the stop, wakes the tracer,
   then **parks in a service loop**. There it answers `PEEK`/`POKE`/`GETREGSET`/
   `SETREGSET`/`GETSIGINFO`/`CONT`/`SYSCALL`/`DETACH`/… using its own `CPU` and
@@ -1487,8 +1521,14 @@ thread-local `g_ptrace_*` int gates the hot paths):
   (inheriting its options and attach flavor: the initial stop is `SIGSTOP` for an
   `ATTACH`-flavored relationship, `PTRACE_EVENT_STOP` for a `SEIZE`'d one, as
   the kernel reports them). What it inherits — tracer, options, flavor — is
-  sampled by the parent **before** the fork and handed to the child as arguments,
-  never read by the child out of the parent's registry link. The kernel fixes a
+  sampled by the parent **before** the fork and written into a link slot the
+  parent reserves then (`ptrace_fork_reserve`), never read by the child out of
+  the parent's registry link. The parent publishes that slot under the child's
+  pid the moment `fork` returns it, before it reports the event, and the child
+  waits for the publication and adopts it: the kernel attaches the child at
+  clone time, and gdb waits for the new child's first stop by the pid
+  `GETEVENTMSG` gave it — which, while the child claimed its own link once it
+  ran, a quick tracer was told `ECHILD` for (`tests/ptrace/forkwait.c`). The kernel fixes a
   child's tracer atomically at clone time; here the child may not run until after
   the parent has published its event stop, and a tracer that answers that stop
   with `PTRACE_DETACH` frees the parent's link — leaving a child that reads it a

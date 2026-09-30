@@ -54,23 +54,35 @@ extern int g_sig_kicksig;
 
 /* main(): create the shared link registry (before the first fork). */
 void ptrace_init(void);
-/* clone() fork child. `event` (0 or a PTRACE_EVENT_FORK/VFORK/CLONE code) says
- * whether the parent's tracer is following this creation: nonzero auto-attaches
- * the child to that tracer with an initial stop, zero leaves it untraced.
- * `tracer`/`options`/`seize` are what the child inherits, sampled by the parent
- * BEFORE the fork with the ptrace_self_* accessors below -- exactly as the
- * thread path samples them before pthread_create. The child must not read them
- * out of the parent's link, which by then may be detached and reclaimed. */
-void ptrace_fork_child(CPU *c, int event, s32 tracer, u32 options, u32 seize);
+/* A followed fork (PTRACE_O_TRACE{FORK,VFORK,CLONE}): the child's tracee link,
+ * which the kernel makes at clone time. _reserve, in the parent BEFORE the
+ * fork, takes a registry slot and fills it with what the child inherits --
+ * `tracer`/`tracer_tid`/`options`/`seize`, sampled with the ptrace_self_*
+ * accessors below, exactly as the thread path samples them before
+ * pthread_create -- unpublished (NULL: registry full, the child runs
+ * untraced). _publish, in the parent the moment fork returns, puts it under
+ * the child's pid (or gives it back, pid <= 0, when there is no child), so it
+ * is a tracee before the fork event is reported and a wait for that pid finds
+ * it. ptrace_fork_child, in the child, waits for the publication and adopts
+ * the link with an initial stop; its `slot` is NULL for a creation nobody
+ * follows. The child must not read what it inherits out of the parent's own
+ * link, which by then may be detached and reclaimed. */
+void *ptrace_fork_reserve(s32 tracer, s32 tracer_tid, u32 options, u32 seize);
+void ptrace_fork_publish(void *slot, s32 pid);
+void ptrace_fork_child(CPU *c, void *slot);
 /* Is the calling thread a tracee, and what are its inherited PTRACE_O_*
- * options / tracer pid / SEIZE flag? (Used by clone to decide whether/which
- * fork or clone event to report and what a followed new thread inherits.) */
+ * options / tracer pid / tracing thread / SEIZE flag? (Used by clone to
+ * decide whether/which fork or clone event to report and what a followed new
+ * thread inherits.) */
 int  ptrace_self_active(void);
 u32  ptrace_self_options(void);
 s32  ptrace_self_tracer(void);
+s32  ptrace_self_tracer_tid(void);
 u32  ptrace_self_seize(void);
 /* Tracer of any guest thread (0 = untraced), for /proc/<tid>/status TracerPid:
- * the host task is never really ptrace-attached, so its own file reads 0. */
+ * the host task is never really ptrace-attached, so its own file reads 0. The
+ * tracing thread's tid, as the kernel's, or its process's pid where that
+ * thread is not known. */
 s32  ptrace_tracer_of(s32 tid);
 /* Is any thread of this process currently a tracee? Gates the process-wide
  * signal-disposition mirroring (sig_host_update): default-terminate catchers
@@ -86,7 +98,7 @@ void ptrace_report_event(CPU *c, int event, u64 msg);
  * (a tracer's wait4 poll on it never sees a not-a-tracee window); _stop parks
  * in the initial attach stop after the wake, so clone() in the creator is not
  * blocked on the tracer resuming the child. */
-void ptrace_thread_child_claim(s32 tracer, u32 options, u32 seize);
+void ptrace_thread_child_claim(s32 tracer, s32 tracer_tid, u32 options, u32 seize);
 void ptrace_thread_child_stop(CPU *c);
 
 /* ---- Tracee-side stop reports (call only when g_ptrace_* say we are traced) ---- */
@@ -153,6 +165,14 @@ void ptrace_jobctl_service(CPU *c);
 /* The calling process, a tracer, is exiting: detach its tracees, killing
  * those that asked for it (PTRACE_O_EXITKILL) -- the kernel's exit_ptrace. */
 void ptrace_tracer_exit(void);
+/* The same for one thread that ends while its process goes on (a secondary
+ * thread's exit, a main thread parking): a tracer is a task, and only the
+ * tracees this thread attached are released. */
+void ptrace_tracer_thread_exit(void);
+/* A secondary thread's execve, before it hands the new image to the main
+ * thread: the old leader's tracees released, as its death under de_thread
+ * releases them, and `old_tid`'s moved to the pid it is renumbered to. */
+void ptrace_tracer_exec_rename(s32 old_tid);
 /* Exit of the calling thread: release its tracee link (or publish a synthetic
  * exit for the tracer to collect -- always for a secondary thread, whose death
  * is never host-waitable, and for a process whose tracer is not its host
@@ -207,9 +227,12 @@ int  ptrace_any_trace(void);
 /* Which tracees a wait asks about, as the kernel's wait_opts has it: any
  * (P_ALL, wait4(-1)), one task (P_PID, a pidfd's, wait4(pid > 0)), or the
  * members of a process group (P_PGID, wait4(-pgid), and wait4(0) for the
- * caller's own, taken when the wait begins) -- eligible_pid. */
+ * caller's own, taken when the wait begins) -- eligible_pid. `thread`, when
+ * nonzero, is the waiting thread under __WNOTHREAD: only the tracees that
+ * thread traces are asked about, where any thread of the tracer process may
+ * otherwise wait for every tracee of it. */
 enum { PT_SEL_ANY, PT_SEL_PID, PT_SEL_PGID };
-typedef struct { int type; s32 id; } PtWaitSel;
+typedef struct { int type; s32 id; s32 thread; } PtWaitSel;
 /* Does the caller currently trace a task the wait selects?
  * A tracer attached to a non-child via PTRACE_ATTACH/SEIZE has no host child,
  * so a host wait4 ECHILD is not terminal while this is true: the tracee's stop

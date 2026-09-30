@@ -162,6 +162,7 @@ SYSDEF(exit) {
          * (delay_group_leader), and reports the death when the group's last
          * thread is gone -- or never, if an execve revives the pid. */
         ptrace_leader_zombie();
+        ptrace_tracer_thread_exit();   /* ...and what it traced is released */
         robust_list_exit_self(c);   /* before the tid clear, as mm_release */
         if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
         g_tls.clear_child_tid = 0;
@@ -776,11 +777,12 @@ typedef struct {
     u32 stop_gen, image_gen;
     int tid;                  /* real host tid, filled by the thread itself */
     volatile s32 *start_tid;  /* startup handshake word on the creator's stack */
-    /* ptrace thread-follow (PTRACE_O_TRACECLONE): the creator's tracer/options/
-     * SEIZE flavor, snapshotted at clone time for the new thread's auto-attach
+    /* ptrace thread-follow (PTRACE_O_TRACECLONE): the creator's tracer (its
+     * process and its tracing thread)/options/SEIZE flavor, snapshotted at
+     * clone time for the new thread's auto-attach
      * (its own thread-local tracee state starts empty). pt_tracer == 0 when the
      * creator is untraced or thread creation is not followed. */
-    s32 pt_tracer;
+    s32 pt_tracer, pt_tracer_tid;
     u32 pt_options, pt_seize;
     pthread_t host;
 } GThread;
@@ -845,7 +847,8 @@ static void *thread_entry(void *arg) {
      * PTRACE_EVENT_CLONE the new tid is already registry-visible -- but park
      * in the initial attach stop only after it, so the creator's clone() is
      * not blocked on the tracer resuming us. */
-    ptrace_thread_child_claim(t->pt_tracer, t->pt_options, t->pt_seize);
+    ptrace_thread_child_claim(t->pt_tracer, t->pt_tracer_tid, t->pt_options,
+                              t->pt_seize);
     /* A personality its creator changed from the process's base is published
      * for other processes' /proc before clone() returns the tid to anyone. */
     if (t->pers != c->m->pers_base) pers_adopt(c->m, t->pers);
@@ -858,7 +861,9 @@ static void *thread_entry(void *arg) {
     ptrace_thread_child_stop(c);
     emu_loop(c);
     /* Thread exited via exit()/exit_group(): CLONE_CHILD_CLEARTID wakes
-     * joiners. */
+     * joiners. A tracer is a task, so what this thread traced is released
+     * with it (exit_ptrace), however long its process goes on. */
+    ptrace_tracer_thread_exit();
     jit_thread_exit();
     sig_thread_exit();   /* what it caught for the process, to another thread */
     sig_tls_release();   /* and whatever this thread's signal queue grew into */
@@ -1054,8 +1059,8 @@ static void vfork_parent_wait(CPU *c, struct VforkBox *b, pid_t child) {
  * whose exit signal is always SIGCHLD, so the host knows none of this: its
  * SIGCHLD comes for every child, and its waits see them all alike.
  *
- * So a parent keeps a table of its clone children and consults it where the
- * difference shows:
+ * So a parent keeps a table of its children -- every one, ordinary ones too,
+ * for the waits below -- and consults it where the difference shows:
  *   - the death notification: the host's SIGCHLD for a clone child becomes
  *     the signal the child asked for, or nothing (host_catcher, signal.c,
  *     through clonekid_exit_signal), with SIGCHLD kept caught while one is to
@@ -1064,37 +1069,52 @@ static void vfork_parent_wait(CPU *c, struct VforkBox *b, pid_t child) {
  *   - a wait that names the child -- wait4(pid), waitid(P_PID), a pidfd --
  *     finds it only where the kernel's rule would, and asks the host without
  *     __WCLONE, since to the host it is an ordinary child;
+ *   - a wait for ANY child, or for a process group, while a clone child is
+ *     live: the host would find the clone child without __WCLONE and nothing
+ *     with it, and cannot be asked to pass one kind by -- its answer is the
+ *     first child ready, whichever it is. So the wait is answered here
+ *     instead, a child at a time, over the kind the kernel's rule selects
+ *     (ck_waitid_any);
  *   - the reaping at death that ignoring SIGCHLD or SA_NOCLDWAIT asks for,
  *     which the kernel does for an ordinary child only: while a clone child
  *     is about (clonekids_any), the host is not let do it, and the ordinary
  *     children are reaped by the capture and passed by by the waits instead
  *     (signal.c sig_chld_host, chld_autoreaped below).
- * The table is a shared page, so that each child enters ITSELF before it runs
- * a guest instruction: its death, and so its SIGCHLD, cannot come before its
- * entry, however the parent's threads are scheduled. A reaped child's entry
- * stays, marked, because its SIGCHLD may still be on its way to a thread when
- * a wait reaps it; a new child under the same pid clears it, and a clone child
- * that needs a slot takes the oldest such one.
+ * The table is a shared page, made at the process's first fork, so that each
+ * child enters ITSELF before it runs a guest instruction: its death, and so
+ * its SIGCHLD, cannot come before its entry, however the parent's threads are
+ * scheduled -- nor can a wait for any child miss it. A reaped clone child's
+ * entry stays, marked, because its SIGCHLD may still be on its way to a
+ * thread when a wait reaps it; a new child under the same pid clears it, and
+ * a child that needs a slot takes the oldest such one. An ordinary child's
+ * entry goes at its reap -- or, reaped where no wait saw it (the host's own
+ * reaping for a parent that ignores SIGCHLD, the capture's), when a wait next
+ * finds it is no child any more, or a new child finds its pid gone.
  *
- * What is not kept: a wait for ANY child, or for a process group, still finds
- * a clone child without __WCLONE and misses it with one -- keeping that would
- * mean enumerating the other children, which nothing here can. It says so,
- * once, if a wait of that shape ever meets a live clone child
- * (clonekid_wait_note). Go's pidfd probe is the everyday clone child: a
- * CLONE_PIDFD vfork child with exit signal 0, waited for through its pidfd
- * with __WCLONE. */
+ * What is not kept: a table so full of live children that an ordinary one
+ * found no slot. A wait for any child then cannot know it holds them all, and
+ * goes to the host as it always did -- finding a clone child without __WCLONE
+ * and missing it with one -- and says so, once (clonekid_wait_note). Go's
+ * pidfd probe is the everyday clone child: a CLONE_PIDFD vfork child with exit
+ * signal 0, waited for through its pidfd with __WCLONE. */
 #define CK_MAX 256
 enum { CK_FREE = 0, CK_CLAIMING, CK_LIVE, CK_REAPED };
+/* `sig` SIGCHLD is an ordinary child, anything else a clone child. */
 struct CloneKid { s32 pid; s32 sig; u32 state; u32 age; };
 struct CloneKids {
     u32 age;                     /* reap counter: the oldest reaped slot goes first */
-    u32 nlive;                   /* entries in CK_LIVE, for the fast paths */
+    u32 nlive;                   /* clone children in CK_LIVE, for the fast paths */
     u32 nbirth;                  /* children with a death signal of their own
                                   * forked but not yet entered: SIGCHLD must be
                                   * caught for them already (clonekids_signalling) */
     u32 nborn;                   /* every clone child forked but not yet entered:
                                   * the host must not reap it at its death
                                   * already (clonekids_any) */
+    u32 nordborn;                /* ordinary children forked but not yet
+                                  * entered: a wait for any child must count
+                                  * them already (ck_waitid_any) */
+    u32 lost;                    /* an ordinary child found no slot: the table
+                                  * no longer holds every child */
     struct CloneKid e[CK_MAX];
 };
 
@@ -1105,8 +1125,8 @@ static int ck_signals(int exitsig) {
     return exitsig != 0 && exitsig != SIGCHLD && exitsig <= 64;
 }
 
-/* This process's table, made before the first clone child is forked (the child
- * enters itself into it). Under task_lock: two threads cloning at once must
+/* This process's table, made before its first child is forked (the child
+ * enters itself into it). Under task_lock: two threads forking at once must
  * not each map one. */
 static struct CloneKids *clonekids_ensure(struct Machine *m) {
     struct CloneKids *t = __atomic_load_n(&m->clonekids, __ATOMIC_ACQUIRE);
@@ -1125,6 +1145,26 @@ static struct CloneKids *clonekids_ensure(struct Machine *m) {
     return t;
 }
 
+/* An ordinary child's entry that names no child any more -- reaped where no
+ * wait saw it -- is given up: CK_LIVE -> CK_FREE, by whoever gets it first. */
+static int ck_drop_stale(struct CloneKid *k) {
+    u32 l = CK_LIVE;
+    return __atomic_compare_exchange_n(&k->state, &l, CK_FREE, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
+/* A child of this exit signal forked (+1, by the parent, before the fork) or
+ * entered, or never born (-1). */
+static void ck_birth(struct CloneKids *t, int exitsig, int d) {
+    if (!t) return;
+    if (exitsig == SIGCHLD) {
+        __atomic_add_fetch(&t->nordborn, (u32)d, __ATOMIC_ACQ_REL);
+        return;
+    }
+    if (ck_signals(exitsig)) __atomic_add_fetch(&t->nbirth, (u32)d, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&t->nborn, (u32)d, __ATOMIC_ACQ_REL);
+}
+
 /* Child side: enter ourselves into the table the parent made. */
 static void clonekid_enter(struct Machine *m, int exitsig) {
     struct CloneKids *t = m->clonekids;
@@ -1136,9 +1176,21 @@ static void clonekid_enter(struct Machine *m, int exitsig) {
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             slot = i;
     }
+    /* Full: an ordinary sibling's entry whose pid is gone altogether -- it
+     * was reaped where no wait saw it, and nothing now has the number. */
+    for (int i = 0; i < CK_MAX && slot < 0; i++) {
+        struct CloneKid *k = &t->e[i];
+        if (__atomic_load_n(&k->state, __ATOMIC_ACQUIRE) != CK_LIVE ||
+            k->sig != SIGCHLD || kill((pid_t)k->pid, 0) == 0 || errno != ESRCH)
+            continue;
+        u32 l = CK_LIVE;
+        if (__atomic_compare_exchange_n(&k->state, &l, CK_CLAIMING, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            slot = i;
+    }
     if (slot < 0) {
-        /* Full of live and reaped entries: take the reaped one reaped longest
-         * ago, whose SIGCHLD has surely been taken by now. */
+        /* ...then the reaped one reaped longest ago, whose SIGCHLD has surely
+         * been taken by now. */
         int best = -1;
         u32 best_age = 0;
         for (int i = 0; i < CK_MAX; i++)
@@ -1154,6 +1206,10 @@ static void clonekid_enter(struct Machine *m, int exitsig) {
             slot = best;
     }
     if (slot < 0) {
+        if (exitsig == SIGCHLD) {
+            __atomic_store_n(&t->lost, 1, __ATOMIC_RELEASE);   /* clonekid_wait_note */
+            return;
+        }
         static const char msg[] = "arm64chroot: too many clone children at once; "
                                   "one reports its death with SIGCHLD\n";
         (void)!write(2, msg, sizeof msg - 1);
@@ -1161,30 +1217,31 @@ static void clonekid_enter(struct Machine *m, int exitsig) {
     }
     t->e[slot].pid = (s32)getpid();
     t->e[slot].sig = exitsig;
-    __atomic_add_fetch(&t->nlive, 1, __ATOMIC_ACQ_REL);
+    if (exitsig != SIGCHLD) __atomic_add_fetch(&t->nlive, 1, __ATOMIC_ACQ_REL);
     __atomic_store_n(&t->e[slot].state, CK_LIVE, __ATOMIC_RELEASE);
 }
 
 /* Every fork child, first thing, in its parent's table (inherited, shared):
- * a reaped clone child's entry under our pid is stale now -- the pid is ours,
- * and the SIGCHLD our death sends is ours -- and a clone child enters itself.
- * Both before any guest code, so before this child can die. Then the parent's
- * table is dropped: it is not ours to add our own children to. */
+ * an entry under our pid is stale now -- a reaped clone child's, or an
+ * ordinary child's nobody saw reaped: the pid is ours, and the SIGCHLD our
+ * death sends is ours -- and we enter ourselves. Both before any guest code,
+ * so before this child can die. Then the parent's table is dropped: it is not
+ * ours to add our own children to. */
 static void clonekids_child_start(struct Machine *m, int exitsig) {
     struct CloneKids *t = m->clonekids;
     if (!t) return;
     s32 me = (s32)getpid();
     for (int i = 0; i < CK_MAX; i++) {
+        struct CloneKid *k = &t->e[i];
+        if (__atomic_load_n(&k->pid, __ATOMIC_RELAXED) != me) continue;
         u32 r = CK_REAPED;
-        if (__atomic_load_n(&t->e[i].pid, __ATOMIC_RELAXED) == me)
-            __atomic_compare_exchange_n(&t->e[i].state, &r, CK_FREE, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        if (!__atomic_compare_exchange_n(&k->state, &r, CK_FREE, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED) &&
+            k->sig == SIGCHLD)
+            ck_drop_stale(k);
     }
-    if (exitsig != SIGCHLD) {
-        clonekid_enter(m, exitsig);
-        if (ck_signals(exitsig)) __atomic_sub_fetch(&t->nbirth, 1, __ATOMIC_ACQ_REL);
-        __atomic_sub_fetch(&t->nborn, 1, __ATOMIC_ACQ_REL);
-    }
+    clonekid_enter(m, exitsig);
+    ck_birth(t, exitsig, -1);
     m->clonekids = NULL;
     munmap(t, sizeof *t);
 }
@@ -1195,10 +1252,10 @@ static int clonekids_live(struct Machine *m) {
     return t && __atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE) != 0;
 }
 
-/* The live entry for `pid`, or NULL. */
-static struct CloneKid *clonekid_live(struct Machine *m, s32 pid) {
+/* The live entry for child `pid`, of either kind, or NULL. */
+static struct CloneKid *ck_entry(struct Machine *m, s32 pid) {
     struct CloneKids *t = __atomic_load_n(&m->clonekids, __ATOMIC_ACQUIRE);
-    if (!t || !__atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE)) return NULL;
+    if (!t) return NULL;
     for (int i = 0; i < CK_MAX; i++)
         if (__atomic_load_n(&t->e[i].state, __ATOMIC_ACQUIRE) == CK_LIVE &&
             t->e[i].pid == pid)
@@ -1206,14 +1263,29 @@ static struct CloneKid *clonekid_live(struct Machine *m, s32 pid) {
     return NULL;
 }
 
-/* A wait reaped `pid` (not a WNOWAIT look): its entry, if it had one, is
- * kept for a SIGCHLD still on its way. */
+/* The live entry for `pid` if it is a clone child, or NULL. */
+static struct CloneKid *clonekid_live(struct Machine *m, s32 pid) {
+    struct CloneKids *t = __atomic_load_n(&m->clonekids, __ATOMIC_ACQUIRE);
+    if (!t || !__atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE)) return NULL;
+    for (int i = 0; i < CK_MAX; i++)
+        if (__atomic_load_n(&t->e[i].state, __ATOMIC_ACQUIRE) == CK_LIVE &&
+            t->e[i].pid == pid && t->e[i].sig != SIGCHLD)
+            return &t->e[i];
+    return NULL;
+}
+
+/* A wait reaped `pid` (not a WNOWAIT look): a clone child's entry is kept for
+ * a SIGCHLD still on its way, an ordinary child's given up. */
 static void clonekid_reaped(struct Machine *m, s32 pid) {
-    struct CloneKid *k = clonekid_live(m, pid);
+    struct CloneKid *k = ck_entry(m, pid);
     if (!k) return;
+    if (k->sig == SIGCHLD) { ck_drop_stale(k); return; }
     struct CloneKids *t = m->clonekids;
     k->age = __atomic_add_fetch(&t->age, 1, __ATOMIC_RELAXED);
-    __atomic_store_n(&k->state, CK_REAPED, __ATOMIC_RELEASE);
+    u32 l = CK_LIVE;
+    if (!__atomic_compare_exchange_n(&k->state, &l, CK_REAPED, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;
     __atomic_sub_fetch(&t->nlive, 1, __ATOMIC_ACQ_REL);
     sig_host_update(m, SIGCHLD);   /* maybe the last, of either kind */
 }
@@ -1241,7 +1313,8 @@ int clonekid_exit_signal(s32 pid) {
     if (!t) return -1;
     for (int i = 0; i < CK_MAX; i++) {
         u32 st = __atomic_load_n(&t->e[i].state, __ATOMIC_ACQUIRE);
-        if ((st == CK_LIVE || st == CK_REAPED) && t->e[i].pid == pid)
+        if ((st == CK_LIVE || st == CK_REAPED) && t->e[i].pid == pid &&
+            t->e[i].sig != SIGCHLD)
             return t->e[i].sig;
     }
     return -1;
@@ -1260,18 +1333,146 @@ static int clonekid_wait_ok(struct Machine *m, s32 pid, u32 opts, u32 *host_opts
     return (opts & G_WCLONE) != 0;
 }
 
-/* A wait for any child, or a process group, with a live clone child about:
- * the one shape the table cannot answer for (see above). Once per process. */
+/* Is a wait for any child or a process group, with these options, one the
+ * host cannot answer (a live clone child, and no __WALL) and the table can
+ * (it holds every child)? Then ck_waitid_any answers it. */
+static int ck_wait_any_here(struct Machine *m, u32 opts) {
+    struct CloneKids *t = __atomic_load_n(&m->clonekids, __ATOMIC_ACQUIRE);
+    return t && !(opts & G_WALL) && __atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&t->lost, __ATOMIC_ACQUIRE);
+}
+
+/* ...one it can answer for neither: the table lost track of an ordinary child
+ * (see above), and the host is asked as it always was. Once per process. */
 static void clonekid_wait_note(struct Machine *m, u32 opts) {
     struct CloneKids *t = __atomic_load_n(&m->clonekids, __ATOMIC_ACQUIRE);
-    if (!t || (opts & G_WALL) || !__atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE))
+    if (!t || (opts & G_WALL) || !__atomic_load_n(&t->nlive, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&t->lost, __ATOMIC_ACQUIRE))
         return;
     static char warned;
     if (__atomic_test_and_set(&warned, __ATOMIC_RELAXED)) return;
-    fprintf(stderr, "arm64chroot: a wait for any child or a process group "
-                    "cannot tell a clone child (exit signal other than SIGCHLD) "
-                    "from the others: it is found %s __WCLONE\n",
+    fprintf(stderr, "arm64chroot: more children than can be told apart: a wait "
+                    "for any child or a process group finds a clone child (exit "
+                    "signal other than SIGCHLD) %s __WCLONE\n",
             (opts & G_WCLONE) ? "only without" : "without");
+}
+
+/* Is `pid` no child of ours at all any more (reaped where no wait saw it)? A
+ * look that takes nothing, of every thread's children. */
+static int ck_not_child(s32 pid) {
+    siginfo_t x;
+    memset(&x, 0, sizeof x);
+    return syscall(SYS_waitid, P_PID, (id_t)pid, &x,
+                   WEXITED | WSTOPPED | WCONTINUED | WNOHANG | WNOWAIT, NULL) < 0 &&
+           errno == ECHILD;
+}
+
+/* waitid(P_ALL or P_PGID `id`) as the kernel answers it with a clone child
+ * live (ck_wait_any_here): of the children of the kind `opts` selects --
+ * clone children under __WCLONE, the others without it -- and in the group
+ * for P_PGID, the first with something to report, asked of the host one pid
+ * at a time; -1 and ECHILD when there is none of that kind at all. Returns as
+ * the raw syscall does: 0, with `si` zeroed when WNOHANG found nothing ready,
+ * or -1 and errno.
+ *
+ * To block, it asks the host for ANY child's state change without taking it
+ * (WNOWAIT) -- the wait sleeps in the kernel as it would, and a signal ends
+ * it with EINTR as it would -- and goes round again. A child of the other
+ * kind that has something to report makes that return at once, and goes on
+ * making it; the wait then naps between rounds (10 ms, growing to 50) rather
+ * than spin on it, which is the latency a wait here can see. */
+static int ck_waitid_any(struct Machine *m, int idtype, s32 id, siginfo_t *si,
+                         u32 opts, KRusage *ru) {
+    int want_clone = (opts & G_WCLONE) != 0;
+    int hopts = (int)(opts & ~(G_WCLONE | G_WALL));
+    int nap_ms = 10;
+    for (;;) {
+        struct CloneKids *t = __atomic_load_n(&m->clonekids, __ATOMIC_ACQUIRE);
+        int any = 0;
+        for (int i = 0; t && i < CK_MAX; i++) {
+            struct CloneKid *k = &t->e[i];
+            if (__atomic_load_n(&k->state, __ATOMIC_ACQUIRE) != CK_LIVE) continue;
+            if ((k->sig != SIGCHLD) != want_clone) continue;
+            s32 x = k->pid;
+            if (idtype == P_PGID) {
+                pid_t g = getpgid((pid_t)x);   /* a zombie still has one */
+                if (g < 0) {
+                    if (k->sig == SIGCHLD && ck_not_child(x)) ck_drop_stale(k);
+                    continue;
+                }
+                if ((s32)g != id) continue;
+            }
+            memset(si, 0, sizeof *si);
+            int r = (int)syscall(SYS_waitid, P_PID, (id_t)x, si, hopts | WNOHANG, ru);
+            if (r == 0 && si->si_pid != 0) return 0;
+            if (r == 0) { any = 1; continue; }
+            if (errno != ECHILD) return -1;
+            /* Not ours to wait for: another thread's child under __WNOTHREAD,
+             * or no child at all any more -- whose entry goes. */
+            if (!(opts & G_WNOTHREAD) || ck_not_child(x)) {
+                if (k->sig == SIGCHLD) ck_drop_stale(k);
+                else clonekid_reaped(m, x);
+            }
+        }
+        /* A child forked and not yet entered is one all the same: the
+         * kernel's wait finds it the moment fork returns. */
+        if (!any && t && __atomic_load_n(want_clone ? &t->nborn : &t->nordborn,
+                                         __ATOMIC_ACQUIRE))
+            any = 1;
+        if (!any) { errno = ECHILD; return -1; }
+        memset(si, 0, sizeof *si);
+        if (opts & G_WNOHANG) return 0;
+        siginfo_t w;
+        memset(&w, 0, sizeof w);
+        int kinds = hopts & (WEXITED | WSTOPPED | WCONTINUED | (int)G_WNOTHREAD);
+        if (syscall(SYS_waitid, P_ALL, 0, &w, kinds | WNOWAIT, NULL) < 0) {
+            if (errno == ECHILD) continue;     /* gone meanwhile: look again */
+            return -1;                         /* EINTR: the caller's to handle */
+        }
+        struct CloneKid *k = ck_entry(m, (s32)w.si_pid);
+        if (k && (k->sig != SIGCHLD) == want_clone &&
+            (idtype != P_PGID || getpgid(w.si_pid) == (pid_t)id)) {
+            nap_ms = 10;
+            continue;                          /* one of ours: take it */
+        }
+        struct timespec ts = { 0, nap_ms * 1000000L };
+        if (nanosleep(&ts, NULL) < 0 && errno == EINTR) return -1;
+        if (nap_ms < 50) nap_ms += 10;
+    }
+}
+
+/* The same wait in wait4's terms: `wpid` -1 or a group (0, -pgid), its
+ * options, its status word and its rusage. */
+static pid_t ck_wait4_any(struct Machine *m, pid_t wpid, int *status, u32 opts,
+                          struct rusage *ru) {
+    int idtype = wpid == -1 ? P_ALL : P_PGID;
+    s32 id = wpid == 0 ? (s32)getpgid(0) : (s32)-wpid;
+    u32 wo = WEXITED | ((opts & G_WUNTRACED) ? WSTOPPED : 0) |
+             (opts & (G_WCONTINUED | G_WNOHANG | G_WNOTHREAD | G_WCLONE));
+    siginfo_t si;
+    KRusage k;
+    memset(&k, 0, sizeof k);
+    if (ck_waitid_any(m, idtype, id, &si, wo, &k) < 0) return -1;
+    if (!si.si_pid) return 0;
+    int st = si.si_status;
+    switch (si.si_code) {
+    case CLD_EXITED:    *status = (st & 0xff) << 8; break;
+    case CLD_KILLED:    *status = st & 0x7f; break;
+    case CLD_DUMPED:    *status = (st & 0x7f) | 0x80; break;
+    case CLD_CONTINUED: *status = 0xffff; break;
+    default:            *status = ((st & 0xff) << 8) | 0x7f; break;   /* stopped */
+    }
+    memset(ru, 0, sizeof *ru);
+    ru->ru_utime.tv_sec = (time_t)k.utime_sec;   ru->ru_utime.tv_usec = (suseconds_t)k.utime_usec;
+    ru->ru_stime.tv_sec = (time_t)k.stime_sec;   ru->ru_stime.tv_usec = (suseconds_t)k.stime_usec;
+    ru->ru_maxrss = (long)k.maxrss;   ru->ru_ixrss = (long)k.ixrss;
+    ru->ru_idrss = (long)k.idrss;     ru->ru_isrss = (long)k.isrss;
+    ru->ru_minflt = (long)k.minflt;   ru->ru_majflt = (long)k.majflt;
+    ru->ru_nswap = (long)k.nswap;     ru->ru_inblock = (long)k.inblock;
+    ru->ru_oublock = (long)k.oublock; ru->ru_msgsnd = (long)k.msgsnd;
+    ru->ru_msgrcv = (long)k.msgrcv;   ru->ru_nsignals = (long)k.nsignals;
+    ru->ru_nvcsw = (long)k.nvcsw;     ru->ru_nivcsw = (long)k.nivcsw;
+    return si.si_pid;
 }
 
 /* A child the kernel would have reaped at its death, which no wait ever
@@ -1297,6 +1498,12 @@ static int chld_autoreaped(struct Machine *m, s32 pid, int looked) {
     }
     return 1;
 }
+
+/* The thread of our parent that forked us: the kernel's real_parent is that
+ * task, which a PTRACE_TRACEME makes the tracer (ptracetab.c). 0 for the
+ * initial guest process, whose parent is none of the guest's. */
+static s32 g_fork_parent_tid;
+s32 proc_fork_parent_tid(void) { return g_fork_parent_tid; }
 
 /* ---- pidfds ----
  *
@@ -1381,6 +1588,45 @@ SYSDEF(pidfd_open) {
     if (fd < 0) return (u64)(s64)fd;
     if (!fd_within_limit(c, (int)fd)) return (u64)(s64)-EMFILE;
     return (u64)fd;
+}
+
+/* pidfd_getfd(pidfd, targetfd, flags): a duplicate of another process's
+ * descriptor. Guest fd IS host fd, in the target as here, so the host's own
+ * call takes the right one -- its open file description, shared, as the
+ * kernel's receive_fd hands it over, O_CLOEXEC. What is judged here first is
+ * the kernel's order up to the task (flags EINVAL, a descriptor that is no
+ * pidfd EBADF, a process gone ESRCH) and containment: only a guest process's
+ * table may be reached, and in it only what the guest could hold -- the
+ * emulator's own descriptors of that process live above every number a guest
+ * can have (guest_fd_ceiling), and one there is EBADF, as the kernel answers
+ * a number the target has nothing at. The permission is the host's, which
+ * asks what the kernel asks (ptrace_may_access, ATTACH_REALCREDS): a host
+ * whose Yama scope admits no tracing of a non-descendant answers EPERM where
+ * a kernel with the guest's own view might not. A host that has no
+ * pidfd_getfd (before 5.6, or a seccomp filter over it) answers ENOSYS,
+ * which its users probe for. The descriptor arrives as an SCM_RIGHTS one
+ * does, of a class not known, which the memfd tier is told of. */
+SYSDEF(pidfd_getfd) {
+    (void)a3; (void)a4; (void)a5;
+    int pidfd = (int)(s32)a0, targetfd = (int)(s32)a1;
+    if ((u32)a2) return (u64)(s64)-EINVAL;
+    s32 pid = 0;
+    int e = pidfd_target(pidfd, &pid, 0);
+    if (e < 0) return (u64)(s64)e;
+    if (pid <= 0 || !proctab_has(pid)) return (u64)(s64)-ESRCH;
+    if (targetfd < 0 || targetfd >= guest_fd_ceiling()) return (u64)(s64)-EBADF;
+#ifdef SYS_pidfd_getfd
+    sig_sigsys_expected(SYS_pidfd_getfd);
+    long fd = syscall(SYS_pidfd_getfd, pidfd, targetfd, 0);
+    if (fd < 0) return host_err();
+    if (!fd_within_limit(c, (int)fd)) return (u64)(s64)-EMFILE;
+    mfd_track_close((int)fd);   /* a fresh number: no stale class */
+    mfd_track_recv((int)fd);
+    return (u64)fd;
+#else
+    (void)c;
+    return (u64)(s64)-ENOSYS;
+#endif
 }
 
 /* CLONE_PIDFD, before the fork: the descriptor the child's pidfd will be
@@ -1479,6 +1725,7 @@ SYSDEF(clone) {
             (ptrace_self_options() & G_PTRACE_O_TRACECLONE)) {
             pt_ev = G_PTRACE_EVENT_CLONE;
             t->pt_tracer = ptrace_self_tracer();
+            t->pt_tracer_tid = ptrace_self_tracer_tid();
             t->pt_options = ptrace_self_options();
             t->pt_seize = ptrace_self_seize();
         }
@@ -1521,7 +1768,7 @@ SYSDEF(clone) {
      * is CLONE, else FORK. The child then auto-attaches; the parent reports the
      * event stop below. */
     int pt_ev = 0;
-    s32 pt_tracer = 0;
+    s32 pt_tracer = 0, pt_tracer_tid = 0;
     u32 pt_options = 0, pt_seize = 0;
     if (ptrace_self_active()) {
         u32 o = ptrace_self_options();
@@ -1537,6 +1784,7 @@ SYSDEF(clone) {
          * the child may not have run yet. Same capture, and for the same reason,
          * as the thread path above does before pthread_create. */
         pt_tracer = ptrace_self_tracer();
+        pt_tracer_tid = ptrace_self_tracer_tid();
         pt_options = o;
         pt_seize = ptrace_self_seize();
     }
@@ -1591,19 +1839,16 @@ SYSDEF(clone) {
                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         if (box == MAP_FAILED) { proctab_release(rsv); return (u64)(s64)-ENOMEM; }
     }
-    /* A clone child enters itself into our table of them, which must exist
-     * before it does (see "clone children"). One that is to report its death
-     * with a signal of its own needs SIGCHLD caught to turn into it -- from
-     * now, since a SIGCHLD at its default is discarded as it is sent, and
-     * this child might die before we run again; it drops the count itself
+    /* Every child enters itself into our table of them, which must exist
+     * before it does (see "clone children"). A clone child that is to report
+     * its death with a signal of its own needs SIGCHLD caught to turn into it
+     * -- from now, since a SIGCHLD at its default is discarded as it is sent,
+     * and this child might die before we run again; it drops the count itself
      * once its entry is there to keep SIGCHLD caught instead. */
     int exitsig = (int)(flags & G_CSIGNAL);
-    struct CloneKids *ck = exitsig != SIGCHLD ? clonekids_ensure(m) : NULL;
-    if (ck) {
-        if (ck_signals(exitsig)) __atomic_add_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
-        __atomic_add_fetch(&ck->nborn, 1, __ATOMIC_ACQ_REL);
-        sig_host_update(m, SIGCHLD);
-    }
+    struct CloneKids *ck = clonekids_ensure(m);
+    ck_birth(ck, exitsig, 1);
+    if (ck && exitsig != SIGCHLD) sig_host_update(m, SIGCHLD);
     /* CLONE_PIDFD: the descriptor, and parent_tid's writability, settled while
      * no child exists yet -- a kernel fails the clone there, not after. */
     int pidfd_slot = -1;
@@ -1612,27 +1857,27 @@ SYSDEF(clone) {
         if (r < 0) {
             if (box) munmap(box, VF_BOX_SIZE);
             proctab_release(rsv);
-            if (ck) {
-                if (ck_signals(exitsig)) __atomic_sub_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
-                __atomic_sub_fetch(&ck->nborn, 1, __ATOMIC_ACQ_REL);
-                sig_host_update(m, SIGCHLD);
-            }
+            ck_birth(ck, exitsig, -1);
+            if (ck && exitsig != SIGCHLD) sig_host_update(m, SIGCHLD);
             return (u64)(s64)r;
         }
     }
+
+    /* A followed child's tracee link, taken now and published under its pid
+     * the moment there is one (ptrace_fork_reserve). */
+    void *pt_slot = pt_ev ? ptrace_fork_reserve(pt_tracer, pt_tracer_tid,
+                                                pt_options, pt_seize) : NULL;
 
     emu_fork_check("the guest fork/clone syscall");
     pid_t pid = fork();
     if (pid < 0) {
         int e = errno;
+        ptrace_fork_publish(pt_slot, -1);
         if (box) munmap(box, VF_BOX_SIZE);
         proctab_release(rsv);
         if (pidfd_slot >= 0) fdheld_close(pidfd_slot);
-        if (ck) {
-            if (ck_signals(exitsig)) __atomic_sub_fetch(&ck->nbirth, 1, __ATOMIC_ACQ_REL);
-            __atomic_sub_fetch(&ck->nborn, 1, __ATOMIC_ACQ_REL);
-            sig_host_update(m, SIGCHLD);
-        }
+        ck_birth(ck, exitsig, -1);
+        if (ck && exitsig != SIGCHLD) sig_host_update(m, SIGCHLD);
         return (u64)(s64)-e;
     }
     if (pid == 0) {
@@ -1643,6 +1888,7 @@ SYSDEF(clone) {
          * republish the inherited chain into our own record. Skipped for the
          * unfiltered fork, which is nearly every fork. */
         if (__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED)) seccomp_publish(m);
+        g_fork_parent_tid = (s32)g_tls.tid;   /* the parent's forking thread */
         g_tls.tid = getpid();             /* new process: tid == pid */
         /* Only our own thread came across, so anything else the host lists in
          * our thread group is not a guest thread. Re-sampled rather than
@@ -1755,9 +2001,13 @@ SYSDEF(clone) {
         /* Auto-attach to the parent's tracer + initial stop when followed;
          * otherwise drop the inherited tracee-self state (a fresh untraced pid).
          * Last, so the child is fully set up before it parks for the tracer. */
-        ptrace_fork_child(c, pt_ev, pt_tracer, pt_options, pt_seize);
+        ptrace_fork_child(c, pt_slot);
         return 0;
     }
+    /* The child is its tracer's tracee before anything else can happen: the
+     * event stop below hands the tracer its pid, and a wait for it must find
+     * it (ptrace_fork_reserve). */
+    ptrace_fork_publish(pt_slot, (s32)pid);
     /* A plain fork does not re-run load_elf, so the child needs publishing (with
      * the inherited cmdline/exe/cwd/environ/auxv and its own fresh starttime) or
      * it stays invisible in the hidden /proc view until it execve's. The PARENT
@@ -3052,6 +3302,9 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * its tracer (or its lack of one) under the leader's pid, and its old
          * tid is not reported as a thread that died -- it is not one. */
         m->dethread_ptlink = ptrace_exec_handover();
+        /* ...and what we trace is traced by the pid we are renumbered to,
+         * where the old leader's tracees go with its death. */
+        ptrace_tracer_exec_rename((s32)g_tls.tid);
         __atomic_store_n(&m->dethread_done, 1, __ATOMIC_RELEASE);
         return 0;
     }
@@ -3203,10 +3456,12 @@ SYSDEF(wait4) {
     if (wpid == INT_MIN) return (u64)(s64)-ESRCH;   /* -INT_MIN is undefined */
     /* Which tracees it asks about (kernel_wait4): one pid, a process group --
      * -pid, or the caller's own for 0, taken now -- or any. */
-    PtWaitSel sel = { PT_SEL_ANY, 0 };
+    PtWaitSel sel = { PT_SEL_ANY, 0, 0 };
     if (wpid > 0) { sel.type = PT_SEL_PID; sel.id = (s32)wpid; }
     else if (wpid < -1) { sel.type = PT_SEL_PGID; sel.id = (s32)-wpid; }
     else if (wpid == 0) { sel.type = PT_SEL_PGID; sel.id = (s32)getpgid(0); }
+    /* __WNOTHREAD: this thread's own tracees only (a tracer is a task). */
+    if ((u32)options & G_WNOTHREAD) sel.thread = (s32)g_tls.tid;
 
     /* Two modes, re-evaluated every pass (a kick can flip us between them).
      *
@@ -3230,9 +3485,12 @@ SYSDEF(wait4) {
         /* A clone child is found only where the kernel's rule would find it,
          * and the host is never asked with __WCLONE (clonekid_wait_ok). */
         u32 hopts = (u32)options;
+        int ck_any = 0;   /* a wait for any child the host cannot answer */
         if (wpid > 0) {
             if (!clonekid_wait_ok(c->m, (s32)wpid, (u32)options, &hopts))
                 return (u64)(s64)-ECHILD;
+        } else if (ck_wait_any_here(c->m, (u32)options)) {
+            ck_any = 1;
         } else {
             clonekid_wait_note(c->m, (u32)options);
         }
@@ -3240,7 +3498,8 @@ SYSDEF(wait4) {
             !ptrace_have_tracee(sel, 1)) {
             int status;
             struct rusage ru;   /* always taken: children_reaped needs it */
-            pid_t pid = wait4(wpid, &status, (int)hopts, &ru);
+            pid_t pid = ck_any ? ck_wait4_any(c->m, wpid, &status, (u32)options, &ru)
+                               : wait4(wpid, &status, (int)hopts, &ru);
             if (pid < 0) {
                 if (errno == EINTR) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
@@ -3296,7 +3555,9 @@ SYSDEF(wait4) {
         }
         int status;
         struct rusage ru;
-        pid_t pid = wait4(wpid, &status, (int)hopts | WNOHANG, &ru);
+        pid_t pid = ck_any ? ck_wait4_any(c->m, wpid, &status,
+                                          (u32)options | G_WNOHANG, &ru)
+                           : wait4(wpid, &status, (int)hopts | WNOHANG, &ru);
         int werr = errno;
         if (pid > 0) {
             /* A reaped child's link goes with it; a stop or a continue
@@ -3393,7 +3654,7 @@ SYSDEF(waitid) {
      * with the kernel's refusal of a descriptor that is not a pidfd (EBADF),
      * which the host would give too. A pidfd opened O_NONBLOCK makes the wait
      * WNOHANG, and one that finds nothing then says EAGAIN. */
-    PtWaitSel sel = { PT_SEL_ANY, 0 };
+    PtWaitSel sel = { PT_SEL_ANY, 0, 0 };
     int nonblock = 0;
     s32 who = 0;
     if (idtype == P_PID) {
@@ -3410,15 +3671,18 @@ SYSDEF(waitid) {
         sel.id = who;                  /* -1 once reaped: selects nothing */
         nonblock = (fcntl((int)id, F_GETFL) & O_NONBLOCK) != 0;
     }
+    if ((u32)options & G_WNOTHREAD) sel.thread = (s32)g_tls.tid;   /* see wait4 */
     /* A clone child is found only where the kernel's rule would find it, and
      * the host is never asked with __WCLONE (clonekid_wait_ok). */
     u32 hopts = (u32)options;
+    int ck_any = 0;   /* a wait for any child the host cannot answer */
     {
         if (who > 0) {
             if (!clonekid_wait_ok(c->m, who, (u32)options, &hopts))
                 return (u64)(s64)-ECHILD;
         } else if (idtype == P_ALL || idtype == P_PGID) {
-            clonekid_wait_note(c->m, (u32)options);
+            if (ck_wait_any_here(c->m, (u32)options)) ck_any = 1;
+            else clonekid_wait_note(c->m, (u32)options);
         }
     }
     int pflags = ((u32)options & G_WEXITED ? PT_WAIT_EXITS : 0) |
@@ -3436,8 +3700,11 @@ SYSDEF(waitid) {
              * NULL), and a guest that supplies one expects it filled -- this is
              * the wait4-less way to get a child's accounting. Kernel layout, so
              * see KRusage. */
-            int r = (int)syscall(SYS_waitid, (int)idtype, (int)id, &si, (int)hopts,
-                                 &ru);   /* always taken: children_reaped */
+            int r = ck_any ? ck_waitid_any(c->m, (int)idtype, sel.id, &si,
+                                           (u32)options, &ru)
+                           : (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
+                                          (int)hopts, &ru);   /* always taken:
+                                                               * children_reaped */
             if (r < 0) {
                 if (errno == EINTR) {
                     if (g_ptrace_kick) ptrace_service_kick(c);
@@ -3503,8 +3770,10 @@ SYSDEF(waitid) {
         KRusage ru;
         memset(&si, 0, sizeof si);
         memset(&ru, 0, sizeof ru);
-        int r = (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
-                             (int)hopts | WNOHANG, &ru);
+        int r = ck_any ? ck_waitid_any(c->m, (int)idtype, sel.id, &si,
+                                       (u32)options | G_WNOHANG, &ru)
+                       : (int)syscall(SYS_waitid, (int)idtype, (int)id, &si,
+                                      (int)hopts | WNOHANG, &ru);
         int werr = errno;
         if (r == 0 && si.si_pid != 0 &&
             (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
