@@ -33,6 +33,34 @@ no working SysV shm to diff against (Android drops it); the guest links
 dynamically *and* the seccomp tier is inert, so neither tier reaches libc's own
 `svc` sites.
 
+### On Termux (Android)
+
+The device is the strictest host, and most of its skips are the platform
+refusing something rather than a leg being unsound. A skip is only ever taken
+for a fact the run observed — the driver or the shell says which — never for an
+expected failure:
+
+* **Android's seccomp filter blocks syscalls** that the kernel has (`openat2`,
+  `faccessat2`, `name_to_handle_at`, `fchmodat2`, `rseq`, `set_robust_list`, the
+  6.13 `*xattrat` family). The emulation answers `ENOSYS` as an older kernel
+  would; a leg that needs the real call, or a host-built reference that issues
+  it, skips.
+* **SELinux hides or refuses what a kernel would allow**: hardlinks (`ln` is
+  `EACCES`, so the l2s fallback is what runs), `stat` and `open` of
+  `/proc/{loadavg,uptime,stat}` (they are synthesized for that reason),
+  reopening a memfd through `/proc/self/fd/N` (so a synthesized fd stays
+  writable), and opening `/dev/pts`.
+* **The kernel is built without checkpoint/restore support**: no
+  `/proc/self/timers`, and `PTRACE_O_SUSPEND_SECCOMP` is `EINVAL`.
+* **`$TMPDIR` is inside `$PREFIX`, which the harness binds** for a guest's
+  linker. A scratch directory the guest must *not* be able to name therefore has
+  to be moved out of the binds (`cng_outside_binds`), and the arm64chroot oracle
+  needs its rootfs there too, because it spells a guest path with the longest
+  host prefix it finds.
+* **`LD_PRELOAD` carries `libtermux-exec`**, which answers some `execve`
+  failures itself. A host-built reference that stands for "the kernel" is run
+  through `kref`, which drops it.
+
 ## Environment knobs
 
 | variable | meaning |
