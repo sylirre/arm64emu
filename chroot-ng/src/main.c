@@ -115,8 +115,18 @@ static const struct test_entry g_tests[] = {
 static int dispatch_test(const char *name, int argc, char **argv, char **envp,
                          unsigned long *auxv) {
     for (unsigned k = 0; k < sizeof g_tests / sizeof *g_tests; k++)
-        if (!strcmp(name, g_tests[k].name))
+        if (!strcmp(name, g_tests[k].name)) {
+            /* What the ambient (Android) filter refuses, measured the way the
+             * real monitor measures it at install. A driver runs the
+             * dispatcher directly and nothing here catches a SIGSYS, so a
+             * re-issue of a refused number does not come back as an errno, it
+             * kills the run (openat2, faccessat2 and the rest of the set on
+             * Android) — and which drivers reach such a re-issue changes with
+             * every path the dispatcher learns to pin or probe. Measuring once
+             * here, ahead of all of them, means a new driver cannot forget. */
+            cng_probe_blocked();
             return g_tests[k].fn(argc, argv, envp, auxv);
+        }
     cng_dprintf(2, "chroot-ng: unknown test '%s'\n", name);
     return 2;
 }

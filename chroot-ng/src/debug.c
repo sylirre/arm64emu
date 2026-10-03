@@ -169,13 +169,6 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         }
     }
     cng_g_fs = &fs;
-    /* What the ambient (Android) filter refuses, measured the same way the real
-     * monitor measures it. Two reasons this driver needs it as much as the
-     * monitor does: dispatch may only answer ENOSYS for a blocked syscall if it
-     * knows which ones those are, and nothing here catches a SIGSYS — so a
-     * re-issue of a refused syscall does not come back as an errno, it kills
-     * the run (faccessat2 on Android 13, measured). */
-    cng_probe_blocked();
 
     if (!strcmp(op, "open")) {
         long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
@@ -2974,11 +2967,6 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
             return 1;
         }
     }
-    /* The emulation asks this what the ambient (Android) filter refuses, the
-     * same as it does when the real monitor installs it — and here nothing
-     * catches a SIGSYS, so a syscall issued in ignorance is fatal rather than
-     * merely re-answered. */
-    cng_probe_blocked();
 
     char **gargv = argv + i;
     const char *gpath = gargv[0];
@@ -5533,12 +5521,6 @@ int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
     size_t n = cng_strlcpy(bhost, rootfs, sizeof bhost);
     cng_strlcpy(bhost + n, "/b", sizeof bhost - n);
     cng_fs_add_bind(&fs, "/mnt", bhost, 0);
-    /* What the ambient (Android) filter refuses, measured the way the real
-     * monitor measures it — dispatch may only answer ENOSYS for a blocked
-     * syscall if it knows which ones those are, and nothing here catches a
-     * SIGSYS, so a re-issue of a refused number kills the run rather than
-     * coming back as an errno. openat2 itself is one of them on Android 13. */
-    cng_probe_blocked();
     int fails = 0;
 
     /* The tree, made through the dispatcher so it lands in the rootfs. */
@@ -9872,7 +9854,6 @@ int cng_cmd_pintest(int argc, char **argv, char **envp, unsigned long *auxv) {
     static struct cng_fs fs;
     cng_fs_init(&fs, root);
     cng_g_fs = &fs;
-    cng_probe_blocked();
     char a[CNG_PATH_MAX], b[CNG_PATH_MAX], x[CNG_PATH_MAX], p[CNG_PATH_MAX];
     cng_snprintf(a, sizeof a, "%s/a", fs.rootfs);
     cng_snprintf(b, sizeof b, "%s/a/b", fs.rootfs);
