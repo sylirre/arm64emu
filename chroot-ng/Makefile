@@ -34,9 +34,13 @@ endif
 # Is the compiler clang (Termux/NDK) rather than gcc? Some flags are gcc-only.
 CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -ci clang)
 
-# Freestanding: no libc, no PIE, our own _start.
+# Freestanding: no libc, no PIE, our own _start. Only the compile-time halves
+# belong here (-ffreestanding, -fno-pie); the link-only `-static -nostdlib
+# -no-pie` live in LDFLAGS below. They used to be listed in both, which is a
+# silent no-op on gcc but makes clang (Termux/NDK) report `-no-pie` as "argument
+# unused during compilation" — fatal in the one unit built with -Werror.
 CFLAGS  ?= -O2 -g
-CFLAGS  += -std=gnu11 -ffreestanding -nostdlib -static -fno-pie -no-pie \
+CFLAGS  += -std=gnu11 -ffreestanding -fno-pie \
            -fno-stack-protector \
            -fno-asynchronous-unwind-tables -fno-builtin \
            -ffunction-sections -fdata-sections \
@@ -72,9 +76,16 @@ CFLAGS  += -mgeneral-regs-only
 # the first segment *starts* there; the -T*/--image-base flags don't relocate a
 # -no-pie binary cleanly on lld (they pad a segment up from 0x200000 instead).
 LDFLAGS ?=
-LDFLAGS += -static -nostdlib -no-pie -Wl,-T,scripts/chroot-ng.ld \
+LDFLAGS += -static -nostdlib -Wl,-T,scripts/chroot-ng.ld \
            -Wl,--build-id=none -Wl,-z,noexecstack \
            -Wl,--gc-sections -Wl,-e,_start
+# gcc links PIE by default on most distributions, so it needs -no-pie to keep
+# the fixed-address ET_EXEC the script above lays out. Clang already implies
+# non-PIE from -static (-static-pie being the opt-in), and says so by warning
+# that -no-pie went unused, so it is only passed to gcc.
+ifeq ($(CC_IS_CLANG),0)
+LDFLAGS += -no-pie
+endif
 
 CSRC := $(shell find src -name '*.c' 2>/dev/null)
 ASRC := $(shell find src -name '*.S' 2>/dev/null)
