@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -165,7 +166,10 @@ int main(int argc, char **argv) {
     mprotect(s, pg, PROT_READ | PROT_EXEC);
     int sok = run(s, 0) == want;
     npatched += patched(s, 0);
-    int mfd = memfd_create("lazystale", MFD_CLOEXEC);
+    /* The raw call: the libc wrapper is declared by glibc 2.27+ and bionic's
+     * API 30+ only, and the syscall is the same under every libc. 1 is
+     * MFD_CLOEXEC. */
+    int mfd = (int)syscall(SYS_memfd_create, "lazystale", 1);
     shared = 0;
     if (mfd >= 0 && ftruncate(mfd, pg) == 0) {
         char *rw = mmap(0, pg, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);

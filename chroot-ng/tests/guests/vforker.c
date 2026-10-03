@@ -17,6 +17,26 @@
 
 extern char **environ;
 
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <errno.h>
+/* The device's libc has posix_spawn, but the link stubs of the API level a
+ * Termux toolchain targets do not (the symbol is declared and then undefined at
+ * link time), so it is looked up in the running libc instead. */
+static int spawn(pid_t *p, const char *path, char *const av[]) {
+    int (*fn)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+              const posix_spawnattr_t *, char *const[], char *const[]) =
+        (int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                 const posix_spawnattr_t *, char *const[], char *const[]))
+            dlsym(RTLD_DEFAULT, "posix_spawn");
+    return fn ? fn(p, path, 0, 0, av, environ) : ENOSYS;
+}
+#else
+static int spawn(pid_t *p, const char *path, char *const av[]) {
+    return posix_spawn(p, path, 0, 0, av, environ);
+}
+#endif
+
 static void ended(const char *tag, int st) {
     if (WIFEXITED(st))
         printf("%s: exited %d\n", tag, WEXITSTATUS(st));
@@ -59,7 +79,7 @@ int main(int argc, char **argv) {
     ended("vfork-exec", st);
 
     st = 0;
-    int e = posix_spawn(&p, av[0], 0, 0, av, environ);
+    int e = spawn(&p, av[0], av);
     if (e) {
         printf("posix_spawn: error %d\n", e);
         return 3;
