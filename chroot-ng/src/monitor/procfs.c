@@ -962,13 +962,22 @@ static void synth_seal(int fd, long gflags) {
  * global files is root and for a process's own entries is that process — a
  * question the fake identity has no say in, since it is asked of the real
  * inode. Answered from a stat of the host name so a non-dumpable process's
- * root-owned entries are judged right too. */
-static int noatime_allowed(const char *host) {
+ * root-owned entries are judged right too.
+ *
+ * Where the host refuses even the stat (Android's policy does, for the global
+ * files it hides — they are synthesized for exactly that reason) the owner
+ * cannot be read, but a global file's is known without asking: root, on every
+ * kernel. A process's own entry is not, and its open stands rather than being
+ * refused on a guess. */
+static int noatime_allowed(const char *host, int global) {
     unsigned euid = (unsigned)sys_geteuid();
     if (euid == 0)
         return 1;
     char st[128];
-    if (cng_pin_fstatat(host, st, 0) != 0)
+    long r = cng_pin_fstatat(host, st, 0);
+    if (r == -EACCES || r == -EPERM)
+        return !global;
+    if (r != 0)
         return 1; /* cannot tell: let the open stand rather than invent EPERM */
     return *(unsigned *)(st + 24) == euid; /* st_uid */
 }
@@ -1207,7 +1216,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         *ret = -EACCES;
         return 1;
     }
-    if ((gflags & CNG_O_NOATIME) && !noatime_allowed(host)) {
+    if ((gflags & CNG_O_NOATIME) && !noatime_allowed(host, !leaf)) {
         *ret = -EPERM;
         return 1;
     }
