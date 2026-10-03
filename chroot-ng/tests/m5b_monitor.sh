@@ -238,8 +238,14 @@ elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
     # a negative or closed number is EBADF, as root would have had them.
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
     ep_r=$(run_t 60 -R -u 0:0 $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    # ...and the link it makes is the host's to make: made where the filesystem
+    # allows a hardlink (link_plain=0), and answered with the host's own errno
+    # where it does not (Android's SELinux policy: EACCES). Either way it is a
+    # link by name's verdict, which is not what the capability gate answers.
+    ep_lp=$(printf '%s\n' "$ep_r" | sed -n 's/^link_plain=//p')
+    case "$ep_lp" in '' | *[!0-9]*) ep_lp=missing ;; esac
     check_contains "fake root links by descriptor on every kernel" \
-        "link_byfd=0" "$ep_r"
+        "link_byfd=$ep_lp" "$ep_r"
     check_contains "...and AT_FDCWD is still the working directory there" \
         "link_cwd=1" "$ep_r"
     check_contains "...a number that is no descriptor is still EBADF" \
@@ -248,7 +254,7 @@ elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
     check_contains "...and an unknown flag bit is still EINVAL" \
         "link_badflag=22" "$ep_r"
     check_contains "...and the flag beside a real name links it" \
-        "link_named_flag=0" "$ep_r"
+        "link_named_flag=$ep_lp" "$ep_r"
 fi
 rm -rf "$EPD"
 

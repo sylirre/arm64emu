@@ -166,6 +166,21 @@ int main(int argc, char **argv) {
     linkprobe("link_badflag", lf, "lk_bad", AT_EMPTY_PATH | 0x8);
     close(lf);
     linkprobe("link_closedfd", lf, "lk_closed", AT_EMPTY_PATH);
+    /* What a plain link of the same file is worth on this host: 0 where its
+     * filesystem allows a hardlink, its errno where it does not (Android's
+     * SELinux policy refuses every one, EACCES). The fake-root legs of the
+     * suite are held to it: a link by descriptor there is still made by the
+     * host, so it cannot be worth more than a link by name — and it must not
+     * be worth less, which is the capability refusal the fake root removes. */
+    {
+        char dp[512];
+        snprintf(dp, sizeof dp, "%s/lk_plain", base);
+        unlink(dp);
+        errno = 0;
+        int r = linkat(AT_FDCWD, src, AT_FDCWD, dp, 0);
+        printf("link_plain=%d\n", r < 0 ? errno : 0);
+        unlink(dp);
+    }
     {
         int bd = open(base[0] ? base : "/", O_RDONLY | O_DIRECTORY);
         char np[512];

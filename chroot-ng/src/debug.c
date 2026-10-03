@@ -1215,7 +1215,11 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
          * the new name's own verdict; made anyway, the new name was a
          * writable way into the :ro file, and under -l the fallback moved
          * the file into the store. The rw bind is the control: every link
-         * there is the host's to make. */
+         * there is the host's to make, so what it must answer is the host's
+         * own verdict on the same link, asked raw — 0 where the filesystem
+         * allows a hardlink, its errno where it does not (Android's SELinux
+         * policy refuses every one with EACCES) — and dispatch adds nothing
+         * to it. */
         int ro = fs.nbinds > 0 && fs.binds[0].ro;
         const char *rs = ro ? "ro" : "rw";
         char host[CNG_PATH_MAX], st0[144], st1[144];
@@ -1226,6 +1230,15 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
             return 1;
         }
         long xdev = ro ? -EXDEV : 0;
+        long lnk = xdev;
+        if (!ro) {
+            char hl[CNG_PATH_MAX];
+            cng_snprintf(hl, sizeof hl, "%s/rolink.host", rootfs);
+            lnk = CNG_SYS(__NR_linkat, CNG_AT_FDCWD, host, CNG_AT_FDCWD, hl, 0,
+                          0);
+            if (lnk == 0)
+                CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, hl, 0, 0, 0, 0);
+        }
         cng_dispatch(__NR_symlinkat, (long)gpath, CNG_AT_FDCWD,
                      (long)"/rolink.sym", 0, 0, 0, 0);
         long tf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/rolink.taken",
@@ -1240,15 +1253,15 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         long probe = fd >= 0 ? CNG_SYS(__NR_linkat, fd, (long)"", CNG_AT_FDCWD,
                                        (long)"/", CNG_AT_EMPTY_PATH, 0)
                              : -EBADF;
-        long byfd = probe == -EEXIST ? xdev : probe;
+        long byfd = probe == -EEXIST ? lnk : probe;
         struct {
             const char *name;
             long want, r;
         } t[] = {
-            {"name", xdev,
+            {"name", lnk,
              cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath, CNG_AT_FDCWD,
                           (long)"/rolink.a", 0, 0, 0)},
-            {"followed", xdev,
+            {"followed", lnk,
              cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/rolink.sym",
                           CNG_AT_FDCWD, (long)"/rolink.b",
                           CNG_AT_SYMLINK_FOLLOW, 0, 0)},
