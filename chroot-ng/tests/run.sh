@@ -71,8 +71,10 @@ out=$(run -h 2>&1); check "short -h rc" 0 $?
 # through it: an accumulator that overflowed was undefined behaviour, which the
 # compiler is entitled to act on rather than wrap. The width is clamped to
 # HELP_MIN_COLS..HELP_MAX_COLS, and the help is long enough that some line fills
-# whatever width it is given.
-help_width() { run --help 2>&1 | awk '{ if (length > m) m = length } END { print m+0 }'; }
+# whatever width it is given. The help asks stdin as well as stdout and stderr,
+# and a suite started from a terminal has one there, so stdin is detached too:
+# without it a terminal answers and $COLUMNS is never consulted.
+help_width() { run --help </dev/null 2>&1 | awk '{ if (length > m) m = length } END { print m+0 }'; }
 export COLUMNS
 COLUMNS=40
 check "COLUMNS renders the help at that width" 40 "$(help_width)"
