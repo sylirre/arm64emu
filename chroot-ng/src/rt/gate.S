@@ -9,6 +9,10 @@
  * whose instruction pointer lies in [__cng_gate_start, __cng_gate_end); that
  * is how the SIGSYS handler re-issues translated syscalls without trapping
  * itself.  Keep this region tiny and self-contained.
+ *
+ * The instruction pointer the filter sees is the one AFTER the svc, so a svc
+ * is in the gate only if the instruction that follows it is too: __cng_gate_end
+ * must never directly follow a svc that is meant to be allowed.
  */
     .section .text.gate,"ax",%progbits
     .balign 64
@@ -29,7 +33,8 @@ cng_syscall6:
  * here instead, in the guest's own context, with the guest's own registers.
  * The handler rewrites the trap frame so that sigreturn resumes at
  * cng_bounce_wait with x0..x5 and x8 as the guest issued them (a mask pointer
- * redirected to a copy with SIGSYS taken out); the svc is inside the gate, so
+ * redirected to a copy with SIGSYS taken out); the svc is inside the gate, and
+ * so is the mov after it, where the filter sees its instruction pointer, so
  * the filter allows it. The svc after __cng_gate_end is outside the gate and
  * traps: that is the completion, which the handler recognizes by its address
  * (cng_bounce_svc_end) and answers by putting the guest's registers back and
@@ -40,11 +45,11 @@ cng_syscall6:
     .type cng_bounce_wait, %function
 cng_bounce_wait:
     svc     #0
+    mov     x8, #160                /* __NR_uname */
 
     .global __cng_gate_end
     .hidden __cng_gate_end
 __cng_gate_end:
-    mov     x8, #160                /* __NR_uname */
     svc     #0
     .global cng_bounce_svc_end
 cng_bounce_svc_end:

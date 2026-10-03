@@ -557,6 +557,30 @@ else
             printf '       kernel: %s\n       guest : %s\n' \
                 "$(echo "$mw_k" | tr '\n' '|')" "$(echo "$mw_g" | tr '\n' '|')"
         fi
+        # ...and on the SIGSYS tier, where the wait cannot be run by the
+        # handler and is bounced through a second svc in the gate. Whether the
+        # filter lets that svc through depends on where the gate ends relative
+        # to the instruction after it, which the kernel reports as the call's
+        # ip: with the gate one instruction short, every masked wait (musl's
+        # select() is one — it passes a {NULL, size} pair) trapped again from
+        # the stub, each round a record lower on the guest's stack, until it
+        # was gone (a SEGV on Android, a hang under a VM's TCG). The run needs
+        # a live filter and no -R, or it never reaches the handler.
+        if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            skip "masked waits on the SIGSYS tier: the seccomp filter is inert on this host"
+        else
+            # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+            mw_s=$(run_t 90 $GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
+            if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_s" ]; then
+                pass=$((pass + 1))
+                echo "  ok   the mask-taking waits answer as the kernel's on the SIGSYS tier too"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL the mask-taking waits diverge from the kernel on the SIGSYS tier"
+                printf '       kernel: %s\n       guest : %s\n' \
+                    "$(echo "$mw_k" | tr '\n' '|')" "$(echo "$mw_s" | tr '\n' '|')"
+            fi
+        fi
     else
         skip "masked waits: could not build tests/guests/maskwait.c with -pthread"
     fi
