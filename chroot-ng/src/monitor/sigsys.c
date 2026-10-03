@@ -229,6 +229,48 @@ static int bounce_finish(struct cng_ucontext *uc) {
     return 1;
 }
 
+/* sigaltstack, answered from the frame. The guest's alternate stack is what the
+ * kernel saved in uc_stack at delivery and what rt_sigreturn puts back —
+ * sigsys_on_scratch disarms the live one for the length of the handler, so that
+ * nothing nests onto it — and a call re-issued as it stands changes the
+ * disarmed one and is undone by that same restore. Only a tracee's
+ * trap-everything filter sends this call here, and it is the call bionic makes
+ * on the way out of every thread that has a stack of its own: disable it, then
+ * unmap it. Re-issued, the disable was lost at the sigreturn, the thread was
+ * handed the stale stack again at its next trap, and the kernel wrote that
+ * trap's frame into the unmapped pages and killed the process with a SIGSEGV
+ * nothing can catch.
+ *
+ * What the kernel judges stays the kernel's: the new stack is applied for real
+ * (it validates the flags and the size, and the live one is disarmed anyway),
+ * read back into the frame, and disarmed again. Two answers cannot come from
+ * it, because it measures "on the stack" against the stack pointer it runs on,
+ * which is ours: the old stack's SS_ONSTACK is the frame's (the guest's own sp
+ * at the trap), and so is the EPERM for changing the stack one is on. The old
+ * stack is written out last, after the new one has taken effect, as the
+ * kernel's own sigaltstack does. */
+static long sigsys_altstack(struct cng_ucontext *uc, const void *uss,
+                            void *uoss) {
+    cng_stack_t neu, now, off = {0, CNG_SS_DISABLE, 0};
+    cng_stack_t old = uc->uc_stack;
+    if (uss) {
+        if (cng_user_copyin(&neu, uss, sizeof neu) < 0)
+            return -EFAULT;
+        if (old.ss_flags & CNG_SS_ONSTACK)
+            return -EPERM;
+        long r = CNG_SYS(__NR_sigaltstack, (long)&neu, 0, 0, 0, 0, 0);
+        if (r < 0)
+            return r;
+        if (CNG_SYS(__NR_sigaltstack, 0, (long)&now, 0, 0, 0, 0) == 0)
+            uc->uc_stack = now;
+        if (now.ss_size)
+            CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
+    }
+    if (uoss && cng_user_copyout(uoss, &old, sizeof old) < 0)
+        return -EFAULT;
+    return 0;
+}
+
 /* The trapped syscall itself: the cases the handler must own (they need the
  * signal context), then the dispatcher for everything else. Returns 1 when the
  * result is in x0 and the caller still owes a syscall-exit stop, 0 when the
@@ -288,6 +330,14 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
             return 1;
         }
         r[0] = 0;
+        return 1;
+    }
+
+    /* sigaltstack is the same kind of call: state the sigreturn restores from
+     * the frame, so it is answered there (sigsys_altstack). */
+    if (nr == __NR_sigaltstack) {
+        r[0] = (unsigned long long)sigsys_altstack(uc, (const void *)r[0],
+                                                   (void *)r[1]);
         return 1;
     }
 
