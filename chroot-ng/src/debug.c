@@ -2191,6 +2191,63 @@ int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
     fails += !ok2;
 
     cng_blocked[__NR_fchownat] = 0; /* reset */
+
+    /* accept(2) where only accept4(2) is allowed — Android's filter, and the
+     * call every glibc and musl server makes on AArch64. The same call with no
+     * flags, so it has to be made, with and without an address to fill; and
+     * when accept4 is refused too the answer is ENOSYS again, while accept4
+     * itself is untouched. A listening abstract socket, two clients queued
+     * for the first pair and one for the last. */
+    {
+        struct cng_sockaddr_un sa;
+        memset(&sa, 0, sizeof sa);
+        sa.family = CNG_AF_UNIX;
+        cng_snprintf(sa.path + 1, sizeof sa.path - 1, "cng-blocktest-accept.%d",
+                     (int)sys_getpid());
+        unsigned alen = 2 + 1 + (unsigned)strlen(sa.path + 1);
+        long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+        long cl[3] = {-1, -1, -1};
+        int up = ls >= 0 &&
+                 CNG_SYS(__NR_bind, ls, (long)&sa, alen, 0, 0, 0) == 0 &&
+                 CNG_SYS(__NR_listen, ls, 8, 0, 0, 0, 0) == 0;
+        for (int i = 0; up && i < 3; i++) {
+            cl[i] = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+            up &= cl[i] >= 0 &&
+                  CNG_SYS(__NR_connect, cl[i], (long)&sa, alen, 0, 0, 0) == 0;
+        }
+        long a1 = -1, a2 = -1, a3 = -1, a4 = -1;
+        unsigned plen = sizeof sa;
+        struct cng_sockaddr_un peer;
+        if (up) {
+            cng_blocked[__NR_accept] = 1;
+            cng_blocked[__NR_accept4] = 0;
+            a1 = cng_dispatch(__NR_accept, ls, 0, 0, 0, 0, 0, /*trapped=*/1);
+            a2 = cng_dispatch(__NR_accept, ls, (long)&peer, (long)&plen, 0, 0, 0,
+                              1);
+            cng_blocked[__NR_accept4] = 1;
+            a3 = cng_dispatch(__NR_accept, ls, 0, 0, 0, 0, 0, 1);
+            cng_blocked[__NR_accept4] = 0;
+            a4 = cng_dispatch(__NR_accept4, ls, 0, 0, 0, 0, 0, 1);
+            cng_blocked[__NR_accept] = 0;
+        }
+        int ok3 = up && a1 >= 0 && a2 >= 0 && plen >= 2 && plen <= sizeof peer &&
+                  peer.family == CNG_AF_UNIX && a3 == -ENOSYS && a4 >= 0;
+        cng_dprintf(1,
+                    "blocktest accept(blocked, accept4 allowed)=%d addr=%d "
+                    "len=%u both blocked=%d accept4=%d -> %s\n",
+                    (int)a1, (int)a2, plen, (int)a3, (int)a4,
+                    ok3 ? "OK" : "FAIL");
+        fails += !ok3;
+        long got[3] = {a1, a2, a4};
+        for (int i = 0; i < 3; i++)
+            if (got[i] >= 0)
+                sys_close((int)got[i]);
+        for (int i = 0; i < 3; i++)
+            if (cl[i] >= 0)
+                sys_close((int)cl[i]);
+        if (ls >= 0)
+            sys_close((int)ls);
+    }
     return fails ? 1 : 0;
 }
 

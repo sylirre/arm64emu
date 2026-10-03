@@ -580,6 +580,18 @@ static long pin_args(long *nr, long *a, struct cng_pin *x, struct cng_pin *y,
 static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
                     long nr) {
     char pb[CNG_PATH_MAX];
+    /* accept(2) is accept4(2) with no flags, and an ambient filter can allow
+     * the one without the other: Android's allows only accept4, because bionic
+     * never issues the old number, while glibc and musl issue nothing else on
+     * AArch64 — so every server in an Alpine or Debian rootfs got the ENOSYS
+     * below for a call the kernel takes (`nc -l`: "accept: Function not
+     * implemented"). The two are the same call, so make the one that is
+     * allowed. When accept4 is blocked too, the answer is still ENOSYS. */
+    if (nr == __NR_accept && cng_blocked[__NR_accept] &&
+        !cng_blocked[__NR_accept4]) {
+        nr = __NR_accept4;
+        a3 = 0;
+    }
     if (nr >= 0 && nr < CNG_NR_MAX && cng_blocked[nr]) {
         cng_note_blocked((int)nr);
         if (cng_g_debug)

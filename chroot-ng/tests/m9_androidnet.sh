@@ -15,5 +15,13 @@ check_contains "an aliased sigprocmask unblocks only what it named" \
 check_contains "sigprocmask refuses a bad sigsetsize and a bad how" \
     "nettest sigprocmask args: size=-22 kept=1 how=-22 kept=1 -> OK" \
     "$nettest_out"
-run -t blocktest >/dev/null 2>&1
-check "blocklist gates reissue -> ENOSYS" 0 $?
+blocktest_out=$(run -t blocktest 2>&1); blocktest_rc=$?
+check "blocklist gates reissue -> ENOSYS" 0 $blocktest_rc
+# Android allows accept4 and blocks accept, and glibc and musl issue only the
+# latter on AArch64: a blocked accept is made as the accept4 it is, with and
+# without an address to fill, and is ENOSYS only when accept4 is blocked too.
+check_contains "a blocked accept is made as accept4, which is allowed" \
+    "blocktest accept(blocked, accept4 allowed)=" "$blocktest_out"
+check_contains "...and the whole of it holds" \
+    "both blocked=-38 accept4=" "$blocktest_out"
+check_absent "...with no failing leg" "-> FAIL" "$blocktest_out"
