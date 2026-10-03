@@ -3760,7 +3760,8 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         if (hr1 == 0 && hr2 == 0)
             handle_same = h1.bytes == h2.bytes && h1.type == h2.type &&
                           !memcmp(h1.h, h2.h, h1.bytes);
-        else if (hr1 != -EOPNOTSUPP && hr2 != -EOPNOTSUPP)
+        else if (hr1 != -EOPNOTSUPP && hr2 != -EOPNOTSUPP && hr1 != -ENOSYS &&
+                 hr2 != -ENOSYS)
             handle_same = 0;
         /* (c) l-xattr: set through one name, read back through another, listed,
          *     removed, gone */

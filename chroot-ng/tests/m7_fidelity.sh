@@ -135,10 +135,21 @@ check_contains "l2s O_NOFOLLOW opens the link, still ELOOPs real symlinks" \
 # calls (set through one name, read through another), an IN_DONT_FOLLOW watch
 # (fires for a change through another name), fchmodat2(AT_SYMLINK_NOFOLLOW),
 # and openat2's O_NOFOLLOW and RESOLVE_NO_SYMLINKS. Each used to operate on the
-# emulation's own symlink. Fields the host cannot issue (openat2 under qemu-user,
-# fchmodat2 on a kernel before 6.6) read -1 and are not failures; the rest must be 1.
+# emulation's own symlink. Fields the host cannot issue (openat2 under qemu-user
+# or Android's filter, fchmodat2 on a kernel before 6.6) read -1 and are not
+# failures; the rest must be 1. The handle is the one the needle has to know
+# about: name_to_handle_at is refused by Android's ambient filter and by
+# filesystems without export operations, and its -1 is the only one of these
+# fields the needle pins, so it is skipped by name and everything else still holds.
+nf_needle="l2s-nofollow-rest: opath_reg=1 handle=1 xattr=1 watch=1"
+case "$out" in
+*"l2s-nofollow-rest: opath_reg=1 handle=-1 xattr=1 watch=1"*)
+    skip "l2s name_to_handle_at leg: this host cannot issue it (ambient filter or filesystem)"
+    nf_needle="l2s-nofollow-rest: opath_reg=1 handle=-1 xattr=1 watch=1"
+    ;;
+esac
 check_contains "l2s no-follow calls all land on the backing file" \
-    "l2s-nofollow-rest: opath_reg=1 handle=1 xattr=1 watch=1" "$out"
+    "$nf_needle" "$out"
 check_absent "...and none of them failed" "-> FAIL (-1 = not issuable here)" "$out"
 check_contains "l2s legacy per-dir format fully interoperates" \
     "l2s-old: reg=1 same=1 bump3=1 xdir4=1 back2=1 einval=1 -> OK" "$out"
