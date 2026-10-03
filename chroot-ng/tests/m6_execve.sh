@@ -510,7 +510,8 @@ else
     mkdir -p "$TED/bin"; cp "$TED/threadexec" "$TED/bin/threadexec"
     for mode in leader nonleader; do
         te_k=$(cd "$TED/bin" && emu_t 60 ./threadexec $mode 2>/dev/null)
-        te_g=$(run_t 90 -R "$TED" /bin/threadexec $mode 2>/dev/null)
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        te_g=$(run_t 90 -R $GUEST_BINDS "$TED" /bin/threadexec $mode 2>/dev/null)
         if [ -n "$te_k" ] && [ "$te_k" = "$te_g" ]; then
             pass=$((pass + 1))
             printf '  ok   execve by the %s thread matches the kernel (%s)\n' "$mode" "$te_g"
@@ -527,7 +528,8 @@ else
     if guest_cc "$TED/maskwait" tests/guests/maskwait.c -pthread; then
         cp "$TED/maskwait" "$TED/bin/maskwait"
         mw_k=$(emu_t 60 "$TED/maskwait" 2>/dev/null)
-        mw_g=$(run_t 90 -R "$TED" /bin/maskwait 2>/dev/null)
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        mw_g=$(run_t 90 -R $GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
         if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_g" ]; then
             pass=$((pass + 1))
             echo "  ok   the mask-taking waits answer as the kernel's, SIGSYS taken out"
@@ -564,7 +566,7 @@ else
         # shellcheck disable=SC2086  # the shape is two words
         se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec $shape 2>/dev/null | grep '^report:')
         # shellcheck disable=SC2086
-        se_g=$(run_t 240 -R "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
+        se_g=$(run_t 240 -R $GUEST_BINDS "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
         if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
             pass=$((pass + 1))
             printf '  ok   execve reaches every sibling (%s) as the kernel does (%s)\n' "$shape" "$se_g"
