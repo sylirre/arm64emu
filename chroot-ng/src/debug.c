@@ -6973,8 +6973,29 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
      *     reported O_RDWR from F_GETFL. The status flags it did ask for
      *     (O_APPEND here) still have to come back from F_GETFL, as the kernel
      *     records them on any file. Every answer here is the host kernel's for
-     *     the real file (measured). */
-    {
+     *     the real file (measured).
+     *
+     *     The one way to a read-only description of a memfd is to reopen it
+     *     through its own /proc link, and a host policy may refuse that —
+     *     Android's does (EACCES). The fd then stays writable, as synth_seal
+     *     says it does, and there is nothing to assert: that is reported as
+     *     such, rather than as the guest being handed a writable /proc file
+     *     on a host that could have given it a read-only one. */
+    long ro_probe = -1, ro_mfd = sys_memfd_create("cng-probe", CNG_MFD_CLOEXEC);
+    if (ro_mfd >= 0) {
+        char rl[40];
+        cng_snprintf(rl, sizeof rl, "/proc/self/fd/%ld", ro_mfd);
+        ro_probe = sys_openat(CNG_AT_FDCWD, rl, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        if (ro_probe >= 0)
+            sys_close((int)ro_probe);
+        sys_close((int)ro_mfd);
+    }
+    if (ro_mfd >= 0 && ro_probe < 0) {
+        cng_dprintf(1,
+                    "proctest synth fd is read-only: unavailable (the host "
+                    "refuses to reopen a memfd, errno %ld)\n",
+                    -ro_probe);
+    } else {
         long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
                                CNG_O_RDONLY | CNG_O_APPEND | CNG_O_CLOEXEC, 0, 0,
                                0, 0);
@@ -7102,6 +7123,9 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                                             "/proc/self/cmdline",
                                             "/proc/self/mounts"};
         int st_ok = 1, sx_ok = 1, fs_ok = 1;
+        char proc_st[144];
+        long rproc = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/proc",
+                                  (long)proc_st, 0, 0, 0, 0);
         for (int k = 0; k < 3; k++) {
             char ps[144], fs[144], px[256], fx[256], pf[120], ff[120];
             long fd = pt_open(names[k]);
@@ -7131,6 +7155,28 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
                               : -1;
             if (fd >= 0)
                 sys_close((int)fd);
+            if (r1 == -EACCES) {
+                /* The host refuses the path form outright — Android denies
+                 * stat of the global files it hides, which is why they are
+                 * synthesized — so there is no real file to be compared
+                 * with. The descriptor is held to the shape every /proc
+                 * regular file has instead, which is what the real one would
+                 * say: 0444, one link, no size, procfs's device, root's. */
+                st_ok &= r2 == 0 && r2b == 0 && rproc == 0 &&
+                         !memcmp(fs, es, 120) &&
+                         ST_MODE(fs) == (0100000 | 0444) &&
+                         *(unsigned *)(fs + 20) == 1 &&   /* st_nlink */
+                         *(unsigned *)(fs + 24) == 0 &&   /* st_uid */
+                         *(long long *)(fs + 48) == 0 &&  /* st_size */
+                         !memcmp(fs, proc_st, 8);         /* st_dev */
+                sx_ok &= r4 == 0 &&
+                         *(unsigned *)(fx + 16) == 1 &&   /* stx_nlink */
+                         *(unsigned *)(fx + 20) == 0 &&   /* stx_uid */
+                         *(unsigned short *)(fx + 28) == (0100000 | 0444) &&
+                         *(unsigned long long *)(fx + 40) == 0; /* stx_size */
+                fs_ok &= r6 == 0 && *(long *)ff == 0x9fa0; /* PROC_SUPER_MAGIC */
+                continue;
+            }
             /* the whole struct: dev, ino, mode, nlink, uid, gid, size,
              * blksize, blocks and the times */
             st_ok &= r1 == 0 && r2 == 0 && r2b == 0 &&

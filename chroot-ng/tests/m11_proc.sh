@@ -108,9 +108,19 @@ check_contains "uptime is synthesized" "proctest uptime:" "$out"
 # write(), ftruncate() and mmap(MAP_SHARED|PROT_WRITE), reporting O_RDWR from
 # F_GETFL — all refused on the real file (EBADF, EINVAL, EACCES, O_RDONLY). The
 # status flags it did ask for (O_APPEND) still come back from F_GETFL.
-check_contains "a synthesized fd is read-only, with the guest's status flags" \
-    "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
-    "$out"
+# The only way to a read-only description of a memfd is to reopen it through its
+# own /proc link, and Android's policy refuses that: the driver says so, and the
+# fd stays writable there (documented at synth_seal) — nothing to hold it to.
+case "$out" in
+*"proctest synth fd is read-only: unavailable"*)
+    skip "synthesized fds are read-only: this host refuses to reopen a memfd, so they stay writable"
+    ;;
+*)
+    check_contains "a synthesized fd is read-only, with the guest's status flags" \
+        "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
+        "$out"
+    ;;
+esac
 # ...and the open flags are judged as the kernel judges them on the real file,
 # in its order: O_TRUNC is write intent (EACCES on a 0444 file), O_CREAT|O_EXCL
 # is EEXIST on a name that exists, O_DIRECTORY is ENOTDIR, O_DIRECT EINVAL,
@@ -386,10 +396,20 @@ if [ "$m11_ready" -eq 1 ]; then
         'a=$(stat -c "%f %h %s %d %i" /proc/$$/mounts);
          b=$(stat -L -c "%f %h %s %d %i" /dev/stdin < /proc/$$/mounts);
          [ "$a" = "$b" ] && echo same || echo "$a | $b"'
-    m11_sh "...and for a root-owned global file" "same" \
-        'a=$(stat -c "%f %h %s %d %i %u" /proc/loadavg);
-         b=$(stat -L -c "%f %h %s %d %i %u" /dev/stdin < /proc/loadavg);
-         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+    if [ -e /proc/loadavg ]; then
+        m11_sh "...and for a root-owned global file" "same" \
+            'a=$(stat -c "%f %h %s %d %i %u" /proc/loadavg);
+             b=$(stat -L -c "%f %h %s %d %i %u" /dev/stdin < /proc/loadavg);
+             [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+    else
+        # Android denies even the stat of the global files it hides, which is why
+        # they are synthesized: the path form has no answer to compare with, so
+        # the descriptor is held to the shape of a real /proc regular file —
+        # 0444, one link, no size, root's.
+        m11_sh "...and a global file the host denies is still a /proc regular file" "ok" \
+            'b=$(stat -L -c "%f %h %s %u" /dev/stdin < /proc/loadavg);
+             [ "$b" = "8124 1 0 0" ] && echo ok || echo "$b"'
+    fi
     m11_sh "the fd link of a synthesized file names the file" \
         "/proc/loadavg" 'readlink /proc/self/fd/0 < /proc/loadavg'
     m11_sh "...and a process entry by its number" "ok" \
