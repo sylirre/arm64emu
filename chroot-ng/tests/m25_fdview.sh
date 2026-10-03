@@ -83,8 +83,13 @@ elif guest_cc_report "$FVR/fdescape" tests/guests/fdescape.c; then
     check_contains "stdin on an outside directory becomes /dev/null" \
         "stdin=/dev/null" "$out0"
     for _leg in proc-dotdot procself-dotdot devpts-dotdot; do
-        check_contains "$_leg: a .. run from a zone dirfd stays in the rootfs" \
-            "$_leg=ok(GUEST-MARKER)" "$out"
+        case "$out" in
+        *"$_leg=unopenable"*)
+            skip "$_leg: the host refuses to open that directory, so there is no zone dirfd to walk from" ;;
+        *)
+            check_contains "$_leg: a .. run from a zone dirfd stays in the rootfs" \
+                "$_leg=ok(GUEST-MARKER)" "$out" ;;
+        esac
     done
     check_contains "a .. run through a dirfd's magic link stays in the rootfs" \
         "magic-dotdot=ok(GUEST-MARKER)" "$out"

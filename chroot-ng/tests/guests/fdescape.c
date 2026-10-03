@@ -122,7 +122,13 @@ int main(void) {
     int ps = open("/proc/self", O_RDONLY | O_DIRECTORY);
     content("procself-dotdot", openat(ps, "../../etc/marker", O_RDONLY));
     int pts = open("/dev/pts", O_RDONLY | O_DIRECTORY);
-    content("devpts-dotdot", openat(pts, "../../etc/marker", O_RDONLY));
+    /* Some hosts will not let an app open this directory at all (Android's
+     * policy: EACCES), and then there is no descriptor to walk from. Said so,
+     * rather than reported as the EBADF of an openat on -1. */
+    if (pts < 0)
+        printf("devpts-dotdot=unopenable(%s)\n", strerror(errno));
+    else
+        content("devpts-dotdot", openat(pts, "../../etc/marker", O_RDONLY));
 
     /* Through a directory fd's magic link. */
     int sub = open("/sub", O_RDONLY | O_DIRECTORY);
