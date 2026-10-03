@@ -262,6 +262,33 @@ cng_guest_binds() {
     done
 }
 
+# cng_outside_binds DIR — where a scratch tree may be put in front of the
+# arm64chroot oracle. The oracle spells a guest path with the longest HOST prefix
+# it finds, and a rootfs that sits inside a directory $GUEST_BINDS exposes is then
+# spelled as the bind: Termux's $TMPDIR is inside $PREFIX, which is bound for the
+# linker, so the oracle's getcwd answered "/data/data/.../tmp.X/a/b" for a guest
+# whose cwd is /a/b — chroot-ng answers /a/b there, as the kernel's chroot would,
+# so the reference is the one at fault. Prints DIR itself when no bind contains it;
+# otherwise DIR is moved under $HOME, where none does, and the new name is
+# printed. Callers re-point their variable and clean up as before.
+cng_outside_binds() {
+    _real=$(cd "$1" 2>/dev/null && pwd -P) || {
+        printf '%s\n' "$1"
+        return 0
+    }
+    _in=0
+    for _w in $GUEST_BINDS; do
+        [ "$_w" = -b ] && continue
+        case "$_real/" in "${_w#*:}"/*) _in=1 ;; esac
+    done
+    if [ "$_in" = 1 ] && _to=$(mktemp -d "${HOME:-/}/cng-unbound.XXXXXX" 2>/dev/null) &&
+        rmdir "$_to" && mv "$1" "$_to"; then
+        printf '%s\n' "$_to"
+        return 0
+    fi
+    printf '%s\n' "$1"
+}
+
 # cng_dyn_binds — the same directories, for a guest that is dynamic even though
 # this host's probed link mode is static (M23 builds one deliberately, since the
 # noexec .so path only exists for a guest whose OWN ld.so maps libraries). On a

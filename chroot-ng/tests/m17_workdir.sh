@@ -195,6 +195,9 @@ elif ! guest_xlate_ready "-w oracle differential"; then
 elif [ -z "$M17W_ORACLE" ] || [ ! -x "$M17W_ORACLE" ]; then
     skip "-w oracle differential: no arm64chroot oracle for this host"
 else
+    # The tree moves out from under any bind first (Termux's $TMPDIR is inside
+    # the bound $PREFIX), where the oracle would spell the cwd as the bind.
+    M17W=$(cng_outside_binds "$M17W")
     # m17w_diff <desc> <args...> — the same invocation both sides, stdout
     # compared whole. chroot-ng needs -R for translation on a cross host; the
     # oracle emulates every instruction and needs nothing.

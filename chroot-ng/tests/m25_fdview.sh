@@ -58,6 +58,10 @@ rm -rf "$FVR" "$FVO"
 # the escapes must land on instead, and a /dev so "/dev/pts/../.." has a
 # parent to walk through.
 FVR=$(mktemp -d); FVO=$(mktemp -d)
+# "Outside" has to be true: where the guest binds a directory that contains the
+# scratch space (Termux's $TMPDIR is inside the bound $PREFIX), a name there is
+# one the guest HAS, and no descriptor on it is a leak.
+FVO=$(cng_outside_binds "$FVO")
 mkdir -p "$FVR/etc" "$FVR/sub" "$FVR/dev"
 printf 'GUEST-MARKER' > "$FVR/etc/marker"
 ln -s /etc/marker "$FVR/sub/lnk"

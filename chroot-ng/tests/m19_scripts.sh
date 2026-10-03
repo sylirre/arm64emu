@@ -173,6 +173,9 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/guests/scriptprobe.c; then
     # The oracle is a whole-instruction emulator with a purely virtual cwd, so
     # it never had either bug; its answers are the reference for ours.
     if [ -n "$M19_ORACLE" ] && [ -x "$M19_ORACLE" ]; then
+        # Out from under any bind first: where the rootfs is inside one (Termux's
+        # $TMPDIR is inside the bound $PREFIX) the oracle spells the cwd as the bind.
+        M19=$(cng_outside_binds "$M19")
         m19_diff() { # desc, args...
             _d=$1
             shift

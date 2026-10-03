@@ -42,6 +42,11 @@ else
     # has, and leave their mark there if they ever get through.
     if guest_cc "$M26D/pathrace" tests/guests/pathrace.c -pthread; then
         R=$(mktemp -d); H=$(mktemp -d)
+        # The host side must be a place the guest has no name for: where a bind
+        # contains the scratch space (Termux's $TMPDIR is inside the bound
+        # $PREFIX) it would be reachable by right, and every leg below would
+        # be measuring the bind.
+        H=$(cng_outside_binds "$H")
         mkdir -p "$R/bin" "$R/w/d" "$H/hostdir" "$H/sub"
         cp "$M26D/pathrace" "$R/bin/pathrace"
         printf 'guest\n' > "$R/w/d/x"; chmod 755 "$R/w/d/x"
