@@ -222,10 +222,28 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
     if [ "$CNG_NATIVE" = 1 ]; then
         check_contains "...a hundred of them, past the old record's 64" \
             "timers_created=100" "$out"
-        check_contains "...a timer the emulation never saw handed out too" \
-            "unseen_timer_gone=1" "$out"
-        check_contains "...and the rseq area unregistered" \
-            "rseq_registered=1 rseq_gone=1 -> OK" "$out"
+        # The raw timer is found by the kernel's own list and nothing else, so
+        # a kernel that publishes none (Android's GKI has no checkpoint/restore
+        # support, hence no /proc/self/timers) has nothing for the emulation to
+        # find it by: only the timers it was told of can be dropped there.
+        if [ -e /proc/self/timers ]; then
+            check_contains "...a timer the emulation never saw handed out too" \
+                "unseen_timer_gone=1" "$out"
+        else
+            skip "an unseen timer's exec reset: this kernel has no /proc/self/timers to list it by"
+        fi
+        # rseq is registered wherever the host allows it. Where the ambient filter
+        # refuses it (Android 15's does) there is no area to unregister: the driver
+        # says it was refused as unavailable, and nothing else excuses the leg.
+        case "$out" in
+        *"rseq_enosys=1 rseq_registered=0 rseq_gone=0 -> OK"*)
+            skip "rseq area reset: the host refuses rseq (ambient filter), so none was registered"
+            ;;
+        *)
+            check_contains "...and the rseq area unregistered" \
+                "rseq_registered=1 rseq_gone=1 -> OK" "$out"
+            ;;
+        esac
     else
         check_contains "...and there was no rseq area to unregister here" \
             "rseq_registered=0 rseq_gone=0 -> OK" "$out"

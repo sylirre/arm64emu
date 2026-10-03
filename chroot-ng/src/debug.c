@@ -3025,6 +3025,7 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * native host (tests/m6_execve.sh). */
     enum { NTIMERS = 100 };
     int tid[NTIMERS], tid_raw = 0, ntimers = 0, have_raw = 0, have_rseq = 0;
+    int rseq_enosys = 0;
     /* struct rseq: 32 bytes, 32-aligned; the signature is any word. */
     static struct {
         unsigned int cpu_id_start, cpu_id;
@@ -3046,9 +3047,14 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
             ntimers++;
         /* Likewise the rseq area, which is recorded the same way. A kernel or
          * emulator without rseq (qemu-user answers ENOSYS) leaves nothing to
-         * drop, and that is not a failure. */
-        have_rseq = cng_dispatch(__NR_rseq, (long)&rs_old, 32, 0, 0x53053053,
-                                 0, 0, 1) == 0;
+         * drop, and that is not a failure — nor is a host whose ambient filter
+         * refuses it (Android 15's does, and the dispatcher answers the ENOSYS
+         * a kernel without it would). The two are told apart from a refusal
+         * for any other reason, which is: rseq_enosys says which this was. */
+        long rr = cng_dispatch(__NR_rseq, (long)&rs_old, 32, 0, 0x53053053, 0,
+                               0, 1);
+        have_rseq = rr == 0;
+        rseq_enosys = rr == -ENOSYS;
     }
 
     static struct cng_ucontext uc;
@@ -3074,9 +3080,10 @@ int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
         int ok = brk_back && gone && (!have_rseq || rseq_gone);
         cng_dprintf(1,
                     "execreset: brk_back=%d timers_created=%d timers_gone=%d "
-                    "unseen_timer_gone=%d rseq_registered=%d rseq_gone=%d -> %s\n",
-                    brk_back, ntimers, gone, raw_gone, have_rseq, rseq_gone,
-                    ok ? "OK" : "FAIL");
+                    "unseen_timer_gone=%d rseq_enosys=%d rseq_registered=%d "
+                    "rseq_gone=%d -> %s\n",
+                    brk_back, ntimers, gone, raw_gone, rseq_enosys, have_rseq,
+                    rseq_gone, ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }
     unsigned long entry = (unsigned long)uc.uc_mcontext.pc;
