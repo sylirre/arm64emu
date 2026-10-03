@@ -1132,7 +1132,17 @@ static int self_snapshot(struct cng_procsnap *out) {
 
 /* ---- the open hook ------------------------------------------------------- */
 
-int cng_procfs_open(const char *canon, long gflags, long *ret) {
+/* What the canonical guest name `canon` is as far as synthesis goes: the PF_*
+ * kind of the file cng_procfs_open would build for it, or 0 when the host's own
+ * file is the answer. *host is the host path it names (the views that read the
+ * real file need it), *pid and *leaf the process and entry of a
+ * /proc/<pid>/<leaf> name (leaf is 0 for a global one). One list, asked by the
+ * open and by the stat family alike: what can be opened as a synthesized file
+ * is exactly what can be stat'ed as one when the host refuses to. */
+static int synth_kind(const char *canon, char *host, size_t hsz, int *pid,
+                      const char **leafp) {
+    *pid = 0;
+    *leafp = 0;
     if (cng_g_no_proc || !cng_g_fs)
         return 0;
 
@@ -1140,12 +1150,11 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
      * redirects — an explicit `-b /proc:DIR`, or the rootfs prefix a hidden pid
      * falls back to — is the user's mapping (or the hidden view) speaking, and
      * it outranks synthesis. */
-    char host[CNG_PATH_MAX];
-    if (host_of(canon, host, sizeof host) != 0 || strcmp(host, canon) != 0)
+    if (host_of(canon, host, hsz) != 0 || strcmp(host, canon) != 0)
         return 0;
 
-    int kind = 0, pid = 0;
-    const char *leaf = pid_tail(canon, &pid);
+    int kind = 0;
+    const char *leaf = pid_tail(canon, pid);
     if (leaf) {
         kind = per_pid_kind(leaf);
         /* status only diverges under a fake identity; everything else about a
@@ -1154,7 +1163,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
             return 0;
         /* Another process is describable only if it is a guest process; a host
          * one is already hidden by the path layer. */
-        if (kind && !cng_procreg_has(pid))
+        if (kind && !cng_procreg_has(*pid))
             return 0;
     } else if (!strcmp(canon, "/proc/mounts")) {
         kind = PF_MOUNTS; /* where the /etc/mtab symlink usually lands */
@@ -1169,6 +1178,34 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
             return 0; /* a readable host file is strictly richer */
         kind = PF_STAT;
     }
+    *leafp = leaf;
+    return kind;
+}
+
+/* The name the kernel's fd link would show for a synthesized file, and the one
+ * its attributes are looked up under: a process's entries by number (self
+ * resolved, thread-self as the task entry), /proc/mounts as the self/mounts it
+ * links to, the global files as themselves. */
+static void synth_link(const char *canon, int kind, const char *leaf, int pid,
+                       char *link, size_t sz) {
+    if (leaf) {
+        if (!strncmp(canon + 6, "thread-self/", 12))
+            cng_snprintf(link, sz, "/proc/%d/task/%ld/%s", pid, sys_gettid(),
+                         leaf);
+        else
+            cng_snprintf(link, sz, "/proc/%d/%s", pid, leaf);
+    } else if (kind == PF_MOUNTS) {
+        cng_snprintf(link, sz, "/proc/%d/mounts", (int)sys_getpid());
+    } else {
+        cng_strlcpy(link, canon, sz);
+    }
+}
+
+int cng_procfs_open(const char *canon, long gflags, long *ret) {
+    char host[CNG_PATH_MAX];
+    int pid;
+    const char *leaf;
+    int kind = synth_kind(canon, host, sizeof host, &pid, &leaf);
     if (!kind)
         return 0;
 
@@ -1227,21 +1264,8 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
 
     int refreshable =
         (kind == PF_LOADAVG || kind == PF_UPTIME || kind == PF_STAT);
-    /* The name the kernel's fd link would show: a process's entries by number
-     * (self resolved, thread-self as the task entry), /proc/mounts as the
-     * self/mounts it links to, the global files as themselves. */
     char link[CNG_PATH_MAX];
-    if (leaf) {
-        if (!strncmp(canon + 6, "thread-self/", 12))
-            cng_snprintf(link, sizeof link, "/proc/%d/task/%ld/%s", pid,
-                         sys_gettid(), leaf);
-        else
-            cng_snprintf(link, sizeof link, "/proc/%d/%s", pid, leaf);
-    } else if (kind == PF_MOUNTS) {
-        cng_snprintf(link, sizeof link, "/proc/%d/mounts", (int)sys_getpid());
-    } else {
-        cng_strlcpy(link, canon, sizeof link);
-    }
+    synth_link(canon, kind, leaf, pid, link, sizeof link);
     long fd = synth_memfd(refreshable, link);
     if (fd < 0)
         return 0; /* no memfd: degrade to host passthrough */
@@ -1362,12 +1386,40 @@ static int synth_name_of(int fd, char *out, size_t sz) {
 }
 
 /* What every regular file under /proc has in common, put on a stat that could
- * not be taken from the file itself: the kernel keeps a held inode answering
- * after its process is gone, and there is no path left to ask for one of
- * those. So the procfs mount's own identity carries 0444 (0400 for environ and
- * auxv, which are the owner's alone), one link, size 0, 1 KiB blocks, and the
- * memfd's inode number in place of one nobody can look up any more. A
- * process's entries are its owner's, and every guest process runs as us. */
+ * not be taken from the file itself. Two things leave it so: the kernel keeps a
+ * held inode answering after its process is gone, with no path left to ask for
+ * one of those; and Android's SELinux policy refuses an app the stat — and the
+ * read access check — of the global files it hides (version, loadavg, uptime,
+ * stat), which is why they are synthesized at all, and which left `stat` and
+ * `test -r` failing on a name that `cat` could read. So the procfs mount's own
+ * identity carries 0444 (0400 for environ and auxv, which are the owner's
+ * alone), one link, size 0, 1 KiB blocks, and an inode number: the memfd's for
+ * a file whose process is gone (nobody can look up the real one any more),
+ * synth_ino()'s for a name the host refuses. A process's entries are its
+ * owner's, and every guest process runs as us. */
+/* CNG_PROC_DENY_STAT=1: answer every stat-family call on a synthesized name as
+ * if the host had refused it, which is what Android does and a test host does
+ * not. Settled before the first guest instruction, read-only after. */
+int cng_g_proc_deny_stat = 0;
+
+/* An inode number for a name the host will not stat. A real file has one, the
+ * same from stat(path) and fstat(fd) and from one open to the next, so it is
+ * made from the name — not from the memfd, whose number is a different one for
+ * every open — and put where procfs puts its static entries (it counts up from
+ * PROC_DYNAMIC_FIRST, 0xf0000000) so it cannot be mistaken for a pid's. */
+static unsigned long synth_ino(const char *name) {
+    unsigned h = 2166136261u; /* FNV-1a */
+    for (; *name; name++)
+        h = (h ^ (unsigned char)*name) * 16777619u;
+    return 0xf0000000ul + (h & 0x0ffffffful);
+}
+
+/* stat(name) on the host, with the knob's refusal laid over a success. */
+static long host_stat_name(const char *name, char *st) {
+    long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, name, st, 0, 0, 0);
+    return r == 0 && cng_g_proc_deny_stat ? -EACCES : r;
+}
+
 #define ST_U32(b, o) (*(unsigned *)((b) + (o)))
 #define ST_S64(b, o) (*(long long *)((b) + (o)))
 static unsigned proc_mode_of(const char *name) {
@@ -1379,20 +1431,20 @@ static unsigned proc_mode_of(const char *name) {
 static int proc_owned(const char *name) {
     return name[6] >= '0' && name[6] <= '9'; /* "/proc/<pid>/..." */
 }
-static int synth_stat_gone(const char *name, unsigned long memfd_ino, char *st) {
+static int synth_stat_gone(const char *name, unsigned long ino, char *st) {
     if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, "/proc", st, 0, 0, 0) != 0)
         return 0;
     ST_U32(st, 16) = proc_mode_of(name);
     ST_U32(st, 20) = 1;
     ST_U32(st, 24) = proc_owned(name) ? (unsigned)sys_getuid() : 0;
     ST_U32(st, 28) = proc_owned(name) ? (unsigned)sys_getgid() : 0;
-    *(unsigned long *)(st + STAT_INO_OFF) = memfd_ino;
+    *(unsigned long *)(st + STAT_INO_OFF) = ino;
     ST_S64(st, 48) = 0;
     *(int *)(st + 56) = 1024;
     ST_S64(st, 64) = 0;
     return 1;
 }
-static int synth_statx_gone(const char *name, unsigned long long memfd_ino,
+static int synth_statx_gone(const char *name, unsigned long long ino,
                             unsigned flags, unsigned mask, char *sx) {
     if (CNG_SYS(__NR_statx, CNG_AT_FDCWD, "/proc", flags, mask, sx, 0) != 0)
         return 0;
@@ -1401,7 +1453,7 @@ static int synth_statx_gone(const char *name, unsigned long long memfd_ino,
     ST_U32(sx, 20) = proc_owned(name) ? (unsigned)sys_getuid() : 0;
     ST_U32(sx, 24) = proc_owned(name) ? (unsigned)sys_getgid() : 0;
     *(unsigned short *)(sx + 28) = (unsigned short)proc_mode_of(name);
-    *(unsigned long long *)(sx + 32) = memfd_ino;
+    *(unsigned long long *)(sx + 32) = ino;
     ST_S64(sx, 40) = 0;
     ST_S64(sx, 48) = 0;
     return 1;
@@ -1416,9 +1468,10 @@ int cng_procfs_fix_fd(int fd, void *stat) {
     if (!synth_name_of(fd, name, sizeof name))
         return 0; /* a memfd, but not one of ours */
     unsigned long ino = *(unsigned long *)(st + STAT_INO_OFF);
-    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, name, st, 0, 0, 0) == 0)
+    long e = host_stat_name(name, st);
+    if (e == 0)
         return 1;
-    return synth_stat_gone(name, ino, st);
+    return synth_stat_gone(name, e == -EACCES ? synth_ino(name) : ino, st);
 }
 
 int cng_procfs_fix_path(long dirfd, const char *path, void *stat) {
@@ -1429,9 +1482,10 @@ int cng_procfs_fix_path(long dirfd, const char *path, void *stat) {
     if (!synth_name_at(dirfd, path, name, sizeof name))
         return 0;
     unsigned long ino = *(unsigned long *)(st + STAT_INO_OFF);
-    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, name, st, 0, 0, 0) == 0)
+    long e = host_stat_name(name, st);
+    if (e == 0)
         return 1;
-    return synth_stat_gone(name, ino, st);
+    return synth_stat_gone(name, e == -EACCES ? synth_ino(name) : ino, st);
 }
 
 /* statx's dev is major/minor; stat's encoding has major in bits 8..19 and
@@ -1457,9 +1511,13 @@ static int fix_statx(long dirfd, const char *path, int fd, unsigned flags,
      * flags (AT_STATX_*) are what remains. */
     flags &= ~(unsigned)(CNG_AT_SYMLINK_NOFOLLOW | CNG_AT_EMPTY_PATH |
                          CNG_AT_NO_AUTOMOUNT);
-    if (CNG_SYS(__NR_statx, CNG_AT_FDCWD, name, flags, mask, sx, 0) == 0)
+    long e = CNG_SYS(__NR_statx, CNG_AT_FDCWD, name, flags, mask, sx, 0);
+    if (e == 0 && cng_g_proc_deny_stat)
+        e = -EACCES;
+    if (e == 0)
         return 1;
-    return synth_statx_gone(name, ino, flags, mask, sx);
+    return synth_statx_gone(name, e == -EACCES ? synth_ino(name) : ino, flags,
+                            mask, sx);
 }
 
 int cng_procfs_fix_fd_statx(int fd, unsigned flags, unsigned mask,
@@ -1470,6 +1528,98 @@ int cng_procfs_fix_fd_statx(int fd, unsigned flags, unsigned mask,
 int cng_procfs_fix_path_statx(long dirfd, const char *path, unsigned flags,
                               unsigned mask, void *statx) {
     return fix_statx(dirfd, path, -1, flags, mask, statx);
+}
+
+/* ---- a stat the host refused --------------------------------------------- */
+
+/* The name a descriptor was opened on, when that is under /proc: what
+ * /proc/self/fd/N reads for an O_PATH fd — the one kind of fd on a synthesized
+ * name that is the host's own, since an O_PATH open is left to the kernel. */
+static int fd_proc_name(int fd, char *out, size_t sz) {
+    char link[40];
+    cng_snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    long n = sys_readlinkat(CNG_AT_FDCWD, link, out, sz - 1);
+    if (n <= 0)
+        return 0;
+    out[n] = '\0';
+    return !strncmp(out, "/proc/", 6);
+}
+
+/* The synthesized name behind `canon`, in the form its fd link and its stat
+ * are known by, or 0 when the host's own answer stands. `follow` is whether the
+ * call follows a final symlink. */
+static int synth_stat_name(const char *canon, int follow, char *name,
+                           size_t sz) {
+    char host[CNG_PATH_MAX];
+    int pid;
+    const char *leaf;
+    int kind = synth_kind(canon, host, sizeof host, &pid, &leaf);
+    if (!kind)
+        return 0;
+    /* /proc/mounts is a symlink, and a call that does not follow it is asking
+     * about the link, which the host has no reason to refuse. */
+    if (!follow && !leaf && kind == PF_MOUNTS)
+        return 0;
+    synth_link(canon, kind, leaf, pid, name, sz);
+    return 1;
+}
+
+int cng_procfs_refused(long r) {
+    return r == -EACCES || (r == 0 && cng_g_proc_deny_stat);
+}
+
+int cng_procfs_synth_stat(const char *canon, int follow, void *stat) {
+    char name[CNG_PATH_MAX];
+    return synth_stat_name(canon, follow, name, sizeof name) &&
+           synth_stat_gone(name, synth_ino(name), (char *)stat);
+}
+
+int cng_procfs_synth_fd_stat(int fd, void *stat) {
+    char canon[CNG_PATH_MAX];
+    /* An fd's name is the file's own: /proc/mounts there is the symlink. */
+    return fd >= 0 && fd_proc_name(fd, canon, sizeof canon) &&
+           cng_procfs_synth_stat(canon, 0, stat);
+}
+
+/* The same flags fix_statx() hands the kernel: the lookup ones are the name's
+ * business, and what remains are the sync flags. */
+#define STATX_NAME_FLAGS                                                       \
+    (CNG_AT_SYMLINK_NOFOLLOW | CNG_AT_EMPTY_PATH | CNG_AT_NO_AUTOMOUNT)
+
+int cng_procfs_synth_statx(const char *canon, int follow, unsigned flags,
+                           unsigned mask, void *statx) {
+    char name[CNG_PATH_MAX];
+    return synth_stat_name(canon, follow, name, sizeof name) &&
+           synth_statx_gone(name, synth_ino(name),
+                            flags & ~(unsigned)STATX_NAME_FLAGS, mask,
+                            (char *)statx);
+}
+
+int cng_procfs_synth_fd_statx(int fd, unsigned flags, unsigned mask,
+                              void *statx) {
+    char canon[CNG_PATH_MAX];
+    return fd >= 0 && fd_proc_name(fd, canon, sizeof canon) &&
+           cng_procfs_synth_statx(canon, 0, flags, mask, statx);
+}
+
+/* access(2) mode bits */
+#define ACC_X 1
+#define ACC_W 2
+
+int cng_procfs_synth_access(const char *canon, int mode, int follow) {
+    char name[CNG_PATH_MAX];
+    if (!synth_stat_name(canon, follow, name, sizeof name))
+        return 1;
+    /* The attributes synth_stat_gone() gives: 0444 (0400, and the owner's, for
+     * environ and auxv — the caller is that owner). Reading is always allowed,
+     * and nothing here has an execute bit. Write is the one that depends on who
+     * asks: root's DAC bypass is the one the dispatcher applies to every other
+     * file it is denied on. */
+    if (mode & ACC_X)
+        return -EACCES;
+    if ((mode & ACC_W) && !cng_fake_root())
+        return -EACCES;
+    return 0;
 }
 
 int cng_procfs_fstatfs(int fd, void *buf) {

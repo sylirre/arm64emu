@@ -521,6 +521,11 @@ static void help(char **envp) {
                       "directory under $TMPDIR even where the host has a real "
                       "/dev/shm. Test aid: a host that has one otherwise never "
                       "takes the stand-in path at all."},
+        {"CNG_PROC_DENY_STAT", "Answer stat, statx and access on a synthesized "
+                      "/proc file (version, loadavg, uptime, stat, ...) from "
+                      "the guest's view as if the host kernel had refused "
+                      "them, which Android's SELinux policy does. Test aid: "
+                      "a host that allows them never takes that path."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "
                       "socket, which refuses the connection. Test aid: a "

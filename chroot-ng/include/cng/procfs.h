@@ -99,4 +99,34 @@ int cng_procfs_fstatfs(int fd, void *buf);
 int cng_procfs_fix_path_statfs(long dirfd, const char *path, void *buf);
 int cng_procfs_link_name(const char *tgt, char *out, size_t sz);
 
+/* A stat the host refused. Android's SELinux policy denies an app the getattr
+ * and the read access check of the global files it hides — /proc/version,
+ * loadavg, uptime, stat — so `stat`, `test -r` and an fstat on an O_PATH fd of
+ * a name the guest can read and has been served in full fail with EACCES, where
+ * the file the guest was promised answers them. `cng_procfs_refused(r)` says
+ * whether the host's answer `r` to a stat/access call is one to replace
+ * (EACCES, or a success where CNG_PROC_DENY_STAT says it should have been
+ * one). Then, for the canonical guest name `canon` (or the O_PATH fd, whose
+ * name is read off its link), the cng_procfs_synth_* calls put the attributes
+ * of a /proc regular file into the buffer — the same ones cng_procfs_fix_fd
+ * gives an fd it opened, so the path and the descriptor agree — and return 1;
+ * 0 means the name is not one we synthesize and the host's refusal stands.
+ * `follow` is whether the call follows a final symlink (/proc/mounts is one,
+ * and a call that does not is asking about the link); `flags` and `mask` are
+ * the guest's statx arguments. cng_procfs_synth_access answers the access check
+ * itself: 0 granted, -EACCES refused, 1 not ours. */
+int cng_procfs_refused(long r);
+int cng_procfs_synth_stat(const char *canon, int follow, void *stat);
+int cng_procfs_synth_fd_stat(int fd, void *stat);
+int cng_procfs_synth_statx(const char *canon, int follow, unsigned flags,
+                           unsigned mask, void *statx);
+int cng_procfs_synth_fd_statx(int fd, unsigned flags, unsigned mask,
+                              void *statx);
+int cng_procfs_synth_access(const char *canon, int mode, int follow);
+
+/* CNG_PROC_DENY_STAT=1: make every stat-family call on a synthesized name
+ * behave as if the host had refused it, which Android does and a test host does
+ * not. This is how the fallback above gets exercised off a device. */
+extern int cng_g_proc_deny_stat;
+
 #endif /* CNG_PROCFS_H */

@@ -296,6 +296,45 @@ if guest_xlate_ready "leading-zero /proc name leg" &&
 fi
 rm -rf "$PN_ROOT"
 
+# stat, statx, access and an O_PATH fstat on the synthesized global files
+# (version, loadavg, uptime, stat). Android's SELinux refuses an app every one of
+# them, and the open was served from memory regardless, so `cat` worked where
+# `stat` and `test -r` of the same name failed. The guest checks the shape every
+# form must agree on, which holds wherever the host answers or refuses the call
+# itself: on a device the refusal is real, and elsewhere CNG_PROC_DENY_STAT=1
+# makes the second run take the same path (/proc/stat, readable here, joins it
+# with CNG_PROCSTAT_SYNTH).
+PS_ROOT=$(mktemp -d)
+if guest_xlate_ready "synthesized /proc stat leg" &&
+    guest_cc_report "$PS_ROOT/procstat" tests/guests/procstat.c; then
+    ps_want="/proc/version: ok
+/proc/loadavg: ok
+/proc/uptime: ok
+/proc/stat: ok"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    ps_got=$(run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    if [ "$ps_got" = "$ps_want" ]; then
+        pass=$((pass + 1))
+        echo "  ok   stat and access of a synthesized /proc file agree with the file it is served as"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL stat and access of a synthesized /proc file agree with the file it is served as"
+        printf '%s\n' "$ps_got" | sed 's/^/    /'
+    fi
+    # shellcheck disable=SC2086
+    ps_got=$(CNG_PROC_DENY_STAT=1 CNG_PROCSTAT_SYNTH=1 \
+        run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    if [ "$ps_got" = "$ps_want" ]; then
+        pass=$((pass + 1))
+        echo "  ok   ...and with the host's own refusal of each call forced"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL ...and with the host's own refusal of each call forced"
+        printf '%s\n' "$ps_got" | sed 's/^/    /'
+    fi
+fi
+rm -rf "$PS_ROOT"
+
 # --- guest-shell scenarios -------------------------------------------------
 m11_ready=0
 if [ -n "$M11_ALPINE" ] && [ -x "$M11_ALPINE/bin/busybox" ]; then
@@ -396,20 +435,18 @@ if [ "$m11_ready" -eq 1 ]; then
         'a=$(stat -c "%f %h %s %d %i" /proc/$$/mounts);
          b=$(stat -L -c "%f %h %s %d %i" /dev/stdin < /proc/$$/mounts);
          [ "$a" = "$b" ] && echo same || echo "$a | $b"'
-    if [ -e /proc/loadavg ]; then
-        m11_sh "...and for a root-owned global file" "same" \
-            'a=$(stat -c "%f %h %s %d %i %u" /proc/loadavg);
-             b=$(stat -L -c "%f %h %s %d %i %u" /dev/stdin < /proc/loadavg);
-             [ "$a" = "$b" ] && echo same || echo "$a | $b"'
-    else
-        # Android denies even the stat of the global files it hides, which is why
-        # they are synthesized: the path form has no answer to compare with, so
-        # the descriptor is held to the shape of a real /proc regular file —
-        # 0444, one link, no size, root's.
-        m11_sh "...and a global file the host denies is still a /proc regular file" "ok" \
-            'b=$(stat -L -c "%f %h %s %u" /dev/stdin < /proc/loadavg);
-             [ "$b" = "8124 1 0 0" ] && echo ok || echo "$b"'
-    fi
+    # The global files Android hides (loadavg, uptime, stat, version) answer
+    # their stat as the file they are served as: the host refuses it there, and
+    # the guest used to read /proc/version with cat and be told "Permission
+    # denied" by stat on the same name. The descriptor and the path agree.
+    m11_sh "...and for a root-owned global file" "same" \
+        'a=$(stat -c "%f %h %s %d %i %u" /proc/loadavg);
+         b=$(stat -L -c "%f %h %s %d %i %u" /dev/stdin < /proc/loadavg);
+         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+    m11_sh "stat of a global /proc file is a /proc regular file, as access says" \
+        "8124 1 0 0 readable" \
+        'a=$(stat -c "%f %h %s %u" /proc/version) || exit 1;
+         [ -r /proc/version ] && echo "$a readable" || echo "$a unreadable"'
     m11_sh "the fd link of a synthesized file names the file" \
         "/proc/loadavg" 'readlink /proc/self/fd/0 < /proc/loadavg'
     m11_sh "...and a process entry by its number" "ok" \

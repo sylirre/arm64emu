@@ -2302,6 +2302,34 @@ static int leaf_may_synth(const char *p) {
     return 0;
 }
 
+static int at_canon(long dirfd, const char *path, char *out, size_t sz);
+
+/* The canonical guest name of (dirfd, gp), when it could be a synthesized /proc
+ * file: absolute and cwd-relative names canonicalize without a syscall, a real
+ * dirfd costs a readlink and is resolved only for a name leaf_may_synth()
+ * lets through. 1 with `canon` filled, else 0. */
+static int synth_canon_at(long dirfd, const char *gp, char *canon, size_t sz) {
+    if (!gp)
+        return 0;
+    if (gp[0] == '/' || (int)dirfd == CNG_AT_FDCWD)
+        return cng_fs_abscanon(cng_g_fs, gp, canon, sz) == 0;
+    return leaf_may_synth(gp) && at_canon(dirfd, gp, canon, sz) == 0;
+}
+
+/* The same for a stat-family call the host has just refused (see
+ * cng_procfs_refused): only a name that is a /proc file is worth the question,
+ * and a trailing "/" or "/." is not one. They canonicalize away, but the kernel
+ * takes them as "this is a directory" and the answer for a regular file is its
+ * own to give. */
+static int synth_stat_canon(long dirfd, const char *gp, char *canon,
+                            size_t sz) {
+    size_t n = gp ? strlen(gp) : 0;
+    if (!n || gp[n - 1] == '/' ||
+        (n >= 2 && gp[n - 1] == '.' && gp[n - 2] == '/'))
+        return 0;
+    return synth_canon_at(dirfd, gp, canon, sz) && !strncmp(canon, "/proc", 5);
+}
+
 /* Same idea for readlinkat: could this name be an fd or map_files link, whose
  * target is a host path that has to be mapped back into the guest view? An
  * absolute name must be under /proc; a cwd-relative one is cheap to
@@ -3902,10 +3930,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                  * does and so is the one entitled to answer EXDEV. */
                 if ((have = have_scanon))
                     cng_strlcpy(canon, scanon, sizeof canon);
-            } else if (gp && (gp[0] == '/' || (int)a0 == CNG_AT_FDCWD))
-                have = cng_fs_abscanon(cng_g_fs, gp, canon, sizeof canon) == 0;
-            else if (gp && leaf_may_synth(gp))
-                have = at_canon(a0, gp, canon, sizeof canon) == 0;
+            } else {
+                have = synth_canon_at(a0, gp, canon, sizeof canon);
+            }
             if (have && !strncmp(canon, "/proc", 5) &&
                 cng_procfs_open(canon, oflags, &pr))
                 return pr;
@@ -4041,6 +4068,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             }
         }
         long r = reissue(dfd, (long)p, a2, fl, a4, a5, nr);
+        /* The host's refusal of a synthesized name (see newfstatat): the guest
+         * can read the file, so `test -r` has to say it can. Settled before
+         * root's bypass below, which would be asking the host to stat it. */
+        if (!cng_g_no_proc && a1 && cng_procfs_refused(r)) {
+            char canon[CNG_PATH_MAX];
+            if (synth_stat_canon(a0, (const char *)a1, canon, sizeof canon)) {
+                long v = cng_procfs_synth_access(canon, (int)a2, deref);
+                if (v <= 0)
+                    r = v;
+            }
+        }
         /* Only what root actually bypasses, which is a *permission* denial.
          * This used to fire on any negative answer at all, and the stat below
          * succeeds for most of them, so two refusals the kernel gives root as
@@ -4227,6 +4265,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (xlate_bad(p))
             return xlate_errno(p);
         long r = reissue(a0, (long)p, ob, a3, a4, a5, __NR_newfstatat);
+        /* The host's refusal of a synthesized name (Android's SELinux denies
+         * the getattr of the global files it hides) is not the file's answer:
+         * the guest was served it in full, and stat says what any /proc
+         * regular file would. */
+        if (!cng_g_no_proc && a2 && cng_procfs_refused(r)) {
+            char canon[CNG_PATH_MAX];
+            if (byfd ? cng_procfs_synth_fd_stat((int)a0, sb)
+                     : synth_stat_canon(a0, (const char *)a1, canon,
+                                        sizeof canon) &&
+                           cng_procfs_synth_stat(canon, deref, sb))
+                r = 0;
+        }
         /* A synthesized /proc fd, asked about by fd or through its own fd link
          * (stat -L /proc/self/fd/N lands on the memfd the same way). */
         if (r == 0 && !cng_g_no_proc && a2) {
@@ -4265,6 +4315,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (xlate_bad(p))
             return xlate_errno(p);
         long r = reissue(a0, (long)p, a2, a3, ob, a5, __NR_statx);
+        /* Refused by the host: see newfstatat above. */
+        if (!cng_g_no_proc && a4 && cng_procfs_refused(r)) {
+            char canon[CNG_PATH_MAX];
+            if (byfd ? cng_procfs_synth_fd_statx((int)a0, (unsigned)a2,
+                                                 (unsigned)a3, sx)
+                     : synth_stat_canon(a0, (const char *)a1, canon,
+                                        sizeof canon) &&
+                           cng_procfs_synth_statx(canon, deref, (unsigned)a2,
+                                                  (unsigned)a3, sx))
+                r = 0;
+        }
         if (r == 0 && !cng_g_no_proc && a4) {
             if (byfd)
                 cng_procfs_fix_fd_statx((int)a0, (unsigned)a2, (unsigned)a3,
@@ -4447,6 +4508,10 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         char sb[STAT_BUF_SIZE];
         long r = reissue(a0, bounce ? (long)sb : a1, a2, a3, a4, a5,
                          __NR_fstat);
+        /* An O_PATH fd on a name the host refuses to describe (newfstatat). */
+        if (!cng_g_no_proc && bounce && cng_procfs_refused(r) &&
+            cng_procfs_synth_fd_stat((int)a0, sb))
+            r = 0;
         if (r == 0 && bounce) {
             if (!cng_g_no_proc)
                 cng_procfs_fix_fd((int)a0, sb);

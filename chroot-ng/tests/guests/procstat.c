@@ -1,0 +1,171 @@
+/* What stat and access say about the /proc files chroot-ng synthesizes.
+ *
+ * Android's SELinux policy refuses an app the getattr and the read access check
+ * of /proc/version, loadavg, uptime and stat, so the monitor serves their
+ * content from memory — and `cat /proc/version` worked while `stat
+ * /proc/version` and `test -r /proc/version` failed with EACCES on the very same
+ * name. Every way of asking is put to each file here, and what comes back has
+ * to be what any /proc regular file is (0444, one link, no size, root's), the
+ * same from every form, with one inode number the path, the descriptor and the
+ * O_PATH descriptor all agree on:
+ *
+ *   stat, lstat, statx, fstatat against a /proc dirfd, fstat of an O_PATH fd,
+ *   fstat of the file opened for reading, access(R_OK), access(X_OK).
+ *
+ * Prints one line per file, "<name>: ok" or the first thing that was wrong.
+ * It asserts nothing about the host: the same output is right where the host
+ * answers every one of these itself and where it refuses them all.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+
+/* The statx buffer is 256 bytes; these are the offsets of what is read. */
+struct sx {
+    unsigned char b[256];
+};
+static unsigned sx_u32(const struct sx *s, int o) {
+    unsigned v;
+    memcpy(&v, s->b + o, sizeof v);
+    return v;
+}
+static unsigned long long sx_u64(const struct sx *s, int o) {
+    unsigned long long v;
+    memcpy(&v, s->b + o, sizeof v);
+    return v;
+}
+
+static char why[160];
+
+static int bad(const char *what, const char *fmt, long a, long b) {
+    int n = snprintf(why, sizeof why, "%s: ", what);
+    snprintf(why + n, sizeof why - (size_t)n, fmt, a, b);
+    return 1;
+}
+
+static int fail_errno(const char *what) {
+    snprintf(why, sizeof why, "%s: errno %d", what, errno);
+    return 1;
+}
+
+/* A /proc regular file: 0444, one link, empty, root's. */
+static int shape(const char *what, mode_t mode, unsigned long nlink, long size,
+                 unsigned uid, unsigned gid) {
+    if (mode != (S_IFREG | 0444))
+        return bad(what, "mode %lo, want %lo", (long)mode, (long)(S_IFREG | 0444));
+    if (nlink != 1)
+        return bad(what, "nlink %ld, want %ld", (long)nlink, 1);
+    if (size != 0)
+        return bad(what, "size %ld, want %ld", size, 0);
+    if (uid != 0 || gid != 0)
+        return bad(what, "owner %ld:%ld, want 0:0", (long)uid, (long)gid);
+    return 0;
+}
+
+static int check_st(const char *what, const struct stat *s, const struct stat *ref) {
+    if (shape(what, s->st_mode, s->st_nlink, s->st_size, s->st_uid, s->st_gid))
+        return 1;
+    if (ref && (s->st_ino != ref->st_ino || s->st_dev != ref->st_dev))
+        return bad(what, "identity %ld, want %ld", (long)s->st_ino,
+                   (long)ref->st_ino);
+    return 0;
+}
+
+static int one(const char *name, int procfd) {
+    struct stat st, ls, as, ps, fs;
+    struct sx sx;
+    const char *leaf = strrchr(name, '/') + 1;
+
+    if (stat(name, &st))
+        return fail_errno("stat");
+    if (check_st("stat", &st, 0))
+        return 1;
+    if (lstat(name, &ls))
+        return fail_errno("lstat");
+    if (check_st("lstat", &ls, &st))
+        return 1;
+
+    memset(&sx, 0, sizeof sx);
+    if (syscall(__NR_statx, AT_FDCWD, name, 0, 0x7ffu /* STATX_BASIC_STATS */,
+                sx.b))
+        return fail_errno("statx");
+    if (shape("statx", sx_u32(&sx, 28) & 0xffff, sx_u32(&sx, 16),
+              (long)sx_u64(&sx, 40), sx_u32(&sx, 20), sx_u32(&sx, 24)))
+        return 1;
+    if (sx_u64(&sx, 32) != st.st_ino ||
+        makedev(sx_u32(&sx, 136), sx_u32(&sx, 140)) != st.st_dev)
+        return bad("statx", "identity %ld, want %ld", (long)sx_u64(&sx, 32),
+                   (long)st.st_ino);
+
+    if (fstatat(procfd, leaf, &as, 0))
+        return fail_errno("fstatat(/proc)");
+    if (check_st("fstatat(/proc)", &as, &st))
+        return 1;
+
+    int pfd = open(name, O_PATH | O_CLOEXEC);
+    if (pfd < 0)
+        return fail_errno("open O_PATH");
+    if (fstat(pfd, &ps))
+        return fail_errno("fstat O_PATH");
+    if (check_st("fstat O_PATH", &ps, &st))
+        return 1;
+    memset(&sx, 0, sizeof sx);
+    if (syscall(__NR_statx, pfd, "", AT_EMPTY_PATH, 0x7ffu, sx.b))
+        return fail_errno("statx O_PATH");
+    if (sx_u64(&sx, 32) != st.st_ino)
+        return bad("statx O_PATH", "identity %ld, want %ld",
+                   (long)sx_u64(&sx, 32), (long)st.st_ino);
+    close(pfd);
+
+    int rfd = open(name, O_RDONLY | O_CLOEXEC);
+    if (rfd < 0)
+        return fail_errno("open");
+    if (fstat(rfd, &fs))
+        return fail_errno("fstat");
+    if (check_st("fstat", &fs, &st))
+        return 1;
+    close(rfd);
+
+    if (access(name, R_OK))
+        return fail_errno("access R_OK");
+    if (faccessat(procfd, leaf, R_OK, 0))
+        return fail_errno("faccessat(/proc) R_OK");
+    if (!access(name, X_OK) || errno != EACCES)
+        return fail_errno("access X_OK");
+    /* The write check is root's to pass: a real root gets W_OK on a 0444 file. */
+    if (geteuid() != 0 && (!access(name, W_OK) || errno != EACCES))
+        return fail_errno("access W_OK");
+    return 0;
+}
+
+int main(void) {
+    static const char *const names[] = {"/proc/version", "/proc/loadavg",
+                                        "/proc/uptime", "/proc/stat"};
+    int procfd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (procfd < 0) {
+        printf("open /proc: errno=%d\n", errno);
+        return 1;
+    }
+    int rc = 0;
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+        why[0] = '\0';
+        if (one(names[i], procfd)) {
+            printf("%s: %s\n", names[i], why);
+            rc = 1;
+        } else {
+            printf("%s: ok\n", names[i]);
+        }
+        fflush(stdout);
+    }
+    return rc;
+}

@@ -247,6 +247,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_PROCSTAT_SYNTH=", 19) && (*e)[19] != '\0' &&
             (*e)[19] != '0')
             cng_g_procstat_synth = 1;
+        /* CNG_PROC_DENY_STAT=1 makes stat/access of a synthesized /proc name
+         * answer as the host does on Android, where SELinux refuses them. */
+        if (!strncmp(*e, "CNG_PROC_DENY_STAT=", 19) && (*e)[19] != '\0' &&
+            (*e)[19] != '0')
+            cng_g_proc_deny_stat = 1;
     }
     /* Stamp the build: this tree is copied to test devices by hand, so a trace
      * has to be able to say whether it came from the build you just made. */

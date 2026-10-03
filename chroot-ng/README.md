@@ -79,11 +79,13 @@ report the guest program (no real `execve` ever happens, so the kernel's copies
 would name the chroot-ng invocation), `mounts`/`mountinfo` describe the rootfs
 and its binds instead of the host's mount namespace, `maps` and the `fd` links
 are mapped back to guest paths, and `loadavg`/`uptime`/`stat` are synthesized
-where the host denies them (as Android does). Separate invocations normally
-hide each other's processes; `--shared-proc` keys the process registry by the
-rootfs instead — served diskless by a per-rootfs broker daemon that exits by
-itself once the last guest is gone — so `ps`/`top` in one session see the
-guest processes of another.
+where the host denies them (as Android does), `version` always (the real one
+names the host's kernel and build host). Their `stat` and access checks are
+answered to match, so a file the guest can read is one it can also `stat`.
+Separate invocations normally hide each other's processes; `--shared-proc`
+keys the process registry by the rootfs instead — served diskless by a
+per-rootfs broker daemon that exits by itself once the last guest is gone — so
+`ps`/`top` in one session see the guest processes of another.
 
 `/dev` works the same way, and for the same reason: a rootfs directory tree
 ships no device nodes and `mknod` needs privileges we lack. A fixed whitelist —

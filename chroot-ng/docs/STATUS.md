@@ -3427,6 +3427,39 @@ vfork/`posix_spawn` child-stack handling.
   header with no iovec at all is left out, since qemu-user answers it
   without asking the kernel).
 
+- [x] **M74 — a synthesized `/proc` file could be read but not stat'ed**
+  On Android, SELinux refuses an app the getattr and the read access check
+  of `/proc/version`, `loadavg`, `uptime` and `stat`. The open of each was
+  already served from a memfd, so `cat /proc/version` worked, while `stat
+  /proc/version` — and `ls -l`, `[ -r ]`, `[ -e ]` through busybox's stat,
+  `statx`, and an `fstat` of an `O_PATH` fd of the name — went to the kernel
+  and came back EACCES. Only the descriptor of a synthesized open had its
+  stat repaired, and only when the kernel's stat of the memfd had succeeded.
+  - What the host refuses (EACCES, from `cng_procfs_refused`) is now answered
+    for any name the open would synthesize (`synth_kind`, one classification
+    for both): `newfstatat`, `statx` (path, dirfd-relative, and by fd),
+    `fstat`, and `faccessat`/`faccessat2` get the attributes of a `/proc`
+    regular file — 0444 (0400 for environ/auxv), one link, size 0, the
+    procfs mount's device and times — and the access check R_OK granted,
+    X_OK refused, W_OK refused unless the guest is fake root, as for any
+    other 0444 file. A name that is a symlink (`/proc/mounts`) is left to
+    the host unless the call follows it, and a trailing `/` or `/.` is the
+    kernel's answer to give. Where the host's own stat works, it still
+    stands and nothing changes.
+  - The inode number is made from the name (FNV-1a into procfs's static
+    range from 0xf0000000) and is the same from the path, from the open
+    descriptor and from the `O_PATH` one; the descriptor's stat used the
+    memfd's, a different number for every open, once the host had refused
+    the name. A process that is gone keeps the memfd's.
+  - `CNG_PROC_DENY_STAT=1` answers every such call as if the host had refused
+    it, so a host that allows them (the dev machine, CI) takes the same
+    path. `tests/guests/procstat.c` in m11 puts every form to each of the four
+    files and checks one shape and one identity across them, with and
+    without the knob; on the device the first run is the real refusal (the
+    previous build fails on its first `stat`). The m11 leg that compared a
+    redirected fd with the path and fell back to "the path form has no
+    answer" where the host denied it now runs everywhere.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
