@@ -18,11 +18,15 @@
  * arch/arm64/kernel/Makefile.syscalls selects (common, 64, renameat, rlimit,
  * memfd_secret); 0..461 cross-checked against the aarch64-linux-gnu toolchain's
  * own <asm/unistd.h>, and 462..469 against the running 6.17 kernel, where each
- * answers something other than ENOSYS and 470 answers ENOSYS. The eleven
- * `__NR3264_*` names are spelled exactly as asm-generic/unistd.h spells them,
- * because src/rt/unistd_check.c includes both headers where the host has one:
- * an identical redefinition is silent and a differing one is a compile error,
- * which is the whole of that check.
+ * answers something other than ENOSYS and 470 answers ENOSYS. Every __NR_* is
+ * a plain number, the way bionic's and musl's own tables spell them, so that
+ * src/rt/unistd_check.c — which includes the host's <asm/unistd.h> too, where
+ * there is one — sees an identical redefinition (silent) for a number the two
+ * agree on, and a differing one (a compile error) otherwise. The eleven
+ * `__NR3264_*` names carry that same check on an asm-generic host, the one
+ * spelling that is not numeric: there <asm/unistd.h> gives those eleven numbers
+ * under the __NR3264_* name and makes __NR_* aliases of them, so the check unit
+ * drops the derived alias and the number itself still has to meet ours.
  *
  * This is the only header to name a syscall number. New entries go at the end,
  * with the kernel release that introduced them; the code that handles one
@@ -57,7 +61,7 @@
 #define __NR_dup 23
 #define __NR_dup3 24
 #define __NR3264_fcntl 25
-#define __NR_fcntl __NR3264_fcntl
+#define __NR_fcntl 25
 #define __NR_inotify_init1 26
 #define __NR_inotify_add_watch 27
 #define __NR_inotify_rm_watch 28
@@ -76,13 +80,13 @@
 #define __NR_pivot_root 41
 #define __NR_nfsservctl 42
 #define __NR3264_statfs 43
-#define __NR_statfs __NR3264_statfs
+#define __NR_statfs 43
 #define __NR3264_fstatfs 44
-#define __NR_fstatfs __NR3264_fstatfs
+#define __NR_fstatfs 44
 #define __NR3264_truncate 45
-#define __NR_truncate __NR3264_truncate
+#define __NR_truncate 45
 #define __NR3264_ftruncate 46
-#define __NR_ftruncate __NR3264_ftruncate
+#define __NR_ftruncate 46
 #define __NR_fallocate 47
 #define __NR_faccessat 48
 #define __NR_chdir 49
@@ -99,7 +103,7 @@
 #define __NR_quotactl 60
 #define __NR_getdents64 61
 #define __NR3264_lseek 62
-#define __NR_lseek __NR3264_lseek
+#define __NR_lseek 62
 #define __NR_read 63
 #define __NR_write 64
 #define __NR_readv 65
@@ -109,7 +113,7 @@
 #define __NR_preadv 69
 #define __NR_pwritev 70
 #define __NR3264_sendfile 71
-#define __NR_sendfile __NR3264_sendfile
+#define __NR_sendfile 71
 #define __NR_pselect6 72
 #define __NR_ppoll 73
 #define __NR_signalfd4 74
@@ -118,9 +122,9 @@
 #define __NR_tee 77
 #define __NR_readlinkat 78
 #define __NR3264_fstatat 79
-#define __NR_newfstatat __NR3264_fstatat
+#define __NR_newfstatat 79
 #define __NR3264_fstat 80
-#define __NR_fstat __NR3264_fstat
+#define __NR_fstat 80
 #define __NR_sync 81
 #define __NR_fsync 82
 #define __NR_fdatasync 83
@@ -263,9 +267,9 @@
 #define __NR_clone 220
 #define __NR_execve 221
 #define __NR3264_mmap 222
-#define __NR_mmap __NR3264_mmap
+#define __NR_mmap 222
 #define __NR3264_fadvise64 223
-#define __NR_fadvise64 __NR3264_fadvise64
+#define __NR_fadvise64 223
 #define __NR_swapon 224
 #define __NR_swapoff 225
 #define __NR_mprotect 226
