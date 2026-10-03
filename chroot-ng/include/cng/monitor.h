@@ -448,6 +448,13 @@ void cng_probe_blocked(void);
  * itself. Implemented in sigsys.c, which owns it. */
 int cng_sig_deliverable_in(const struct cng_ucontext *uc);
 
+/* What the guest's rt_sigprocmask asked for, as far as "every signal blocked"
+ * goes, kept per thread (sigsys.c has the story): cng_sig_note_mask records it
+ * from the emulated call, cng_sig_all_blocked reads it for another thread. The
+ * exec's de_thread uses it to leave a thread that is unmapping its own stack. */
+void cng_sig_note_mask(int how, unsigned long set);
+int cng_sig_all_blocked(long tid);
+
 /* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
 int cng_sig_install(int signo, cng_sighandler_t h);
 

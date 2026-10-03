@@ -747,7 +747,8 @@ static long dt_left_revisit(long pid) {
  * and the exec goes ahead as it always did). */
 static char g_dt_dents[16384];
 
-static long dt_round(long pid, long me, int mark, int first, long *told) {
+static long dt_round(long pid, long me, int mark, int first, int grace,
+                     long *told) {
     long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
     if (fd < 0)
@@ -782,6 +783,19 @@ static long dt_round(long pid, long me, int mark, int first, long *told) {
                     continue;
                 }
             }
+            /* A thread that has asked for every signal to be blocked is, more
+             * often than not, on its way out: bionic and musl block everything,
+             * unmap their own stack and exit, and a request that lands between
+             * the unmap and the exit has no stack to put its frame on — the
+             * kernel kills the whole process for it. Held back while the
+             * grace lasts, and still waited for: it counts as there until it
+             * is gone, as the kernel's de_thread waits for one that is
+             * exiting. Past the grace it is told like any other, so a thread
+             * that sits with everything blocked for good is not left. */
+            if (grace && cng_sig_all_blocked(tid)) {
+                live++;
+                continue;
+            }
             if (dethread_send(tid, CNG_DT_DIE) == -ESRCH)
                 continue;
             live++;
@@ -792,6 +806,12 @@ static long dt_round(long pid, long me, int mark, int first, long *told) {
     return live;
 }
 
+/* How many rounds (each a poll of 100 us and the listing it makes) a thread
+ * that has blocked every signal is left alone for: a thread leaving takes
+ * microseconds, so this is generous, and an exec that does have such a thread to
+ * kill waits that much longer for it and no more. */
+#define DT_GRACE_SPINS 100
+
 static void cng_dethread(void) {
     long pid = sys_getpid(), me = sys_gettid(), told = 0;
     g_dt_nleft = 0;
@@ -799,7 +819,7 @@ static void cng_dethread(void) {
         int mark = spin % 10000 == 0; /* once a second */
         if (mark && spin)
             dt_left_revisit(pid);
-        long live = dt_round(pid, me, mark, !spin, &told);
+        long live = dt_round(pid, me, mark, !spin, spin < DT_GRACE_SPINS, &told);
         if (live < 0)
             return;
         if (!spin && cng_g_debug && live)

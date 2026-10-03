@@ -324,6 +324,7 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
                                 : (how == 1) ? (cur & ~set)  /* SIG_UNBLOCK */
                                              : set;          /* SIG_SETMASK */
             uc->uc_sigmask.sig[0] = neu & ~(1UL << (CNG_SIGSYS - 1));
+            cng_sig_note_mask(2 /*SETMASK: the mask that results*/, neu);
         }
         if (pold && cng_user_copyout(pold, &cur, sizeof cur) < 0) {
             r[0] = (unsigned long long)(long)-EFAULT;
@@ -481,6 +482,10 @@ static struct {
      * which the blocking IPC waits need and cannot get any other way, since the
      * live mask while the handler runs is ours. */
     struct cng_ucontext *uc;
+    /* The guest's own mask asks for every signal blocked (cng_sig_note_mask).
+     * Not the live mask, which keeps SIGSYS open whatever the guest asked: this
+     * is what the exec's de_thread reads to leave a thread that is leaving. */
+    int sigfull;
 } cng_scr[CNG_SCR_N];
 
 /* Claim `*p` from `want` to `tid` (inline LL/SC so we need no libgcc atomics
@@ -604,12 +609,61 @@ static int cng_scratch_slot(long tid) {
             continue; /* another thread reclaimed it first */
         cng_scr[i].busy = 0;
         cng_scr[i].uc = 0;
+        cng_scr[i].sigfull = 0;
         /* Its owner can have died between claiming the slot and mapping it. */
         if (!cng_scr[i].hi && scr_map(i) != 0)
             return -1;
         return (int)i;
     }
     return -1;
+}
+
+/* A thread of a program that calls pthread_exit on a detached thread — bionic
+ * and musl both — blocks every signal, unmaps its own stack and exits, the
+ * three of them without a syscall the filter traps. The first is there so that
+ * no signal frame is wanted once the second has happened, and we do not let it
+ * mean that: SIGSYS is never blocked for real (a trap taken while it is would
+ * kill the process), so the exec's de_thread request can arrive between the
+ * unmap and the exit, where the kernel has nowhere to put the frame and force-
+ * kills the whole process with a SIGSEGV nothing can catch (measured: a chain
+ * of short-lived detached threads under an exec, one run in four).
+ *
+ * So what the guest asked for is kept, per thread, for de_thread to read: a
+ * thread that has asked for every signal to be blocked is, for a moment, left
+ * alone and waited for, like the kernel's de_thread does for one already
+ * exiting. It is a hint with a deadline (execve.c gives it a few milliseconds),
+ * not a refusal: a thread that really does sit with everything blocked — the
+ * sigwait thread of a daemon — is told after that as it always was. `how` and
+ * `set` are the call's own; the SIGSYS tier, which computes the resulting mask,
+ * passes it as a SETMASK. */
+void cng_sig_note_mask(int how, unsigned long set) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0)
+        return;
+    int full = (set | (1UL << (CNG_SIGSYS - 1))) == ~0UL;
+    int cur = __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_RELAXED);
+    if (how == 2 /*SETMASK*/)
+        cur = full;
+    else if (how == 0 /*BLOCK*/ && full)
+        cur = 1;
+    else if (how == 1 /*UNBLOCK*/ && set)
+        cur = 0;
+    __atomic_store_n(&cng_scr[i].sigfull, cur, __ATOMIC_RELAXED);
+}
+
+/* Has thread `tid` asked for every signal to be blocked? Read by another thread
+ * and never allocates: a thread with no slot has asked for nothing. */
+int cng_sig_all_blocked(long tid) {
+    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+    for (unsigned k = 0; k < CNG_SCR_N; k++) {
+        unsigned i = (h + k) % CNG_SCR_N;
+        long t = __atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE);
+        if (t == tid)
+            return __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_RELAXED);
+        if (t == 0)
+            return 0;
+    }
+    return 0;
 }
 
 /* Testing: the allocator, for a TID the caller names rather than its own, with

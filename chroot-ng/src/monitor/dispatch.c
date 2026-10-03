@@ -5629,9 +5629,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             unsigned long set;
             if (cng_user_copyin(&set, (void *)a1, sizeof set) < 0)
                 return -EFAULT;
+            cng_sig_note_mask(how, set);
             set &= ~(1UL << (CNG_SIGSYS - 1));
             return cng_syscall6(a0, (long)&set, a2, a3, a4, a5,
                                 __NR_rt_sigprocmask);
+        }
+        /* An unblock lets a thread be signalled again (cng_sig_note_mask). */
+        if (how == 1 /*UNBLOCK*/ && a1 && (unsigned long)a3 == sizeof(unsigned long)) {
+            unsigned long set;
+            if (cng_user_copyin(&set, (void *)a1, sizeof set) == 0)
+                cng_sig_note_mask(how, set);
         }
         return cng_syscall6(a0, a1, a2, a3, a4, a5, __NR_rt_sigprocmask);
     }
