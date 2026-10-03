@@ -68,6 +68,14 @@ emu_t() {
     fi
 }
 
+# kref CMD... — run a host-built reference, the stand-in for "what the kernel
+# answers" in a differential. Termux preloads libtermux-exec into every process,
+# and it wraps execve: the exec probes of a reference run answered EACCES for a
+# path the kernel calls ENOTDIR or ENOENT, which is the shim's verdict and not
+# the kernel's. A guest under chroot-ng never carries the preload (its
+# environment is the one it was given), so the reference is run without it.
+kref() { env -u LD_PRELOAD "$@"; }
+
 run() { emu "$BIN" "$@"; }
 run_t() {
     _t=$1

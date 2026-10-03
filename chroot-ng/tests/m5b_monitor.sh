@@ -213,7 +213,7 @@ if ! guest_xlate_ready "AT_EMPTY_PATH legs"; then
 elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
     ep_k=""
     if have cc && cc -O1 -o "$EPD/ep_host" tests/guests/emptypath.c 2>/dev/null; then
-        ep_k=$("$EPD/ep_host" "$EPD" 2>/dev/null)
+        ep_k=$(kref "$EPD/ep_host" "$EPD" 2>/dev/null)
     fi
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
     ep_g=$(run_t 60 -R $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
@@ -263,13 +263,19 @@ if ! guest_xlate_ready "name_to_handle_at legs"; then
     :
 elif guest_cc_report "$NHD/handleat" tests/guests/handleat.c; then
     nh_k=""
+    nh_built=0
     if have cc && cc -O1 -o "$NHD/nh_host" tests/guests/handleat.c 2>/dev/null; then
-        nh_k=$("$NHD/nh_host" "$NHD" 2>/dev/null)
+        nh_built=1
+        # Android's ambient filter kills a process that issues name_to_handle_at
+        # (SIGSYS), and the shell reports that on ITS stderr: the group takes it.
+        nh_k=$({ kref "$NHD/nh_host" "$NHD" || true; } 2>/dev/null)
     fi
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
     nh_g=$(run_t 60 -R $GUEST_BINDS "$NHD" /handleat 2>/dev/null)
-    if [ -z "$nh_k" ]; then
+    if [ "$nh_built" = 0 ]; then
         skip "name_to_handle_at differential: no host compiler for the oracle"
+    elif [ -z "$nh_k" ]; then
+        skip "name_to_handle_at differential: the host build cannot issue it (the ambient filter refuses it)"
     elif [ "$nh_k" = "$nh_g" ]; then
         pass=$((pass + 1))
         echo "  ok   name_to_handle_at matches the kernel byte-for-byte"
@@ -840,7 +846,7 @@ elif guest_cc_report "$TSD/trailslash" tests/guests/trailslash.c; then
     ts_k=""
     if have cc && cc -O1 -o "$TSD/ts_host" tests/guests/trailslash.c \
         2>/dev/null; then
-        ts_k=$("$TSD/ts_host" "$TSD" 2>/dev/null)
+        ts_k=$(kref "$TSD/ts_host" "$TSD" 2>/dev/null)
     fi
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
     ts_g=$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash 2>/dev/null)

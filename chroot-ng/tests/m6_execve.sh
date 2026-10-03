@@ -275,7 +275,7 @@ if_oracle_build() {
     done
     return 1
 }
-if_host_run() { if [ -n "$TIMEOUT" ]; then "$TIMEOUT" 60 "$@"; else "$@"; fi; }
+if_host_run() { if [ -n "$TIMEOUT" ]; then "$TIMEOUT" 60 env -u LD_PRELOAD "$@"; else kref "$@"; fi; }
 
 if [ -z "$GUESTCC" ]; then
     skip "failed-exec survival: no AArch64 guest toolchain"
