@@ -90,7 +90,9 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
  * install one (seccomp(2) and PR_SET_SECCOMP are refused), so a tracer that
  * asks for it gets exactly the events it would get: none. SUSPEND_SECCOMP needs
  * CAP_SYS_ADMIN, which the guest holds under fake-root; it suspends the
- * tracee's own filters, of which it has none it can see. */
+ * tracee's own filters, of which it has none it can see. A host kernel built
+ * without checkpoint/restore support does not know the option at all, and the
+ * emulation then answers it EINVAL as that kernel does. */
 #define CNG_PTRACE_O_TRACESYSGOOD    0x0001
 #define CNG_PTRACE_O_TRACEFORK       0x0002
 #define CNG_PTRACE_O_TRACEVFORK      0x0004

@@ -1493,16 +1493,46 @@ static long pt_traceme(void) {
 
 /* ---- tracer: the guest's ptrace(2) ---- */
 
+/* Does the host kernel know PTRACE_O_SUSPEND_SECCOMP at all? It exists only in
+ * a kernel built with CONFIG_CHECKPOINT_RESTORE (and seccomp), and one built
+ * without answers EINVAL to the option ahead of every privilege question —
+ * Android's GKI kernels are, so there the option is not a privilege a guest
+ * lacks but a request nothing understands. Asked of the kernel itself, once: a
+ * SEIZE of our own pid carrying the option is refused whichever way it goes
+ * (the option is judged before the same-thread-group refusal, which is what
+ * keeps this from ever attaching to anything), and only EINVAL says "no such
+ * option". A host that cannot be asked — ptrace refused by its filter, or an
+ * emulator with none — is taken to have it, as every kernel with the config
+ * does. */
+static int g_susp_host; /* 0 unasked, 1 understood, 2 EINVAL */
+
+static int host_suspend_seccomp(void) {
+    int k = __atomic_load_n(&g_susp_host, __ATOMIC_ACQUIRE);
+    if (k)
+        return k == 1;
+    long r = -ENOSYS;
+    if (!cng_blocked[__NR_ptrace])
+        r = CNG_SYS(__NR_ptrace, CNG_PTRACE_SEIZE, sys_getpid(), 0,
+                    CNG_PTRACE_O_SUSPEND_SECCOMP, 0, 0);
+    __atomic_store_n(&g_susp_host, r == -EINVAL ? 2 : 1, __ATOMIC_RELEASE);
+    return r != -EINVAL;
+}
+
 /* check_ptrace_options(): the one option with a privilege attached.
  * PTRACE_O_SUSPEND_SECCOMP wants CAP_SYS_ADMIN and a tracer that is not itself
- * under seccomp, else EPERM (measured). Both are judged as the guest sees
- * itself: fake-root holds every capability, and no guest sees a filter on
- * itself (PR_GET_SECCOMP answers 0), so it comes down to the identity. What
- * the option would suspend is the tracee's own filters, of which it has none
- * it can see, so accepting it has nothing further to do. */
+ * under seccomp, else EPERM (measured) — or is EINVAL outright where the host
+ * kernel has no such option (host_suspend_seccomp). Both are judged as the
+ * guest sees itself: fake-root holds every capability, and no guest sees a
+ * filter on itself (PR_GET_SECCOMP answers 0), so it comes down to the
+ * identity. What the option would suspend is the tracee's own filters, of which
+ * it has none it can see, so accepting it has nothing further to do. */
 static long pt_check_options(u32 data) {
-    if ((data & CNG_PTRACE_O_SUSPEND_SECCOMP) && !cng_fake_root())
-        return -EPERM;
+    if (data & CNG_PTRACE_O_SUSPEND_SECCOMP) {
+        if (!host_suspend_seccomp())
+            return -EINVAL;
+        if (!cng_fake_root())
+            return -EPERM;
+    }
     return 0;
 }
 
