@@ -846,23 +846,14 @@ void cng_scratch_leave(void) {
  * whose default action is to be discarded, is likewise not an interruption.
  *
  * The -R trampoline tier has no signal frame; there the live mask is already the
- * guest's, so it is read straight from the kernel. */
-int cng_sig_deliverable(void) {
+ * guest's, so it is read straight from the kernel (`uc` is then NULL). A caller
+ * that already holds the frame passes it; cng_sig_deliverable() below finds it. */
+int cng_sig_deliverable_in(const struct cng_ucontext *uc) {
     unsigned long pend = 0;
     if (CNG_SYS(__NR_rt_sigpending, &pend, sizeof pend, 0, 0, 0, 0) < 0 || !pend)
         return 0;
 
     unsigned long blocked = 0;
-    long tid = sys_gettid();
-    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
-    struct cng_ucontext *uc = 0;
-    for (unsigned k = 0; k < CNG_SCR_N; k++) {
-        unsigned i = (h + k) % CNG_SCR_N;
-        if (__atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE) == tid) {
-            uc = cng_scr[i].uc;
-            break;
-        }
-    }
     if (uc)
         blocked = uc->uc_sigmask.sig[0];
     else if (CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &blocked,
@@ -875,6 +866,13 @@ int cng_sig_deliverable(void) {
         if (!(live & bit))
             continue;
         live &= ~bit;
+        /* The ptrace kick is ours, not the guest's: queued at a tracer on every
+         * event of its tracees and never in its mask, so it is pending more
+         * often than not while the tracer waits here — and no wait the guest
+         * could have made is ended by it. Where it does end a native wait
+         * (that is its other job) the call is simply made again. */
+        if (sig == cng_g_kicksig)
+            continue;
         /* SIGCHLD, SIGCONT, SIGURG and SIGWINCH are discarded at delivery when
          * the disposition is still the default, so their arrival is not an
          * interruption; every other default action is (it terminates). */
@@ -892,6 +890,22 @@ int cng_sig_deliverable(void) {
         return 1;
     }
     return 0;
+}
+
+/* The same question for the frame this thread is in, found by its tid: for a
+ * caller that is not handed one. */
+int cng_sig_deliverable(void) {
+    long tid = sys_gettid();
+    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+    struct cng_ucontext *uc = 0;
+    for (unsigned k = 0; k < CNG_SCR_N; k++) {
+        unsigned i = (h + k) % CNG_SCR_N;
+        if (__atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE) == tid) {
+            uc = cng_scr[i].uc;
+            break;
+        }
+    }
+    return cng_sig_deliverable_in(uc);
 }
 
 /* Testing: the SIGSYS handler on its own — no filter, no blocked-syscall probe,

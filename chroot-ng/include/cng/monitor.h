@@ -440,6 +440,14 @@ long cng_user_strcopyin(char *dst, const char *src, unsigned long cap);
 extern unsigned char cng_blocked[CNG_NR_MAX];
 void cng_probe_blocked(void);
 
+/* Is a signal pending that the guest would take delivery of, judged against the
+ * mask of the frame `uc` will restore (NULL on the -R tier, which has no frame
+ * and whose live mask is the guest's) and against dispositions: a signal the
+ * guest ignores, or one that is discarded at the default (SIGCHLD and its kind),
+ * is not an interruption. cng_sig_deliverable() (sysvipc.h) finds the frame
+ * itself. Implemented in sigsys.c, which owns it. */
+int cng_sig_deliverable_in(const struct cng_ucontext *uc);
+
 /* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
 int cng_sig_install(int signo, cng_sighandler_t h);
 

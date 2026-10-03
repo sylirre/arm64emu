@@ -1919,21 +1919,15 @@ void cng_pt_note_reaped(long pid) {
  * runs with everything but SIGSYS masked, so a signal that arrives while we
  * poll here cannot interrupt the poll by itself — but the guest's wait4 must
  * still answer -EINTR for it, or a tracer becomes unkillable while waiting. The
- * guest's own mask is the one the signal frame will restore. */
+ * guest's own mask is the one the signal frame will restore, and a signal the
+ * guest would not have been interrupted by — one it ignores, or SIGCHLD and its
+ * kind still at the default — is no interruption: a tracee's own stop raises
+ * SIGCHLD at its tracer (pt_wake_tracer), which sits pending here for as long
+ * as the tracer is inside the handler, and a real waitid is not cut short by it;
+ * nor by the kick (measured: the first wait after a PTRACE_SYSCALL answered
+ * EINTR on one run in seven). */
 static int pt_signal_pending(const struct cng_ucontext *uc) {
-    unsigned long set = 0;
-    if (CNG_SYS(__NR_rt_sigpending, &set, 8, 0, 0, 0, 0) < 0)
-        return 0;
-    unsigned long blocked = 0;
-    if (uc) {
-        /* On a signal frame the live mask is ours (everything but SIGSYS); the
-         * guest's is the one sigreturn will restore. */
-        blocked = uc->uc_sigmask.sig[0];
-    } else if (CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &blocked,
-                       sizeof(unsigned long), 0, 0) < 0) {
-        blocked = 0;
-    }
-    return (set & ~blocked) != 0;
+    return cng_sig_deliverable_in(uc);
 }
 
 #define PT_WNOHANG   1
