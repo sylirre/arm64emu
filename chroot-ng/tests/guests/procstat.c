@@ -5,8 +5,8 @@
  * content from memory — and `cat /proc/version` worked while `stat
  * /proc/version` and `test -r /proc/version` failed with EACCES on the very same
  * name. Every way of asking is put to each file here, and what comes back has
- * to be what any /proc regular file is (0444, one link, no size, root's), the
- * same from every form, with one inode number the path, the descriptor and the
+ * to be what any /proc regular file is (0444, one link, no size, root's; the
+ * sysctls under sys/kernel are 0644), the same from every form, with one inode number the path, the descriptor and the
  * O_PATH descriptor all agree on:
  *
  *   stat, lstat, statx, fstatat against a /proc dirfd, fstat of an O_PATH fd,
@@ -58,11 +58,16 @@ static int fail_errno(const char *what) {
     return 1;
 }
 
-/* A /proc regular file: 0444, one link, empty, root's. */
+/* The permission bits of the file under test: 0444 for a /proc file, 0644 for
+ * a sysctl. */
+static mode_t want_perm;
+
+/* A /proc regular file: 0444 (see want_perm), one link, empty, root's. */
 static int shape(const char *what, mode_t mode, unsigned long nlink, long size,
                  unsigned uid, unsigned gid) {
-    if (mode != (S_IFREG | 0444))
-        return bad(what, "mode %lo, want %lo", (long)mode, (long)(S_IFREG | 0444));
+    if (mode != (S_IFREG | want_perm))
+        return bad(what, "mode %lo, want %lo", (long)mode,
+                   (long)(S_IFREG | want_perm));
     if (nlink != 1)
         return bad(what, "nlink %ld, want %ld", (long)nlink, 1);
     if (size != 0)
@@ -84,7 +89,10 @@ static int check_st(const char *what, const struct stat *s, const struct stat *r
 static int one(const char *name, int procfd) {
     struct stat st, ls, as, ps, fs;
     struct sx sx;
-    const char *leaf = strrchr(name, '/') + 1;
+    /* The name under the /proc directory the dirfd forms are given. */
+    const char *leaf = name + strlen("/proc/");
+
+    want_perm = strstr(name, "/overflow") ? 0644 : 0444;
 
     if (stat(name, &st))
         return fail_errno("stat");
@@ -136,13 +144,25 @@ static int one(const char *name, int procfd) {
         return 1;
     close(rfd);
 
+    /* ...and opened against the /proc directory, which is how procps and
+     * bubblewrap's neighbours reach them: the same file, the same identity. */
+    int dfd = openat(procfd, leaf, O_RDONLY | O_CLOEXEC);
+    if (dfd < 0)
+        return fail_errno("openat(/proc)");
+    if (fstat(dfd, &fs))
+        return fail_errno("fstat openat(/proc)");
+    if (check_st("fstat openat(/proc)", &fs, &st))
+        return 1;
+    close(dfd);
+
     if (access(name, R_OK))
         return fail_errno("access R_OK");
     if (faccessat(procfd, leaf, R_OK, 0))
         return fail_errno("faccessat(/proc) R_OK");
     if (!access(name, X_OK) || errno != EACCES)
         return fail_errno("access X_OK");
-    /* The write check is root's to pass: a real root gets W_OK on a 0444 file. */
+    /* The write check is root's to pass: a real root gets W_OK on a 0444 file,
+     * and on a 0644 one only root has the write bit at all. */
     if (geteuid() != 0 && (!access(name, W_OK) || errno != EACCES))
         return fail_errno("access W_OK");
     return 0;
@@ -150,7 +170,9 @@ static int one(const char *name, int procfd) {
 
 int main(void) {
     static const char *const names[] = {"/proc/version", "/proc/loadavg",
-                                        "/proc/uptime", "/proc/stat"};
+                                        "/proc/uptime", "/proc/stat",
+                                        "/proc/sys/kernel/overflowuid",
+                                        "/proc/sys/kernel/overflowgid"};
     int procfd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (procfd < 0) {
         printf("open /proc: errno=%d\n", errno);

@@ -78,8 +78,9 @@ including under an explicit `-b /proc:/proc`), `cmdline`/`environ`/`auxv`
 report the guest program (no real `execve` ever happens, so the kernel's copies
 would name the chroot-ng invocation), `mounts`/`mountinfo` describe the rootfs
 and its binds instead of the host's mount namespace, `maps` and the `fd` links
-are mapped back to guest paths, and `loadavg`/`uptime`/`stat` are synthesized
-where the host denies them (as Android does), `version` always (the real one
+are mapped back to guest paths, and `loadavg`/`uptime`/`stat` (and the
+`sys/kernel/overflow{u,g}id` sysctls, which bubblewrap insists on reading) are
+synthesized where the host denies them (as Android does), `version` always (the real one
 names the host's kernel and build host). Their `stat` and access checks are
 answered to match, so a file the guest can read is one it can also `stat`.
 Separate invocations normally hide each other's processes; `--shared-proc`

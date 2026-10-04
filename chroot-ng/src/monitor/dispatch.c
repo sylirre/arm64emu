@@ -2293,6 +2293,7 @@ static int leaf_may_synth(const char *p) {
     static const char *const leafs[] = {
         "cmdline", "environ",   "auxv",    "maps",   "mounts", "mountinfo",
         "status",  "mountstats", "loadavg", "uptime", "stat",   "version",
+        "overflowuid", "overflowgid",
     };
     const char *b = strrchr(p, '/');
     b = b ? b + 1 : p;

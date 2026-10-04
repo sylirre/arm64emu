@@ -21,7 +21,7 @@
 enum {
     PF_CMDLINE = 1, PF_ENVIRON, PF_AUXV, PF_MAPS,
     PF_MOUNTS, PF_MOUNTINFO, PF_MOUNTSTATS,
-    PF_LOADAVG, PF_UPTIME, PF_STAT, PF_STATUS, PF_VERSION,
+    PF_LOADAVG, PF_UPTIME, PF_STAT, PF_STATUS, PF_VERSION, PF_OVERFLOWID,
 };
 
 /* put_mounts rendering. */
@@ -359,6 +359,29 @@ static int stat_blocked(void) {
     return blocked;
 }
 
+/* The same try-host-first gate for /proc/sys/kernel/overflow{u,g}id, which
+ * Android's SELinux policy denies an app along with the rest of /proc/sys. A
+ * guest that cannot read them is not hypothetical: bubblewrap reads them before
+ * anything else and dies outright ("Can't read /proc/sys/kernel/overflowuid").
+ * Probed once per file, so a policy that allowed one and not the other is
+ * answered as it is. CNG_OVERFLOWID_SYNTH forces the fallback in tests. */
+int cng_g_overflowid_synth = 0;
+static int overflowid_blocked(int is_gid) {
+    static int blocked[2] = {-1, -1};
+    if (blocked[is_gid] < 0) {
+        if (cng_g_overflowid_synth) {
+            blocked[is_gid] = 1;
+        } else {
+            long fd = open_host_ro(is_gid ? "/proc/sys/kernel/overflowgid"
+                                          : "/proc/sys/kernel/overflowuid");
+            blocked[is_gid] = fd < 0;
+            if (fd >= 0)
+                sys_close((int)fd);
+        }
+    }
+    return blocked[is_gid];
+}
+
 static unsigned long stat_ncpu(void) {
     unsigned long mask[16];
     long r = CNG_SYS(__NR_sched_getaffinity, 0, sizeof mask, mask, 0, 0, 0);
@@ -490,6 +513,15 @@ static void put_uptime(int fd) {
 static void put_version(int fd) {
     cng_dprintf(fd, "Linux version %s (chroot-ng@localhost) (chroot-ng) %s\n",
                 CNG_KREL, CNG_KVER);
+}
+
+/* The id a file's owner is reported as when it does not fit the caller's view
+ * of it (a 16-bit stat, an unmapped id in a user namespace). 65534 is the
+ * kernel's compiled-in default for both sysctls, which is also what every
+ * distro ships — so it is the right answer when the real file is out of reach,
+ * and a readable one passes through when it is not. */
+static void put_overflowid(int fd) {
+    cng_dprintf(fd, "65534\n");
 }
 
 /* The guest /proc/stat where the host's is unreadable (see stat_blocked). CPU
@@ -1177,6 +1209,11 @@ static int synth_kind(const char *canon, char *host, size_t hsz, int *pid,
         if (!stat_blocked())
             return 0; /* a readable host file is strictly richer */
         kind = PF_STAT;
+    } else if (!strcmp(canon, "/proc/sys/kernel/overflowuid") ||
+               !strcmp(canon, "/proc/sys/kernel/overflowgid")) {
+        if (!overflowid_blocked(!strcmp(canon, "/proc/sys/kernel/overflowgid")))
+            return 0; /* a readable host file wins */
+        kind = PF_OVERFLOWID;
     }
     *leafp = leaf;
     return kind;
@@ -1302,6 +1339,9 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
     case PF_STAT:
         put_stat((int)fd);
         break;
+    case PF_OVERFLOWID:
+        put_overflowid((int)fd);
+        break;
     case PF_STATUS:
         rc = put_status((int)fd, host, pid == (int)sys_getpid());
         break;
@@ -1390,10 +1430,11 @@ static int synth_name_of(int fd, char *out, size_t sz) {
  * held inode answering after its process is gone, with no path left to ask for
  * one of those; and Android's SELinux policy refuses an app the stat — and the
  * read access check — of the global files it hides (version, loadavg, uptime,
- * stat), which is why they are synthesized at all, and which left `stat` and
- * `test -r` failing on a name that `cat` could read. So the procfs mount's own
- * identity carries 0444 (0400 for environ and auxv, which are the owner's
- * alone), one link, size 0, 1 KiB blocks, and an inode number: the memfd's for
+ * stat, sys/kernel/overflow{u,g}id), which is why they are synthesized at all,
+ * and which left `stat` and `test -r` failing on a name that `cat` could read.
+ * So the procfs mount's own identity carries 0444 (0400 for environ and auxv,
+ * which are the owner's alone; 0644 for the two sysctls, root's to write), one
+ * link, size 0, 1 KiB blocks, and an inode number: the memfd's for
  * a file whose process is gone (nobody can look up the real one any more),
  * synth_ino()'s for a name the host refuses. A process's entries are its
  * owner's, and every guest process runs as us. */
@@ -1425,8 +1466,12 @@ static long host_stat_name(const char *name, char *st) {
 static unsigned proc_mode_of(const char *name) {
     const char *b = strrchr(name, '/');
     b = b ? b + 1 : name;
-    return 0100000u | (!strcmp(b, "environ") || !strcmp(b, "auxv") ? 0400u
-                                                                     : 0444u);
+    /* The sysctls are root's to write (0644); only the open refuses a write,
+     * since a synthesized file has nothing to store it in. */
+    return 0100000u | (!strcmp(b, "environ") || !strcmp(b, "auxv")   ? 0400u
+                       : !strcmp(b, "overflowuid") || !strcmp(b, "overflowgid")
+                           ? 0644u
+                           : 0444u);
 }
 static int proc_owned(const char *name) {
     return name[6] >= '0' && name[6] <= '9'; /* "/proc/<pid>/..." */

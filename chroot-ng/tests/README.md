@@ -47,8 +47,10 @@ expected failure:
   it, skips.
 * **SELinux hides or refuses what a kernel would allow**: hardlinks (`ln` is
   `EACCES`, so the l2s fallback is what runs), `stat` and `open` of
-  `/proc/{loadavg,uptime,stat,version}` (they are synthesized for that reason,
-  and so is their `stat` — `CNG_PROC_DENY_STAT=1` forces that path elsewhere),
+  `/proc/{loadavg,uptime,stat,version}` and `/proc/sys/kernel/overflow{u,g}id`
+  (they are synthesized for that reason, and so is their `stat` —
+  `CNG_PROC_DENY_STAT=1` forces that path elsewhere, `CNG_OVERFLOWID_SYNTH=1`
+  the open of the sysctls),
   reopening a memfd through `/proc/self/fd/N` (so a synthesized fd stays
   writable), and opening `/dev/pts`.
 * **The kernel is built without checkpoint/restore support**: no

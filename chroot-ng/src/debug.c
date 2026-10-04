@@ -6623,6 +6623,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     cng_g_fs = &fs;
     cng_g_exe_guest = "/bin/busybox";
     cng_g_procstat_synth = 1; /* exercise the fallback where the host allows /proc/stat */
+    cng_g_overflowid_synth = 1; /* ...and /proc/sys/kernel/overflow{u,g}id */
 
     int fails = 0;
     char buf[8192];
@@ -7021,6 +7022,31 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
             sys_close((int)fd);
         cng_dprintf(1, "proctest stat: %ld bytes -> %s\n", n, ok ? "OK" : "FAIL");
         fails += !ok;
+
+        /* overflowuid / overflowgid: the kernel's default id and nothing else,
+         * and from a memfd — forced above, since a test host can read the real
+         * ones, which would otherwise pass through and prove nothing. The fd's
+         * own link says which it was. */
+        static const char *const ovf[] = {"/proc/sys/kernel/overflowuid",
+                                          "/proc/sys/kernel/overflowgid"};
+        for (int i = 0; i < 2; i++) {
+            fd = pt_open(ovf[i]);
+            n = pt_slurp(fd, buf, sizeof buf);
+            char lk[40], tgt[CNG_PATH_MAX + 64], want[CNG_PATH_MAX + 64];
+            cng_snprintf(lk, sizeof lk, "/proc/self/fd/%ld", fd);
+            long tl = fd >= 0 ? sys_readlinkat(CNG_AT_FDCWD, lk, tgt, sizeof tgt - 1)
+                              : -1;
+            if (tl >= 0)
+                tgt[tl] = '\0';
+            cng_snprintf(want, sizeof want, "/memfd:cng-proc:%s (deleted)", ovf[i]);
+            ok = n == 6 && !strcmp(buf, "65534\n") && tl > 0 &&
+                 !strcmp(tgt, want);
+            if (fd >= 0)
+                sys_close((int)fd);
+            cng_dprintf(1, "proctest %s: %ld bytes -> %s\n", ovf[i] + 17, n,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
     }
 
     /* 5a) the description a synthesized open hands over is what the real file

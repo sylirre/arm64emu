@@ -9,7 +9,10 @@
  * libraries. mounts/mountinfo/mountstats describe the host (on Android, the
  * app-sandbox) mount namespace, which confuses df- and apt-style tools.
  * loadavg, uptime and stat are readable here but denied to apps by Android's
- * SELinux policy, where an unpatched guest tool would simply fail. And under
+ * SELinux policy, where an unpatched guest tool would simply fail; so are
+ * /proc/sys/kernel/overflowuid and overflowgid (bubblewrap reads them first
+ * and dies without). Like stat they are served only where the host file is
+ * unreadable. And under
  * --fake-id the Uid:/Gid:/Groups: lines of status carry the real invoking id,
  * which ps/top read to name the user.
  *
@@ -54,6 +57,10 @@ extern int cng_g_synth_fd_base;
  * file is readable. Android denies it to apps (which is what the synthesis is
  * for); test hosts do not, so this is how the fallback gets exercised. */
 extern int cng_g_procstat_synth;
+
+/* CNG_OVERFLOWID_SYNTH=1: serve the synthesized /proc/sys/kernel/overflow{u,g}id
+ * even where the host files are readable (Android denies them to apps). */
+extern int cng_g_overflowid_synth;
 
 /* Bring up the registry and choose the reserved fd range. Called once from
  * cng_run, before the seccomp filter is built. */

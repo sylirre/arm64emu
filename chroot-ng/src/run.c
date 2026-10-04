@@ -247,6 +247,10 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_PROCSTAT_SYNTH=", 19) && (*e)[19] != '\0' &&
             (*e)[19] != '0')
             cng_g_procstat_synth = 1;
+        /* CNG_OVERFLOWID_SYNTH=1 does the same for /proc/sys/kernel/overflow{u,g}id. */
+        if (!strncmp(*e, "CNG_OVERFLOWID_SYNTH=", 21) && (*e)[21] != '\0' &&
+            (*e)[21] != '0')
+            cng_g_overflowid_synth = 1;
         /* CNG_PROC_DENY_STAT=1 makes stat/access of a synthesized /proc name
          * answer as the host does on Android, where SELinux refuses them. */
         if (!strncmp(*e, "CNG_PROC_DENY_STAT=", 19) && (*e)[19] != '\0' &&

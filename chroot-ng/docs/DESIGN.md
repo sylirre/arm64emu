@@ -127,7 +127,8 @@ directory tree has none), non-guest pids are hidden, the magic links
 (`exe`/`cwd`/`root`, and the `fd` links' targets) are answered in guest terms,
 and the files that would otherwise describe chroot-ng — `cmdline`, `environ`,
 `auxv`, `maps`, the mount tables — are served from the guest's own view (and
-the global files Android's SELinux hides, `version`, `loadavg`, `uptime`, `stat`,
+the global files Android's SELinux hides, `version`, `loadavg`, `uptime`, `stat`
+and `sys/kernel/overflow{u,g}id`,
 answer `stat` and `access` as well as `open`: a refused call on a name we serve
 gets the attributes of a `/proc` regular file). Because
 we run the guest in this process and never `execve`, those files are the kernel's

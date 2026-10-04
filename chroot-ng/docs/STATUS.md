@@ -3460,6 +3460,32 @@ vfork/`posix_spawn` child-stack handling.
     redirected fd with the path and fell back to "the path form has no
     answer" where the host denied it now runs everywhere.
 
+- [x] **M75 — `/proc/sys/kernel/overflow{u,g}id` were unreadable on Android**
+  Android's SELinux policy refuses an app all of `/proc/sys`, and a guest
+  that cannot read `overflowuid` and `overflowgid` is not hypothetical:
+  bubblewrap reads them before it does anything else and dies with "Can't
+  read /proc/sys/kernel/overflowuid". Ported from arm64chroot's
+  `sys_procfs.c`, which already served them.
+  - Same try-host-first rule as `/proc/stat`: the host file is probed once
+    per name, and only where it cannot be opened is the open served from a
+    memfd holding `65534\n` (the kernel's compiled-in default for both,
+    and what every distro ships). A readable host file passes through.
+  - They take part in the stat family like the other synthesized names
+    (`synth_kind` is the one list), as 0644 files — the sysctls are root's
+    to write, where the rest are 0444. A write open is still `EACCES`,
+    since a synthesized file has nothing to store the value in.
+  - `leaf_may_synth` in the dispatcher is the pre-filter for names asked
+    against a `/proc` dirfd (`sys/kernel/overflowuid` relative to it), and
+    it did not know these two: an `openat`, `fstatat` or `faccessat` that
+    way skipped synthesis whatever the absolute spelling did.
+  - `CNG_OVERFLOWID_SYNTH=1` forces the fallback where the host can read
+    the files (listed in `--help`). `-t proctest` forces it and checks the
+    content and the memfd behind it; `tests/guests/procstat.c` now covers
+    both names (0644, and a dirfd-relative open as well as stat) with and
+    without the stat refusal forced; m11 reads them from a guest shell with
+    the fallback forced, and checks with `CNG_DEBUG=1` that a readable host
+    file is not shadowed.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

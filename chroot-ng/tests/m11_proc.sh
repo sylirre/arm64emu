@@ -143,6 +143,10 @@ check_contains "a synthesized fd stats as the real /proc file, and outlives it" 
     "$out"
 check_contains "stat falls back to synthesis where the host denies it" \
     "proctest stat:" "$out"
+check_contains "overflowuid is the kernel default, from a memfd, where forced" \
+    "proctest overflowuid: 6 bytes -> OK" "$out"
+check_contains "overflowgid is the kernel default, from a memfd, where forced" \
+    "proctest overflowgid: 6 bytes -> OK" "$out"
 check_contains "maps leaks no host path" "proctest maps:" "$out"
 check_contains "an fd link reports the guest path" \
     "proctest fdlink: / -> OK" "$out"
@@ -297,20 +301,23 @@ fi
 rm -rf "$PN_ROOT"
 
 # stat, statx, access and an O_PATH fstat on the synthesized global files
-# (version, loadavg, uptime, stat). Android's SELinux refuses an app every one of
-# them, and the open was served from memory regardless, so `cat` worked where
+# (version, loadavg, uptime, stat, sys/kernel/overflow{u,g}id). Android's SELinux
+# refuses an app every one of them, and the open was served from memory regardless, so `cat` worked where
 # `stat` and `test -r` of the same name failed. The guest checks the shape every
 # form must agree on, which holds wherever the host answers or refuses the call
 # itself: on a device the refusal is real, and elsewhere CNG_PROC_DENY_STAT=1
-# makes the second run take the same path (/proc/stat, readable here, joins it
-# with CNG_PROCSTAT_SYNTH).
+# makes the second run take the same path (/proc/stat and the overflow{u,g}id
+# sysctls, readable here, join it with CNG_PROCSTAT_SYNTH and
+# CNG_OVERFLOWID_SYNTH).
 PS_ROOT=$(mktemp -d)
 if guest_xlate_ready "synthesized /proc stat leg" &&
     guest_cc_report "$PS_ROOT/procstat" tests/guests/procstat.c; then
     ps_want="/proc/version: ok
 /proc/loadavg: ok
 /proc/uptime: ok
-/proc/stat: ok"
+/proc/stat: ok
+/proc/sys/kernel/overflowuid: ok
+/proc/sys/kernel/overflowgid: ok"
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
     ps_got=$(run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
     if [ "$ps_got" = "$ps_want" ]; then
@@ -322,7 +329,7 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
         printf '%s\n' "$ps_got" | sed 's/^/    /'
     fi
     # shellcheck disable=SC2086
-    ps_got=$(CNG_PROC_DENY_STAT=1 CNG_PROCSTAT_SYNTH=1 \
+    ps_got=$(CNG_PROC_DENY_STAT=1 CNG_PROCSTAT_SYNTH=1 CNG_OVERFLOWID_SYNTH=1 \
         run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
     if [ "$ps_got" = "$ps_want" ]; then
         pass=$((pass + 1))
@@ -418,6 +425,38 @@ if [ "$m11_ready" -eq 1 ]; then
     # loadavg / uptime shape (Android denies the real files to apps).
     m11_sh "loadavg has five fields" "5" 'wc -w < /proc/loadavg'
     m11_sh "uptime has two fields" "2" 'wc -w < /proc/uptime'
+
+    # bubblewrap reads these two before it does anything else and dies where
+    # Android denies them. Forced here, the guest gets the kernel's default;
+    # unforced, a readable host file is the answer, and the debug trace shows
+    # which one served the open.
+    got=$(CNG_OVERFLOWID_SYNTH=1 CNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
+        'echo $(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)' 2>&1)
+    case $got in
+    *"procfs /proc/sys/kernel/overflowuid -> fd"*"procfs /proc/sys/kernel/overflowgid -> fd"*"65534 65534")
+        pass=$((pass + 1)); echo "  ok   m11 overflowuid and overflowgid are served from the fallback, 65534" ;;
+    *)
+        fail=$((fail + 1)); echo "  FAIL m11 overflowuid and overflowgid are served from the fallback, 65534"
+        printf '%s\n' "$got" | sed 's/^/    /' ;;
+    esac
+    if [ -r /proc/sys/kernel/overflowuid ] && [ -r /proc/sys/kernel/overflowgid ]; then
+        want="$(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)"
+        got=$(CNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
+            'echo $(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)' 2>&1)
+        case $got in
+        *"procfs /proc/sys/kernel/overflow"*)
+            fail=$((fail + 1)); echo "  FAIL m11 a readable host overflowuid/overflowgid is not shadowed"
+            printf '%s\n' "$got" | sed 's/^/    /' ;;
+        *"$want")
+            pass=$((pass + 1)); echo "  ok   m11 a readable host overflowuid/overflowgid is not shadowed" ;;
+        *)
+            fail=$((fail + 1)); echo "  FAIL m11 a readable host overflowuid/overflowgid is not shadowed"
+            echo "    want: $want"
+            printf '%s\n' "$got" | sed 's/^/    /' ;;
+        esac
+    else
+        skip "overflowuid/overflowgid passthrough: the host cannot read them"
+    fi
 
     # comm is the guest program, not chroot-ng (PR_SET_NAME, not synthesis).
     m11_sh "comm names the guest program" "busybox" 'cat /proc/self/comm'
