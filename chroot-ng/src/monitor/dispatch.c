@@ -5946,6 +5946,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return cng_execmap((unsigned long)a0, (unsigned long)a1, a2, a3, a4,
                            (unsigned long)a5);
 
+    /* mprotect asking for PROT_EXEC. There is nothing to translate: it is
+     * trapped (seccomp.c) so that the kernel sees it from the scratch stack
+     * rather than the guest's own. SELinux judges an executable mprotect with
+     * the whole VMA the range lies in, and a VMA holding the caller's stack
+     * pointer is a stack being made executable, which an app domain may not
+     * do. Anonymous mappings of equal permissions merge, so a page beside a
+     * thread's stack is refused for it — the JVM's startup probe, among others.
+     * The scratch stack is bounded by guard pages (scr_mmap) and so is never
+     * in a VMA the guest can reach. Under -R every syscall comes through here
+     * on that stack already; the case is spelled out so the reason is not
+     * lost with the default. */
+    case __NR_mprotect:
+        return reissue(a0, a1, a2, a3, a4, a5, nr);
+
     /* --- credential syscalls (trapped only when --fake-id is active) ---
      * All get/set uid/gid family, groups, and capability calls are emulated
      * against the synthetic credential set in cred.c, which enforces real POSIX

@@ -575,6 +575,56 @@ check_contains "a full scratch table recovers the slots of threads that exited" 
     "stacksw reclaim: filled=300/300 then=" "$out"
 check_contains "...with a stack, and never at the expense of a live thread" \
     "mapped=1 mine_kept=1 -> OK" "$out"
+# The stack has to be a VMA of its own. The kernel merges adjacent anonymous
+# mappings of equal permissions, and SELinux judges an mprotect(PROT_EXEC) with
+# the whole VMA the range lies in: one holding the caller's stack pointer is a
+# stack being made executable, which an Android app domain is refused. A bare
+# stack sat among the guest's own mappings, so every executable mprotect made
+# from the handler failed for a page beside it (the JVM's startup probe, which
+# is how this was found). A PROT_NONE page on each side cannot merge with a
+# read-write neighbour.
+check_contains "the scratch stack is bounded by inaccessible pages" \
+    "stacksw guards: below=---p first=rw-p last=rw-p above=---p -> OK" "$out"
+
+# End to end, the shape the JVM hit: a page that shares a VMA with a thread's
+# stack, made executable by that thread. Where SELinux is enforcing the kernel
+# refuses it for the stack pointer's sake (EACCES), so what is asserted is that
+# the guest gets the same answer for that page as for one of its own. Elsewhere
+# the call never fails and the legs pass without proving much; the structural
+# legs above are what hold there. The gate is the harness's own probe of
+# anonymous executable memory, not a case of the guest's: a baseline taken
+# through the monitor would be refused by the very defect being tested (under
+# -R the dispatcher's stack was in the page's VMA), and the leg would skip
+# instead of fail.
+EXD=$(mktemp -d)
+if guest_xlate_ready "executable mprotect beside a thread's stack" &&
+    guest_cc_report "$EXD/execstack" tests/guests/execstack.c -lpthread; then
+    for _tier in -R plain; do
+        if [ "$_tier" = plain ]; then
+            if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+                skip "executable mprotect beside a thread's stack, seccomp tier: the filter is inert here"
+                continue
+            fi
+            _opt=""
+        else
+            _opt="-R"
+        fi
+        if [ "$CNG_EXECMEM" != 1 ]; then
+            skip "executable mprotect beside a thread's stack ($_tier): the host denies anonymous executable memory"
+            continue
+        fi
+        # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
+        out=$(run_t 60 $_opt $GUEST_BINDS "$EXD" /execstack 2>/dev/null)
+        check_contains "a page of its own can be made RWX ($_tier)" \
+            "rwx_main=0" "$out"
+        check_contains "a page beside a thread's stack can be made RWX ($_tier)" \
+            "rwx_beside_stack=0" "$out"
+        check_contains "...or R+X ($_tier)" "rx_beside_stack=0" "$out"
+        check_contains "...and the guest is none the worse for it ($_tier)" \
+            "rwx_after=0" "$out"
+    done
+fi
+rm -rf "$EXD"
 
 # And a SIGSYS that arrives while the handler is already on that scratch stack
 # must not land on the frame of the one that put it there. The kernel picks a
@@ -675,6 +725,22 @@ check_contains "a foreign architecture is killed" \
     "bpftest foreign arch killed -> OK" "$out"
 check_contains "the System V shm syscalls trap (M12 emulation)" \
     "bpftest shmat traps: TRAP -> OK" "$out"
+# mprotect(PROT_EXEC) is judged by SELinux against the whole VMA the range lies
+# in, stack pointer and all, so it has to be made from the dispatcher's own
+# stack rather than the guest's. Only that shape traps: RELRO, guard pages and
+# the allocator's growth carry no PROT_EXEC and must not pay for a handler.
+check_contains "an executable mprotect traps (made from the scratch stack)" \
+    "bpftest mprotect RWX traps: TRAP -> OK" "$out"
+check_contains "...whichever other bits ride with PROT_EXEC" \
+    "bpftest mprotect RX traps: TRAP -> OK" "$out"
+check_contains "...down to PROT_EXEC alone" \
+    "bpftest mprotect X alone traps: TRAP -> OK" "$out"
+check_contains "an mprotect without PROT_EXEC runs native" \
+    "bpftest mprotect RW runs native: ALLOW -> OK" "$out"
+check_contains "...PROT_NONE included" \
+    "bpftest mprotect PROT_NONE runs native: ALLOW -> OK" "$out"
+check_contains "the dispatcher's own mprotect is not trapped again" \
+    "bpftest mprotect the dispatcher's own re-issue is allowed: ALLOW -> OK" "$out"
 # io_uring submits path operations through a ring, never an svc, so a created
 # ring reaches the host filesystem with no trap and no translation. The filter
 # must refuse it outright -- including from inside the gate, which exempts our

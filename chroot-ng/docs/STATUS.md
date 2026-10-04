@@ -3486,6 +3486,49 @@ vfork/`posix_spawn` child-stack handling.
     the fallback forced, and checks with `CNG_DEBUG=1` that a readable host
     file is not shadowed.
 
+- [x] **M76 — the JVM died at startup: an executable `mprotect` beside a stack**
+  `java` in an Alpine rootfs (OpenJDK 25, musl) exited before running any
+  Java: "Failed to mark memory page as executable - check if
+  grsecurity/PaX is enabled". HotSpot's `os::init_2` maps a page and makes
+  it RWX, from the thread that runs the VM, to find out whether it may. The
+  kernel answered EACCES, and not for anything about the page.
+  - SELinux judges an `mprotect(PROT_EXEC)` with the whole VMA the range lies
+    in, before the VMA is split to it, and a VMA that holds the caller's stack
+    pointer is a stack being made executable (`execstack`), which an app
+    domain is not granted. Adjacent anonymous mappings of equal permissions
+    are one VMA, and a thread's stack is such a mapping. In the trace the
+    probe page (`0x7c57932000`) sat directly below the thread's 256 KiB scratch
+    stack, which sat directly below its own stack: one VMA, with SP in it.
+    Reproduced with no chroot-ng in the picture (a freestanding program: SP
+    in the merged VMA is -13, SP on another map is 0). bionic never meets it
+    because it names its stacks, which keeps them out of any merge.
+  - **The scratch stacks are bounded by a `PROT_NONE` page on each side**
+    (`scr_mmap`), so neither can be merged into a mapping of the guest's. A
+    dispatcher that ran off the end of one used to write into whatever lay
+    beyond it; now it faults. `cng_scr_hit` covers the guards, so the exec
+    sweep and the loader's overlap checks keep them.
+  - **`mprotect` with `PROT_EXEC` is trapped** (two arguments' worth of BPF:
+    the number and `args[2] & PROT_EXEC`; RELRO, guards and the allocator's
+    growth carry none and stay native) and made by the dispatcher from the
+    scratch stack. That is what makes it independent of where the guest's
+    own mappings lie: a page beside the thread's stack is no longer refused for
+    the stack. Under -R every syscall already arrives on the scratch stack, so
+    there only the guards were missing; without them a guest's plain
+    main-thread RWX probe failed too.
+  - Not covered: `pkey_mprotect` (same hook, nothing issues it with
+    `PROT_EXEC`), and the calls made where no scratch slot can be had
+    (`CNG_SCRATCH_NONE`, 256 live threads), which run on the guest's own stack
+    as they always did.
+  - Tests: `-t bpftest` has the mprotect cases (trap with `PROT_EXEC`, native
+    without, the gate's own re-issue allowed); `-t stackswtest` checks the
+    permissions of the page on each side of a slot; `tests/guests/execstack.c`
+    (m5b) maps one region, starts a thread on the top of it and makes the first
+    page RWX and R+X, on the -R tier and, where the filter is live, without.
+    On the device the original binary answers -13 for both (and for the
+    baseline under -R); the fixed one 0. `java -version`, `javac` plus a JIT
+    and GC heavy program (C1 and C2 both run), and a Minecraft `server.jar`
+    started through `su -l` work on the seccomp tier.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

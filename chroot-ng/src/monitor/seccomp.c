@@ -610,6 +610,40 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
+    /* mprotect, only when it asks for PROT_EXEC. Where SELinux is enforcing, the
+     * kernel judges such a call with the *whole* VMA the range lies in — before
+     * the VMA is split to the range — and if that VMA holds the caller's stack
+     * pointer it is an attempt to make a stack executable, which an Android app
+     * domain is not granted (EACCES, "execstack"). Adjacent anonymous mappings
+     * with equal permissions are one VMA, and a thread's stack is exactly such a
+     * mapping, so a page the guest maps beside its own stack and then makes
+     * RWX is refused for reasons that have nothing to do with the page. The JVM
+     * does precisely this at startup (a one-page RWX probe, os::init_2) and
+     * exits with "Failed to mark memory page as executable"; bionic escapes it
+     * only because it names its stacks, which keeps them out of any merge.
+     *
+     * The call is therefore made by the dispatcher, from the scratch stack — a
+     * mapping of ours that is never part of a guest's VMA (see scr_mmap).
+     * Only PROT_EXEC is tested: a mprotect without it cannot reach the check
+     * and stays untrapped, and one with it is a JIT or a loader making code,
+     * rare enough that the signal costs nothing measurable. */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_mprotect, 0,
+        5); /* not mprotect -> reload nr */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 16); /* A = prot */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_PROT_EXEC);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 1,
+        0); /* no EXEC -> allow, EXEC -> trap */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* no PROT_EXEC */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+
     /* The mask-taking waits (see the note in path_syscalls): trapped only
      * when the sigset argument is non-NULL. It is a pointer, so both halves
      * are tested. Offsets: for each, "not this nr" skips the whole block;

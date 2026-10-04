@@ -4537,6 +4537,8 @@ static long sp_probe(void *lo, void *hi) {
     return (sp > (unsigned long)lo && sp <= (unsigned long)hi) ? 0xC0DE : sp;
 }
 
+static void lz_perms(unsigned long addr, char perm[5]);
+
 int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
@@ -4593,6 +4595,33 @@ int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv)
                     filled, CNG_SCR_TEST_N, slot_new, hi_new != 0,
                     slot_mine >= 0 && again == slot_mine, gok ? "OK" : "FAIL");
         fails += !gok;
+    }
+
+    /* The stack is a VMA of its own: an inaccessible page on each side, so no
+     * read-write neighbour of the guest's can ever be merged with it. A VMA
+     * that held our stack pointer made every mprotect(PROT_EXEC) on any page
+     * of it an attempt to make a stack executable, which SELinux refuses an
+     * Android app (the JVM's startup probe, issued from the handler). The
+     * permissions of the page on either side of each end are what the merge
+     * rule reads, so they are what is asserted. */
+    {
+        unsigned long hi = 0;
+        int s = cng_scratch_slot_for(sys_gettid(), &hi);
+        unsigned long lo = hi - 256 * 1024;
+        char below[5] = "", first[5] = "", last[5] = "", above[5] = "";
+        if (s >= 0 && hi) {
+            lz_perms(lo - 1, below);
+            lz_perms(lo, first);
+            lz_perms(hi - 1, last);
+            lz_perms(hi, above);
+        }
+        int bok = s >= 0 && hi && !strcmp(below, "---p") &&
+                  !strcmp(first, "rw-p") && !strcmp(last, "rw-p") &&
+                  !strcmp(above, "---p");
+        cng_dprintf(1,
+                    "stacksw guards: below=%s first=%s last=%s above=%s -> %s\n",
+                    below, first, last, above, bok ? "OK" : "FAIL");
+        fails += !bok;
     }
     return fails ? 1 : 0;
 }
@@ -7986,6 +8015,48 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
             u32 got = bpf_run(f, n, d, &bad);
             int ok = !bad && got == mm[k].want;
             cng_dprintf(1, "bpftest mmap %s: %s -> %s\n", mm[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
+    /* mprotect traps when — and only when — it asks for PROT_EXEC (args[2]):
+     * that is the call SELinux judges against the whole VMA the range lies in,
+     * stack pointer and all, so the dispatcher has to make it from its own
+     * stack. RELRO, guard pages and the allocator's growth carry no PROT_EXEC
+     * and stay off the handler. The call is also allowed from the gate, where
+     * the dispatcher's own re-issue comes from. */
+    {
+        static const struct {
+            const char *what;
+            u32 prot;
+            unsigned long ip;
+            u32 want;
+        } mp[] = {
+            {"RWX traps", CNG_PROT_READ | CNG_PROT_WRITE | CNG_PROT_EXEC,
+             0x1000, CNG_SECCOMP_RET_TRAP},
+            {"RX traps", CNG_PROT_READ | CNG_PROT_EXEC, 0x1000,
+             CNG_SECCOMP_RET_TRAP},
+            {"X alone traps", CNG_PROT_EXEC, 0x1000, CNG_SECCOMP_RET_TRAP},
+            {"RW runs native", CNG_PROT_READ | CNG_PROT_WRITE, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"PROT_NONE runs native", CNG_PROT_NONE, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"the dispatcher's own re-issue is allowed",
+             CNG_PROT_READ | CNG_PROT_EXEC, 0, CNG_SECCOMP_RET_ALLOW},
+        };
+        for (unsigned k = 0; k < sizeof mp / sizeof mp[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, __NR_mprotect, mp[k].ip ? mp[k].ip : gate, 0);
+            d[8] = mp[k].prot; /* args[2] low */
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == mp[k].want;
+            cng_dprintf(1, "bpftest mprotect %s: %s -> %s\n", mp[k].what,
                         bad ? "malformed"
                         : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
                         : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"

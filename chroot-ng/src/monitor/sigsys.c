@@ -508,13 +508,37 @@ static int cng_claim_slot(volatile long *p, long want, long tid) {
     return fail == 0;
 }
 
-/* One stack, straight from the kernel. Returns the base, or 0. */
+/* One stack, straight from the kernel, with an inaccessible page on each side.
+ * Returns the base of the usable part, or 0.
+ *
+ * The guards are not there for overflow alone. The kernel merges adjacent
+ * anonymous mappings of equal permissions into one VMA, and a bare stack lands
+ * wherever the allocator put it — in the middle of a guest's own mappings, a
+ * thread's stack and the page the guest then maps beside it among them. The
+ * VMA that results holds our stack pointer, and an mprotect(PROT_EXEC) on any
+ * page of it is judged by SELinux as a stack being made executable (see the
+ * mprotect case in dispatch.c), which an Android app domain is refused: the
+ * JVM's startup probe died of exactly that, issued from the handler's own
+ * stack. A PROT_NONE page on each side cannot merge with a read-write
+ * neighbour, so this VMA is ours alone. */
 static unsigned long scr_mmap(void) {
-    void *base = sys_mmap(0, CNG_SCR_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
-                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
-    if (base == CNG_MAP_FAILED || cng_is_err((long)base))
+    unsigned long g = cng_page_size, len = CNG_SCR_SZ + 2 * g;
+    void *map = sys_mmap(0, len, CNG_PROT_NONE,
+                         CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (map == CNG_MAP_FAILED || cng_is_err((long)map))
         return 0;
-    return (unsigned long)base;
+    unsigned long base = (unsigned long)map + g;
+    if (sys_mprotect((void *)base, CNG_SCR_SZ,
+                     CNG_PROT_READ | CNG_PROT_WRITE) < 0) {
+        sys_munmap(map, len);
+        return 0;
+    }
+    return base;
+}
+
+/* The whole of what scr_mmap mapped, guards included. */
+static void scr_unmap(unsigned long base) {
+    sys_munmap((void *)(base - cng_page_size), CNG_SCR_SZ + 2 * cng_page_size);
 }
 
 /* Map a stack into a slot this thread has just claimed. 0, or -1 with the slot
@@ -552,8 +576,8 @@ int cng_scr_hit(unsigned long lo, unsigned long hi) {
         if (!__atomic_load_n(&cng_scr[i].hi, __ATOMIC_ACQUIRE))
             continue; /* never mapped, or not published yet */
         unsigned long b = cng_scr[i].lo;
-        if (lo < b + CNG_SCR_SZ && b < hi)
-            return 1;
+        if (lo < b + CNG_SCR_SZ + cng_page_size && b - cng_page_size < hi)
+            return 1; /* the guards are ours too: see scr_mmap */
         unsigned long f = (unsigned long)__atomic_load_n(&cng_scr[i].uc,
                                                          __ATOMIC_ACQUIRE);
         if (f && f >= lo && f < hi)
@@ -747,17 +771,16 @@ void cng_sigsys_fabricate(void) {
  * runs ~66 KiB deep, against Go's ~8 KiB goroutine stacks, musl's 128 KiB
  * thread stacks and whatever size a guest hands sigaltstack — and because the
  * frame is bigger than a guard page it steps clean over the guard into ordinary
- * guest memory, where nothing faults and nothing is reported. Two mmap
- * syscalls, on a path taken at most once per blocked syscall number (the
- * gate-net records it) or by the 257th live thread, buy that away.
+ * guest memory, where nothing faults and nothing is reported. Three
+ * syscalls (map, protect, unmap), on a path taken at most once per blocked
+ * syscall number (the gate-net records it) or by the 257th live thread, buy
+ * that away.
  *
  * If even this mmap fails there is no stack to be had anywhere and the caller
  * runs where it stands, which is where it always ran. */
 static unsigned long scr_temp(void) { return scr_mmap(); }
 
-static void scr_temp_free(unsigned long base) {
-    sys_munmap((void *)base, CNG_SCR_SZ);
-}
+static void scr_temp_free(unsigned long base) { scr_unmap(base); }
 
 /* Run the dispatcher on this thread's scratch stack, or on a stack taken for
  * the call when the slot cannot be had. The busy flag (not an SP-range test) is
