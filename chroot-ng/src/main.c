@@ -542,6 +542,11 @@ static void help(char **envp) {
                       "isatty() is false and an interactive bash prints no "
                       "prompt. Test aid: a host that serves them never takes "
                       "that path."},
+        {"CNG_TIOCGSID_DENY", "Refuse TIOCGSID (tcgetsid) with EACCES before "
+                      "the host is asked, as Android's policy does on a pty "
+                      "slave and a pipe, so it is served from TCGETS, "
+                      "TIOCGPGRP and getsid. Test aid: a host that serves it "
+                      "never takes that path."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "
                       "socket, which refuses the connection. Test aid: a "

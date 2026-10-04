@@ -108,7 +108,9 @@ into a verdict about its terminal are trapped and, where the host refuses them,
 answered from the commands it allows: the termios2 family (`TCGETS2`,
 `TCSETS2`, ... — a glibc since 2.42 builds `tcgetattr`, and so `isatty`, on
 them, so without this an interactive bash in an Ubuntu 26.04 rootfs ran
-non-interactively and printed no prompt) from `TCGETS`/`TCSETS*`.
+non-interactively and printed no prompt) from `TCGETS`/`TCSETS*`, and
+`TIOCGSID` (`tcgetsid(3)`: `login`, `script`, `agetty`) from `TCGETS`,
+`TIOCGPGRP` and `getsid`.
 
 **AF_UNIX sockets** are contained like any other path. A pathname socket carries
 a filesystem path in `sun_path`, so `bind`/`connect`/`sendto`/`sendmsg` translate

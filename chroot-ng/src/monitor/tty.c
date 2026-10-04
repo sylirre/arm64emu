@@ -37,15 +37,39 @@
  * remaining calls go straight to the fallback instead of being denied -- and
  * logged by the policy -- every time. CNG_TERMIOS2_DENY=1 forces the tier on
  * any host.
+ *
+ * ---- TIOCGSID: the session a terminal belongs to ----
+ *
+ * tcgetsid(3), which login, script and agetty ask. Android's SELinux policy
+ * whitelists a pty's ioctls and TIOCGSID is not on the list for a slave or a
+ * pipe (the ptmx master it lets through): EACCES, where a kernel answers the
+ * session, or ENOTTY for a descriptor that is no terminal of the caller's.
+ * The host is asked first; on that refusal it is served from the commands
+ * that are allowed -- TCGETS to know a terminal from a pipe (ENOTTY, as a
+ * kernel says), TIOCGPGRP for the kernel's own reach check (a slave answers
+ * only the process whose controlling terminal it is, a master always: ENOTTY
+ * otherwise) -- and the session is then worked out the way the kernel holds
+ * it:
+ *   - a slave the caller controls belongs to the caller's session: getsid(0).
+ *     A terminal is a session's only while it is that session's controlling
+ *     terminal, and a process controls it only from inside that session;
+ *   - a master answers for its slave, the session of its foreground group (a
+ *     slave nobody controls has no group, and no session: ENOTTY).
+ * The ids are the host's, as getsid(2) and TIOCGPGRP report them -- there is
+ * no pid namespace here. As with termios2 above, the first refusal that the
+ * allowed commands prove to be about TIOCGSID is remembered, and
+ * CNG_TIOCGSID_DENY=1 forces the tier on any host.
  */
 #include "cng/monitor.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/tty.h"
+#include "cng/uapi.h"
 
 #include <asm-generic/errno.h>
 
 int cng_g_termios2_deny = 0;
+int cng_g_tiocgsid_deny = 0;
 
 #define TC_GETS    0x5401u
 #define TC_SETS    0x5402u
@@ -56,6 +80,8 @@ int cng_g_termios2_deny = 0;
 #define TC_CBAUD   0x100fu /* c_cflag's output-rate field */
 #define TC_BOTHER  0x1000u /* ... holding "the rate is in c_ospeed" */
 #define TC_IBSHIFT 16      /* the input-rate field is CBAUD << this */
+#define TC_GPGRP   0x540fu
+#define TC_GSID    0x5429u
 #define TC_TIOCGPTN 0x80045430u
 #define TC_TERMIOS_SZ  36  /* kernel struct termios: 4 u32 + c_line + c_cc[19] */
 #define TC_TERMIOS2_SZ 44  /* kernel struct termios2: termios + c_ispeed + c_ospeed */
@@ -66,6 +92,7 @@ const unsigned cng_ioctl_tty[] = {
     TC_SETS2,
     TC_SETSW2,
     TC_SETSF2,
+    TC_GSID,
 };
 const int cng_ioctl_tty_n =
     (int)(sizeof cng_ioctl_tty / sizeof cng_ioctl_tty[0]);
@@ -116,6 +143,9 @@ static unsigned tc_minor(u64 rd) {
     return (unsigned)((rd & 0xff) | ((rd >> 12) & 0xfff00));
 }
 
+/* /dev/ptmx, whichever devpts mounts it: a pty's master end. */
+static int tc_is_ptmx(u64 rd) { return tc_major(rd) == 5 && tc_minor(rd) == 2; }
+
 /* Which terminal a descriptor is: the slave's device number, which the master
  * ptmx's termios is too (it talks to its slave's). Bit 63 keeps it nonzero. */
 static u64 tc_key(int fd) {
@@ -125,9 +155,7 @@ static u64 tc_key(int fd) {
         return 1;
     u64 rd = *(u64 *)(st + ST_RDEV_OFF);
     int n;
-    /* /dev/ptmx, whichever devpts mounts it: a pty's master end. */
-    if (tc_major(rd) == 5 && tc_minor(rd) == 2 &&
-        sys_ioctl(fd, TC_TIOCGPTN, &n) == 0 && n >= 0) {
+    if (tc_is_ptmx(rd) && sys_ioctl(fd, TC_TIOCGPTN, &n) == 0 && n >= 0) {
         unsigned maj = 136 + (unsigned)n / 256, min = (unsigned)n % 256;
         rd = (min & 0xff) | ((u64)maj << 8); /* UNIX98_PTY_SLAVE_MAJOR */
     }
@@ -218,6 +246,127 @@ static long tty_termios2(long fd, unsigned req, long argp) {
     return 0;
 }
 
+/* Fields of /proc/<pid>/stat after the command name, as proc(5) numbers
+ * them from 3: state, ppid, pgrp, session. */
+static int stat_ids(long dfd, int pid, char *state, int *pgrp, int *sess) {
+    char path[32], b[512];
+    cng_snprintf(path, sizeof path, "%d/stat", pid);
+    long fd = sys_openat((int)dfd, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    long r = sys_read((int)fd, b, sizeof b - 1);
+    sys_close((int)fd);
+    if (r <= 0)
+        return 0;
+    b[r] = '\0';
+    char *p = strrchr(b, ')');
+    if (!p)
+        return 0;
+    p++;
+    while (*p == ' ')
+        p++;
+    *state = *p++;
+    long v[3];
+    for (int i = 0; i < 3; i++) {
+        while (*p == ' ')
+            p++;
+        int neg = *p == '-', nd = 0;
+        long x = 0;
+        p += neg;
+        for (; *p >= '0' && *p <= '9'; p++, nd++)
+            x = x * 10 + (*p - '0');
+        if (!nd)
+            return 0;
+        v[i] = neg ? -x : x;
+    }
+    *pgrp = (int)v[1];
+    *sess = (int)v[2];
+    return 1;
+}
+
+/* The session of process group `pg`, or -1 if no process of it can be found.
+ * getsid(pg) answers while the group's leader is there -- as a zombie too --
+ * but a group outlives its leader, and then one of its members' /proc stat
+ * says (a member the host's /proc will not show cannot be found). The members
+ * are read relative to a directory descriptor on /proc: under qemu-user an
+ * absolute spelling of the caller's own stat is a synthesized copy, and the
+ * relative form is never intercepted (see procreg.c). */
+static int pgrp_session(int pg) {
+    if (pg <= 0)
+        return -1;
+    long s = CNG_SYS(__NR_getsid, pg, 0, 0, 0, 0, 0);
+    if (s >= 0)
+        return (int)s;
+    if (s != -ESRCH)
+        return -1;
+    long dfd = sys_openat(CNG_AT_FDCWD, "/proc",
+                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (dfd < 0)
+        return -1;
+    int found = -1;
+    char buf[1024];
+    for (long n; found < 0 &&
+                 (n = CNG_SYS(__NR_getdents64, dfd, buf, sizeof buf, 0, 0, 0)) > 0;) {
+        /* linux_dirent64: d_ino(8) d_off(8) d_reclen(2 @16) d_type(1) name(@19) */
+        for (long o = 0; found < 0 && o + 19 <= n;) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen < 20 || o + reclen > n)
+                break;
+            const char *nm = buf + o + 19;
+            o += reclen;
+            int pid = 0, nd = 0;
+            for (; *nm >= '0' && *nm <= '9' && nd < 9; nm++, nd++)
+                pid = pid * 10 + (*nm - '0');
+            if (!nd || *nm)
+                continue;
+            char st;
+            int pgr, se;
+            if (stat_ids(dfd, pid, &st, &pgr, &se) && pgr == pg && st != 'X')
+                found = se;
+        }
+    }
+    sys_close((int)dfd);
+    return found;
+}
+
+/* Set once the host refused TIOCGSID where the allowed commands answered. */
+static int tsid_host_lacks;
+
+static long tty_tiocgsid(long fd, long argp) {
+    long r = cng_g_tiocgsid_deny ||
+                     __atomic_load_n(&tsid_host_lacks, __ATOMIC_RELAXED)
+                 ? -EACCES
+                 : CNG_SYS(__NR_ioctl, fd, TC_GSID, argp, 0, 0, 0);
+    if (r != -EACCES)
+        return r;
+
+    u8 probe[TC_TERMIOS_SZ];
+    char st[144];
+    s32 pg = 0, sid;
+    r = sys_ioctl((int)fd, TC_GETS, probe); /* no terminal */
+    if (r < 0)
+        return r;
+    r = sys_ioctl((int)fd, TC_GPGRP, &pg); /* not the caller's */
+    if (r < 0)
+        return r;
+    if (sys_fstat((int)fd, st) == 0 &&
+        (*(unsigned *)(st + ST_MODE_OFF) & 0170000) == 0020000 &&
+        tc_is_ptmx(*(u64 *)(st + ST_RDEV_OFF))) {
+        if (pg <= 0 || (sid = pgrp_session(pg)) < 0)
+            return -ENOTTY;
+    } else {
+        r = CNG_SYS(__NR_getsid, 0, 0, 0, 0, 0, 0);
+        if (r < 0)
+            return r;
+        sid = (s32)r;
+    }
+    __atomic_store_n(&tsid_host_lacks, 1, __ATOMIC_RELAXED);
+    if (cng_user_copyout((void *)argp, &sid, sizeof sid) < 0)
+        return -EFAULT;
+    return 0;
+}
+
 long cng_tty_ioctl(long fd, unsigned req, long argp) {
-    return tty_termios2(fd, req, argp);
+    return req == TC_GSID ? tty_tiocgsid(fd, argp) : tty_termios2(fd, req, argp);
 }

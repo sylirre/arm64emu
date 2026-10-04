@@ -12,14 +12,16 @@ echo "== M27: terminal ioctls =="
 
 TTY_DIR=$(mktemp -d)
 
-# tty_check DESC GUEST KNOB WANT — run /GUEST on every tier this host has, once
-# as the host serves it and once with KNOB=1, which refuses the ioctl before
-# the host is asked (the tier Android's policy serves).
+# tty_check DESC GUEST KNOB WANT [WHY] — run /GUEST on every tier this host has,
+# once as the host serves it and once with KNOB=1, which refuses the ioctl
+# before the host is asked (the tier Android's policy serves). WHY, when given,
+# is the reason the first of the two cannot be judged on this host.
 tty_check() {
     _desc=$1
     _guest=$2
     _knob=$3
     _want=$4
+    _why=${5:-}
     for _tier in -R plain; do
         if [ "$_tier" = plain ]; then
             if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
@@ -33,6 +35,10 @@ tty_check() {
         for _deny in 0 1; do
             _label="$_desc ($_tier)"
             [ "$_deny" = 1 ] && _label="$_desc, the host's refusal forced ($_tier)"
+            if [ "$_deny" = 0 ] && [ -n "$_why" ]; then
+                skip "$_label: $_why"
+                continue
+            fi
             # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
             _got=$(
                 [ "$_deny" = 1 ] && export "$_knob=1"
@@ -76,6 +82,39 @@ get2_fault=-1 errno=14
 set2_fault=-1 errno=14
 pipe=-1 errno=25
 done"
+fi
+
+# TIOCGSID (tcgetsid(3): login, script, agetty) over a real pty: ENOTTY with no
+# session, a child that setsid()s and takes the pty reads its own pid from the
+# slave and from the master, the parent reads it from the master and is ENOTTY
+# of the slave it does not control, the leader's exit takes the session away, a
+# pipe and /dev/null are ENOTTY, a null buffer is EFAULT, and a foreground group
+# whose leader is gone still names its session (the members have to be looked
+# through for it). Android's policy answers EACCES to it on a slave and on a
+# pipe; the forced tier serves it from TCGETS, TIOCGPGRP and getsid and must
+# say the same. The guest's own probe, run outside the monitor, says whether
+# the host can be believed with the unforced rows: qemu-user's table lists the
+# request as input only, so it answers success and writes no session.
+if guest_xlate_ready "TIOCGSID" &&
+    guest_cc_report "$TTY_DIR/tiocgsid" tests/guests/tiocgsid.c; then
+    _host=$(emu_t 30 "$TTY_DIR/tiocgsid" probe 2>/dev/null)
+    _why=""
+    [ "$_host" = broken ] &&
+        _why="the host answers TIOCGSID with success and no session (qemu-user)"
+    tty_check "TIOCGSID agrees with a kernel's" tiocgsid CNG_TIOCGSID_DENY \
+"slave_nosess=-1 errno=25
+master_nosess=-1 errno=25
+slave_foreign=-1 errno=25
+slave_ctl=0 own=1
+slave_fault=-1 errno=14
+master_ctl=0 own=1
+master_parent=0 kid=1
+master_gone=-1 errno=25
+pipe=-1 errno=25
+null=-1 errno=25
+closed=-1 errno=9
+master_orphan=0 sess=1
+done" "$_why"
 fi
 
 rm -rf "$TTY_DIR"

@@ -55,7 +55,11 @@ expected failure:
   writable), and opening `/dev/pts`. The ioctls on a pty are a whitelist as
   well: `TCGETS2` and the other termios2 commands are `EACCES`, which the
   monitor answers from `TCGETS`/`TCSETS*` (m27; `CNG_TERMIOS2_DENY=1` forces
-  that path on a host that serves them).
+  that path on a host that serves them), and so is `TIOCGSID` on a slave and
+  on a pipe, answered from `TCGETS`, `TIOCGPGRP` and `getsid`
+  (`CNG_TIOCGSID_DENY=1`). qemu-user answers `TIOCGSID` with success and no
+  session, so m27 asks the host once, outside the monitor, and judges only the
+  forced rows there.
 * **The kernel is built without checkpoint/restore support**: no
   `/proc/self/timers`, and `PTRACE_O_SUSPEND_SECCOMP` is `EINVAL`.
 * **`$TMPDIR` is inside `$PREFIX`, which the harness binds** for a guest's

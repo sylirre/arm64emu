@@ -7952,8 +7952,8 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
         {"our own prctl re-issue is allowed", __NR_prctl, gate,
          CNG_PR_SET_SECCOMP, CNG_SECCOMP_RET_ALLOW},
         /* ioctl: the SIOCxIF request band traps, and so do the four termios2
-         * requests (tty.c), so a terminal TCGETS and every driver call keep
-         * running native. The request is args[1]. */
+         * requests and TIOCGSID (tty.c), so a terminal TCGETS and every
+         * driver call keep running native. The request is args[1]. */
         {"SIOCGIFCONF traps", __NR_ioctl, 0x1000, 0x8912,
          CNG_SECCOMP_RET_TRAP},
         {"SIOCGIFADDR traps", __NR_ioctl, 0x1000, 0x8915,
@@ -7974,6 +7974,11 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
          CNG_SECCOMP_RET_TRAP},
         {"TCSETSF2 traps", __NR_ioctl, 0x1000, 0x402c542d,
          CNG_SECCOMP_RET_TRAP},
+        {"TIOCGSID traps", __NR_ioctl, 0x1000, 0x5429, CNG_SECCOMP_RET_TRAP},
+        {"TIOCGPGRP runs native", __NR_ioctl, 0x1000, 0x540f,
+         CNG_SECCOMP_RET_ALLOW},
+        {"our own TIOCGSID re-issue is allowed", __NR_ioctl, gate, 0x5429,
+         CNG_SECCOMP_RET_ALLOW},
         {"a request beside the termios2 four runs native", __NR_ioctl, 0x1000,
          0x402c542e, CNG_SECCOMP_RET_ALLOW},
         {"our own termios2 re-issue is allowed", __NR_ioctl, gate, 0x802c542a,
@@ -8260,6 +8265,8 @@ int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 {"TCGETS2 still traps", __NR_ioctl, 0x802c542a,
                  CNG_SECCOMP_RET_TRAP},
                 {"TCSETSF2 still traps", __NR_ioctl, 0x402c542d,
+                 CNG_SECCOMP_RET_TRAP},
+                {"TIOCGSID still traps", __NR_ioctl, 0x5429,
                  CNG_SECCOMP_RET_TRAP},
                 {"FS_IOC_GETFLAGS runs native", __NR_ioctl, 0x80086601,
                  CNG_SECCOMP_RET_ALLOW},

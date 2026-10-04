@@ -32,4 +32,9 @@ long cng_tty_ioctl(long fd, unsigned req, long argp);
  * read-only after. */
 extern int cng_g_termios2_deny;
 
+/* CNG_TIOCGSID_DENY=1: the same for TIOCGSID (tcgetsid), which the policy
+ * refuses on a pty slave and on a pipe; it is then served from TCGETS,
+ * TIOCGPGRP and getsid. */
+extern int cng_g_tiocgsid_deny;
+
 #endif /* CNG_TTY_H */

@@ -262,6 +262,10 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_TERMIOS2_DENY=", 18) && (*e)[18] != '\0' &&
             (*e)[18] != '0')
             cng_g_termios2_deny = 1;
+        /* CNG_TIOCGSID_DENY=1 does the same for TIOCGSID. */
+        if (!strncmp(*e, "CNG_TIOCGSID_DENY=", 18) && (*e)[18] != '\0' &&
+            (*e)[18] != '0')
+            cng_g_tiocgsid_deny = 1;
     }
     /* Stamp the build: this tree is copied to test devices by hand, so a trace
      * has to be able to say whether it came from the build you just made. */

@@ -3636,6 +3636,51 @@ vfork/`posix_spawn` child-stack handling.
     on the three that do not depend on its policy. Removing the guard fails
     all three rows with -14.
 
+- [x] **M80 — `tcgetsid(3)` failed on an Android pty**
+  `TIOCGSID` is read by `login`, `script`, `agetty` and anything else that
+  asks which session a terminal belongs to. The policy of M78 refuses it too:
+  measured on the device, `EACCES` on a pty slave and on a pipe, where a
+  kernel answers the session or `ENOTTY`; the ptmx master is let through.
+  Found next to M78, with the same probe, and ported from arm64chroot.
+  - The request is trapped (one more `JEQ` in the terminal list) and
+    answered by `tty_tiocgsid`. The host is asked first, with the guest's
+    pointer; on `EACCES` the answer is worked out from commands the policy
+    allows: `TCGETS` tells a terminal from a pipe (the kernel's `ENOTTY`
+    where the policy says `EACCES`), `TIOCGPGRP` is the kernel's own reach
+    check — a slave answers only the process whose controlling terminal it
+    is, a master always — so its `ENOTTY` is passed on. The session of a slave
+    the caller controls is the caller's own, `getsid(0)`: a terminal is a
+    session's only while it is that session's controlling terminal, and a
+    process controls one only from inside that session. A master answers for
+    its slave: the session of the slave's foreground group, `ENOTTY` when
+    there is none.
+  - The session of a group is `getsid` of its id while the leader is there (a
+    zombie included), and a group outlives its leader, so after that a
+    member's `/proc/<pid>/stat` says (`pgrp_session`; opened relative to a
+    directory descriptor on `/proc`, as `cng_proc_starttime` is, since
+    qemu-user serves an absolute spelling of the caller's own stat from a
+    synthesized copy). A member the host's `/proc` will not show cannot be
+    found, and the master answers `ENOTTY`. The ids are the host's, as
+    `getsid(2)` and `TIOCGPGRP` already report them: there is no pid
+    namespace here.
+  - The first refusal that the allowed commands prove to be about `TIOCGSID`
+    is remembered, as in M78, and `CNG_TIOCGSID_DENY=1` forces the tier on
+    any host (listed in `--help`).
+  - Not covered: `TIOCGPGRP` on a pipe is still the host's `EACCES` where a
+    kernel says `ENOTTY`.
+  - Tests: `-t bpftest` has `TIOCGSID` (trap, `TIOCGPGRP` native, the gate's
+    re-issue allowed). `tests/guests/tiocgsid.c` (m27) runs over a real pty
+    with the text of a native kernel: `ENOTTY` with no session, a child that
+    `setsid()`s and takes the pty reads its own pid from the slave and from
+    the master, the parent reads it from the master and is `ENOTTY` of the
+    slave it does not control, the leader's exit takes the session away, a
+    null buffer, a pipe, `/dev/null`, a closed descriptor — and a foreground
+    group whose leader is gone, which is the one that has to look through
+    `/proc` (it fails if that scan is removed). qemu-user answers `TIOCGSID`
+    with success and writes no session, so the guest has a `probe` mode that
+    m27 runs outside the monitor, and only the forced rows are judged where it
+    says `broken`.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
