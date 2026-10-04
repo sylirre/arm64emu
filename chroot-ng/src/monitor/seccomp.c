@@ -564,9 +564,11 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         f[n++] = (struct sock_filter)CNG_BPF_STMT(
             CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 8); /* request */
         f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-            CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, 0x8910, 0, 2); /* below */
+            CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, CNG_SIOC_BAND_LO, 0,
+            2); /* below */
         f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-            CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K, 0x8970, 1, 0); /* above */
+            CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K, CNG_SIOC_BAND_HI, 1,
+            0); /* above */
         f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                                   CNG_SECCOMP_RET_TRAP);
         for (int k = 0; k < m; k++)

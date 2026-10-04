@@ -3607,6 +3607,35 @@ vfork/`posix_spawn` child-stack handling.
     build answers `EACCES` (errno 13) to the first call on both tiers; this one
     passes all four legs.
 
+- [x] **M79 — an ioctl beside the interface band was EFAULT under -R**
+  Found by M80's test on the device: a child that `setsid()`s and asks
+  `ioctl(pty, TIOCSCTTY, 0)` was answered `EFAULT` under `-R`, and only once
+  something had trapped the same `ioctl` site before it. `cng_nl_ioctl`
+  answers the SIOCGIF* family, from the interface enumeration, on a host that
+  refuses rtnetlink (every Android device), and reads its argument as an
+  `ifreq` — for every request but `SIOCGIFCONF`, with no check that the
+  request was one of its own. The filter traps exactly the band
+  0x8910..0x8970, so on the seccomp tier it never saw anything else; but
+  under `-R` the dispatcher is handed every ioctl, and the lazy patcher turns
+  a trapped `svc` into a trampoline for every call that site makes, which for
+  a bionic or musl stub is every request of its syscall. A request with a NULL
+  argument (`TIOCSCTTY`, `FIONCLEX`, `FIOCLEX`) or an argument at the end of a
+  mapping (`FIONREAD` into the last word of a page) then failed the 40-byte
+  copy and was `EFAULT` where the kernel answers. Measured on the device with
+  one band ioctl followed by `TIOCSCTTY`: `-R` -14, the seccomp tier and a
+  native run 0.
+  - `cng_nl_ioctl` returns 0 for a request outside the band at its top, before
+    it asks the host anything or reads the argument; the band is named once
+    (`CNG_SIOC_BAND_LO/HI`, `uapi.h`) and the filter's two comparisons use the
+    same names. The dispatcher hands it the request as the kernel reads it, an
+    `unsigned int`, as the filter does, rather than the sign-extended register
+    a bionic `ioctl(int, int, ...)` leaves.
+  - Test: `tests/guests/ioctlband.c` (m16, forced block, `-R`) makes a band
+    request and then `FIOCLEX`, `FIONCLEX` and `FIONREAD` into the last word
+    of a mapping; the text is a kernel's, and the host's own run is compared
+    on the three that do not depend on its policy. Removing the guard fails
+    all three rows with -14.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

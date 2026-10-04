@@ -1331,6 +1331,16 @@ static unsigned mask_of(unsigned char plen) {
 
 int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
     (void)fd;
+    /* Only the interface-query band is ours, and the filter traps exactly that.
+     * It is not the only way in: under -R, and at any `svc` the lazy patcher
+     * has caught -- one site serves every request of its syscall, which is all
+     * of a musl or bionic stub -- the dispatcher is handed every ioctl the guest
+     * makes. Past this point `arg` is an ifreq, and a request that merely has
+     * an argument of another shape took the copy below for its own: a NULL one
+     * (TIOCSCTTY, FIONCLEX) or one that ends a mapping (FIONREAD into the last
+     * word of a page) was EFAULT where the host answers. */
+    if (req < CNG_SIOC_BAND_LO || req > CNG_SIOC_BAND_HI)
+        return 0;
     if (!host_blocks())
         return 0; /* the host's own answers and its dumps agree already */
 

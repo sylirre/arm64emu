@@ -495,6 +495,45 @@ recvmmsg: r=1 len=32 second=1 flags=0x20 controllen=0'
         skip "recvmsg header leg: could not build tests/guests/nlhdr.c"
     fi
 
+    # The interface-query band is all cng_nl_ioctl answers for. Every other
+    # request used to be taken for an ifreq as well wherever the dispatcher saw
+    # it (all of them under -R, and every request at a patched site), so a NULL
+    # argument, or one at the end of a mapping, was EFAULT where the host
+    # answers: once anything had asked for the interface list, TIOCSCTTY,
+    # FIONCLEX and FIONREAD stopped working on Android. The text is a kernel's.
+    ioctlband_want='siocgifconf=0
+fioclex=0 cloexec=1
+fionclex=0 cloexec=0
+fionread_edge=0 n=3'
+    if guest_cc "$M16D/ioctlband" tests/guests/ioctlband.c; then
+        cp "$M16D/ioctlband" "$R/bin/ioctlband"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/ioctlband 2>/dev/null)
+        if [ "$st" = "$ioctlband_want" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 an ioctl beside the interface band is the host's, whatever its argument"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 an ioctl beside the interface band is the host's, whatever its argument"
+            printf '%s\n' "$ioctlband_want" >"$M16D/ioctlband.want"
+            printf '%s\n' "$st" >"$M16D/ioctlband.got"
+            diff "$M16D/ioctlband.want" "$M16D/ioctlband.got" | sed 's/^/    /'
+        fi
+        kst=$(emu_t 60 "$M16D/ioctlband" 2>/dev/null)
+        # The kernel's own text, where its first line is the same: a host that
+        # refuses SIOCGIFCONF would differ in that row alone.
+        if [ "$(printf '%s\n' "$kst" | tail -n +2)" = \
+            "$(printf '%s\n' "$ioctlband_want" | tail -n +2)" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 ...and the host kernel here agrees on the other three"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 ...and the host kernel here agrees on the other three"
+            printf '%s\n' "$kst" | sed 's/^/    /'
+        fi
+    else
+        skip "ioctl beside the interface band leg: could not build tests/guests/ioctlband.c"
+    fi
+
     rm -rf "$R"
 fi
 rm -rf "$M16D"

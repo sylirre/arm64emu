@@ -163,6 +163,10 @@ struct cng_open_how {
  * The encodings are the kernel's, identical on every arch that uses the
  * asm-generic ioctl layout (arm64 and the x86_64 dev host both); FIDEDUPERANGE
  * is apart because its targets are the dest_fd fields of its argument. */
+/* The interface-query request band, SIOCGIFNAME..SIOCGIFMAP: the filter traps
+ * all of it (seccomp.c), and it is all cng_nl_ioctl answers for. */
+#define CNG_SIOC_BAND_LO                 0x8910u
+#define CNG_SIOC_BAND_HI                 0x8970u
 #define CNG_FS_IOC_SETFLAGS              0x40086602u /* _IOW('f', 2, long) */
 #define CNG_FS_IOC_FSSETXATTR            0x401c5820u /* _IOW('X', 32, fsxattr) */
 #define CNG_FS_IOC_SETVERSION            0x40087602u /* _IOW('v', 2, long) */
