@@ -521,6 +521,10 @@ static void help(char **envp) {
                       "directory under $TMPDIR even where the host has a real "
                       "/dev/shm. Test aid: a host that has one otherwise never "
                       "takes the stand-in path at all."},
+        {"CNG_PROCSTAT_SYNTH", "Serve /proc/stat from the synthesized "
+                      "fallback even where the host file is readable. Test "
+                      "aid: Android's SELinux policy denies it, which is the "
+                      "only case that reaches the fallback otherwise."},
         {"CNG_OVERFLOWID_SYNTH", "Serve /proc/sys/kernel/overflowuid and "
                       "overflowgid from the synthesized fallback (65534) "
                       "even where the host files are readable. Test aid: "
