@@ -3551,6 +3551,62 @@ vfork/`posix_spawn` child-stack handling.
     in a list. m8 runs it under -R: it was a SEGV on the first thread before.
     Checked on the device with `java -R` as well (JIT and GC program included).
 
+- [x] **M78 — a glibc 2.42+ guest took its terminal for none on Android**
+  Ubuntu 26.04's bash printed no prompt on Termux where 24.04's did, on the
+  same device. glibc 2.42 builds `tcgetattr` — and so `isatty` — on `TCGETS2`
+  instead of `TCGETS`, and Android's SELinux policy whitelists the ioctls an
+  app may issue on its pty without the termios2 ones: the host answers
+  `EACCES`, on a terminal and on a pipe alike. A guest makes its ioctls itself
+  (the filter lets them run native), so it met the refusal itself: `isatty(0)`
+  was false, bash ran non-interactively, and readline's `tcsetattr` would have
+  been refused the same way. Measured on the device (Android, 5.15 GKI) with a
+  probe: on a pty slave and on a pipe `TCGETS` is answered and `TCGETS2` is
+  `EACCES`; the ptmx master is let through. Found by reading arm64chroot's
+  `sys_file.c`, which had the same defect and the same fix.
+  - The four requests (`TCGETS2`, `TCSETS2`, `TCSETSW2`, `TCSETSF2`) are now
+    trapped by the filter, always — a short list of `JEQ`s behind the SIOCxIF
+    band test, beside the mount writers a `:ro` bind adds — and the dispatcher
+    answers them (`src/monitor/tty.c`, `cng_tty_ioctl`). The host is asked
+    first, with the guest's own pointer, so a host that implements them serves
+    them itself and answers `EFAULT` for a bad one as it should. On `EACCES`
+    or `ENOTTY` (a kernel too old for them is in the same position, and so is
+    qemu-user, whose ioctl table has no entry) the classic `TCGETS`/`TCSETS`/
+    `TCSETSW`/`TCSETSF` answer instead: the termios is the first 36 bytes
+    either way, and the two rates the classic struct lacks come from `c_cflag`
+    — a `Bnnn` constant in `CBAUD` (output) and `CIBAUD` (input, 0 meaning as
+    the output). The classic command says `ENOTTY` itself for a descriptor that
+    is no terminal, so a pipe still reads as one.
+  - A `BOTHER` rate ("the number is in `c_ospeed`") has no field in the
+    classic struct to live in, so the last one set is kept per terminal in a
+    small lock-free table (a lock held across `fork()` would be inherited
+    held, and the handler is re-entered by guest signals); a pty's master and
+    slave are one terminal, found through `TIOCGPTN`. The `BOTHER` marker
+    itself rides in the host's own termios. The table is per host process (an
+    emulated `execve` keeps it, a `fork`'s child starts with a copy), so a
+    `BOTHER` rate set by some other process is not known here and reads as
+    38400.
+  - The first refusal that the classic command proves to be about termios2
+    (it worked on the same descriptor) is remembered, so the policy is not
+    asked — and does not log a denial — on every call.
+  - `CNG_TERMIOS2_DENY=1` refuses the four before the host is asked, as the
+    policy does (listed in `--help`), so a host that serves them takes the
+    same path.
+  - Not ported: arm64chroot's first commit, which only added the four to its
+    ioctl whitelist. chroot-ng has no whitelist to be missing from; the guest's
+    ioctl reaches the kernel untouched unless the filter traps it.
+  - Tests: `-t bpftest` has the four requests (trap, with and without a `:ro`
+    bind; `TCGETS`, `TCSETS` and `TIOCGWINSZ` still native; the gate's own
+    re-issue allowed). `tests/guests/termios2.c` (m27) runs over a real pty:
+    the 44 bytes come back whole and no further, agree with `TCGETS` on the
+    first 36, each setter carries all of them in, a rate set through the master
+    is read through the slave, a bad buffer is `EFAULT` both ways and a pipe is
+    `ENOTTY`; the expected text is a native kernel's. It runs on both tiers,
+    as the host serves it and with the refusal forced. Where the host's classic
+    termios cannot hold the `BOTHER` marker (qemu-user answers `B0`) the guest
+    uses `Bnnn` rates and prints the same rows. On the device the previous
+    build answers `EACCES` (errno 13) to the first call on both tiers; this one
+    passes all four legs.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

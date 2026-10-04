@@ -23,6 +23,7 @@
 #include "cng/shm.h"
 #include "cng/sysvipc.h"
 #include "cng/syscall.h"
+#include "cng/tty.h"
 #include "cng/uapi.h"
 
 /* cng_g_fs, the published fs view, lives in path.c. */
@@ -5738,12 +5739,19 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * a copy of the argument) and would answer EPERM or EFAULT ahead of
      * EROFS for a call that is refused either way; that precedence is not
      * reproduced. FIDEDUPERANGE names its targets in the argument, and is
-     * answered per destination (ioctl_dedupe). */
+     * answered per destination (ioctl_dedupe).
+     *
+     * The terminal requests (tty.c) trap for another reason: Android's policy
+     * refuses an app some of them on its pty, and a libc's verdict about its
+     * terminal is built on them. Tested first, since the netlink answer
+     * enumerates the interfaces before it looks at the request. */
     case __NR_ioctl: {
         long r = 0;
+        unsigned req = (unsigned)a1;
+        if (cng_tty_request(req))
+            return cng_tty_ioctl(a0, req, a2);
         if (cng_nl_ioctl((int)a0, (unsigned long)a1, (void *)a2, &r))
             return r;
-        unsigned req = (unsigned)a1;
         if (req == CNG_FIDEDUPERANGE && fs_has_ro())
             return ioctl_dedupe(a0, a1, a2, a3, a4, a5);
         for (int i = 0; i < cng_ioctl_mnt_write_n; i++)

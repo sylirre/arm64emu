@@ -52,7 +52,10 @@ expected failure:
   `CNG_PROC_DENY_STAT=1` forces that path elsewhere, `CNG_OVERFLOWID_SYNTH=1`
   the open of the sysctls),
   reopening a memfd through `/proc/self/fd/N` (so a synthesized fd stays
-  writable), and opening `/dev/pts`.
+  writable), and opening `/dev/pts`. The ioctls on a pty are a whitelist as
+  well: `TCGETS2` and the other termios2 commands are `EACCES`, which the
+  monitor answers from `TCGETS`/`TCSETS*` (m27; `CNG_TERMIOS2_DENY=1` forces
+  that path on a host that serves them).
 * **The kernel is built without checkpoint/restore support**: no
   `/proc/self/timers`, and `PTRACE_O_SUSPEND_SECCOMP` is `EINVAL`.
 * **`$TMPDIR` is inside `$PREFIX`, which the harness binds** for a guest's

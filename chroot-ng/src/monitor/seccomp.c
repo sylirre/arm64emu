@@ -13,6 +13,7 @@
 #include "cng/rt.h"
 #include "cng/seccomp.h"
 #include "cng/syscall.h"
+#include "cng/tty.h"
 #include "cng/uapi.h"
 
 /* Must match the set handled in dispatch.c. */
@@ -526,30 +527,37 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
-    /* ioctl, for the interface-query band — and, with a :ro bind in the view,
-     * the requests that write the mount (cng_ioctl_mnt_write). SIOCGIF*
-     * answers the same questions the netlink dumps do and has to agree with
-     * them, but the requests arrive on an ordinary AF_INET socket — there is
-     * no fd range to key on, the way the synthesized /proc files have.
+    /* ioctl, for the interface-query band, the terminal requests a libc turns
+     * into a verdict about its terminal (cng_ioctl_tty) -- and, with a :ro
+     * bind in the view, the requests that write the mount
+     * (cng_ioctl_mnt_write). SIOCGIF* answers the same questions the netlink
+     * dumps do and has to agree with them, but the requests arrive on an
+     * ordinary AF_INET socket -- there is no fd range to key on, the way the
+     * synthesized /proc files have. The terminal requests are the ones Android's
+     * policy refuses an app on its pty (tty.c), which only the dispatcher can
+     * answer.
      * Trapping ioctl wholesale would put every terminal TCGETS and every
      * driver call through the handler, so the request itself is tested
      * instead: 0x8910..0x8970 is the SIOCxIF band, which is small enough to
      * trap whole (the setters land in the dispatcher and are passed straight
-     * through), and each mutating request is one JEQ after it. Layout, with
-     * M the number of those (0 without a :ro bind):
+     * through), and each other request is one JEQ after it. Layout, with M the
+     * number of those (the terminal requests, and the mount writers with a
+     * :ro bind):
      *
      *   JEQ ioctl        no -> reload nr
      *   LD  request
-     *   JGE 0x8910       no -> the M checks (or allow)
-     *   JGT 0x8970       yes -> the M checks (or allow), no -> trap
+     *   JGE 0x8910       no -> the M checks
+     *   JGT 0x8970       yes -> the M checks, no -> trap
      *   RET TRAP
      *   JEQ m[k]         yes -> trap, no -> next; the last: no -> allow
-     *   RET TRAP         (only with M > 0)
+     *   RET TRAP
      *   RET ALLOW
      *   LD  nr */
     {
-        int m = has_ro ? cng_ioctl_mnt_write_n : 0;
-        int blk = 4 + m + (m > 0) + 1; /* LD .. RET ALLOW, after the JEQ */
+        int nt = cng_ioctl_tty_n;
+        int nw = has_ro ? cng_ioctl_mnt_write_n : 0;
+        int m = nt + nw;
+        int blk = 4 + m + 1 + 1; /* LD .. RET ALLOW, after the JEQ */
         f[n++] = (struct sock_filter)CNG_BPF_JUMP(
             CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_ioctl, 0,
             (uint8_t)blk); /* not ioctl -> reload nr */
@@ -563,11 +571,11 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
                                                   CNG_SECCOMP_RET_TRAP);
         for (int k = 0; k < m; k++)
             f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, cng_ioctl_mnt_write[k],
+                CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K,
+                k < nt ? cng_ioctl_tty[k] : cng_ioctl_mnt_write[k - nt],
                 (uint8_t)(m - 1 - k), (uint8_t)(k == m - 1 ? 1 : 0));
-        if (m > 0)
-            f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                                      CNG_SECCOMP_RET_TRAP);
+        f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                                  CNG_SECCOMP_RET_TRAP);
         f[n++] = (struct sock_filter)CNG_BPF_STMT(
             CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* neither */
         f[n++] = (struct sock_filter)CNG_BPF_STMT(

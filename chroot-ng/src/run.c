@@ -41,6 +41,7 @@
 #include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
+#include "cng/tty.h"
 #include "cng/uapi.h"
 
 static struct cng_fs g_fs; /* static: the monitor keeps a pointer after we jump */
@@ -256,6 +257,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_PROC_DENY_STAT=", 19) && (*e)[19] != '\0' &&
             (*e)[19] != '0')
             cng_g_proc_deny_stat = 1;
+        /* CNG_TERMIOS2_DENY=1 refuses the termios2 ioctls with EACCES before
+         * the host is asked, as Android's SELinux policy does. */
+        if (!strncmp(*e, "CNG_TERMIOS2_DENY=", 18) && (*e)[18] != '\0' &&
+            (*e)[18] != '0')
+            cng_g_termios2_deny = 1;
     }
     /* Stamp the build: this tree is copied to test devices by hand, so a trace
      * has to be able to say whether it came from the build you just made. */

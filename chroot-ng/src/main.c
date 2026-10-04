@@ -535,6 +535,13 @@ static void help(char **envp) {
                       "the guest's view as if the host kernel had refused "
                       "them, which Android's SELinux policy does. Test aid: "
                       "a host that allows them never takes that path."},
+        {"CNG_TERMIOS2_DENY", "Refuse the termios2 ioctls (TCGETS2, TCSETS2, "
+                      "...) with EACCES before the host is asked, as "
+                      "Android's policy does, so they are served from "
+                      "TCGETS/TCSETS -- without which a glibc 2.42+ guest's "
+                      "isatty() is false and an interactive bash prints no "
+                      "prompt. Test aid: a host that serves them never takes "
+                      "that path."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "
                       "socket, which refuses the connection. Test aid: a "

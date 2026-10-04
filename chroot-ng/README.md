@@ -101,6 +101,15 @@ shows nothing while `/dev/null` opens fine, and a bind destination stays
 invisible to anything that enumerates before opening. `--no-dev` turns the zone
 off.
 
+**Terminals.** A guest's `ioctl`s run in the kernel as they are, and Android's
+SELinux policy lets an app issue only a short list of them on its pty; the
+others answer `EACCES`, on a terminal and on a pipe alike. The ones a libc turns
+into a verdict about its terminal are trapped and, where the host refuses them,
+answered from the commands it allows: the termios2 family (`TCGETS2`,
+`TCSETS2`, ... — a glibc since 2.42 builds `tcgetattr`, and so `isatty`, on
+them, so without this an interactive bash in an Ubuntu 26.04 rootfs ran
+non-interactively and printed no prompt) from `TCGETS`/`TCSETS*`.
+
 **AF_UNIX sockets** are contained like any other path. A pathname socket carries
 a filesystem path in `sun_path`, so `bind`/`connect`/`sendto`/`sendmsg` translate
 it into the rootfs and `getsockname`/`getpeername`/`accept`/`recvfrom`/`recvmsg`

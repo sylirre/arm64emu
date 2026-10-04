@@ -120,6 +120,7 @@ if [ -f tests/m23_execmap.sh ]; then . tests/m23_execmap.sh; fi
 if [ -f tests/m24_openat2.sh ]; then . tests/m24_openat2.sh; fi
 if [ -f tests/m25_fdview.sh ]; then . tests/m25_fdview.sh; fi
 if [ -f tests/m26_pinned.sh ]; then . tests/m26_pinned.sh; fi
+if [ -f tests/m27_tty.sh ]; then . tests/m27_tty.sh; fi
 
 echo
 echo "== summary: $pass passed, $fail failed, $skipped skipped =="
