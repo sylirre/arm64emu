@@ -304,3 +304,24 @@ if guest_xlate_ready "small-stack syscall leg" &&
     done
 fi
 rm -rf "$SSR"
+
+# A thread that frees its own stack on the way out. musl's __unmapself and
+# bionic's _exit_with_stack_teardown are an munmap of the stack under the caller
+# and an exit, with nothing between that touches the stack — which is how every
+# detached thread of those libcs ends (the JVM's all are). The rewriter turned
+# both `svc` into trampolines, which build their frame on the caller's stack and
+# read every register back from it: the thread came back from the munmap to an
+# unmapped frame and died of a SEGV, taking the process with it. The sequence is
+# written out as libc has it, on a stack the guest mapped, and each of twenty
+# threads is started on a fresh one.
+UMD=$(mktemp -d)
+if guest_xlate_ready "stack-teardown leg" &&
+    guest_cc_report "$UMD/unmapself" tests/guests/unmapself.c; then
+    for _v in musl bionic; do
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $GUEST_BINDS "$UMD" /unmapself $_v 2>/dev/null)
+        check_contains "threads freeing their own stack survive -R ($_v's sequence)" \
+            "survived=20" "$out"
+    done
+fi
+rm -rf "$UMD"

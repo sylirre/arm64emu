@@ -3529,6 +3529,28 @@ vfork/`posix_spawn` child-stack handling.
     and GC heavy program (C1 and C2 both run), and a Minecraft `server.jar`
     started through `su -l` work on the seccomp tier.
 
+- [x] **M77 — under -R a thread that freed its own stack killed the process**
+  Found behind M76: with the JVM past its startup probe, `java` under -R died
+  of a SEGV as soon as its first thread ended. musl's `__unmapself` and bionic's
+  `_exit_with_stack_teardown` end a detached thread with an `munmap` of the
+  stack it is standing on and an `exit` (`mov x8,#215; svc 0; [mov x0,#0;]
+  mov x8,#93; svc 0`), and every detached thread of those libcs takes that
+  road — the JVM's all are. The rewriter replaced both `svc` with branches to
+  trampolines, and a trampoline builds its frame on the caller's stack and reads
+  every register back from it, so the thread returned from the munmap to a
+  frame that was gone. The default action of that SEGV takes the whole process.
+  - `scan()` leaves the pair alone: the munmap is told from any other by an
+    exit two or three words on, and the exit by an munmap two or three words
+    before it (`stack_teardown`), so a program's ordinary calls are rewritten as
+    they were. Neither is a call the filter traps, so left native they do what
+    they always did; the exit's scratch-slot release in the trampoline is not
+    missed (a slot of a dead thread is taken over when the table fills).
+  - `tests/guests/unmapself.c` writes the sequence out as libc has it (both
+    spellings) and runs twenty threads, each on a fresh stack made with a bare
+    clone, since a glibc handed a thread's stack keeps the descriptor on it
+    in a list. m8 runs it under -R: it was a SEGV on the first thread before.
+    Checked on the device with `java -R` as well (JIT and GC program included).
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

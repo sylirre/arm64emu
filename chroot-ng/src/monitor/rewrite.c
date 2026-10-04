@@ -26,6 +26,8 @@ extern char cng_svc_tramp_back[];
 #define MOVZ_X8_MASK 0xFFE0001Fu /* movz x8, #imm16 (hw=0) */
 #define MOVZ_X8      0xD2800008u
 #define NR_RT_SIGRETURN 139u
+#define NR_MUNMAP       215u
+#define NR_EXIT         93u
 
 /* Section headers we are willing to walk, and how many at a time: a page's
  * worth, which is 4 KiB of the caller's frame — the loader's, or the
@@ -187,6 +189,37 @@ static int writes_x8(uint32_t w) {
     return 0;
 }
 
+/* Is the word at `a` an `svc #0` with `mov x8, #nr` in the word before it? Reads
+ * `a - 4` and `a`, so the caller keeps both inside the mapping. */
+static int svc_nr(unsigned long a, unsigned long floor, unsigned nr) {
+    if (a < floor + 4 || *(uint32_t *)a != SVC0_INSN)
+        return 0;
+    uint32_t prev = *(uint32_t *)(a - 4);
+    return (prev & MOVZ_X8_MASK) == MOVZ_X8 && ((prev >> 5) & 0xFFFFu) == nr;
+}
+
+/* One of the two `svc` of a thread freeing its own stack: unmap the stack it is
+ * standing on, then exit. musl's __unmapself is exactly
+ *     mov x8,#215; svc 0; mov x8,#93; svc 0
+ * and bionic's _exit_with_stack_teardown has a `mov x0,#0` between them. The
+ * munmap is told from the others by the exit that follows it, and the exit by
+ * the munmap before it, so that a program's ordinary munmap and exit are as
+ * they were. `hi` bounds the look ahead, which is the only read that could
+ * leave the code. */
+static int stack_teardown(unsigned long a, unsigned long floor,
+                          unsigned long hi) {
+    if (svc_nr(a, floor, NR_MUNMAP)) {
+        for (unsigned long j = 2; j <= 3; j++)
+            if (a + 4 * j + 4 <= hi && svc_nr(a + 4 * j, floor, NR_EXIT))
+                return 1;
+    } else if (svc_nr(a, floor, NR_EXIT)) {
+        for (unsigned long j = 2; j <= 3; j++)
+            if (a >= floor + 4 * j + 4 && svc_nr(a - 4 * j, floor, NR_MUNMAP))
+                return 1;
+    }
+    return 0;
+}
+
 /* Scan [lo,hi) for sites, never reading below `floor` for context. `verify`
  * asks for the syscall-context filter, which the caller sets when it has no
  * code map to trust. */
@@ -212,6 +245,18 @@ static int scan(unsigned long lo, unsigned long hi, unsigned long floor,
                 ((prev >> 5) & 0xFFFFu) == NR_RT_SIGRETURN)
                 continue;
         }
+
+        /* Nor the pair a thread uses to free its own stack. A trampoline builds
+         * its frame on the caller's stack and reads every register back from
+         * it, and here that stack is the very thing the first call removes:
+         * the thread came back from the munmap to a frame that was no longer
+         * mapped (SEGV, which with the default action takes the whole process
+         * with it — every musl thread that is detached, as the JVM's all are,
+         * and every bionic one, died so on its way out under -R). Neither
+         * call is one the filter traps, so left native they behave as they
+         * always did. */
+        if (stack_teardown(a, floor, hi))
+            continue;
 
         /* No code map: the word is a syscall only if something nearby put a
          * number in x8. Costs the ~3% of real sites that load it from further
