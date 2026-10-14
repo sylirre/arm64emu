@@ -2002,7 +2002,12 @@ static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
     int f = 2;
     int shorth = procfs_old_host();
     s32 stid = (s32)strtol(buf, NULL, 10);
-    for (char *tok = strtok(rp + 1, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
+    /* strtok_r: every guest thread is a host thread, and strtok's one hidden
+     * position (glibc keeps a single one per process) let two threads reading
+     * a stat file at once tokenize each other's lines. */
+    char *save = NULL;
+    for (char *tok = strtok_r(rp + 1, " \t\n", &save); tok;
+         tok = strtok_r(NULL, " \t\n", &save)) {
         u64 v;
         if (shorth && f >= 44) break;      /* stand in for a pre-3.3 kernel */
         if (f == 2) {                      /* field 3: the state */

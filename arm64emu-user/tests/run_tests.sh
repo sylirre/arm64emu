@@ -2868,6 +2868,14 @@ check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=
               A64_MINCORE_FORCE_FAIL=1 "no-mincore tier" \
               A64_PROCFS_FORCE_OLD=1 "old-procfs tier" \
               "A64_PROCFS_FORCE_OLD=1 A64_MINCORE_FORCE_FAIL=1" "old-procfs, no-mincore tier"
+# /proc/self/stat read by four threads at once: every read one whole line with
+# the field count of a read made alone. The synthesized line was cut up with
+# strtok(3), whose position glibc keeps once per process, so threads building
+# it at the same time tokenized each other's (~1 read in 5 came back
+# malformed). Self-checking; the old-procfs tier appends the fields past 44
+# instead of rewriting them, which is the other half of the same loop.
+check_fixture procstatmt $'single=ok\nconcurrent bad=0\ndone' \
+              A64_PROCFS_FORCE_OLD=1 "old-procfs tier"
 # madvise over a range with a hole in it: ENOMEM, whatever the advice. Self-
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.
