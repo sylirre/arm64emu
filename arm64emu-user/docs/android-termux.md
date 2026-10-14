@@ -225,10 +225,20 @@ unfiltered:
   `FIONCLEX` are refused on a memfd as well; they only set or clear
   close-on-exec, which `F_SETFD` does unrefused. `A64_TTYIOCTL_FORCE_DENY`
   forces the tier anywhere (the suite's `ttynotty (denied tier)` row).
-  Still refused on a pty slave, where the kernel serves them: `TCSBRK`
-  (`tcdrain`, `tcsendbreak`), `TCXONC` (`tcflow`), `TIOCGSOFTCAR`/
-  `TIOCSSOFTCAR` and `TIOCNOTTY`; those reach a real terminal, so no answer can
-  be inferred from the kind of file.
+
+* **Terminal ioctls on the pty slave.** The policy lets an app issue only
+  `TCGETS`, `TCSETS*`, `TCFLSH`, `TIOCSCTTY`, `TIOC[GS]PGRP`, `TIOC[GS]WINSZ`
+  and `TIOCOUTQ` there (and `TCGETS2`, `TIOCGSID`, above, are refused too):
+  `tcdrain`, `tcsendbreak` and `tcflow` were `EACCES`, as were the soft-carrier
+  pair, `TIOCNOTTY` and the modem/packet/console commands a kernel answers
+  `ENOTTY` on a pty. A pty slave's answers are the tty core's alone, so they
+  are served from the allowed commands (`pts_refused`, `sys_file.c`; the
+  details are in `docs/syscalls.md`) — `TCFLSH` with no queue named is exactly
+  the background-job check `tcdrain` makes. `TCXONC`'s `TCOOFF` and
+  `TIOCNOTTY` on the caller's own controlling terminal stay refused: nothing an
+  app may issue stops a terminal's output or drops a controlling terminal.
+  `A64_TTYIOCTL_FORCE_DENY` refuses the same list on any host (the suite's
+  `ptsioctl (denied tier)` row).
 
 * **`stat` of a device node an app may still name.** `/dev/full` (and
   `/dev/kmsg`, ...) answers `stat`, `lstat` and `fstat` of an `O_PATH` fd

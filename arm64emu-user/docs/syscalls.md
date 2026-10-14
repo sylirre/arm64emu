@@ -158,6 +158,41 @@ is not the oracle for most, so the expected block is a native run's):
   them; an `O_PATH` or closed descriptor is the host's `EBADF` before any policy
   is asked. `A64_TTYIOCTL_FORCE_DENY` makes any host refuse the same way, and
   the suite runs `tests/fixtures/ttynotty.c` over it.
+- On a pty slave the policy allows only `TCGETS`, `TCSETS*`, `TCFLSH`,
+  `TIOCSCTTY`, `TIOC[GS]PGRP`, `TIOC[GS]WINSZ` and `TIOCOUTQ`. A slave has no
+  ioctl, break, modem lines, output queue or xchar of its own
+  (`pty_unix98_ops`), so the kernel's answer to each refused command is the tty
+  core's, and `pts_refused` (`sys_file.c`) serves it from the allowed ones:
+  `TIOCM*`, `TIOCPKT`, `TIOCGPTN`, `TIOCSPTLCK`, `VT_GETSTATE` and
+  `KDGKBTYPE` are `ENOTTY`; `TIOCGSOFTCAR` is `CLOCAL` from `TCGETS`;
+  `TIOCSSOFTCAR` sets it with `TCGETS` + `TCSETS` while SIGTTOU is blocked —
+  the kernel's in-place change makes no background-job check and a `TCSETS`
+  does, one that passes for a caller blocking SIGTTOU (`is_ignored`) — though
+  unlike the kernel the pair is not atomic against another process's
+  `TCSETS`; `TCSBRK`/`TCSBRKP` (`tcdrain`, `tcsendbreak`) are that
+  background-job check and nothing else (a pty never holds output back and has
+  no break), taken from `TCFLSH`, which makes exactly that check and then,
+  with no queue named, answers `EINVAL`; `TCXONC` is the same check followed
+  by nothing for `TCOON`, the STOP/START character written through the line
+  discipline for `TCIOFF`/`TCION` (a control character passes it unchanged;
+  one `OPOST` would rewrite keeps the refusal, and one sent while output is
+  stopped by ^S is dropped, as the kernel drops it when the master has no
+  room), and `EINVAL` for anything else; `TIOCNOTTY` is `ENOTTY` on a slave
+  that is not the caller's controlling terminal (`TIOCGPGRP` tells). Two stay
+  refused, since nothing allowed can do them: `TCXONC`'s `TCOOFF` and
+  `TIOCNOTTY` on the caller's own terminal. `tests/fixtures/ptsioctl.c` runs
+  over `A64_TTYIOCTL_FORCE_DENY`, background, ignoring and orphaned process
+  groups included.
+- `TIOCOUTQ` (on a socket `SIOCOUTQ`, the bytes not yet sent) and `TCSBRKP`
+  (glibc's `tcsendbreak(fd, n > 0)`) are forwarded; they used to be answered
+  `ENOTTY` as unhandled. On a netlink socket the emulator stands in for with an
+  `AF_UNIX` one, `FIONREAD` and `SIOCOUTQ` are `ENOTTY`, as netlink answers no
+  ioctl of its own, where the stand-in would count its queued bytes.
+- An integer ioctl argument wider than a 32-bit host's `unsigned long` goes
+  over as the largest one instead of wrapped: none of the commands that take one
+  takes such a word as valid, and wrapped, `TCFLSH 0x100000000` would have
+  flushed the input queue and `TCXONC 0x100000001` restarted output
+  (`TIOCSCTTY` wraps, as its kernel handler reads an int).
 - `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
 
 ## Struct marshalling: always convert

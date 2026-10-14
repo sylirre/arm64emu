@@ -2811,6 +2811,19 @@ check_fixture tiocgsid $'slave_nosess=-1 errno=25\nmaster_nosess=-1 errno=25\nsl
 # kernel's.
 check_fixture ttynotty $'pipe_r: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\npipe_w: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nstream: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\ndgram: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\ndir: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nfile: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nmemfd: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nproc: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\neventfd: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nnull: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nopath: all EBADF | fioclex=EBADF fd=0 fionclex=EBADF fd=0\nclosed: all EBADF | fioclex=EBADF fd=-1 fionclex=EBADF fd=-1\nfionread=ok n=3\ndone' \
     "A64_TTYIOCTL_FORCE_DENY=1" "denied tier"
+# The terminal commands a pty slave answers from the tty core alone, over a
+# real pty: TIOC[GS]SOFTCAR, TCSBRK/TCSBRKP, TCXONC (the master reads the
+# STOP/START characters), TIOCNOTTY, the modem/packet/pty-number/console
+# commands; TIOCOUTQ/SIOCOUTQ on a slave, master, pipe and socket, FIONREAD and
+# SIOCOUTQ on netlink; and from a session whose terminal it is, a background
+# group's job-control checks (SIGTTOU stops it, ignoring it passes, an orphaned
+# group is EIO, TIOCSSOFTCAR makes none). Android's policy refuses most of
+# these on a slave; the denied tier refuses them the same way, the
+# netlink-blocked tier puts the emulator's AF_UNIX stand-in under the netlink
+# rows. Self-checking; the expected output is a real kernel's.
+check_fixture ptsioctl $'softcar_get0=0\nsoftcar_set1=0 errno=0\nsoftcar_now=1 clocal=1 master=1\nsoftcar_set0=0 errno=0\nsoftcar_now=0 clocal=0 master=0\nsoftcar_get_fault=-1 errno=14\nsoftcar_set_fault=-1 errno=14\ntcsbrk_drain=0 errno=0\ntcsbrk_break=0 errno=0\ntcsbrkp_0=0 errno=0\ntcsbrkp_2=0 errno=0\ntcxonc_on=0 errno=0\ntcxonc_bad=-1 errno=22\ntcxonc_wide=-1 errno=22\ntcflsh_wide=-1 errno=22\nbefore_xchar=none\ntcxonc_ioff=0 errno=0\nmaster_read=13\ntcxonc_ion=0 errno=0\nmaster_read=11\ntcxonc_ioff_disabled=0 errno=0\nmaster_read=none\nnotty_not_ctty=-1 errno=25\nslave_tty_core: TIOCMGET=25 TIOCMBIS=25 TIOCMBIC=25 TIOCMSET=25 TIOCPKT=25 TIOCGPTN=25 TIOCSPTLCK=25 VT_GETSTATE=25 KDGKBTYPE=25\noutq_slave=0 errno=0 n=0\noutq_master=0 errno=0 n=0\noutq_pipe=-1 errno=25\noutq_sock=0 errno=0 queued=1\noutq_sock_read=0 errno=0 n=0\noutq_sock_fault=-1 errno=14\nnetlink_fionread=-1 errno=25\nnetlink_outq=-1 errno=25\nbg_ignored: tcsbrk=0/0 tcxonc=0/0 softcar=0/0\nbg_default: softcar=0/0\nbg_default: tcsbrk stopped SIGTTOU\norphaned: tcsbrk=-1/5 tcxonc=-1/5\ndone' \
+    "A64_TTYIOCTL_FORCE_DENY=1" "denied tier" \
+    "A64_NETLINK_FORCE_BLOCK=1" "netlink-blocked tier"
 # AT_EXECFN and comm: the path execve was GIVEN, not the one it resolved to.
 # Through a symlink, a relative path or a script a kernel keeps the name as
 # written; the emulator reported the resolved file's, and uutils' coreutils

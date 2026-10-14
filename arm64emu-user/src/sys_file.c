@@ -3265,18 +3265,21 @@ typedef struct { u32 cmd; u16 size; u8 dir; u8 kind; } IoctlEnt;   /* dir: 0 non
 #define IOK_FILE 0          /* any file's: FIONREAD, FIONBIO */
 #define IOK_TTY  1          /* a terminal's: ENOTTY from anything that is none */
 #define IOK_FD   2          /* the descriptor's own close-on-exec flag */
+#define IOK_OUTQ 3          /* a terminal's, and a socket's (SIOCOUTQ): TIOCOUTQ */
 #define IOC_TERMIOS_SZ 36   /* kernel struct termios: 4 u32 + c_line + c_cc[19] */
 static const IoctlEnt ioctl_tab[] = {
     { 0x5401 /*TCGETS*/,     IOC_TERMIOS_SZ, 1, IOK_TTY },
     { 0x5402 /*TCSETS*/,     IOC_TERMIOS_SZ, 2, IOK_TTY },
     { 0x5403 /*TCSETSW*/,    IOC_TERMIOS_SZ, 2, IOK_TTY },
     { 0x5404 /*TCSETSF*/,    IOC_TERMIOS_SZ, 2, IOK_TTY },
-    { 0x5409 /*TCSBRK*/,     0, 0, IOK_TTY },
+    { 0x5409 /*TCSBRK*/,     0, 0, IOK_TTY },     /* tcdrain (arg != 0), tcsendbreak (0) */
+    { 0x5425 /*TCSBRKP*/,    0, 0, IOK_TTY },     /* glibc's tcsendbreak(fd, n > 0): n deciseconds */
     { 0x540A /*TCXONC*/,     0, 0, IOK_TTY },
     { 0x540B /*TCFLSH*/,     0, 0, IOK_TTY },
     { 0x540E /*TIOCSCTTY*/,  0, 0, IOK_TTY },
     { 0x540F /*TIOCGPGRP*/,  4, 1, IOK_TTY },
     { 0x5410 /*TIOCSPGRP*/,  4, 2, IOK_TTY },
+    { 0x5411 /*TIOCOUTQ*/,   4, 1, IOK_OUTQ },    /* bytes not yet sent; SIOCOUTQ on a socket */
     { 0x5413 /*TIOCGWINSZ*/, 8, 1, IOK_TTY },
     { 0x5414 /*TIOCSWINSZ*/, 8, 2, IOK_TTY },
     { 0x5415 /*TIOCMGET*/,     4, 1, IOK_TTY },   /* get modem status bits (out) */
@@ -3303,34 +3306,68 @@ static const IoctlEnt ioctl_tab[] = {
  * may issue, and answers EACCES for the rest before the file's own handler is
  * reached. On anything that is not a terminal it lists next to none of the
  * terminal commands: on a pipe, a socket or a regular file every one but TCGETS
- * (and a socket's TIOCGWINSZ) is EACCES, on a directory, a memfd or a /proc
- * file TCGETS too, and on a memfd FIOCLEX/FIONCLEX besides. A kernel
- * answers each of those terminal commands ENOTTY (a socket's SIOCOUTQ aside,
- * which is no terminal command), so a guest asking tcgetpgrp(3) of a pipe --
- * bash's job control does, to report why it has none -- was told "Permission
- * denied" where it should read "Inappropriate ioctl for device", and isatty(3)
- * of a /proc file failed with EACCES.
+ * (and a socket's TIOCGWINSZ and SIOCOUTQ) is EACCES, on a directory, a memfd
+ * or a /proc file TCGETS too, and on a memfd FIOCLEX/FIONCLEX besides. A
+ * kernel answers each of those terminal commands ENOTTY, so a guest asking
+ * tcgetpgrp(3) of a pipe -- bash's job control does, to report why it has
+ * none -- was told "Permission denied" where it should read "Inappropriate
+ * ioctl for device", and isatty(3) of a /proc file failed with EACCES.
  *
  * No terminal is a pipe, a socket, a regular file or a directory, so a terminal
  * command refused on one of those is answered ENOTTY: what the kernel would
- * have said. A character or block device keeps the host's answer -- a driver
+ * have said (TIOCOUTQ on a socket aside, which is SIOCOUTQ there and keeps the
+ * refusal). A character or block device keeps the host's answer -- a driver
  * decides what it says to a command it does not know (/dev/urandom: EINVAL),
- * and a terminal is one. FIOCLEX and FIONCLEX set or clear close-on-exec on the
- * descriptor, which is all a kernel does for them, and F_SETFD does the same
- * thing unrefused. A64_TTYIOCTL_FORCE_DENY makes any host refuse the way the
- * policy does on a memfd, on each of those four kinds of descriptor. */
+ * and a terminal is one -- except a pty slave, whose answers are the tty
+ * core's alone (pts_refused below). FIOCLEX and FIONCLEX set or clear
+ * close-on-exec on the descriptor, which is all a kernel does for them, and
+ * F_SETFD does the same thing unrefused. A64_TTYIOCTL_FORCE_DENY makes any host
+ * refuse the way the policy does: on a memfd, everything on each of those four
+ * kinds of descriptor; on a pty slave, all but the commands it lists. */
 #define TC_FIOCLEX  0x5451u
 #define TC_FIONCLEX 0x5450u
+#define TC_FIONREAD 0x541bu
+#define TC_OUTQ     0x5411u
 
 static int ttyio_force_deny = -1;     /* as tc2_host_lacks below: -1 = knob unread */
 
-/* Whether the descriptor is one no terminal can be: a pipe, a socket, a
- * regular file or a directory. 0 when it cannot be told. */
-static int fd_never_tty(int fd) {
+/* What a descriptor is, as far as answering a refused ioctl goes. A pty slave
+ * is any of the UNIX98 slave majors (136..143, the kernel's
+ * UNIX98_PTY_SLAVE_MAJOR + UNIX98_PTY_MAJOR_COUNT): the ptys an app has. */
+#define FDK_OTHER 0
+#define FDK_FILE  1         /* a pipe, a regular file or a directory */
+#define FDK_SOCK  2
+#define FDK_PTS   3
+static int fd_kind(int fd) {
     struct stat st;
-    if (fstat(fd, &st) != 0) return 0;
-    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
-           S_ISREG(st.st_mode) || S_ISDIR(st.st_mode);
+    if (fstat(fd, &st) != 0) return FDK_OTHER;
+    if (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) return FDK_FILE;
+    if (S_ISSOCK(st.st_mode)) return FDK_SOCK;
+    if (S_ISCHR(st.st_mode) && major(st.st_rdev) >= 136 && major(st.st_rdev) < 144)
+        return FDK_PTS;
+    return FDK_OTHER;
+}
+
+/* Whether a descriptor of this kind can answer a command of `kind` at all:
+ * 0 means the kernel's answer is ENOTTY whatever the command asks. */
+static int fd_answers(int fdk, int kind) {
+    if (kind == IOK_TTY)  return fdk != FDK_FILE && fdk != FDK_SOCK;
+    if (kind == IOK_OUTQ) return fdk != FDK_FILE;
+    return 1;
+}
+
+/* The commands Android's policy lets an app issue on its pty slave, of those
+ * this table has (its unpriv_tty_ioctls). TIOCOUTQ is among them; it is the
+ * one IOK_OUTQ command, so it is never asked here. */
+static int pts_policy_allows(u32 cmd) {
+    switch (cmd) {
+    case 0x5401: case 0x5402: case 0x5403: case 0x5404:   /* TCGETS, TCSETS{,W,F} */
+    case 0x540B: case 0x540E:                             /* TCFLSH, TIOCSCTTY */
+    case 0x540F: case 0x5410:                             /* TIOC[GS]PGRP */
+    case 0x5413: case 0x5414:                             /* TIOC[GS]WINSZ */
+        return 1;
+    }
+    return 0;
 }
 
 /* The host's ioctl, for a command of `kind` -- or, with A64_TTYIOCTL_FORCE_DENY,
@@ -3340,7 +3377,9 @@ static int ioctl_host(int fd, u32 cmd, unsigned long arg, int kind) {
     if (kind != IOK_FILE &&
         PROBE_ONCE(ttyio_force_deny, getenv("A64_TTYIOCTL_FORCE_DENY") != NULL) > 0) {
         int fl = fcntl(fd, F_GETFL);
-        if (fl >= 0 && !(fl & O_PATH) && fd_never_tty(fd)) {
+        int fdk = fl >= 0 && !(fl & O_PATH) ? fd_kind(fd) : FDK_OTHER;
+        if ((fdk == FDK_FILE || fdk == FDK_SOCK) ? (kind == IOK_FD || !fd_answers(fdk, kind))
+            : fdk == FDK_PTS && kind == IOK_TTY && !pts_policy_allows(cmd)) {
             errno = EACCES;
             return -1;
         }
@@ -3348,15 +3387,22 @@ static int ioctl_host(int fd, u32 cmd, unsigned long arg, int kind) {
     return ioctl(fd, cmd, arg);
 }
 
-/* What the host's refusal (errno) is to the guest: see above. */
-static u64 ioctl_refused(int fd, u32 cmd, int kind) {
+static int pts_refused(int fd, u32 cmd, unsigned long arg, u64 *ret);
+
+/* What the host's refusal (errno) of `cmd` with `arg` -- the very argument the
+ * host was handed -- is to the guest: see above. */
+static u64 ioctl_refused(int fd, u32 cmd, int kind, unsigned long arg) {
     int e = errno;
-    if (e == EACCES && kind == IOK_FD) {
+    if (e != EACCES || kind == IOK_FILE) return (u64)(s64)-e;
+    if (kind == IOK_FD) {
         if (fcntl(fd, F_SETFD, cmd == TC_FIOCLEX ? FD_CLOEXEC : 0) < 0) return host_err();
         return 0;
     }
-    if (e == EACCES && kind == IOK_TTY && fd_never_tty(fd)) return (u64)(s64)-ENOTTY;
-    return (u64)(s64)-e;
+    int fdk = fd_kind(fd);
+    if (!fd_answers(fdk, kind)) return (u64)(s64)-ENOTTY;
+    u64 ret;
+    if (fdk == FDK_PTS && pts_refused(fd, cmd, arg, &ret)) return ret;
+    return (u64)(s64)-EACCES;
 }
 
 /* ---- termios2: TCGETS2 / TCSETS2 / TCSETSW2 / TCSETSF2 ----
@@ -3486,7 +3532,7 @@ static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
         u64 key = 0;
         if (!set) {
             if (ioctl_host(fd, TC_GETS, (unsigned long)buf, IOK_TTY) < 0)
-                return ioctl_refused(fd, TC_GETS, IOK_TTY);
+                return ioctl_refused(fd, TC_GETS, IOK_TTY, (unsigned long)buf);
             memcpy(&cflag, buf + 8, 4);
             u32 ib = (cflag >> TC_IBSHIFT) & TC_CBAUD, ob = cflag & TC_CBAUD;
             u32 hi = 38400, ho = 38400;        /* a BOTHER nobody told us the number of */
@@ -3502,7 +3548,7 @@ static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
             memcpy(&ospeed, buf + 40, 4);
             u32 hcmd = TC_SETS + (cmd - TC_SETS2);          /* TCSETS, TCSETSW, TCSETSF */
             if (ioctl_host(fd, hcmd, (unsigned long)buf, IOK_TTY) < 0)
-                return ioctl_refused(fd, hcmd, IOK_TTY);
+                return ioctl_refused(fd, hcmd, IOK_TTY, (unsigned long)buf);
             if (((cflag & TC_CBAUD) == TC_BOTHER ||
                  ((cflag >> TC_IBSHIFT) & TC_CBAUD) == TC_BOTHER) && (key = tc_key(fd)))
                 tc_shadow_put(key, ispeed, ospeed);
@@ -3550,9 +3596,9 @@ static u64 tty_tiocgsid(CPU *c, int fd, u64 gp) {
         s32 pg = 0;
         struct stat st;
         if (ioctl_host(fd, TC_GETS, (unsigned long)probe, IOK_TTY) < 0)     /* no terminal */
-            return ioctl_refused(fd, TC_GETS, IOK_TTY);
+            return ioctl_refused(fd, TC_GETS, IOK_TTY, (unsigned long)probe);
         if (ioctl_host(fd, TC_GPGRP, (unsigned long)&pg, IOK_TTY) < 0)      /* not the caller's */
-            return ioctl_refused(fd, TC_GPGRP, IOK_TTY);
+            return ioctl_refused(fd, TC_GPGRP, IOK_TTY, (unsigned long)&pg);
         if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && tc_is_ptmx(st.st_rdev)) {
             if (pg <= 0 || (sid = sig_pgrp_session(pg)) < 0) return (u64)(s64)-ENOTTY;
         } else {
@@ -3562,6 +3608,153 @@ static u64 tty_tiocgsid(CPU *c, int fd, u64 gp) {
     }
     if (copy_to_guest(c, gp, &sid, sizeof sid) < 0) return (u64)(s64)-EFAULT;
     return 0;
+}
+
+/* ---- The commands a policy refuses on a pty slave ----
+ *
+ * On its pty slave Android's policy lets an app issue TCGETS, TCSETS{,W,F},
+ * TCFLSH, TIOCSCTTY, TIOC[GS]PGRP, TIOC[GS]WINSZ and TIOCOUTQ (FIONREAD,
+ * FIONBIO and FIOCLEX/FIONCLEX it does not ask about) and refuses the rest
+ * with EACCES. A slave has no ioctl operation, no break, no modem lines, no
+ * output queue and no xchar of its own (drivers/tty/pty.c, pty_unix98_ops), so
+ * the kernel's answer to each of those is the tty core's, and is served from
+ * the commands that are allowed:
+ *   - TIOCMGET/TIOCMSET/TIOCMBIS/TIOCMBIC (no modem lines), TIOCPKT, TIOCGPTN,
+ *     TIOCSPTLCK (the master's) and VT_GETSTATE, KDGKBTYPE (a console's):
+ *     ENOTTY, before the argument is looked at;
+ *   - TIOCGSOFTCAR: CLOCAL in the termios, from TCGETS;
+ *   - TIOCSSOFTCAR: CLOCAL set or cleared with TCGETS + TCSETS. The kernel
+ *     changes the bit without the background-job check every TCSETS makes, and
+ *     that check passes for a caller with SIGTTOU blocked (is_ignored), so it
+ *     is blocked across the pair. Unlike the kernel's change in place the pair
+ *     is not atomic: a TCSETS of another process between the two is undone;
+ *   - TCSBRK and TCSBRKP (tcdrain, tcsendbreak): the background-job check, and
+ *     nothing else -- the output queue is always empty (no chars_in_buffer)
+ *     and there is no break to send (no break_ctl). The check comes from
+ *     TCFLSH, which makes exactly that one and then, with no queue named,
+ *     answers EINVAL;
+ *   - TCXONC: the same check, then TCOON restarts output that TCOOFF stopped
+ *     -- which the policy refuses to everyone, so there is none to restart;
+ *     TCIOFF/TCION send the STOP/START character to the master, written here
+ *     through the line discipline, which passes a control character through
+ *     as it is (refused instead where it would not: OPOST, and one of \n \r
+ *     \t \b or a printable character). The kernel's xchar goes out even while
+ *     output is stopped with ^S; this one is dropped then, as the kernel drops
+ *     one the master has no room for. Any other argument: the check, then
+ *     EINVAL. TCOOFF itself stays refused, since nothing an app may issue
+ *     stops a terminal's output;
+ *   - TIOCNOTTY: ENOTTY unless the slave is the caller's controlling terminal,
+ *     which TIOCGPGRP tells (the kernel's own test). Nothing else can take a
+ *     controlling terminal away, so on the caller's own it stays refused.
+ * TIOCGSID and the termios2 commands have fallbacks of their own, above. */
+#define TC_FLSH      0x540bu
+#define TC_FLSH_NONE 0x7fffffffUL   /* no queue: TCIFLUSH 0, TCOFLUSH 1, TCIOFLUSH 2 */
+#define TC_CLOCAL    0x800u         /* c_cflag (asm-generic 0004000, as everywhere) */
+#define TC_OPOST     0x1u           /* c_oflag */
+#define TC_CC        17             /* c_cc's offset in the 36-byte termios */
+#define TC_VSTART    8
+#define TC_VSTOP     9
+
+/* tty_check_change, as TCSBRK and TCXONC make it: 0 when it passes, else its
+ * answer -- EIO for an orphaned group, or the SIGTTOU it sent the caller's. */
+static int pts_check_change(int fd) {
+    if (ioctl(fd, TC_FLSH, TC_FLSH_NONE) == 0 || errno == EINVAL) return 0;
+    return -errno;
+}
+
+static int pts_softcar(int fd, int on) {
+    sigset_t ttou, was;
+    u8 t[IOC_TERMIOS_SZ];
+    u32 cflag;
+    int r = 0;
+    sigemptyset(&ttou);
+    sigaddset(&ttou, SIGTTOU);
+    pthread_sigmask(SIG_BLOCK, &ttou, &was);
+    if (ioctl(fd, TC_GETS, t) < 0) {
+        r = -errno;
+    } else {
+        memcpy(&cflag, t + 8, 4);
+        cflag = on ? cflag | TC_CLOCAL : cflag & ~TC_CLOCAL;
+        memcpy(t + 8, &cflag, 4);
+        if (ioctl(fd, TC_SETS, t) < 0 || ioctl(fd, TC_GETS, t) < 0) {
+            r = -errno;
+        } else {
+            memcpy(&cflag, t + 8, 4);
+            if (!(cflag & TC_CLOCAL) != !on) r = -EINVAL;   /* tty_change_softcar's */
+        }
+    }
+    /* Only SIGTTOU back: a capture handler may have changed the rest of the
+     * mask meanwhile (the queue's back-pressure gate does). */
+    if (!sigismember(&was, SIGTTOU)) pthread_sigmask(SIG_UNBLOCK, &ttou, NULL);
+    return r;
+}
+
+static int pts_xchar(int fd, int start) {
+    u8 t[IOC_TERMIOS_SZ];
+    u32 oflag;
+    if (ioctl(fd, TC_GETS, t) < 0) return -errno;
+    memcpy(&oflag, t + 4, 4);
+    u8 ch = t[TC_CC + (start ? TC_VSTART : TC_VSTOP)];
+    if (!ch) return 0;                                    /* __DISABLED_CHAR */
+    int ctl = ch < 0x20 || (ch >= 0x7f && ch < 0xa0);     /* the kernel's iscntrl */
+    if ((oflag & TC_OPOST) && (!ctl || ch == '\n' || ch == '\r' || ch == '\t' || ch == '\b'))
+        return -EACCES;
+    struct pollfd pf = { fd, POLLOUT, 0 };
+    if (poll(&pf, 1, 0) == 1 && (pf.revents & POLLOUT)) {
+        ssize_t w = write(fd, &ch, 1);
+        (void)w;                      /* tty_send_xchar ignores the write's count */
+    }
+    return 0;
+}
+
+/* `arg` is what the host was handed: the value for an int-argument command,
+ * the emulator's buffer for the others. 1 and *ret when the refusal is
+ * answered, 0 to keep it. */
+static int pts_refused(int fd, u32 cmd, unsigned long arg, u64 *ret) {
+    int r;
+    switch (cmd) {
+    case 0x5415: case 0x5416: case 0x5417: case 0x5418:   /* TIOCM{GET,BIS,BIC,SET} */
+    case 0x5420: case 0x80045430: case 0x40045431:        /* TIOCPKT, TIOCGPTN, TIOCSPTLCK */
+    case 0x5603: case 0x4b33:                             /* VT_GETSTATE, KDGKBTYPE */
+        r = -ENOTTY;
+        break;
+    case 0x5419: {                                        /* TIOCGSOFTCAR */
+        u8 t[IOC_TERMIOS_SZ];
+        u32 cflag;
+        if (ioctl(fd, TC_GETS, t) < 0) { r = -errno; break; }
+        memcpy(&cflag, t + 8, 4);
+        s32 v = (cflag & TC_CLOCAL) ? 1 : 0;
+        memcpy((void *)arg, &v, sizeof v);
+        r = 0;
+        break;
+    }
+    case 0x541A: {                                        /* TIOCSSOFTCAR */
+        s32 v;
+        memcpy(&v, (const void *)arg, sizeof v);
+        r = pts_softcar(fd, v != 0);
+        break;
+    }
+    case 0x5409: case 0x5425:                             /* TCSBRK, TCSBRKP */
+        r = pts_check_change(fd);
+        break;
+    case 0x540A:                                          /* TCXONC */
+        if (arg == 0) return 0;                           /* TCOOFF */
+        r = pts_check_change(fd);
+        if (!r && (arg == 2 || arg == 3)) r = pts_xchar(fd, arg == 3);   /* TCIOFF, TCION */
+        else if (!r && arg != 1) r = -EINVAL;                            /* not TCOON */
+        break;
+    case 0x5422: {                                        /* TIOCNOTTY */
+        s32 pg;
+        if (ioctl(fd, TC_GPGRP, &pg) == 0 || errno != ENOTTY) return 0;
+        r = -ENOTTY;
+        break;
+    }
+    default:
+        return 0;
+    }
+    if (r == -EACCES) return 0;       /* what it is served from was refused too */
+    *ret = (u64)(s64)r;
+    return 1;
 }
 
 /* The fs reflink ioctls -- FICLONE, FICLONERANGE -- clone the SOURCE fd's
@@ -3764,6 +3957,12 @@ SYSDEF(ioctl) {
             return ret;
         }
     }
+    /* A netlink socket the emulator stands in for with an AF_UNIX one (the
+     * host refused netlink, sys_netlink.c): netlink answers no ioctl of its
+     * own, so FIONREAD and SIOCOUTQ are ENOTTY there, where the stand-in
+     * would count the bytes queued on it. */
+    if ((cmd == TC_FIONREAD || cmd == TC_OUTQ) && nl_is_fd(c->m, (int)a0))
+        return (u64)(s64)-ENOTTY;
     if (cmd == TC_GETS2 || cmd == TC_SETS2 || cmd == TC_SETSW2 || cmd == TC_SETSF2)
         return tty_termios2(c, (int)a0, cmd, a2);
     if (cmd == TC_GSID) return tty_tiocgsid(c, (int)a0, a2);
@@ -3780,8 +3979,17 @@ SYSDEF(ioctl) {
         return (u64)(s64)-ENOTTY;
     }
     if (e->size == 0) {
-        int r = ioctl_host((int)a0, cmd, (unsigned long)a2, e->kind);
-        return r < 0 ? ioctl_refused((int)a0, cmd, e->kind) : (u64)r;
+        /* The argument is the guest's 64-bit word, and a 32-bit host takes 32.
+         * A word that does not fit is one none of these commands takes for a
+         * valid argument, so it goes over as the largest word rather than
+         * wrapped: TCSBRK's "non-zero" stays non-zero, and TCXONC's and
+         * TCFLSH's selectors stay invalid instead of landing on one that is
+         * not (TCFLSH 0x100000000 would flush the input). TIOCSCTTY is the
+         * exception, since its kernel handler reads an int and wraps it too. */
+        unsigned long harg = (unsigned long)a2;
+        if ((u64)harg != a2 && cmd != 0x540E /*TIOCSCTTY*/) harg = ~0UL;
+        int r = ioctl_host((int)a0, cmd, harg, e->kind);
+        return r < 0 ? ioctl_refused((int)a0, cmd, e->kind, harg) : (u64)r;
     }
     u8 buf[256];
     if (e->size > sizeof buf) return (u64)(s64)-EINVAL;   /* table entry too big */
@@ -3794,8 +4002,15 @@ SYSDEF(ioctl) {
     memset(buf, 0, e->size);
     if (e->dir & 2)
         if (copy_from_guest(c, buf, a2, e->size) < 0) return (u64)(s64)-EFAULT;
-    int r = ioctl_host((int)a0, cmd, (unsigned long)buf, e->kind);
-    if (r < 0) return ioctl_refused((int)a0, cmd, e->kind);
+    unsigned long harg = (unsigned long)buf;
+    int r = ioctl_host((int)a0, cmd, harg, e->kind);
+    if (r < 0) {
+        /* A refusal answered in the host's place may have filled `buf`
+         * (TIOCGSOFTCAR): it is copied out like the host's own answer. */
+        u64 rr = ioctl_refused((int)a0, cmd, e->kind, harg);
+        if ((s64)rr < 0) return rr;
+        r = (int)rr;
+    }
     if (e->dir & 1)
         if (copy_to_guest(c, a2, buf, e->size) < 0) return (u64)(s64)-EFAULT;
     return (u64)r;
