@@ -867,6 +867,7 @@ static pid_t rq_pid;   /* (rq_tab's, below) */
 static int rq_put(const PendSig *p);
 static int rq_put_quick(const PendSig *p);
 static void cw_taken(void);
+static int cw_overtake(PendSig *p);
 static int rq_stale(const siginfo_t *si);
 
 /* What the host can carry of a siginfo and do with SIGCHLD's flags, as
@@ -1826,7 +1827,9 @@ static void pendsig_from_host(PendSig *p, int sig, const siginfo_t *si) {
  * below, rt_sigtimedwait, a signalfd read, and a thread handing its signals
  * on. `p` is the host siginfo `si` as pendsig_from_host made it; 1 when it is
  * a signal for the guest -- `p` itself, which may now be another signal than
- * SIGCHLD -- 0 when it is none. What only a notice the host kernel made can
+ * SIGCHLD -- 2 when it is, but `p` is now another SIGCHLD's, one the watcher
+ * took before `si` came, which `si` coalesces into (cw_overtake), and 0 when
+ * it is none. What only a notice the host kernel made can
  * be is asked only of one (si_code > 0): the emulator's own, the notices it
  * sends and the signals handed back through rq_tab, were asked as they were
  * made. Async-signal-safe (the capture's). */
@@ -1943,7 +1946,9 @@ static int sig_chld_notice(PendSig *p, const siginfo_t *si) {
          * releases its death to us first (ptrace_tracer_died): that child's
          * notice is the one we are sent, its SIGCHLD taking this one's
          * place as a second instance would -- unless it is a clone child's
-         * own signal, which goes to the process beside this. */
+         * own signal, which goes to the process beside this. Released and
+         * told already, by the watcher, whose hand-back has not reached the
+         * guest yet: told in this one's place all the same (cw_overtake). */
         s32 kid = ptrace_tracer_died(p->pid);
         PendSig q;
         if (kid && chld_released(&q, kid) &&
@@ -1992,8 +1997,9 @@ notice:
     if (p->code >= CLD_EXITED && p->code <= CLD_CONTINUED &&
         *(volatile u64 *)&g_machine.sigact[SIGCHLD].handler == GSIG_IGN)
         return 0;
-    cw_taken();   /* a SIGCHLD the guest takes: the watcher's turn with it */
-    return 1;
+    /* A SIGCHLD the guest takes: the watcher's turn with it -- and the one
+     * the watcher took before it, if it holds one, to tell instead. */
+    return cw_overtake(p) ? 2 : 1;
 }
 
 static void host_catcher(int sig, siginfo_t *si, void *uctx) {
@@ -2933,9 +2939,11 @@ void sig_helpers_fork_child(void) {
  * 10 ms, and sends the notice of each one found dead (clonekids_tell_dead).
  * A SIGCHLD of the host's that came between its take and its hand-back takes
  * the hand-back's place in the pending set -- the kernel drops the second of
- * a standard signal -- and whatever takes that one takes the hand-back's turn
- * with it (cw_taken); one that was not the guest's leaves the hand-back
- * nowhere, and the watcher finds the process's set empty and sends it again.
+ * a standard signal -- and whatever takes that one for the guest is told of
+ * the hand-back's instead, the first of the two, which is the one a kernel
+ * that never let it go would have kept (cw_overtake); one that was not the
+ * guest's leaves the hand-back nowhere, and the watcher finds the process's
+ * set empty and sends it again.
  *
  * The thread blocks every signal, takes no emulator lock but thr_lock to join
  * the foreign-task set (it is no guest thread, and shown as none), holds no
@@ -2949,12 +2957,16 @@ static long host_sigtimedwait(u64 set, siginfo_t *si, s64 ns);
 static u32 cw_on;    /* the watcher runs: 0 -> 1 by whoever starts it */
 static u32 cw_tok;   /* the token of the SIGCHLD it handed back, while that is
                       * waiting to be taken: 0 none; a futex */
+static u32 cw_hold;  /* 1 while it holds a SIGCHLD it took -- from the take (or
+                      * cw_check's taking it back) until it is handed back or
+                      * found none of the guest's; a futex */
 
 /* A SIGCHLD reached the guest: the one the watcher handed back, or one that
- * took its place. Either way the watcher's is pending no longer, or it is a
- * second instance a kernel would never have queued: its slot is given up
- * (a later take of the token finds it stale, sig_chld_notice) and the
- * watcher may take again. Async-signal-safe. */
+ * took its place and could not be told of it (cw_overtake). Either way the
+ * watcher's is pending no longer, or it is a second instance a kernel would
+ * never have queued: its slot is given up (a later take of the token finds
+ * it stale, sig_chld_notice) and the watcher may take again.
+ * Async-signal-safe. */
 static void cw_taken(void) {
     u32 tok = __atomic_exchange_n(&cw_tok, 0, __ATOMIC_ACQ_REL);
     if (!tok) return;
@@ -2967,6 +2979,65 @@ static void cw_taken(void) {
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
     syscall(SYS_futex, &cw_tok, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+/* A SIGCHLD reaches the guest -- `p`, past every question sig_chld_notice
+ * asks -- while the watcher holds one it took before: handed back and not yet
+ * taken (cw_tok), or still being asked about (cw_hold). The host had that one
+ * first: two cannot be pending at once, so this one was sent after the
+ * watcher's take. A kernel that never let the first go would have kept it
+ * pending, its siginfo and not this one's, and dropped this one as a second
+ * instance -- so the guest is told of the first instead, and its hand-back,
+ * whenever it comes, finds its slot taken (rq_stale). It is the order a
+ * tracer's death has to keep: the deaths it held back from us are released
+ * before its own notice is sent (ptrace_tracer_died), and the watcher's sweep
+ * can release them as the tracer dies (ptrace_held_kids) and take that
+ * release itself while a thread of ours is still at the tracer's own notice
+ * -- whose siginfo the guest was given in place of the child's. A take still
+ * being asked about is waited for, briefly: the watcher takes no lock while
+ * it holds one, so only a stalled host keeps it past the wait, and this one
+ * then goes as it is. (One taken in the instant between the watcher's take
+ * and its hold goes first all the same.) 1 with *p replaced; otherwise the
+ * watcher's turn is given up (cw_taken). Async-signal-safe. */
+static int cw_overtake(PendSig *p) {
+    if (!__atomic_load_n(&cw_hold, __ATOMIC_SEQ_CST) &&
+        !__atomic_load_n(&cw_tok, __ATOMIC_SEQ_CST))
+        return 0;
+    /* The watcher's own question about what it took. */
+    if ((s32)syscall(SYS_gettid) == __atomic_load_n(&cw_tid, __ATOMIC_ACQUIRE)) return 0;
+    for (int i = 0; i < 40; i++) {
+        u32 tok = __atomic_load_n(&cw_tok, __ATOMIC_SEQ_CST);
+        if (tok) {
+            RqSlot *sl = &rq_tab[tok & (RQ_SLOTS - 1)];
+            int queued = 2;
+            if (sl->nonce == tok >> RQ_IDX_BITS &&
+                __atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) == 2) {
+                PendSig q = sl->p;
+                if (__atomic_compare_exchange_n(&sl->state, &queued, 0, false,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    __atomic_compare_exchange_n(&cw_tok, &tok, 0, false,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+                    syscall(SYS_futex, &cw_tok, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+                    *p = q;
+                    return 1;
+                }
+                continue;
+            }
+            /* Taken -- the guest was told of it first -- unless cw_check has
+             * it back to send again, and holds it meanwhile. */
+            if (!__atomic_load_n(&cw_hold, __ATOMIC_SEQ_CST)) break;
+        } else if (!__atomic_load_n(&cw_hold, __ATOMIC_SEQ_CST)) {
+            return 0;   /* none of the guest's after all */
+        }
+        host_futex_wait(&cw_hold, 1, 1);
+    }
+    cw_taken();
+    return 0;
+}
+
+static void cw_unhold(void) {
+    __atomic_store_n(&cw_hold, 0, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, &cw_hold, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
 }
 
 static int cw_due(void) { return clonekids_any() || ptrace_held_kids(1); }
@@ -2997,6 +3068,10 @@ static void cw_check(void) {
     if (syscall(SYS_rt_sigpending, &pend, (size_t)8) != 0)
 #endif
         pend = 1ULL << (SIGCHLD - 1);   /* cannot tell: taken for still waiting */
+    /* Held from before it may be ours again until it is sent again: a thread
+     * of the guest's that takes a SIGCHLD meanwhile waits to be told of it
+     * (cw_overtake). */
+    __atomic_store_n(&cw_hold, 1, __ATOMIC_SEQ_CST);
     if (sl->nonce != tok >> RQ_IDX_BITS ||
         __atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) != 2 ||
         (!(pend & (1ULL << (SIGCHLD - 1))) &&
@@ -3004,15 +3079,31 @@ static void cw_check(void) {
                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))) {
         __atomic_compare_exchange_n(&cw_tok, &tok, 0, false,
                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        cw_unhold();
         return;   /* taken */
     }
-    if (__atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) == 2) return;   /* waiting */
+    if (__atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) == 2) {   /* waiting */
+        cw_unhold();
+        return;
+    }
     PendSig p = sl->p;   /* ours again (state 1): lost as it was sent */
     __atomic_store_n(&sl->state, 0, __ATOMIC_RELEASE);
-    if (!__atomic_compare_exchange_n(&cw_tok, &tok, 0, false,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-        return;   /* a SIGCHLD reached the guest meanwhile: this one went with it */
-    cw_deliver(&p);
+    if (__atomic_compare_exchange_n(&cw_tok, &tok, 0, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        cw_deliver(&p);
+    /* ...or a SIGCHLD reached the guest meanwhile, past the wait: this one
+     * went with it. */
+    cw_unhold();
+}
+
+/* A SIGCHLD the watcher took from the host: asked about, and handed on --
+ * held (cw_hold) from the take until then. */
+static void cw_take(const siginfo_t *si) {
+    __atomic_store_n(&cw_hold, 1, __ATOMIC_SEQ_CST);
+    PendSig p;
+    pendsig_from_host(&p, SIGCHLD, si);
+    if (sig_chld_notice(&p, si)) cw_deliver(&p);
+    cw_unhold();
 }
 
 static void *sig_chld_watcher(void *arg) {
@@ -3037,9 +3128,7 @@ static void *sig_chld_watcher(void *arg) {
             memset(&si, 0, sizeof si);
             if (host_take_pending(chld, &si) == SIGCHLD) {
                 if (si.si_code == SI_TKILL && si.si_pid == getpid()) continue;
-                PendSig p;
-                pendsig_from_host(&p, SIGCHLD, &si);
-                if (sig_chld_notice(&p, &si)) cw_deliver(&p);
+                cw_take(&si);
                 continue;
             }
             __atomic_store_n(&cw_on, 0, __ATOMIC_SEQ_CST);
@@ -3062,9 +3151,7 @@ static void *sig_chld_watcher(void *arg) {
         /* A fork's call to park (sig_helpers_park): the one SIGCHLD ever sent
          * to this thread itself -- no guest can name it. */
         if (si.si_code == SI_TKILL && si.si_pid == getpid()) continue;
-        PendSig p;
-        pendsig_from_host(&p, SIGCHLD, &si);
-        if (sig_chld_notice(&p, &si)) cw_deliver(&p);
+        cw_take(&si);
     }
     return NULL;
 }
@@ -3201,14 +3288,15 @@ int sig_sfd_chld(GSignalfdSiginfo *r) {
     }
     PendSig p;
     pendsig_from_host(&p, SIGCHLD, &si);
-    if (!sig_chld_notice(&p, &si)) return 0;
+    int k = sig_chld_notice(&p, &si);
+    if (!k) return 0;
     if (p.signo != SIGCHLD) {
         u64 prev = host_block_all();
         rq_put(&p);
         host_set_mask(prev);
         return 0;
     }
-    if (r->ssi_code == SI_QUEUE) {
+    if (r->ssi_code == SI_QUEUE || k == 2) {   /* ...or the notice the watcher held */
         GSignalfdSiginfo n;
         memset(&n, 0, sizeof n);
         n.ssi_signo = SIGCHLD;

@@ -1343,7 +1343,11 @@ and the watcher then takes nothing until a thread has taken that one
 (`cw_tok`, `cw_taken`), looking at the clone children itself every 10 ms
 instead and sending the notice of each one found dead (`clonekids_tell_dead`):
 whatever the host says meanwhile goes behind the pending one, as the kernel's
-coalescing has it go. A wait that reaps a clone child before anything took its
+coalescing has it go. A host `SIGCHLD` that a guest thread takes while the
+watcher still holds one — handed back and not yet taken, or still being asked
+about (`cw_hold`) — came after it, and coalesces into it: the guest is told of
+the watcher's, whose siginfo a kernel that never let it go would have kept
+(`cw_overtake`), and the hand-back finds its slot taken when it arrives. A wait that reaps a clone child before anything took its
 notice sends it as it reaps (`clonekid_reaped`): the kernel's went at the
 death, before any wait could see it. Each notice goes once (`clonekid_tell`).
 The capture hands a clone child's signal that its own thread blocks to the
@@ -2108,7 +2112,11 @@ returned before `strace` had heard of its child's exit. So
   (`JCA_DEATH_FREE`, `JCA_DEATH_TOLD`). The death of a tracer that is the
   parent's own child releases its held children first, as `exit_ptrace` does
   before the tracer's own notice — which then finds `SIGCHLD` pending already
-  (`ptrace_tracer_died`).
+  (`ptrace_tracer_died`). The watcher's look can release them as the tracer
+  dies and take that release itself while a guest thread is still at the
+  tracer's own notice; that thread is then told of the child's notice the
+  watcher holds, not the tracer's (`cw_overtake`), the order `exit_ptrace`
+  keeps.
 - *A parent with such a child catches `SIGCHLD`* and runs the SIGCHLD watcher
   (*Clone children*, above) while it lives: a held notice sitting pending under
   a blocked `SIGCHLD` would swallow the ones after it, and a parent that
