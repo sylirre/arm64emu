@@ -868,6 +868,7 @@ static int rq_put(const PendSig *p);
 static int rq_put_quick(const PendSig *p);
 static void cw_taken(void);
 static int cw_overtake(PendSig *p);
+static int cw_self(void);
 static int rq_stale(const siginfo_t *si);
 
 /* What the host can carry of a siginfo and do with SIGCHLD's flags, as
@@ -876,6 +877,7 @@ static int rq_stale(const siginfo_t *si);
  * the first handler and the first thread, read from handlers after. */
 static int g_sig_sicode_ok = 1;   /* a private si_code, si_errno and si_value
                                    * go out and come back as they were */
+static int g_sig_chld_delay;      /* A64_SIGCHLD_DELAY, ms (sig_chld_notice) */
 static int g_sig_nocld_ok = 1;    /* SA_NOCLDWAIT reaps and SA_NOCLDSTOP
                                    * spares the notices */
 
@@ -1468,6 +1470,11 @@ static void sig_probe_host(void) {
     g_sig_sicode_ok = sig_probe_sicode();
     g_sig_nocld_ok = sig_probe_nocld();
     if (!g_sig_sicode_ok) g_sig_pnd_trust = sig_probe_procpnd();
+    const char *d = getenv("A64_SIGCHLD_DELAY");
+    if (d && *d) {
+        int ms = atoi(d);
+        g_sig_chld_delay = ms < 0 ? 0 : ms > 10000 ? 10000 : ms;
+    }
 }
 
 /* ---- group stop ----------------------------------------------------------
@@ -1881,6 +1888,16 @@ static int chld_released(PendSig *p, s32 kid) {
 
 static int sig_chld_notice(PendSig *p, const siginfo_t *si) {
     if (p->signo != SIGCHLD) return 1;
+    /* A64_SIGCHLD_DELAY: a thread of the guest's held as it starts on a
+     * notice the host kernel made, as a loaded host holds one it preempts
+     * there -- long enough for the watcher, which is never held, to do what
+     * it does every 100 ms meanwhile: a dead tracer's held children released
+     * and that release taken by it, while this thread has the tracer's own
+     * notice still to tell (cw_overtake). */
+    if (g_sig_chld_delay && si->si_signo == SIGCHLD && si->si_code > 0 && !cw_self()) {
+        struct timespec d = { g_sig_chld_delay / 1000, (long)(g_sig_chld_delay % 1000) * 1000000L };
+        while (nanosleep(&d, &d) != 0 && errno == EINTR) ;
+    }
     /* A traced child's death released to us (chld_released). Its tracer may
      * have collected it as the child published it, before the child was a
      * zombie: then the host's own notice, which comes once it is, is the one
@@ -3003,8 +3020,7 @@ static int cw_overtake(PendSig *p) {
     if (!__atomic_load_n(&cw_hold, __ATOMIC_SEQ_CST) &&
         !__atomic_load_n(&cw_tok, __ATOMIC_SEQ_CST))
         return 0;
-    /* The watcher's own question about what it took. */
-    if ((s32)syscall(SYS_gettid) == __atomic_load_n(&cw_tid, __ATOMIC_ACQUIRE)) return 0;
+    if (cw_self()) return 0;   /* the watcher's own question about what it took */
     for (int i = 0; i < 40; i++) {
         u32 tok = __atomic_load_n(&cw_tok, __ATOMIC_SEQ_CST);
         if (tok) {
@@ -3033,6 +3049,12 @@ static int cw_overtake(PendSig *p) {
     }
     cw_taken();
     return 0;
+}
+
+/* Is the calling thread the watcher? Async-signal-safe. */
+static int cw_self(void) {
+    s32 w = __atomic_load_n(&cw_tid, __ATOMIC_ACQUIRE);
+    return w > 0 && (s32)syscall(SYS_gettid) == w;
 }
 
 static void cw_unhold(void) {

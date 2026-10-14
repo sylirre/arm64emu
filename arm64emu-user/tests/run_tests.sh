@@ -3362,6 +3362,22 @@ fi
 # killed; a death by SIGKILL; a followed fork. Self-checking: the block is
 # the kernel's.
 check_fixture heldzombie $'tracer reaps it:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: reaped it, exited 5\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ntracer leaves:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: left it\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ntracer killed:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: killed\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\nkilled by SIGKILL:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: reaped it, killed\n  after: notice code=2 status=9 from the child=1\n  wait(child)=the child, killed by 9\nblocked in its wait:\n  wait(child)=the child, exited 5, after the tracer\'s reap\n  tracer: reaped it, exited 5\nSIGCHLD blocked:\n  before: pending=0, signalfd empty\n  tracer: reaped it, exited 5\n  after: signalfd read the child=1 code=1 status=5\n  wait(child)=the child, exited 5\nSIGCHLD ignored:\n  wait(child)=ECHILD, after the tracer\'s reap\n  tracer: reaped it, exited 5\na followed fork\'s child:\n  parent before the tracer: nothing yet\n  parent: the child, exited 6, after the tracer\'s reap\ndone'
+# ...and the tracer killed with every notice the host sends the parent held up
+# 300 ms (A64_SIGCHLD_DELAY): the emulator's look for a gone tracer, every 100
+# ms, releases the child meanwhile, and the SIGCHLD watcher takes that release
+# while the parent's thread is still at the tracer's own notice -- which the
+# guest was told of first (signal.c, cw_overtake). The kernel's order is the
+# child's notice, then the tracer's. Only that case: the others time the
+# parent's waits against the tracer's, which a parent held that long would not
+# keep either.
+if [ -n "$AGCC" ] && "$AGCC" -static -O2 -o tests/fixtures/heldzombie.bin \
+        tests/fixtures/heldzombie.c 2>/dev/null; then
+    got=$(A64_SIGCHLD_DELAY=300 timeout -k 5 60 "$EMU" / tests/fixtures/heldzombie.bin killed 2>/dev/null)
+    fixture_verdict "heldzombie (slow-notice tier)" $'tracer killed:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: killed\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ndone' "$got"
+    fx_rm tests/fixtures/heldzombie.bin
+else
+    skip_build "fixtures/heldzombie (slow-notice tier)"
+fi
 # The arm64 tagged-address ABI (mem.c, uaddr_tag_refused; sys.h, guest_access_ok):
 # managed addresses untagged always, dereferenced ones EFAULT until the thread
 # enables it (before the file is asked anything, even an empty pipe), the

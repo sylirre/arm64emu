@@ -2126,6 +2126,10 @@ returned before `strace` had heard of its child's exit. So
 `tests/fixtures/heldzombie.c` has the parent catching `SIGCHLD`, blocked in
 its wait, blocking `SIGCHLD` (sigpending, a `signalfd`), and ignoring it; the
 tracer reaping, leaving, and killed; a death by `SIGKILL`; and a followed fork.
+Its tracer-killed case runs a second time with every host notice the parent
+takes held up 300 ms (`A64_SIGCHLD_DELAY`, the `slow-notice tier` row), so the
+watcher's look releases the child and takes that release while the parent is
+still at the tracer's notice — the case `cw_overtake` keeps in order.
 
 **A stop's siginfo (`GETSIGINFO`/`SETSIGINFO`).** Every stop publishes the
 siginfo the kernel's `last_siginfo` would hold, in the guest's layout, on its

@@ -400,6 +400,13 @@ static void help(void) {
                         "(exercises the back-pressure gate: a queue with no "
                         "room leaves the rest of a flood in the host kernel's "
                         "own queue until it drains)."},
+        {"A64_SIGCHLD_DELAY=MS", "Hold a guest thread MS milliseconds as it "
+                        "starts on each SIGCHLD notice the host sends (what a "
+                        "loaded host does to a thread it preempts there), so "
+                        "the emulator's SIGCHLD watcher runs meanwhile -- the "
+                        "condition under which a dead tracer's notice and the "
+                        "release of the child it traced must keep the "
+                        "kernel's order."},
         {"A64_SICODE_FORCE_KNOWN", "Send the emulator's own signals between "
                         "processes with si_codes of a layout the kernel knows "
                         "only (the tier a host that cannot carry a private "

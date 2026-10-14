@@ -19,6 +19,15 @@
  * prints everything, so no line depends on which of two processes gets to
  * the terminal first.
  *
+ * `heldzombie killed` runs the tracer-killed case alone, which the suite
+ * also runs with every notice the host sends this process held up
+ * (A64_SIGCHLD_DELAY): the tracer's death then reaches it while the
+ * emulator's own look for a gone tracer -- every 100 ms -- releases the
+ * child, and the kernel's order (the child's notice, then the tracer's,
+ * which finds SIGCHLD pending) has to hold all the same. The other cases
+ * time the parent's waits against the tracer's, which a parent held that
+ * long would not keep either.
+ *
  * Self-checking: every line was taken from a native kernel running this
  * program built for the host. */
 #define _GNU_SOURCE
@@ -288,8 +297,13 @@ static void followed(void) {
     close(rep[0]); close(go[0]); close(go[1]);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 1 && !strcmp(argv[1], "killed")) {
+        handler_run("tracer killed", KILL_TRACER);
+        printf("done\n");
+        return 0;
+    }
     handler_run("tracer reaps it", REAP);
     handler_run("tracer leaves", LEAVE);
     handler_run("tracer killed", KILL_TRACER);
