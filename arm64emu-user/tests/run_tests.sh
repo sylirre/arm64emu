@@ -2801,6 +2801,16 @@ check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 
 # to a new session.
 check_fixture tiocgsid $'slave_nosess=-1 errno=25\nmaster_nosess=-1 errno=25\nslave_foreign=-1 errno=25\nslave_ctl=0 own=1\nslave_fault=-1 errno=14\nmaster_ctl=0 own=1\nmaster_parent=0 kid=1\nmaster_gone=-1 errno=25\npipe=-1 errno=25\nnull=-1 errno=25\nclosed=-1 errno=9\ndone' \
     "A64_TIOCGSID_FORCE_DENY=1" "denied tier"
+# The terminal ioctls on descriptors that are no terminal: ENOTTY for every
+# command on a pipe, a socket, a file, a directory, a memfd, a /proc file, an
+# eventfd and /dev/null, EBADF on an O_PATH or closed descriptor, FIOCLEX and
+# FIONCLEX working, FIONREAD of a pipe untouched. Android's policy refuses
+# nearly all of those commands with EACCES (and FIOCLEX/FIONCLEX on a memfd);
+# the denied tier makes this host refuse the same way, and the guest must still
+# read the kernel's answers. Self-checking; the expected output is a real
+# kernel's.
+check_fixture ttynotty $'pipe_r: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\npipe_w: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nstream: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\ndgram: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\ndir: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nfile: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nmemfd: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nproc: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\neventfd: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nnull: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nopath: all EBADF | fioclex=EBADF fd=0 fionclex=EBADF fd=0\nclosed: all EBADF | fioclex=EBADF fd=-1 fionclex=EBADF fd=-1\nfionread=ok n=3\ndone' \
+    "A64_TTYIOCTL_FORCE_DENY=1" "denied tier"
 # AT_EXECFN and comm: the path execve was GIVEN, not the one it resolved to.
 # Through a symlink, a relative path or a script a kernel keeps the name as
 # written; the emulator reported the resolved file's, and uutils' coreutils

@@ -386,6 +386,10 @@ static void help(void) {
         {"A64_TIOCGSID_FORCE_DENY", "Refuse TIOCGSID (tcgetsid) with EACCES, "
                         "as Android's policy does on a pty slave and a pipe, "
                         "so it is served from TCGETS, TIOCGPGRP and getsid."},
+        {"A64_TTYIOCTL_FORCE_DENY", "Refuse the terminal ioctls and "
+                        "FIOCLEX/FIONCLEX with EACCES on a pipe, socket, file "
+                        "or directory, as Android's policy does, so the guest "
+                        "is answered ENOTTY and close-on-exec through F_SETFD."},
         {"A64_TLBPUB_MAX=N", "Cap the published-epoch table at N slots "
                         "(exercises the tier a guest with more live threads "
                         "than it holds is served by: the retired-backing "

@@ -210,8 +210,25 @@ unfiltered:
   probed on a device: on a pty slave `TCGETS`, `TIOCGPGRP` and `TIOCGWINSZ`
   were answered and `TCGETS2` and `TIOCGSID` refused; on a pipe `TCGETS` got
   the kernel's `ENOTTY` while `TCGETS2`, `TIOCGPGRP` and `TIOCGSID` got
-  `EACCES`. A guest's `TIOCGPGRP` on a pipe is still forwarded as that
   `EACCES`.
+
+* **Terminal ioctls on anything that is no terminal.** The policy lists next
+  to none of them for a pipe, a socket, a regular file or a directory: every
+  terminal command but `TCGETS` (and a socket's `TIOCGWINSZ`) answers `EACCES`
+  on a pipe, a socket or a file, and `TCGETS` too on a directory, a memfd or a
+  `/proc` file, where a kernel answers `ENOTTY` — so a guest's `tcgetpgrp(3)`
+  of a pipe (bash's job control asks, to say why it has none) read "Permission
+  denied", and `isatty(3)` of a `/proc` file failed with `EACCES`. No terminal
+  is one of those four kinds of file, so a terminal command refused on one is
+  answered `ENOTTY` (`ioctl_refused`, `sys_file.c`); a character or block
+  device keeps the host's answer, since its driver decides. `FIOCLEX` and
+  `FIONCLEX` are refused on a memfd as well; they only set or clear
+  close-on-exec, which `F_SETFD` does unrefused. `A64_TTYIOCTL_FORCE_DENY`
+  forces the tier anywhere (the suite's `ttynotty (denied tier)` row).
+  Still refused on a pty slave, where the kernel serves them: `TCSBRK`
+  (`tcdrain`, `tcsendbreak`), `TCXONC` (`tcflow`), `TIOCGSOFTCAR`/
+  `TIOCSSOFTCAR` and `TIOCNOTTY`; those reach a real terminal, so no answer can
+  be inferred from the kind of file.
 
 * **`stat` of a device node an app may still name.** `/dev/full` (and
   `/dev/kmsg`, ...) answers `stat`, `lstat` and `fstat` of an `O_PATH` fd

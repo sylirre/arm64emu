@@ -144,6 +144,20 @@ is not the oracle for most, so the expected block is a native run's):
   the slave has no group. The ids are the host's, as `getsid(2)` and
   `TIOCGPGRP` report them. `A64_TIOCGSID_FORCE_DENY` forces the tier on any
   host and the suite runs `tests/fixtures/tiocgsid.c` over it.
+- A terminal command refused with `EACCES` on a descriptor that is no terminal
+  (`ioctl_refused`, `sys_file.c`) is answered `ENOTTY`. Android's SELinux
+  policy refuses nearly every terminal ioctl ahead of the file on a pipe, a
+  socket, a regular file or a directory (`TCGETS` aside on the first three),
+  where a kernel's answer is `ENOTTY`; no terminal is any of those four kinds of
+  file (`fstat`), so the kernel's answer is known without asking. A character
+  or block device keeps the host's answer — its driver decides what it says to
+  a command it does not know (`/dev/urandom`: `EINVAL`), and a terminal is one.
+  The termios2 and `TIOCGSID` fallbacks above route their `TCGETS`/`TCSETS*`/
+  `TIOCGPGRP` through the same rule. `FIOCLEX`/`FIONCLEX` refused (the policy
+  does so on a memfd) are served by `F_SETFD`, which is all a kernel does for
+  them; an `O_PATH` or closed descriptor is the host's `EBADF` before any policy
+  is asked. `A64_TTYIOCTL_FORCE_DENY` makes any host refuse the same way, and
+  the suite runs `tests/fixtures/ttynotty.c` over it.
 - `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
 
 ## Struct marshalling: always convert

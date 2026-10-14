@@ -3258,39 +3258,106 @@ SYSDEF(fremovexattr) { /* (fd, name) */
 
 /* ioctl whitelist: cmd values below are asm-generic and shared by arm64, arm
  * and x86; the payloads (kernel termios/winsize/int) have identical layout on
- * all four hosts, so a size-tagged bounce is enough. */
-typedef struct { u32 cmd; u16 size; u8 dir; } IoctlEnt;   /* dir: 0 none/int-arg, 1 read(out), 2 write(in), 3 rw */
+ * all four hosts, so a size-tagged bounce is enough. `kind` says whose command
+ * it is, which is what a refusal by the host's policy is answered by
+ * (ioctl_refused below). */
+typedef struct { u32 cmd; u16 size; u8 dir; u8 kind; } IoctlEnt;   /* dir: 0 none/int-arg, 1 read(out), 2 write(in), 3 rw */
+#define IOK_FILE 0          /* any file's: FIONREAD, FIONBIO */
+#define IOK_TTY  1          /* a terminal's: ENOTTY from anything that is none */
+#define IOK_FD   2          /* the descriptor's own close-on-exec flag */
 #define IOC_TERMIOS_SZ 36   /* kernel struct termios: 4 u32 + c_line + c_cc[19] */
 static const IoctlEnt ioctl_tab[] = {
-    { 0x5401 /*TCGETS*/,     IOC_TERMIOS_SZ, 1 },
-    { 0x5402 /*TCSETS*/,     IOC_TERMIOS_SZ, 2 },
-    { 0x5403 /*TCSETSW*/,    IOC_TERMIOS_SZ, 2 },
-    { 0x5404 /*TCSETSF*/,    IOC_TERMIOS_SZ, 2 },
-    { 0x5409 /*TCSBRK*/,     0, 0 },
-    { 0x540A /*TCXONC*/,     0, 0 },
-    { 0x540B /*TCFLSH*/,     0, 0 },
-    { 0x540E /*TIOCSCTTY*/,  0, 0 },
-    { 0x540F /*TIOCGPGRP*/,  4, 1 },
-    { 0x5410 /*TIOCSPGRP*/,  4, 2 },
-    { 0x5413 /*TIOCGWINSZ*/, 8, 1 },
-    { 0x5414 /*TIOCSWINSZ*/, 8, 2 },
-    { 0x5415 /*TIOCMGET*/,     4, 1 },   /* get modem status bits (out) */
-    { 0x5416 /*TIOCMBIS*/,     4, 2 },   /* set the given modem bits (in) */
-    { 0x5417 /*TIOCMBIC*/,     4, 2 },   /* clear the given modem bits (in) */
-    { 0x5418 /*TIOCMSET*/,     4, 2 },   /* set all modem bits (in) */
-    { 0x5419 /*TIOCGSOFTCAR*/, 4, 1 },   /* get CLOCAL/soft-carrier flag (out) */
-    { 0x541A /*TIOCSSOFTCAR*/, 4, 2 },   /* set CLOCAL/soft-carrier flag (in) */
-    { 0x5420 /*TIOCPKT*/,      4, 2 },   /* enable/disable pty packet mode (in: int); screen's OpenPTY needs it */
-    { 0x541B /*FIONREAD*/,   4, 1 },
-    { 0x5421 /*FIONBIO*/,    4, 2 },
-    { 0x5422 /*TIOCNOTTY*/,  0, 0 },
-    { 0x5451 /*FIOCLEX*/,    0, 0 },
-    { 0x5450 /*FIONCLEX*/,   0, 0 },
-    { 0x80045430 /*TIOCGPTN*/, 4, 1 },
-    { 0x40045431 /*TIOCSPTLCK*/, 4, 2 },
-    { 0x5603 /*VT_GETSTATE*/, 6, 1 },   /* struct vt_stat: 3 u16, out */
-    { 0x4b33 /*KDGKBTYPE*/,   1, 1 },   /* char keyboard type, out; ENOTTY off a real VT */
+    { 0x5401 /*TCGETS*/,     IOC_TERMIOS_SZ, 1, IOK_TTY },
+    { 0x5402 /*TCSETS*/,     IOC_TERMIOS_SZ, 2, IOK_TTY },
+    { 0x5403 /*TCSETSW*/,    IOC_TERMIOS_SZ, 2, IOK_TTY },
+    { 0x5404 /*TCSETSF*/,    IOC_TERMIOS_SZ, 2, IOK_TTY },
+    { 0x5409 /*TCSBRK*/,     0, 0, IOK_TTY },
+    { 0x540A /*TCXONC*/,     0, 0, IOK_TTY },
+    { 0x540B /*TCFLSH*/,     0, 0, IOK_TTY },
+    { 0x540E /*TIOCSCTTY*/,  0, 0, IOK_TTY },
+    { 0x540F /*TIOCGPGRP*/,  4, 1, IOK_TTY },
+    { 0x5410 /*TIOCSPGRP*/,  4, 2, IOK_TTY },
+    { 0x5413 /*TIOCGWINSZ*/, 8, 1, IOK_TTY },
+    { 0x5414 /*TIOCSWINSZ*/, 8, 2, IOK_TTY },
+    { 0x5415 /*TIOCMGET*/,     4, 1, IOK_TTY },   /* get modem status bits (out) */
+    { 0x5416 /*TIOCMBIS*/,     4, 2, IOK_TTY },   /* set the given modem bits (in) */
+    { 0x5417 /*TIOCMBIC*/,     4, 2, IOK_TTY },   /* clear the given modem bits (in) */
+    { 0x5418 /*TIOCMSET*/,     4, 2, IOK_TTY },   /* set all modem bits (in) */
+    { 0x5419 /*TIOCGSOFTCAR*/, 4, 1, IOK_TTY },   /* get CLOCAL/soft-carrier flag (out) */
+    { 0x541A /*TIOCSSOFTCAR*/, 4, 2, IOK_TTY },   /* set CLOCAL/soft-carrier flag (in) */
+    { 0x5420 /*TIOCPKT*/,      4, 2, IOK_TTY },   /* enable/disable pty packet mode (in: int); screen's OpenPTY needs it */
+    { 0x541B /*FIONREAD*/,   4, 1, IOK_FILE },
+    { 0x5421 /*FIONBIO*/,    4, 2, IOK_FILE },
+    { 0x5422 /*TIOCNOTTY*/,  0, 0, IOK_TTY },
+    { 0x5451 /*FIOCLEX*/,    0, 0, IOK_FD },
+    { 0x5450 /*FIONCLEX*/,   0, 0, IOK_FD },
+    { 0x80045430 /*TIOCGPTN*/, 4, 1, IOK_TTY },
+    { 0x40045431 /*TIOCSPTLCK*/, 4, 2, IOK_TTY },
+    { 0x5603 /*VT_GETSTATE*/, 6, 1, IOK_TTY },   /* struct vt_stat: 3 u16, out */
+    { 0x4b33 /*KDGKBTYPE*/,   1, 1, IOK_TTY },   /* char keyboard type, out; ENOTTY off a real VT */
 };
+
+/* ---- A policy that refuses an ioctl ahead of the file it is for ----
+ *
+ * Android's SELinux policy lists, per class of file, the ioctl commands an app
+ * may issue, and answers EACCES for the rest before the file's own handler is
+ * reached. On anything that is not a terminal it lists next to none of the
+ * terminal commands: on a pipe, a socket or a regular file every one but TCGETS
+ * (and a socket's TIOCGWINSZ) is EACCES, on a directory, a memfd or a /proc
+ * file TCGETS too, and on a memfd FIOCLEX/FIONCLEX besides. A kernel
+ * answers each of those terminal commands ENOTTY (a socket's SIOCOUTQ aside,
+ * which is no terminal command), so a guest asking tcgetpgrp(3) of a pipe --
+ * bash's job control does, to report why it has none -- was told "Permission
+ * denied" where it should read "Inappropriate ioctl for device", and isatty(3)
+ * of a /proc file failed with EACCES.
+ *
+ * No terminal is a pipe, a socket, a regular file or a directory, so a terminal
+ * command refused on one of those is answered ENOTTY: what the kernel would
+ * have said. A character or block device keeps the host's answer -- a driver
+ * decides what it says to a command it does not know (/dev/urandom: EINVAL),
+ * and a terminal is one. FIOCLEX and FIONCLEX set or clear close-on-exec on the
+ * descriptor, which is all a kernel does for them, and F_SETFD does the same
+ * thing unrefused. A64_TTYIOCTL_FORCE_DENY makes any host refuse the way the
+ * policy does on a memfd, on each of those four kinds of descriptor. */
+#define TC_FIOCLEX  0x5451u
+#define TC_FIONCLEX 0x5450u
+
+static int ttyio_force_deny = -1;     /* as tc2_host_lacks below: -1 = knob unread */
+
+/* Whether the descriptor is one no terminal can be: a pipe, a socket, a
+ * regular file or a directory. 0 when it cannot be told. */
+static int fd_never_tty(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
+           S_ISREG(st.st_mode) || S_ISDIR(st.st_mode);
+}
+
+/* The host's ioctl, for a command of `kind` -- or, with A64_TTYIOCTL_FORCE_DENY,
+ * the policy's EACCES. Only for a descriptor the command could reach at all:
+ * one that is not open, or open O_PATH, is the host's EBADF either way. */
+static int ioctl_host(int fd, u32 cmd, unsigned long arg, int kind) {
+    if (kind != IOK_FILE &&
+        PROBE_ONCE(ttyio_force_deny, getenv("A64_TTYIOCTL_FORCE_DENY") != NULL) > 0) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0 && !(fl & O_PATH) && fd_never_tty(fd)) {
+            errno = EACCES;
+            return -1;
+        }
+    }
+    return ioctl(fd, cmd, arg);
+}
+
+/* What the host's refusal (errno) is to the guest: see above. */
+static u64 ioctl_refused(int fd, u32 cmd, int kind) {
+    int e = errno;
+    if (e == EACCES && kind == IOK_FD) {
+        if (fcntl(fd, F_SETFD, cmd == TC_FIOCLEX ? FD_CLOEXEC : 0) < 0) return host_err();
+        return 0;
+    }
+    if (e == EACCES && kind == IOK_TTY && fd_never_tty(fd)) return (u64)(s64)-ENOTTY;
+    return (u64)(s64)-e;
+}
 
 /* ---- termios2: TCGETS2 / TCSETS2 / TCSETSW2 / TCSETSF2 ----
  *
@@ -3402,7 +3469,7 @@ static int tc2_host(int fd, u32 cmd, void *buf) {
         errno = EACCES;
         return -1;
     }
-    return ioctl(fd, cmd, buf);
+    return ioctl_host(fd, cmd, (unsigned long)buf, IOK_TTY);
 }
 
 static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
@@ -3418,7 +3485,8 @@ static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
         u32 cflag, ispeed = 0, ospeed = 0;
         u64 key = 0;
         if (!set) {
-            if (ioctl(fd, TC_GETS, buf) < 0) return host_err();
+            if (ioctl_host(fd, TC_GETS, (unsigned long)buf, IOK_TTY) < 0)
+                return ioctl_refused(fd, TC_GETS, IOK_TTY);
             memcpy(&cflag, buf + 8, 4);
             u32 ib = (cflag >> TC_IBSHIFT) & TC_CBAUD, ob = cflag & TC_CBAUD;
             u32 hi = 38400, ho = 38400;        /* a BOTHER nobody told us the number of */
@@ -3433,7 +3501,8 @@ static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
             memcpy(&ispeed, buf + 36, 4);
             memcpy(&ospeed, buf + 40, 4);
             u32 hcmd = TC_SETS + (cmd - TC_SETS2);          /* TCSETS, TCSETSW, TCSETSF */
-            if (ioctl(fd, hcmd, buf) < 0) return host_err();
+            if (ioctl_host(fd, hcmd, (unsigned long)buf, IOK_TTY) < 0)
+                return ioctl_refused(fd, hcmd, IOK_TTY);
             if (((cflag & TC_CBAUD) == TC_BOTHER ||
                  ((cflag >> TC_IBSHIFT) & TC_CBAUD) == TC_BOTHER) && (key = tc_key(fd)))
                 tc_shadow_put(key, ispeed, ospeed);
@@ -3473,15 +3542,17 @@ static u64 tty_tiocgsid(CPU *c, int fd, u64 gp) {
     s32 sid = 0;
     int ok = 0;
     if (!PROBE_ONCE(tsid_host_lacks, getenv("A64_TIOCGSID_FORCE_DENY") != NULL)) {
-        if (ioctl(fd, TC_GSID, &sid) == 0) ok = 1;
+        if (ioctl_host(fd, TC_GSID, (unsigned long)&sid, IOK_TTY) == 0) ok = 1;
         else if (errno != EACCES) return host_err();
     }
     if (!ok) {
         u8 probe[IOC_TERMIOS_SZ];
         s32 pg = 0;
         struct stat st;
-        if (ioctl(fd, TC_GETS, probe) < 0) return host_err();    /* no terminal */
-        if (ioctl(fd, TC_GPGRP, &pg) < 0) return host_err();     /* not the caller's */
+        if (ioctl_host(fd, TC_GETS, (unsigned long)probe, IOK_TTY) < 0)     /* no terminal */
+            return ioctl_refused(fd, TC_GETS, IOK_TTY);
+        if (ioctl_host(fd, TC_GPGRP, (unsigned long)&pg, IOK_TTY) < 0)      /* not the caller's */
+            return ioctl_refused(fd, TC_GPGRP, IOK_TTY);
         if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && tc_is_ptmx(st.st_rdev)) {
             if (pg <= 0 || (sid = sig_pgrp_session(pg)) < 0) return (u64)(s64)-ENOTTY;
         } else {
@@ -3709,8 +3780,8 @@ SYSDEF(ioctl) {
         return (u64)(s64)-ENOTTY;
     }
     if (e->size == 0) {
-        int r = ioctl((int)a0, cmd, (unsigned long)a2);
-        return r < 0 ? host_err() : (u64)r;
+        int r = ioctl_host((int)a0, cmd, (unsigned long)a2, e->kind);
+        return r < 0 ? ioctl_refused((int)a0, cmd, e->kind) : (u64)r;
     }
     u8 buf[256];
     if (e->size > sizeof buf) return (u64)(s64)-EINVAL;   /* table entry too big */
@@ -3723,8 +3794,8 @@ SYSDEF(ioctl) {
     memset(buf, 0, e->size);
     if (e->dir & 2)
         if (copy_from_guest(c, buf, a2, e->size) < 0) return (u64)(s64)-EFAULT;
-    int r = ioctl((int)a0, cmd, buf);
-    if (r < 0) return host_err();
+    int r = ioctl_host((int)a0, cmd, (unsigned long)buf, e->kind);
+    if (r < 0) return ioctl_refused((int)a0, cmd, e->kind);
     if (e->dir & 1)
         if (copy_to_guest(c, a2, buf, e->size) < 0) return (u64)(s64)-EFAULT;
     return (u64)r;
