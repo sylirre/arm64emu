@@ -3708,8 +3708,8 @@ static int pts_xchar(int fd, int start) {
 }
 
 /* `arg` is what the host was handed: the value for an int-argument command,
- * the emulator's buffer for the others. 1 and *ret when the refusal is
- * answered, 0 to keep it. */
+ * the emulator's buffer for the others (0 for an input the guest could not
+ * supply). 1 and *ret when the refusal is answered, 0 to keep it. */
 static int pts_refused(int fd, u32 cmd, unsigned long arg, u64 *ret) {
     int r;
     switch (cmd) {
@@ -3730,6 +3730,7 @@ static int pts_refused(int fd, u32 cmd, unsigned long arg, u64 *ret) {
     }
     case 0x541A: {                                        /* TIOCSSOFTCAR */
         s32 v;
+        if (!arg) { r = -EFAULT; break; }
         memcpy(&v, (const void *)arg, sizeof v);
         r = pts_softcar(fd, v != 0);
         break;
@@ -4000,9 +4001,13 @@ SYSDEF(ioctl) {
      * stack, the same disclosure shape as the SIMD-pair bug. Cold path; the
      * largest entry is a 44-byte termios2. */
     memset(buf, 0, e->size);
-    if (e->dir & 2)
-        if (copy_from_guest(c, buf, a2, e->size) < 0) return (u64)(s64)-EFAULT;
+    /* An argument the guest cannot supply goes to the host as an address no
+     * process has (0) rather than as an EFAULT of the emulator's own: the
+     * kernel reads it only after its own refusals -- ENOTTY from anything that
+     * is no terminal, EBADF for a descriptor that is not open, ENOTTY from a
+     * pty slave for its modem lines -- and says EFAULT itself where it does. */
     unsigned long harg = (unsigned long)buf;
+    if ((e->dir & 2) && copy_from_guest(c, buf, a2, e->size) < 0) harg = 0;
     int r = ioctl_host((int)a0, cmd, harg, e->kind);
     if (r < 0) {
         /* A refusal answered in the host's place may have filled `buf`

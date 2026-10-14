@@ -2824,6 +2824,13 @@ check_fixture ttynotty $'pipe_r: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\n
 check_fixture ptsioctl $'softcar_get0=0\nsoftcar_set1=0 errno=0\nsoftcar_now=1 clocal=1 master=1\nsoftcar_set0=0 errno=0\nsoftcar_now=0 clocal=0 master=0\nsoftcar_get_fault=-1 errno=14\nsoftcar_set_fault=-1 errno=14\ntcsbrk_drain=0 errno=0\ntcsbrk_break=0 errno=0\ntcsbrkp_0=0 errno=0\ntcsbrkp_2=0 errno=0\ntcxonc_on=0 errno=0\ntcxonc_bad=-1 errno=22\ntcxonc_wide=-1 errno=22\ntcflsh_wide=-1 errno=22\nbefore_xchar=none\ntcxonc_ioff=0 errno=0\nmaster_read=13\ntcxonc_ion=0 errno=0\nmaster_read=11\ntcxonc_ioff_disabled=0 errno=0\nmaster_read=none\nnotty_not_ctty=-1 errno=25\nslave_tty_core: TIOCMGET=25 TIOCMBIS=25 TIOCMBIC=25 TIOCMSET=25 TIOCPKT=25 TIOCGPTN=25 TIOCSPTLCK=25 VT_GETSTATE=25 KDGKBTYPE=25\noutq_slave=0 errno=0 n=0\noutq_master=0 errno=0 n=0\noutq_pipe=-1 errno=25\noutq_sock=0 errno=0 queued=1\noutq_sock_read=0 errno=0 n=0\noutq_sock_fault=-1 errno=14\nnetlink_fionread=-1 errno=25\nnetlink_outq=-1 errno=25\nbg_ignored: tcsbrk=0/0 tcxonc=0/0 softcar=0/0\nbg_default: softcar=0/0\nbg_default: tcsbrk stopped SIGTTOU\norphaned: tcsbrk=-1/5 tcxonc=-1/5\ndone' \
     "A64_TTYIOCTL_FORCE_DENY=1" "denied tier" \
     "A64_NETLINK_FORCE_BLOCK=1" "netlink-blocked tier"
+# An ioctl whose argument cannot be read: EBADF, or ENOTTY from a file that
+# does not take the command, ahead of the EFAULT the emulator used to answer
+# first; EFAULT where the kernel does read or write it. Gated on the host
+# reading the argument late (qemu-user does not). Self-checking; the expected
+# output is a real kernel's.
+check_fixture ioctlorder $'pipe_tcsets=-1 errno=25\npipe_tiocswinsz=-1 errno=25\npipe_tiocspgrp=-1 errno=25\nsock_tcsets=-1 errno=25\nclosed_tcsets=-1 errno=9\nclosed_fionbio=-1 errno=9\nopath_tcsets=-1 errno=9\nslave_tiocmset=-1 errno=25\nslave_tiocmbis=-1 errno=25\nslave_tiocpkt=-1 errno=25\nslave_tiocsptlck=-1 errno=25\nslave_tcsets=-1 errno=14\nslave_tiocswinsz=-1 errno=14\nslave_tiocssoftcar=-1 errno=14\nmaster_tiocpkt=-1 errno=14\npipe_fionbio=-1 errno=14\npipe_tcgets=-1 errno=25\nslave_tcgets=-1 errno=14\nslave_tiocgsoftcar=-1 errno=14\nsock_tiocoutq=-1 errno=14\ndone' \
+    "A64_TTYIOCTL_FORCE_DENY=1" "denied tier"
 # AT_EXECFN and comm: the path execve was GIVEN, not the one it resolved to.
 # Through a symlink, a relative path or a script a kernel keeps the name as
 # written; the emulator reported the resolved file's, and uutils' coreutils

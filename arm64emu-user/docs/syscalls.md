@@ -193,6 +193,12 @@ is not the oracle for most, so the expected block is a native run's):
   takes such a word as valid, and wrapped, `TCFLSH 0x100000000` would have
   flushed the input queue and `TCXONC 0x100000001` restarted output
   (`TIOCSCTTY` wraps, as its kernel handler reads an int).
+- An ioctl's input argument the guest cannot supply reaches the host as address
+  0 instead of being answered `EFAULT` up front: the kernel reads it only once
+  the file has taken the command, after `EBADF` (not open, `O_PATH`) and the
+  file's own `ENOTTY`, and says `EFAULT` itself where it does read it
+  (`tests/fixtures/ioctlorder.c`; `qemu-user` locks the argument first, hence
+  its `ioctl-ptr-late` gate).
 - `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
 
 ## Struct marshalling: always convert

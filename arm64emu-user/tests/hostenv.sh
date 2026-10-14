@@ -614,6 +614,12 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #                   ioctl table has no entry for it and answers ENOTTY for a
 #                   tty that is there. (A policy that refuses the ioctl on a
 #                   pty is a different answer, EACCES, and not asked here.)
+#   ioctl-ptr-late  an ioctl's argument is read only once the file has taken
+#                   the command, so a terminal command with an unreadable
+#                   argument on a pipe is ENOTTY; qemu-user locks the argument
+#                   in its own memory first and answers EFAULT for it. The
+#                   emulator hands its host such an argument as it stands
+#                   (sys_file.c, SYSDEF(ioctl)) for the kernel to decide.
 #
 # One more names not an interposer's defect but a host kernel's vintage, since
 # the emulator answers the guest by asking the host to do the same thing:
@@ -959,6 +965,17 @@ int main(void) {
     wide[3000 / bits] |= 1UL << (3000 % bits);
     long r = syscall(SYS_pselect6, 3001, wide, (void *)0, (void *)0, (void *)0, (void *)0);
     return !(r == 1 && ((wide[3000 / bits] >> (3000 % bits)) & 1));
+}
+EOF
+        ;;
+    ioctl-ptr-late) cat <<'EOF'
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+int main(void) {
+    int p[2];
+    if (pipe(p)) return 0;
+    return !(ioctl(p[0], 0x5402UL /*TCSETS*/, (void *)0) < 0 && errno == ENOTTY);
 }
 EOF
         ;;
