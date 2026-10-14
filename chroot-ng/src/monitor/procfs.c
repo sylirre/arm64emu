@@ -222,7 +222,14 @@ static void put_mounts(int fd, int fmt) {
     char rootbuf[CNG_PATH_MAX];
     int nb;
     /* The snapshot is static (50 KiB, more than a stack here should carry)
-     * and so is taken one reader at a time. */
+     * and so is taken one reader at a time — with every signal blocked until
+     * it is given back, as the view's writer does (path.c). On the -R tier the
+     * dispatcher runs on the guest's own mask, so a guest handler delivered
+     * here, on the way out of any syscall the emission makes, that opened a
+     * mount table itself waited for the snapshot its own thread held: forever,
+     * since the takeover below is only for a holder that is gone. */
+    unsigned long all = ~0UL, mask;
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &all, &mask, 8, 0, 0);
     long me = sys_gettid();
     for (int spin = 0;; spin++) {
         long none = 0;
@@ -337,6 +344,7 @@ static void put_mounts(int fd, int fmt) {
                         fstype, binds[i].ro ? "ro" : "rw");
     }
     __atomic_store_n(&snap_owner, 0, __ATOMIC_RELEASE);
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
 }
 
 /* ---- loadavg / uptime / stat -------------------------------------------- */

@@ -3681,6 +3681,30 @@ vfork/`posix_spawn` child-stack handling.
     m27 runs outside the monitor, and only the forced rows are judged where it
     says `broken`.
 
+- [x] **M81 — a mount table opened from a signal handler hung under -R**
+  `/proc/mounts`, `/proc/self/mountinfo` and `mountstats` are emitted from a
+  50 KiB snapshot of the view kept in one static buffer, so it is taken one
+  reader at a time, by thread id. The holder is taken over only when it is
+  gone (killed by de_thread mid-table, or the thread a fork child inherited it
+  from), and nothing blocked signals while it was held. On the `-R` tier the
+  dispatcher runs on the guest's own signal mask, and a signal is delivered
+  on the way out of any syscall the emission makes (each bind's `stat`, each
+  row's `write`): a handler that opened a mount table itself then waited for
+  the snapshot its own live thread held, forever. The SIGSYS tier was never
+  exposed — its handler runs with every signal but SIGSYS masked. Found by an
+  audit.
+  - The snapshot is held with every signal blocked, the way the view's and
+    the credentials' writers already hold theirs (path.c, cred.c); a signal
+    that arrives meanwhile is taken once the table is written. A per-call
+    buffer was the alternative, and a re-entrant lock is not one: the nested
+    reader would rewrite the snapshot under the outer one's emission.
+  - Test: `tests/guests/mntsig.c` (m11, `-R`) reads `/proc/self/mountinfo` in
+    a loop, arming before each read a one-shot timer whose handler reads it
+    too, the delay swept across the time one read takes; every read must be
+    the first one's table. The previous build hangs in every run. An interval
+    timer was the first try, and it starved the loop wherever a read takes
+    longer than the interval — natively on a TCG VM, with no chroot-ng at all.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

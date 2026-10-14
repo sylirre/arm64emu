@@ -268,6 +268,22 @@ else
 fi
 rm -rf "$PR_ROOT"
 
+# The mount tables are emitted from one static snapshot of the view, held by
+# thread id. Under -R the dispatcher runs on the guest's signal mask, so a
+# handler that interrupted the emission and opened a mount table itself waited
+# for the snapshot its own thread held: the previous build hangs here in every
+# run. An interval timer interrupts a loop of mountinfo reads, and the handler
+# reads it too; every read must be the same table.
+MS_ROOT=$(mktemp -d)
+if guest_xlate_ready "mount table from a signal handler leg" &&
+    guest_cc_report "$MS_ROOT/mntsig" tests/guests/mntsig.c; then
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    out=$(run_t 60 -R $GUEST_BINDS "$MS_ROOT" /mntsig 2>&1)
+    check_contains "a mount table opened from a handler that interrupted another" \
+        "mntsig: handled>0=1 bad=0" "$out"
+fi
+rm -rf "$MS_ROOT"
+
 # A /proc number spelled with a leading zero is no name at all to procfs
 # (name_to_int), so "/proc/self/fd/05" and "/proc/0<pid>/exe" are ENOENT
 # whatever descriptor 5 and process <pid> are. Where the monitor answers such a
