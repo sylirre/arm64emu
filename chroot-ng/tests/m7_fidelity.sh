@@ -180,6 +180,13 @@ check_contains "l2s links of the emulation's own file join the group" \
 # listed first, and were all there was once the real marker was gone.
 check_contains "l2s reads a group's count from its own marker only" \
     "l2s-marker: two=1 lost=1 three=1 gone=1 strays=1 -> OK" "$out"
+# A first link swaps the file into the store and a symlink into its name in one
+# renameat2 exchange, so the name is never missing; where renameat2 cannot be
+# issued it is a rename and then the symlink. Either way a link that cannot be
+# made puts the file back as it was, and one that can leaves the data the
+# file's own inode (M10's race leg drives the exchange against real readers).
+check_contains "l2s first link moves the file by exchange, or in two steps" \
+    "l2s-swap: exchange=1 two_steps=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

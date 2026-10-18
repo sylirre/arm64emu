@@ -82,13 +82,14 @@ void cng_unpin(struct cng_pin *p);
 
 /* The dirfd-free conveniences: one syscall on a host path, race-free. Each
  * answers what the syscall answers. The atflags of the stat forms and the
- * flags of the open are the caller's; the NOFOLLOW is added here. */
+ * flags of the open and the rename are the caller's; the NOFOLLOW is added
+ * here. */
 long cng_pin_open(const char *host, long flags, long mode);
 long cng_pin_fstatat(const char *host, void *st, int atflags);
 long cng_pin_statx(const char *host, int atflags, unsigned mask, void *sx);
 long cng_pin_readlink(const char *host, char *buf, size_t n);
 long cng_pin_symlink(const char *target, const char *host);
-long cng_pin_rename(const char *from, const char *to);
+long cng_pin_rename(const char *from, const char *to, unsigned flags);
 long cng_pin_unlink(const char *host, int flags);
 long cng_pin_mkdir(const char *host, int mode);
 

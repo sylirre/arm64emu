@@ -218,6 +218,25 @@ if [ "$m10_ready" -eq 1 ] && guest_xlate_ready "l2s raw-dirent leg" &&
     rm -rf "$RO" "$REM"
 fi
 
+# First links of one file, made at once. A first link moves the file into the
+# store and leaves a symlink in its name. Made unlocked, two at once lost the
+# file (the later moved the earlier's symlink over the data), a linker that
+# found the symlink, or no name at all between the rename and the symlink,
+# failed, and a reader saw the name missing or drew ELOOP on it. Eight linkers
+# and a reader per round: with real hardlinks every count is 0, so the kernel's
+# answer is known and no oracle is needed.
+if guest_xlate_ready "l2s first-link race leg" &&
+    guest_cc_report "$CNG_TMP/l2srace" tests/guests/l2srace.c; then
+    R=$(mktemp -d)
+    mkdir -p "$R/bin" "$R/w"
+    cp "$CNG_TMP/l2srace" "$R/bin/l2srace"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 300 $GUEST_BINDS -R -l "$R" /bin/l2srace /w 30 2>/dev/null)
+    check_contains "m10 first links at once: none fails or loses the file, no reader sees it go" \
+        "linkfail=0 miss=0 lost=0 nlinkbad=0 inobad=0" "$out"
+    rm -rf "$R"
+fi
+
 # Debian leg: glibc + GNU coreutils/findutils (`find -samefile`, GNU stat).
 # Gated on a smoke test proving translation is live — a dynamic-glibc guest
 # under -R + qemu can silently run untranslated (ld.so-loaded libc.so has no

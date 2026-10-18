@@ -4407,6 +4407,61 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 m_two, m_lost, m_three, m_gone, m_strays, ok_m ? "OK" : "FAIL");
     fails += !ok_m;
 
+    /* A first link moves the file into the store and leaves a symlink in its
+     * name, by exchanging the two names in one renameat2 (no instant where
+     * the name is missing); where renameat2 cannot be issued, by a rename
+     * and then the symlink. Each way: a link whose new name cannot be made
+     * (no such directory) puts the file back under its name, a plain file
+     * again with nothing left in the store; a link that can be made leaves
+     * the name a symlink to the data file, which keeps the file's inode. */
+    int sw_ok[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        cng_blocked[__NR_renameat2] = (unsigned char)k;
+        char gs[16], gd[16], hs[CNG_PATH_MAX], hdat[CNG_PATH_MAX];
+        char shs[144], shd[144], sgd[144];
+        cng_strlcpy(gs, "/w/s0", sizeof gs);
+        gs[4] = (char)('0' + k);
+        cng_strlcpy(gd, gs, sizeof gd);
+        cng_strlcpy(gd + 5, "l", sizeof gd - 5);
+        long sf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gs,
+                               CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (sf >= 0) {
+            sys_write((int)sf, "sw", 2);
+            sys_close((int)sf);
+        }
+        dbg_mkpath(hs, sizeof hs, rootfs, gs, 0, 0);
+        unsigned long long sino = 0;
+        if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hs, shs,
+                    CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0)
+            sino = ST_INO(shs);
+        dbg_mkpath(hdat, sizeof hdat, rootfs, "/.l2s/.l2s.", sino, 1);
+        long nodir = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gs,
+                                  CNG_AT_FDCWD, (long)"/w/nodir/x", 0, 0, 0);
+        int back = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hs, shs,
+                           CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                   ST_ISREG(shs) && ST_INO(shs) == sino &&
+                   CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hdat, shd,
+                           CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT;
+        long sl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gs,
+                               CNG_AT_FDCWD, (long)gd, 0, 0, 0);
+        int moved = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hs, shs,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                    (ST_MODE(shs) & 0170000) == 0120000 &&
+                    CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hdat, shd,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                    ST_ISREG(shd) && ST_INO(shd) == sino;
+        int grp = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)gd,
+                               (long)sgd, 0, 0, 0, 0) == 0 &&
+                  ST_NLINK(sgd) == 2 && ST_INO(sgd) == sino;
+        sw_ok[k] = sino && nodir == -ENOENT && back && sl == 0 && moved && grp;
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gs, 0, 0, 0, 0, 0);
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gd, 0, 0, 0, 0, 0);
+    }
+    cng_blocked[__NR_renameat2] = 0;
+    cng_dprintf(1, "l2s-swap: exchange=%d two_steps=%d -> %s\n", sw_ok[0],
+                sw_ok[1], sw_ok[0] && sw_ok[1] ? "OK" : "FAIL");
+    fails += !(sw_ok[0] && sw_ok[1]);
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

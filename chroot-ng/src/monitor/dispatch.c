@@ -4026,6 +4026,13 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (r == -ELOOP && is_open && (oflags & CNG_O_NOFOLLOW) &&
             l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
             r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, nr);
+        /* A followed open draws it too, where the name the walk took for a file
+         * became an l2s link before the kernel was handed it: a first link of
+         * that file, made at the same moment (the pin refuses a final link the
+         * walk never saw). Following the link is opening its backing file. */
+        else if (r == -ELOOP && is_open && deref && cng_g_l2s &&
+                 cng_l2s_resolve(p, l2d, sizeof l2d, 0) == 1)
+            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, nr);
         if ((r == -EACCES || r == -EPERM) && nr == __NR_openat)
             r = cng_fd_reopen(p, a2, a3, r);
         return r;

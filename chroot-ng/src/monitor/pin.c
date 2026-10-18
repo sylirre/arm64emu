@@ -351,14 +351,17 @@ long cng_pin_symlink(const char *target, const char *host) {
     return r;
 }
 
-long cng_pin_rename(const char *from, const char *to) {
+long cng_pin_rename(const char *from, const char *to, unsigned flags) {
     struct cng_pin a, b;
     long r = cng_pin_at(CNG_AT_FDCWD, from, &a);
     if (r == 0) {
         r = cng_pin_at(CNG_AT_FDCWD, to, &b);
+        /* renameat2 only for flags: a host can lack it and have renameat. */
         if (r == 0)
-            r = CNG_SYS(__NR_renameat, a.dfd, (long)a.name, b.dfd, (long)b.name,
-                        0, 0);
+            r = flags ? CNG_SYS(__NR_renameat2, a.dfd, (long)a.name, b.dfd,
+                                (long)b.name, flags, 0)
+                      : CNG_SYS(__NR_renameat, a.dfd, (long)a.name, b.dfd,
+                                (long)b.name, 0, 0);
         cng_unpin(&b);
     }
     cng_unpin(&a);
