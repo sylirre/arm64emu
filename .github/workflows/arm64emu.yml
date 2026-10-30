@@ -46,9 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # clang + llvm           -> the asm tests' assembler (--target=aarch64-elf)
-      #                           and llvm-objcopy for their flat images
-      # lld, libc6-dev-arm64-cross, qemu-user
+      # gcc-aarch64-linux-gnu  -> the asm tests' assembler and linker (run_tests.sh
+      #                           prefers it to clang), and the GCC installation
+      #                           (crtbeginT.o, libgcc) clang's static aarch64
+      #                           link below needs
+      # clang, lld, llvm, libc6-dev-arm64-cross, qemu-user
       #                        -> the static aarch64 build of the emulator that
       #                           test-arm64emu-jit-a64 runs under qemu-user:
       #                           the only place the AArch64 JIT backend runs
@@ -57,7 +59,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld llvm libc6-dev-arm64-cross qemu-user
+            gcc-aarch64-linux-gnu clang lld llvm libc6-dev-arm64-cross qemu-user
 
       - name: Build
         run: make arm64emu
