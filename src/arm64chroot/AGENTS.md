@@ -70,13 +70,13 @@ full on real armv7 silicon.
 Makefile                             (repository root) `make arm64chroot` -> build/arm64chroot; also arm64chroot32 (ILP32 host) and arm64chroot_asim (Android behavior)
 lib/arm64/                           Shared with arm64emu (compiled into both):
   types.h cpu.h                      Fixed-width types; CPU state + core interpreter API
+  decode.c                           A64 decoder/executor (+ LSE atomics, host-atomic exclusives under ARM64_SMP)
   sysreg.h sysreg.c                  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers (sysreg_id_read), what EL0 may run
   esr.h                              ESR exception classes + syndrome construction
   exec_fpsimd.c                      FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
-  arm64_config.h                     How lib/arm64 is built here: ARM64_SYSTEM 0 (user mode, the guest stays at EL0)
+  arm64_config.h                     How lib/arm64 is built here: ARM64_SYSTEM 0 (user mode, the guest stays at EL0), ARM64_SMP 1 (guest threads run concurrently)
   core/                              The user-mode variant of the rest of arm64emu's core, kept diffable against src/arm64emu until merged into lib/arm64:
-    decode.c                         A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
     cpu.c                            Step driver, reset, condition codes, debug dump
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
@@ -122,7 +122,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the code and documentation (`docs/arm64chroot/`).
 * Keep in sync the file structure in design section of `docs/arm64chroot/README.md` and structure section of this file.
 * New implemented syscalls must also be defined in `src/arm64chroot/strace.c` argdefs, so they can be decoded by `--strace-full`.
-* The decoder, the step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
+* The step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
 
 ## Testing
 

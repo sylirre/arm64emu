@@ -1,7 +1,12 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* A64 instruction decoder/executor — integer/branch/load-store (M1).
- * FP/SIMD lives in exec_fpsimd.c (M4). System regs in sysreg.c (M2). */
+ * FP/SIMD lives in exec_fpsimd.c (M4). System regs in sysreg.c (M2).
+ * Shared by both emulators; what differs between them is selected by the
+ * program's arm64_config.h: ARM64_SYSTEM (the EL1-only checks and traps,
+ * which fold away in user mode) and ARM64_SMP (host-atomic LSE, exclusives,
+ * LDAR/STLR and barriers where guest threads run concurrently). Guest memory
+ * is reached through the program's mmu.h. */
 #include "cpu.h"
 #include <string.h>
 #include "mmu.h"
@@ -12,7 +17,19 @@
 /* FP/SIMD group hook (M4), implemented in exec_fpsimd.c. */
 void exec_fpsimd(CPU *c, u32 insn);
 
-static void __attribute__((cold)) undefined(CPU *c, u32 insn) {
+#if ARM64_SYSTEM
+/* SCTLR_EL1.nTWI/nTWE: 0 traps an EL0 WFI/WFE that would wait. */
+#define SCTLR_nTWI (1ULL << 16)
+#define SCTLR_nTWE (1ULL << 18)
+
+/* The trap of an EL0 WFI (ti 0) or WFE (ti 1) to EL1: EC 0x01, with
+ * CV=1 and COND=0b1110 (unconditional) and TI in ISS[1:0]. */
+__attribute__((cold)) static void wfx_trap(CPU *c, unsigned ti) {
+    cpu_raise_sync(c, esr_make(EC_WFx, (1u << 24) | (0xEu << 20) | ti), 0);
+}
+#endif
+
+__attribute__((cold)) static void undefined(CPU *c, u32 insn) {
     /* Architecturally an UNDEFINED instruction takes a synchronous exception
      * with EC_UNKNOWN. During bring-up we also log it. */
     if (g_trace)
@@ -21,8 +38,77 @@ static void __attribute__((cold)) undefined(CPU *c, u32 insn) {
     cpu_raise_sync(c, esr_make(EC_UNKNOWN, 0), 0);
 }
 
+#if ARM64_SYSTEM
+/* CPACR_EL1.FPEN guard, one call per FP/SIMD dispatch point (data-processing
+ * and every vector load/store family). Raises the EC 0x07 access trap and
+ * returns false when the current EL's FP access is trapped. It runs before
+ * the fine-grained decode, so an unallocated FP-space encoding traps 0x07
+ * rather than UNDEF while trapping is active — unobservable for real guests
+ * (trapping is off out of reset). */
+static inline bool fp_access_ok(CPU *c) {
+    if (__builtin_expect(!c->fp_trapped, 1)) return true;
+    cpu_fp_trap(c);
+    return false;
+}
+#else
+/* User mode: the guest runs at EL0 under the FPEN Linux gives a process (see
+ * sysreg_init), so its FP/SIMD accesses never trap. */
+static inline bool fp_access_ok(CPU *c) { (void)c; return true; }
+#endif
+
+/* The unprivileged loads and stores (LDTR/STTR, SETxT, CPYxRT/WT) at EL1
+ * access memory with EL0's permissions: c->ldst_unpriv, which arm64emu's MMU
+ * reads, is set across each such access. At EL0 they are the plain forms, and
+ * arm64chroot's guest is always at EL0, so there both fold away. */
+#if ARM64_SYSTEM
+#define unpriv_at_el1(c, t)   ((t) && (c)->el == 1)
+#define set_ldst_unpriv(c, v) ((c)->ldst_unpriv = (v))
+#else
+#define unpriv_at_el1(c, t)   ((void)(c), (void)(t), false)
+#define set_ldst_unpriv(c, v) ((void)(c), (void)(v))
+#endif
+
 /* ---------- arithmetic helpers ---------- */
 
+/* add_with_carry has two shapes, one per program. arm64emu's computes NZCV
+ * unconditionally, with __int128 for the 64-bit carry and overflow, and throws
+ * it away when `flags` is NULL, the common non-S case (plain ADD/SUB). That is
+ * deliberate, and it was measured (2026-08-04): `flags` is a runtime value at
+ * every call site -- `S ? &fl : NULL` -- so neither compiler sinks the math
+ * into the store, but hoisting it into an explicit `if (flags)` (arm64chroot's
+ * shape) makes arm64emu's default gcc build SLOWER: on a 300M-instruction
+ * interpreted ADD loop, 8.27s -> 9.07s with gcc-13, against 6.91s -> 6.54s with
+ * clang. Whole-boot timings could not resolve either direction above the
+ * noise. arm64chroot keeps the hoisted shape, which also does without __int128
+ * for its 32-bit hosts. Static instruction counts predict the opposite of all
+ * of this and should not be trusted here. Re-measure both compilers, in both
+ * programs, before changing either shape. */
+#if ARM64_SYSTEM
+static u64 add_with_carry(u64 x, u64 y, int cin, bool is64, u32 *flags) {
+    u64 res;
+    u32 N, Z, C, V;
+    if (is64) {
+        unsigned __int128 u = (unsigned __int128)x + (unsigned __int128)y + (unsigned)cin;
+        res = (u64)u;
+        C = (u32)((u >> 64) & 1);
+        __int128 s = (__int128)(s64)x + (__int128)(s64)y + cin;
+        V = ((__int128)(s64)res != s);
+        N = (u32)(res >> 63);
+        Z = (res == 0);
+    } else {
+        u32 xx = (u32)x, yy = (u32)y;
+        u64 u = (u64)xx + (u64)yy + (unsigned)cin;
+        res = (u32)u;
+        C = (u32)((u >> 32) & 1);
+        s64 s = (s64)(s32)xx + (s64)(s32)yy + cin;
+        V = ((s64)(s32)(u32)res != s);
+        N = (u32)((u32)res >> 31);
+        Z = ((u32)res == 0);
+    }
+    if (flags) *flags = (N ? PS_N : 0) | (Z ? PS_Z : 0) | (C ? PS_C : 0) | (V ? PS_V : 0);
+    return res;
+}
+#else
 static u64 add_with_carry(u64 x, u64 y, int cin, bool is64, u32 *flags) {
     u64 res;
     if (is64) {
@@ -51,6 +137,7 @@ static u64 add_with_carry(u64 x, u64 y, int cin, bool is64, u32 *flags) {
     }
     return res;
 }
+#endif
 
 static void set_logical_flags(CPU *c, u64 res, bool is64) {
     u32 f = 0;
@@ -77,8 +164,9 @@ static u64 shift_reg(u64 v, unsigned type, unsigned amount, bool is64) {
  * 0x82F63B78 for CRC32C). Matches the hardware instruction the kernel uses.
  * Slicing-by-8 (lazily built 8x256 tables per polynomial): CRC32X consumes
  * its 8 bytes in one combined lookup instead of 64 bit-steps — ext4/btrfs
- * metadata checksumming leans on this, and the JIT leaves CRC32 to this
- * helper (predecode marks the family GENERIC), so it is an all-tier win. */
+ * metadata checksumming leans on this, and every engine executes CRC32
+ * through this helper (predecode leaves the family GENERIC), so it is an
+ * all-tier win. */
 static void crc32_tab_init(u32 t[8][256], u32 poly) {
     for (unsigned i = 0; i < 256; i++) {
         u32 c = i;
@@ -204,7 +292,7 @@ static void dp_immediate(CPU *c, u32 insn) {
         if (sh) imm <<= 12;
         u64 n = reg_xsp(c, Rn);
         u32 fl;
-        u32 *flp = S ? &fl : NULL;         /* #9: skip NZCV math when discarded */
+        u32 *flp = S ? &fl : NULL;         /* NULL: NZCV not wanted */
         u64 r = op ? add_with_carry(n, ~imm, 1, sf, flp)
                    : add_with_carry(n, imm, 0, sf, flp);
         if (S) { c->nzcv = fl; set_x_sz(c, Rd, sf, r); }
@@ -311,6 +399,9 @@ static void dp_register(CPU *c, u32 insn) {
         u64 op2, n; u32 fl;
         if (ext) {                                 /* add/sub extended register */
             unsigned option = BITS(15, 13), imm3 = BITS(12, 10);
+            /* shift amount 5-7 is unallocated, and bits[23:22] (opt) are RES0
+             * for the extended-register form — a nonzero opt was decoded as a
+             * plain extended add/sub. */
             if (imm3 > 4 || BITS(23, 22) != 0) { undefined(c, insn); return; }
             op2 = extend_reg(reg_x(c, Rm), option, imm3);
             n = reg_xsp(c, Rn);
@@ -321,7 +412,7 @@ static void dp_register(CPU *c, u32 insn) {
             op2 = shift_reg(reg_x(c, Rm), shift, imm6, sf);
             n = reg_x(c, Rn);
         }
-        u32 *flp = S ? &fl : NULL;             /* #9: skip NZCV math when discarded */
+        u32 *flp = S ? &fl : NULL;         /* NULL: NZCV not wanted */
         u64 r = op ? add_with_carry(n, ~op2, 1, sf, flp)
                    : add_with_carry(n, op2, 0, sf, flp);
         if (S) { c->nzcv = fl; set_x_sz(c, Rd, sf, r); }
@@ -356,7 +447,7 @@ static void dp_register(CPU *c, u32 insn) {
             if (BITS(15, 10) == 0) {               /* add/sub with carry */
                 bool op = BIT(30), S = BIT(29);
                 u32 fl;
-                u32 *flp = S ? &fl : NULL;    /* #9: skip NZCV math when discarded */
+                u32 *flp = S ? &fl : NULL; /* NULL: NZCV not wanted */
                 int cin = (c->nzcv & PS_C) ? 1 : 0;
                 u64 m = reg_x(c, Rm), n = reg_x(c, Rn);
                 u64 r = op ? add_with_carry(n, ~m, cin, sf, flp)
@@ -393,6 +484,8 @@ static void dp_register(CPU *c, u32 insn) {
             return;
         }
         if (op21 == 0xd2) {                        /* conditional compare */
+            /* S (bit29) must be 1 — CCMP/CCMN always write NZCV — and bit10
+             * (o2) and bit4 (o3) are RES0. */
             if (!BIT(29) || BIT(10) || BIT(4)) { undefined(c, insn); return; }
             bool op = BIT(30);
             unsigned cond = BITS(15, 12), nzcv = BITS(3, 0);
@@ -411,6 +504,8 @@ static void dp_register(CPU *c, u32 insn) {
             return;
         }
         if (op21 == 0xd4) {                        /* conditional select */
+            /* S (bit29) must be 0 — the family never writes NZCV — and bit11
+             * is RES0 (only bit10 selects the increment/invert variant). */
             if (BIT(29) || BIT(11)) { undefined(c, insn); return; }
             bool op = BIT(30), o2 = BIT(10);
             unsigned cond = BITS(15, 12);
@@ -550,6 +645,9 @@ static bool vreg_store(CPU *c, unsigned Vt, u64 va, unsigned bytes) {
     return mem_write(c, va, bytes, c->v[Vt].d[0]);
 }
 
+/* Two implementations: host atomics where guest threads run concurrently
+ * (ARM64_SMP, arm64chroot), plain read-modify-writes on one CPU (arm64emu). */
+#if ARM64_SMP
 /* ============ ARMv8.1-A LSE atomics (contiguous addition) ============
  * Atomic memory operations (LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/
  * LDUMIN and SWP) plus Compare-and-Swap (CAS/CASP). Modern glibc selects these
@@ -715,12 +813,125 @@ static void ldst_casp(CPU *c, u32 insn) {
 #endif
     }
 }
+#else
+/* ============ ARMv8.1-A LSE atomics ============
+ * Atomic memory operations (LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/
+ * LDUMIN and SWP) plus Compare-and-Swap (CAS/CASP) and LDAPR. Modern glibc
+ * selects these via HWCAP_ATOMICS; -march=armv8.1-a+ code uses them
+ * unconditionally. The ARM64_SMP host-__atomic implementation above,
+ * simplified for a single in-order CPU: a plain read-modify-
+ * write through the MMU is architecturally atomic here, and the A/R
+ * acquire/release bits need no fences. A fault from either access aborts
+ * the whole instruction with no register update (mem_read/mem_write raise
+ * the data abort). Alignment is not checked, matching the exclusives below;
+ * the compare-fail path of CAS skips the architectural write-permission
+ * check (documented laxity, same family as TODO_OPCODES §5). */
+
+static void ldst_atomic(CPU *c, u32 insn) {
+    unsigned size = BITS(31, 30);
+    unsigned Rs = BITS(20, 16), o3 = BIT(15), opc = BITS(14, 12);
+    unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
+    unsigned bytes = 1u << size, esize = 8u * bytes;
+    u64 va = reg_xsp(c, Rn);
+
+    /* o3==1 is SWP (opc==0) or LDAPR (opc==4); other opc are LD<op>. */
+    if (o3 && opc != 0) {
+        if (opc == 4) {                          /* LDAPR: load-acquire RCpc */
+            u64 v;
+            if (mem_read(c, va, bytes, &v)) set_x(c, Rt, v);
+            return;
+        }
+        undefined(c, insn);
+        return;
+    }
+
+    u64 emask = (bytes == 8) ? ~0ULL : ((1ULL << esize) - 1);
+    u64 operand = reg_x(c, Rs) & emask, old, res;
+    if (!mem_read(c, va, bytes, &old)) return;
+    if (o3) {
+        res = operand;                                            /* SWP */
+    } else {
+        s64 so = (s64)sign_extend(old, esize), sn = (s64)sign_extend(operand, esize);
+        switch (opc) {
+            case 0: res = old + operand; break;                   /* LDADD  */
+            case 1: res = old & ~operand; break;                  /* LDCLR  */
+            case 2: res = old ^ operand; break;                   /* LDEOR  */
+            case 3: res = old | operand; break;                   /* LDSET  */
+            case 4: res = (so > sn) ? old : operand; break;       /* LDSMAX */
+            case 5: res = (so < sn) ? old : operand; break;       /* LDSMIN */
+            case 6: res = (old > operand) ? old : operand; break; /* LDUMAX */
+            default: res = (old < operand) ? old : operand; break;/* LDUMIN */
+        }
+    }
+    if (!mem_write(c, va, bytes, res & emask)) return;
+    set_x(c, Rt, old);   /* ST<op> forms use Rt==31 and discard */
+}
+
+/* CAS/CASA/CASL/CASAL: compare Rs, swap Rt, return old in Rs. */
+static void ldst_cas(CPU *c, u32 insn) {
+    unsigned size = BITS(31, 30);
+    unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
+    unsigned bytes = 1u << size;
+    u64 emask = (bytes == 8) ? ~0ULL : ((1ULL << (8u * bytes)) - 1);
+    u64 va = reg_xsp(c, Rn), old;
+    if (!mem_read(c, va, bytes, &old)) return;
+    if (old == (reg_x(c, Rs) & emask)) {
+        if (!mem_write(c, va, bytes, reg_x(c, Rt) & emask)) return;
+    }
+    set_x(c, Rs, old);
+}
+
+/* CASP/CASPA/CASPL/CASPAL: 2-register compare-and-swap (Rs:Rs+1 vs Rt:Rt+1).
+ * sz bit30: 0=two 32-bit words (8-byte total), 1=two 64-bit (16-byte). The
+ * pair is naturally aligned, so it never crosses a page: once the first
+ * write succeeds the second cannot fault. */
+static void ldst_casp(CPU *c, u32 insn) {
+    bool sz = BIT(30);
+    unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
+    unsigned bytes = sz ? 8 : 4;
+    u64 emask = sz ? ~0ULL : 0xffffffffULL;
+    u64 va = reg_xsp(c, Rn), lo, hi;
+    if (!mem_read(c, va, bytes, &lo)) return;
+    if (!mem_read(c, va + bytes, bytes, &hi)) return;
+    if (lo == (reg_x(c, Rs) & emask) && hi == (reg_x(c, Rs + 1) & emask)) {
+        if (!mem_write(c, va, bytes, reg_x(c, Rt) & emask)) return;
+        if (!mem_write(c, va + bytes, bytes, reg_x(c, Rt + 1) & emask)) return;
+    }
+    set_x(c, Rs, lo);
+    set_x(c, Rs + 1, hi);
+}
+#endif
 /* ============ end LSE atomics ============ */
 
+#if ARM64_SYSTEM
+/* CheckSPAlignment (SCTLR_EL1.SA/SA0): when SP is the base register of a memory
+ * access and the check is enabled for the current EL, SP must be 16-byte
+ * aligned, else the access takes an SP-alignment fault (EC 0x26). Returns true
+ * if the access may proceed; false after raising the fault. Called before the
+ * access and any base writeback, matching the architecture's per-instruction
+ * check. */
+static bool sp_align_ok(CPU *c, unsigned Rn) {
+    if (Rn != 31) return true;                     /* base is not SP */
+    u64 sp = reg_xsp(c, 31);
+    if ((sp & 15) == 0) return true;               /* 16-byte aligned */
+    unsigned bit = (c->el == 0) ? 4 : 3;           /* SCTLR_EL1.SA0 : .SA */
+    if (!((c->sctlr[1] >> bit) & 1)) return true;  /* check disabled for this EL */
+    cpu_raise_sync(c, esr_make(EC_SP_ALIGN, 0), 0);
+    return false;
+}
+#else
+/* arm64chroot has never checked SP alignment. (A Linux kernel does enable the
+ * check at EL0, SCTLR_EL1.SA0, and answers a fault with SIGBUS; adopting it
+ * would be a behaviour change of its own.) */
+static inline bool sp_align_ok(CPU *c, unsigned Rn) { (void)c; (void)Rn; return true; }
+#endif
+
 /* FEAT_LRCPC2: LDAPUR/STLUR, load-acquire RCpc / store-release with an
- * unscaled 9-bit immediate. The acquire/release ordering piggybacks on the
- * host's ordinary load/store ordering (same as LDAR/LDAPR here); the access
- * is an ordinary unscaled load/store. No writeback, no SIMD&FP forms. */
+ * unscaled 9-bit immediate. The acquire/release ordering takes nothing extra
+ * here: arm64emu's single in-order CPU has none to give, and in arm64chroot it
+ * piggybacks on the host's ordinary load/store ordering (same as LDAR/LDAPR).
+ * The access is an ordinary unscaled load/store. No writeback, and no SIMD&FP
+ * forms at LRCPC=2. */
 static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
     unsigned size = BITS(31, 30), opc = BITS(23, 22);
     unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
@@ -730,6 +941,7 @@ static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
         undefined(c, insn);
         return;
     }
+    if (!sp_align_ok(c, Rn)) return;
     u64 va = reg_xsp(c, Rn) + (u64)(s64)sign_extend(BITS(20, 12), 9);
     if (opc == 0) mem_write(c, va, 1u << size, reg_x(c, Rt));   /* STLUR */
     else do_load(c, Rt, va, size, opc);                         /* LDAPUR* */
@@ -737,21 +949,21 @@ static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
 
 /* ---------------- FEAT_MOPS: Memory Copy and Memory Set ----------------
  * CPYFx (memcpy, forced forward), CPYx (memmove) and SETx, in the "Option A"
- * register format, matching qemu's implementation choice (and the emulator
- * twin of this core) step for step so the guest-visible intermediate state is
- * differentially testable: the prologue performs up to the next page boundary
- * and only then rewrites Xd[,Xs] to the final address and Xn to -(bytes
- * remaining), writing NZCV=0000 to advertise Option A; M does the whole-page
- * middle; E does the sub-page tail and raises the EC 0x27 mismatch exception
- * if it finds a page or more still to do. M/E executed with PSTATE.C set (an
- * Option B state) raise EC 0x27 with the wrong-option bit; loop.c plays the
- * kernel's role for those (arm64_mops_reset_regs + restart at the prologue).
- * Restartability across data aborts: P keeps the registers in input format
- * until it completes, M/E fold progress into Xn after every bounded step, so
- * re-executing the faulting instruction always resumes correctly. A step
- * never crosses a page on either address, which makes each step fault-atomic
- * (permissions are page-granular). The unprivileged T forms behave like the
- * plain ones, as they architecturally do at EL0. */
+ * register format, matching qemu's implementation choice step for step so the
+ * guest-visible intermediate state is differentially testable: the prologue
+ * performs up to the next page boundary and only then rewrites Xd[,Xs] to the
+ * final address and Xn to -(bytes remaining), writing NZCV=0000 to advertise
+ * Option A; M does the whole-page middle; E does the sub-page tail and raises
+ * the EC 0x27 mismatch exception if it finds a page or more still to do.
+ * M/E executed with PSTATE.C set (an Option B state) raise EC 0x27 with the
+ * wrong-option bit; in arm64chroot loop.c plays the kernel's role for those
+ * (arm64_mops_reset_regs + restart at the prologue). Restartability across
+ * data aborts: P keeps the registers in input format until it completes, M/E
+ * fold progress into Xn after every bounded step, so re-executing the faulting
+ * instruction always resumes correctly. A step never crosses a page on either
+ * address, which makes each step fault-atomic on RAM (permissions are
+ * page-granular). The unprivileged T forms take EL0's view at EL1 and are the
+ * plain forms at EL0. */
 
 static u64 mops_page_limit(u64 addr)     { return ((addr + 0x1000) & ~0xfffULL) - addr; }
 static u64 mops_page_limit_rev(u64 addr) { return (addr & 0xfffULL) + 1; }
@@ -768,46 +980,63 @@ static u32 mops_iss(u32 insn, bool wrong_option) {
          | (BITS(4, 0) << 10) | (BITS(20, 16) << 5) | BITS(9, 5);
 }
 
-/* At EL0 the family is gated by SCTLR_EL1.MSCEn (UNDEF when clear); the
- * kernel-role init sets it, as Linux does when it advertises HWCAP2_MOPS. */
+/* At EL0 the family is gated by SCTLR_EL1.MSCEn (UNDEF when clear; arm64chroot's
+ * kernel-role sysreg_init sets it, as Linux does when it advertises
+ * HWCAP2_MOPS); at EL1 it is always enabled (no EL2, so HCRX_EL2.MSCEn doesn't
+ * apply). */
 static bool mops_enabled_ok(CPU *c, u32 insn) {
     if (c->el == 0 && !((c->sctlr[1] >> 33) & 1)) { undefined(c, insn); return false; }
     return true;
 }
 
 /* One bounded memset step: at most to the next page boundary. Fast path is
- * the translated host pointer (same coherence as ordinary stores: translated
- * code relies on IC IVAU); on a miss, a single byte through the faulting
- * slow path. Returns bytes done; 0 means a fault was raised. */
-static u64 mops_set_step(CPU *c, u64 toaddr, u64 setsize, u8 data) {
+ * the program's host pointer (mem_host_ptr: in arm64emu a D-TLB hit on a RAM
+ * page with W granted — the same fast path mem_write uses, so JIT code-page
+ * coherence is preserved; in arm64chroot the translated host pointer, with the
+ * coherence of ordinary stores — translated code relies on IC IVAU); on a miss, a single byte through the faulting slow
+ * path, which also fills the D-TLB so the next step goes fast. Returns bytes
+ * done; 0 means a fault was raised. */
+static u64 mops_set_step(CPU *c, u64 toaddr, u64 setsize, u8 data, bool unpriv) {
     u64 n = mops_page_limit(toaddr);
     if (n > setsize) n = setsize;
+    set_ldst_unpriv(c, unpriv);
     void *hp = mem_host_ptr(c, toaddr, (unsigned)n, ACC_WRITE);
-    if (hp) { memset(hp, data, (size_t)n); return n; }
-    return mem_write(c, toaddr, 1, data) ? 1 : 0;
+    if (hp) { set_ldst_unpriv(c, 0); memset(hp, data, (size_t)n); return n; }
+    bool ok = mem_write(c, toaddr, 1, data);
+    set_ldst_unpriv(c, 0);
+    return ok ? 1 : 0;
 }
 
 /* One bounded copy step. rev=true means toaddr/fromaddr point at the *last*
  * byte and the step works downwards. memmove makes any same-chunk overlap
- * safe. */
+ * safe; the read and write sides carry independent unprivileged views (the
+ * CPYxRT/WT forms). */
 static u64 mops_copy_step(CPU *c, u64 toaddr, u64 fromaddr, u64 copysize,
-                          bool rev) {
+                          bool wunpriv, bool runpriv, bool rev) {
     u64 n = rev ? mops_page_limit_rev(toaddr) : mops_page_limit(toaddr);
     u64 m = rev ? mops_page_limit_rev(fromaddr) : mops_page_limit(fromaddr);
     if (m < n) n = m;
     if (n > copysize) n = copysize;
+    set_ldst_unpriv(c, wunpriv);
     void *w = mem_host_ptr(c, rev ? toaddr - (n - 1) : toaddr,
                            (unsigned)n, ACC_WRITE);
+    set_ldst_unpriv(c, runpriv);
     void *r = mem_host_ptr(c, rev ? fromaddr - (n - 1) : fromaddr,
                            (unsigned)n, ACC_READ);
+    set_ldst_unpriv(c, 0);
     if (w && r) { memmove(w, r, (size_t)n); return n; }
     u64 byte;
-    if (!mem_read(c, fromaddr, 1, &byte)) return 0;
-    return mem_write(c, toaddr, 1, byte) ? 1 : 0;
+    set_ldst_unpriv(c, runpriv);
+    if (!mem_read(c, fromaddr, 1, &byte)) { set_ldst_unpriv(c, 0); return 0; }
+    set_ldst_unpriv(c, wunpriv);
+    bool ok = mem_write(c, toaddr, 1, byte);
+    set_ldst_unpriv(c, 0);
+    return ok ? 1 : 0;
 }
 
 static void mops_set(CPU *c, u32 insn, unsigned stage) {
     unsigned Rd = BITS(4, 0), Rn = BITS(9, 5), Rs = BITS(20, 16);
+    bool unpriv = unpriv_at_el1(c, BIT(12));  /* SETxT: EL0-view stores at EL1 */
     u8 data = (u8)reg_x(c, Rs);               /* Rs may be XZR */
     if (stage == 0) {                                               /* SETP */
         u64 toaddr = reg_x(c, Rd), setsize = reg_x(c, Rn);
@@ -817,7 +1046,7 @@ static void mops_set(CPU *c, u32 insn, unsigned stage) {
         while (stagesetsize) {
             set_x(c, Rd, toaddr);             /* input format until completion */
             set_x(c, Rn, setsize);
-            u64 step = mops_set_step(c, toaddr, stagesetsize, data);
+            u64 step = mops_set_step(c, toaddr, stagesetsize, data, unpriv);
             if (!step) return;
             toaddr += step; setsize -= step; stagesetsize -= step;
         }
@@ -839,7 +1068,7 @@ static void mops_set(CPU *c, u32 insn, unsigned stage) {
     }
     u64 stagesetsize = (stage == 1) ? (setsize & ~0xfffULL) : setsize;
     while (stagesetsize) {
-        u64 step = mops_set_step(c, toaddr, setsize, data);
+        u64 step = mops_set_step(c, toaddr, setsize, data, unpriv);
         if (!step) return;
         toaddr += step; setsize -= step;
         stagesetsize = (step >= stagesetsize) ? 0 : stagesetsize - step;
@@ -849,6 +1078,7 @@ static void mops_set(CPU *c, u32 insn, unsigned stage) {
 
 static void mops_cpy(CPU *c, u32 insn, unsigned stage, bool move) {
     unsigned Rd = BITS(4, 0), Rn = BITS(9, 5), Rs = BITS(20, 16);
+    bool wunpriv = unpriv_at_el1(c, BIT(12)), runpriv = unpriv_at_el1(c, BIT(13));
     if (stage == 0) {                                            /* CPY[F]P */
         bool fwd = true;
         u64 toaddr = reg_x(c, Rd), fromaddr = reg_x(c, Rs), copysize = reg_x(c, Rn);
@@ -871,7 +1101,7 @@ static void mops_cpy(CPU *c, u32 insn, unsigned stage, bool move) {
                 set_x(c, Rs, fromaddr);
                 set_x(c, Rn, copysize);
                 u64 step = mops_copy_step(c, toaddr, fromaddr, stagecopysize,
-                                          false);
+                                          wunpriv, runpriv, false);
                 if (!step) return;
                 toaddr += step; fromaddr += step; copysize -= step; stagecopysize -= step;
             }
@@ -888,7 +1118,8 @@ static void mops_cpy(CPU *c, u32 insn, unsigned stage, bool move) {
             if (stagecopysize > copysize) stagecopysize = copysize;
             while (stagecopysize) {
                 set_x(c, Rn, copysize);
-                u64 step = mops_copy_step(c, t, f, stagecopysize, true);
+                u64 step = mops_copy_step(c, t, f, stagecopysize,
+                                          wunpriv, runpriv, true);
                 if (!step) return;
                 copysize -= step; stagecopysize -= step; t -= step; f -= step;
             }
@@ -917,7 +1148,8 @@ static void mops_cpy(CPU *c, u32 insn, unsigned stage, bool move) {
     }
     /* M runs while a full page remains; E runs to zero. */
     while (stage == 1 ? copysize >= 0x1000 : copysize > 0) {
-        u64 step = mops_copy_step(c, toaddr, fromaddr, copysize, !fwd);
+        u64 step = mops_copy_step(c, toaddr, fromaddr, copysize,
+                                  wunpriv, runpriv, !fwd);
         if (!step) return;
         if (fwd) { toaddr += step; fromaddr += step; }
         else     { toaddr -= step; fromaddr -= step; }
@@ -961,6 +1193,7 @@ static void ldst_register(CPU *c, u32 insn) {
         /* opc<1> selects the 128-bit Q form, which is defined only for size==0;
          * size!=0 with opc&2 is unallocated. */
         if ((opc & 2) && size != 0) { undefined(c, insn); return; }
+        if (!fp_access_ok(c)) return;
         bytes = (opc & 2) ? 16 : (1u << size);
         scale = (opc & 2) ? 4 : size;
     } else {
@@ -972,7 +1205,9 @@ static void ldst_register(CPU *c, u32 insn) {
 
     /* compute effective address and optional writeback */
     u64 va, base = reg_xsp(c, Rn);
+    if (!sp_align_ok(c, Rn)) return;
     int wb = 0;          /* 0 none, 1 post, 2 pre */
+    bool unpriv = false; /* LDTR/STTR: access checked with EL0 permissions */
     if (BIT(24)) {                              /* unsigned immediate offset */
         va = base + ((u64)BITS(21, 10) << scale);
     } else if (BIT(21)) {                       /* register offset or atomic */
@@ -985,10 +1220,12 @@ static void ldst_register(CPU *c, u32 insn) {
     } else {
         unsigned mode = BITS(11, 10);
         s64 imm9 = (s64)sign_extend(BITS(20, 12), 9);
-        if (mode == 0 || mode == 2) {               /* unscaled / unprivileged LDTR/STTR */
-            /* No SIMD&FP unprivileged form; at EL0 the integer LDTR/STTR
-             * behave exactly like LDUR/STUR. */
-            if (mode == 2 && V) { undefined(c, insn); return; }
+        if (mode == 0 || mode == 2) {           /* unscaled / unprivileged LDTR/STTR */
+            if (mode == 2) {
+                if (V) { undefined(c, insn); return; }  /* no SIMD&FP unprivileged form */
+                /* At EL0 LDTR/STTR behave as LDR/STR; EL2+ isn't modeled here. */
+                unpriv = unpriv_at_el1(c, true);
+            }
             va = base + imm9;
         }
         else if (mode == 1) { va = base; wb = 1; }  /* post */
@@ -997,16 +1234,18 @@ static void ldst_register(CPU *c, u32 insn) {
     }
 
     /* opc==3 is the "load signed, 32-bit result" column, which exists only for
-     * the byte and halfword sizes: size==2 (LDRSW has opc==2) and size==3 are
+     * the byte and halfword sizes: size==2 (LDRSW takes opc==2) and size==3 are
      * both unallocated. LSE atomics reach this function too but return above,
      * so opc here is always the size/sign field. size==3 was executed as a
-     * 64-bit signed load truncated to 32; size==2 as a sign-extending word
-     * load truncated to 32 — qemu raises SIGILL for both. */
+     * 64-bit signed load truncated to 32; size==2 as a sign-extending word load
+     * truncated to 32 — qemu raises SIGILL for both. */
     if (!V && opc == 3 && size >= 2) { undefined(c, insn); return; }
 
     bool ok;
+    set_ldst_unpriv(c, unpriv); /* set only across this one access (mmu.c acc_el0) */
     if (V) ok = is_store ? vreg_store(c, Rt, va, bytes) : vreg_load(c, Rt, va, bytes);
     else   ok = is_store ? mem_write(c, va, bytes, reg_x(c, Rt)) : do_load(c, Rt, va, size, opc);
+    set_ldst_unpriv(c, 0);      /* fault paths return through here too (no longjmp) */
     if (!ok) return;   /* faulted: do NOT write back the base (instruction re-executes) */
 
     if (wb == 1) set_xsp(c, Rn, base);
@@ -1031,7 +1270,7 @@ static void ldst_pair(CPU *c, u32 insn) {
          * stack slot. Guest-triggerable emulator stack corruption one way and
          * host stack disclosure into guest memory the other. */
         if (opc == 3) { undefined(c, insn); return; }
-        scale = opc + 2; esz = 1u << scale;             /* S/D/Q = 4/8/16 bytes */
+        scale = opc + 2; esz = 1u << scale;              /* S/D/Q = 4/8/16 bytes */
     } else {
         if (opc == 3) { undefined(c, insn); return; }    /* unallocated (was run as a 32-bit pair) */
         scale = (opc == 2) ? 3 : 2; esz = 1u << scale; signed_word = (opc == 1);
@@ -1039,6 +1278,7 @@ static void ldst_pair(CPU *c, u32 insn) {
     u64 offset = imm7 << scale;
 
     u64 base = reg_xsp(c, Rn), addr;
+    if (!sp_align_ok(c, Rn)) return;
     bool wb = false; u64 wbval = 0;
     switch (mode) {
         case 0: addr = base + offset; break;                            /* STNP/LDNP (non-temporal) */
@@ -1048,11 +1288,12 @@ static void ldst_pair(CPU *c, u32 insn) {
         default: undefined(c, insn); return;
     }
     if (V) {
+        if (!fp_access_ok(c)) return;
         bool ok = L ? (vreg_load(c, Rt, addr, esz) && vreg_load(c, Rt2, addr + esz, esz))
                     : (vreg_store(c, Rt, addr, esz) && vreg_store(c, Rt2, addr + esz, esz));
         if (!ok) return;   /* faulted: skip writeback (instruction re-executes) */
     } else if (L) {
-        if (esz == 8) {                    /* LDP Xt: one 16-byte access (#12) */
+        if (esz == 8) {                    /* LDP Xt: one 16-byte access */
             V128 v;
             if (!mem_read128(c, addr, &v)) return;
             set_x(c, Rt, v.d[0]); set_x(c, Rt2, v.d[1]);
@@ -1064,7 +1305,7 @@ static void ldst_pair(CPU *c, u32 insn) {
             else { set_x(c, Rt, (u32)a); set_x(c, Rt2, (u32)b); }
         }
     } else {
-        if (esz == 8) {                    /* STP Xt: one 16-byte access (#12) */
+        if (esz == 8) {                    /* STP Xt: one 16-byte access */
             V128 v;
             v.d[0] = reg_x(c, Rt); v.d[1] = reg_x(c, Rt2);
             if (!mem_write128(c, addr, &v)) return;
@@ -1084,6 +1325,7 @@ static void ldst_literal(CPU *c, u32 insn) {
     u64 va = c->cur_insn_pc + off;
     if (V) {                                     /* SIMD&FP: LDR St/Dt/Qt (literal) */
         if (opc == 3) { undefined(c, insn); return; }   /* UNALLOCATED */
+        if (!fp_access_ok(c)) return;
         vreg_load(c, Rt, va, 4u << opc);         /* opc 0/1/2 -> 4/8/16 bytes */
         return;
     }
@@ -1102,6 +1344,7 @@ static void ldst_exclusive(CPU *c, u32 insn) {
     unsigned Rs = BITS(20, 16), Rt2 = BITS(14, 10), Rn = BITS(9, 5), Rt = BITS(4, 0);
     unsigned bytes = 1u << size;
     u64 va = reg_xsp(c, Rn);
+    if (!sp_align_ok(c, Rn)) return;
 
     if (o2 && o1) {                            /* CAS/CASA/CASL/CASAL (LSE) */
         ldst_cas(c, insn);
@@ -1111,6 +1354,10 @@ static void ldst_exclusive(CPU *c, u32 insn) {
         ldst_casp(c, insn);
         return;
     }
+    /* Ordered and exclusive accesses: host atomics, and an exclusive monitor
+     * that compares the value LDXR loaded, where guest threads run
+     * concurrently (ARM64_SMP); on one CPU an address match is the monitor. */
+#if ARM64_SMP
     if (o2) {                                  /* LDAR / STLR (ordered, non-exclusive) */
         /* These are the architecture's acquire/release accesses and commonly
          * pair with CAS/exclusives on the same word (locks). They must be host
@@ -1239,12 +1486,52 @@ static void ldst_exclusive(CPU *c, u32 insn) {
         set_x(c, Rs, res);
         c->excl_valid = false;
     }
+#else
+    if (o2) {                                  /* LDAR / STLR (ordered, non-exclusive) */
+        if (L) { u64 v; if (mem_read(c, va, bytes, &v)) set_x(c, Rt, v); }
+        else mem_write(c, va, bytes, reg_x(c, Rt));
+        return;
+    }
+    if (!o1) {                                 /* single-register exclusive */
+        if (L) {                               /* LDXR / LDAXR */
+            u64 v;
+            if (!mem_read(c, va, bytes, &v)) return;
+            set_x(c, Rt, v);
+            c->excl_valid = true; c->excl_addr = va; c->excl_size = bytes;
+        } else {                               /* STXR / STLXR */
+            if (c->excl_valid && c->excl_addr == va) {
+                if (!mem_write(c, va, bytes, reg_x(c, Rt))) return;
+                set_x(c, Rs, 0);
+            } else {
+                set_x(c, Rs, 1);
+            }
+            c->excl_valid = false;
+        }
+        return;
+    }
+    /* pair exclusive LDXP/STXP */
+    if (L) {
+        u64 a, b;
+        if (!mem_read(c, va, bytes, &a)) return;
+        if (!mem_read(c, va + bytes, bytes, &b)) return;
+        set_x(c, Rt, a); set_x(c, Rt2, b);
+        c->excl_valid = true; c->excl_addr = va; c->excl_size = bytes * 2;
+    } else {
+        if (c->excl_valid && c->excl_addr == va) {
+            if (!mem_write(c, va, bytes, reg_x(c, Rt))) return;
+            if (!mem_write(c, va + bytes, bytes, reg_x(c, Rt2))) return;
+            set_x(c, Rs, 0);
+        } else set_x(c, Rs, 1);
+        c->excl_valid = false;
+    }
+#endif
 }
 
 /* AdvSIMD load/store multiple structures: LD1/ST1 (contiguous, 1-4 registers)
  * and LD2/3/4/ST2/3/4 (de-interleaved). Used pervasively for memcpy/memset and
  * NEON block I/O by both EDK2 and Linux. Supports the post-indexed form. */
 static void ldst_vector_multi(CPU *c, u32 insn) {
+    if (!fp_access_ok(c)) return;
     unsigned Q = BIT(30), post = BIT(23), L = BIT(22), Rm = BITS(20, 16);
     unsigned opcode = BITS(15, 12), size = BITS(11, 10), Rn = BITS(9, 5), Rt = BITS(4, 0);
     unsigned nregs, sel;     /* sel = interleave factor (1 = contiguous LD1/ST1) */
@@ -1260,6 +1547,7 @@ static void ldst_vector_multi(CPU *c, u32 insn) {
     }
     unsigned regbytes = Q ? 16 : 8;
     u64 base = reg_xsp(c, Rn), addr = base;
+    if (!sp_align_ok(c, Rn)) return;
     unsigned total = nregs * regbytes;
 
     if (sel == 1) {                            /* contiguous: whole registers */
@@ -1297,6 +1585,7 @@ static void ldst_vector_multi(CPU *c, u32 insn) {
  * memset/strlen-class routines and struct-of-arrays NEON code. Post-indexed
  * form supported. */
 static void ldst_vector_single(CPU *c, u32 insn) {
+    if (!fp_access_ok(c)) return;
     unsigned Q = BIT(30), post = BIT(23), L = BIT(22), R = BIT(21);
     unsigned Rm = BITS(20, 16), opcode = BITS(15, 13), S = BIT(12);
     unsigned size = BITS(11, 10), Rn = BITS(9, 5), Rt = BITS(4, 0);
@@ -1322,6 +1611,7 @@ static void ldst_vector_single(CPU *c, u32 insn) {
     }
 
     u64 base = reg_xsp(c, Rn), addr = base;
+    if (!sp_align_ok(c, Rn)) return;
     unsigned total = selem * ebytes;
 
     for (unsigned r = 0; r < selem; r++) {
@@ -1411,9 +1701,15 @@ static void branch_system(CPU *c, u32 insn) {
             systrace_svc(c);
             exception_take(c, EXC_SYNC, esr_make(EC_SVC64, imm16), 0, c->pc);
         } else if (opc == 0 && ll == 2) {                                 /* HVC */
+            /* HVC is UNDEFINED at EL0 — guest userspace must not reach the PSCI
+             * conduit (it could otherwise power off / reboot the machine).
+             * arm64chroot has no conduit: the lookup below finds none, and
+             * the instruction is UNDEFINED there all the same. */
+            if (ARM64_SYSTEM && c->el == 0) { undefined(c, insn); return; }
             if (smccc_conduit && smccc_conduit(c, true)) return;
             undefined(c, insn);
         } else if (opc == 0 && ll == 3) {                                 /* SMC */
+            if (ARM64_SYSTEM && c->el == 0) { undefined(c, insn); return; }
             if (smccc_conduit && smccc_conduit(c, false)) return;
             undefined(c, insn);
         } else if (opc == 1 && ll == 0) {                                 /* BRK */
@@ -1447,13 +1743,36 @@ static void branch_system(CPU *c, u32 insn) {
         unsigned L = BIT(21), op0 = BITS(20, 19), op1 = BITS(18, 16);
         unsigned CRn = BITS(15, 12), CRm = BITS(11, 8), op2 = BITS(7, 5), Rt = BITS(4, 0);
         if (L == 0 && op0 == 0 && op1 == 3 && CRn == 2 && Rt == 31) {     /* hints */
+#if ARM64_SYSTEM
+            if (CRm == 0 && op2 == 2) {                       /* WFE */
+                /* A pending event completes WFE immediately (and clears it);
+                 * otherwise halt until an event/interrupt. Without this an
+                 * SEVL/WFE pair only made progress when the timer tick fired.
+                 * At EL0 a WFE that would wait traps to EL1 unless
+                 * SCTLR_EL1.nTWE lets it (Linux does). */
+                if (c->event) c->event = false;
+                else if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWE)) wfx_trap(c, 1);
+                else c->halted = true;
+            }
+            else if (CRm == 0 && op2 == 3) {                  /* WFI */
+                /* ...and a WFI unless SCTLR_EL1.nTWI does: Linux leaves it
+                 * clear and skips the instruction, so a user program cannot
+                 * idle the CPU. */
+                if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWI)) wfx_trap(c, 0);
+                else c->halted = true;
+            }
+            else if (CRm == 0 && (op2 == 4 || op2 == 5)) c->event = true;  /* SEV / SEVL */
+            /* NOP/YIELD/DGH/etc -> no-op */
+#else
             if (CRm == 0 && op2 == 2) c->halted = true;       /* WFE */
             else if (CRm == 0 && op2 == 3) c->halted = true;  /* WFI */
             /* NOP/YIELD/SEV/SEVL/etc -> no-op */
+#endif
             return;
         }
         if (L == 0 && op0 == 0 && op1 == 3 && CRn == 3 && Rt == 31) {     /* barriers/CLREX */
             if (op2 == 2) c->excl_valid = false;              /* CLREX */
+#if ARM64_SMP
             else if (op2 == 4 || op2 == 5)                    /* DSB / DMB */
                 /* Map the guest barrier to a host fence. Essential on weakly
                  * ordered hosts (ARM): without it the host reorders our plain
@@ -1461,6 +1780,9 @@ static void branch_system(CPU *c, u32 insn) {
                  * guest memory model (e.g. mutex owner-field corruption). */
                 __atomic_thread_fence(__ATOMIC_SEQ_CST);
             /* ISB (op2==6)/SB: no ordering effect on data in this interpreter */
+#else
+            /* DSB/DMB/ISB/SB: no-op in an in-order interpreter */
+#endif
             return;
         }
         /* MSR(imm)/SYS/SYSL/MRS/MSR(reg) -> sysreg.c (M2) */
@@ -1477,7 +1799,9 @@ void exec_a64(CPU *c, u32 insn) {
         case 0xa: case 0xb: branch_system(c, insn); break;    /* 101x */
         case 0x4: case 0x6: case 0xc: case 0xe: loads_stores(c, insn); break; /* x1x0 */
         case 0x5: case 0xd: dp_register(c, insn); break;      /* x101 */
-        case 0x7: case 0xf: exec_fpsimd(c, insn); break;      /* x111 FP/SIMD */
+        case 0x7: case 0xf:                                   /* x111 FP/SIMD */
+            if (fp_access_ok(c)) exec_fpsimd(c, insn);
+            break;
         default: undefined(c, insn); break;                   /* 00xx reserved */
     }
 }

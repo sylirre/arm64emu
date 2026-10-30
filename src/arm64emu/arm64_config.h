@@ -11,6 +11,11 @@
  * and CPACR_EL1 traps. */
 #define ARM64_SYSTEM 1
 
+/* One CPU, executed by one host thread in program order: an LSE atomic or a
+ * store-exclusive is an ordinary read-modify-write, and a barrier orders
+ * nothing that is not already ordered. */
+#define ARM64_SMP 0
+
 #ifdef ANDROID_JNI
 /* Embedded build (see main.c): the emulator is linked into a host process and
  * entered in a fork()ed child of it, so the atexit handlers and DSO destructors

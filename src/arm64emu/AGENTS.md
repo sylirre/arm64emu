@@ -45,6 +45,13 @@ lib/arm64/                shared with arm64chroot (compiled into both):
                           registers (what features the guest kernel probes),
                           generic-timer registers, DC ZVA, TLBI, AT (the
                           EL1-only ones under ARM64_SYSTEM), CPACR FP trap
+  decode.c                A64 decoder/executor, part 1 — DP-immediate,
+                          DP-register, branches/exceptions/system, the whole
+                          load/store family, exclusives, LSE atomics,
+                          FEAT_MOPS, CRC32, AdvSIMD load/store.
+                          exec_a64() is the top-level dispatch and the
+                          correctness reference for all three engines.
+                          ARM64_SYSTEM/ARM64_SMP pick each program's variants
   exec_fpsimd.c           A64 decoder/executor, part 2 — scalar FP, the full
                           Advanced-SIMD surface (three-same/-diff/-extra,
                           by-element, across-lanes, two-misc, shift-imm, copy,
@@ -56,18 +63,13 @@ src/arm64emu/
                           env-var reference), image loading, the run loop,
                           signal-flush of diagnostics, ARM64EMU_* debug env vars
   arm64_config.h          how lib/arm64 is built here: ARM64_SYSTEM 1 (full
-                          system), and the -DANDROID_JNI exit -> _exit shadow
+                          system), ARM64_SMP 0 (one in-order CPU), and the
+                          -DANDROID_JNI exit -> _exit shadow
   cpu.c                   reset, cpu_step (fetch/decode/execute driver),
                           condition codes, cpu_dump, and the diagnostics:
                           SVC syscall trace, musl-heap tracker (ARM64EMU_HEAP),
                           ARM64EMU_COV coverage-divergence finder, PC ring buffer,
                           hot-PC profiler
-  decode.c                A64 decoder/executor, part 1 — DP-immediate,
-                          DP-register, branches/exceptions/system, the whole
-                          load/store family, exclusives, LSE atomics,
-                          FEAT_MOPS, CRC32, AdvSIMD load/store.
-                          exec_a64() is the top-level dispatch and the
-                          correctness reference for all three engines
   exception.c             exception entry/return: VBAR vectors, ESR/FAR/ELR/
                           SPSR banking, DAIF masking, ERET
   mmu.h                   translation + typed guest memory access API,
@@ -197,7 +199,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the interpreter and JIT parts of emulator where possible.
 * Keep in sync the code and documentation (`docs/arm64emu/`).
 * Keep in sync the file structure in architecture section of `docs/arm64emu/README.md` and structure section of this file.
-* The decoder, the step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64chroot (`src/arm64chroot/core/`, `src/arm64chroot/predecode.c`, `src/arm64chroot/jit/`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
+* The step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64chroot (`src/arm64chroot/core/cpu.c`, `src/arm64chroot/predecode.c`, `src/arm64chroot/jit/`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
 
 ## Testing
 

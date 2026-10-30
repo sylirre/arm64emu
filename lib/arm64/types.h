@@ -12,6 +12,9 @@
 #ifndef ARM64_SYSTEM
 #error "arm64_config.h must define ARM64_SYSTEM (1: full system, 0: user mode)"
 #endif
+#ifndef ARM64_SMP
+#error "arm64_config.h must define ARM64_SMP (1: guest threads run concurrently)"
+#endif
 
 #include <stdint.h>
 #include <stdbool.h>

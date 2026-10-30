@@ -193,7 +193,7 @@ ARM64CHROOT_ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
                          -DA64_LINK2SYMLINK -DA64_L2S_FORCE
 
 ARM64CHROOT_SRC := $(LIB_ARM64) \
-    src/arm64chroot/core/cpu.c src/arm64chroot/core/decode.c \
+    src/arm64chroot/core/cpu.c \
     src/arm64chroot/jit/jit.c src/arm64chroot/jit/frontend.c \
     src/arm64chroot/jit/backend_x86_64.c src/arm64chroot/jit/backend_a64.c \
     src/arm64chroot/jit/backend_x86_32.c src/arm64chroot/jit/backend_arm32.c \

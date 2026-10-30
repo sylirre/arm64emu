@@ -164,7 +164,6 @@ src/arm64emu/
   arm64_config.h  how lib/arm64 is built here (full system; embedded _exit)
   cpu.c         fetch/decode/execute driver, condition codes, dump,
                 hot-PC profiler / ring buffer / coverage-divergence finder
-  decode.c      A64 decoder: integer/branch/load-store, CRC32, AdvSIMD ld/st
   mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB + fetch cache
   exception.c   exception entry/return (VBAR vectors, ESR/FAR/ELR/SPSR, ERET)
   memory.c      physical bus: RAM + NOR-flash CFI command set + MMIO dispatch
@@ -184,6 +183,7 @@ src/arm64emu/
 lib/arm64/      AArch64 emulation shared with arm64chroot:
   types.h       fixed-width types and small helpers
   cpu.h         CPU state, PSTATE bits, core interpreter API
+  decode.c      A64 decoder: integer/branch/load-store, CRC32, AdvSIMD ld/st
   sysreg.{h,c}  MSR/MRS, ID registers, generic-timer registers, DC ZVA, TLBI, AT
   exec_fpsimd.c FP/Advanced-SIMD execution (scalar FP + vector integer)
   esr.h         ESR_ELx exception classes + syndrome construction

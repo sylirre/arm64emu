@@ -14,4 +14,10 @@
  * compiled in. */
 #define ARM64_SYSTEM 0
 
+/* Guest threads are host threads, running guest code at the same time over
+ * one shared address space: LSE atomics, exclusives and LDAR/STLR must be host
+ * atomic accesses, and DMB/DSB host fences, or another guest thread observes
+ * torn or reordered memory (weakly ordered hosts reorder ordinary accesses). */
+#define ARM64_SMP 1
+
 #endif /* ARM64CHROOT_ARM64_CONFIG_H */
