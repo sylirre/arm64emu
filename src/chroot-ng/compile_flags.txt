@@ -6,3 +6,4 @@
 -Wall
 -Wextra
 -Wno-unused-parameter
+-DPROJECT_VERSION="dev"

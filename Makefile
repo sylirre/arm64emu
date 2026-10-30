@@ -33,6 +33,12 @@ BUILD    := build
 OBJDIR   := $(BUILD)/obj
 HOSTARCH := $(shell uname -m)
 
+# The version of all three programs, defined in one place: the VERSION file.
+# Only the units that print it get it on their command line, and they depend on
+# the file, so a bump rebuilds exactly them (see each program's *_VERSIONED).
+PROJECT_VERSION := $(shell cat VERSION)
+VERSION_DEFINE  := -DPROJECT_VERSION='"$(PROJECT_VERSION)"'
+
 # Code shared by both emulators.
 LIB_ARM64 := $(wildcard lib/arm64/*.c)
 
@@ -88,6 +94,11 @@ $(OBJDIR)/arm64emu/%.o: %.c $(ARM64EMU_CFG)
 	$(CC) $(ARM64EMU_FLAGS) $(DEPFLAGS) -c -o $@ $<
 $(OBJDIR)/arm64emu/src/arm64emu/jit/predecode.o: override ARM64EMU_OPT := -O2
 
+ARM64EMU_VERSIONED := $(addprefix $(OBJDIR)/arm64emu/,src/arm64emu/main.o) \
+                      $(addprefix $(OBJDIR)/arm64emu-embed/,src/arm64emu/main.o)
+$(ARM64EMU_VERSIONED): VERSION
+$(ARM64EMU_VERSIONED): ARM64EMU_FLAGS += $(VERSION_DEFINE)
+
 $(BUILD)/arm64emu: $(ARM64EMU_OBJ)
 	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ -lm
 
@@ -118,10 +129,10 @@ ARM64EMU_A64_CC      ?= clang --target=aarch64-linux-gnu -nostdlibinc \
                         -I$(ARM64EMU_A64_SYSROOT)/include -fuse-ld=lld -static \
                         -L$(ARM64EMU_A64_SYSROOT)/lib -B$(ARM64EMU_A64_SYSROOT)/lib
 
-$(BUILD)/arm64emu-a64: $(ARM64EMU_SRC)
+$(BUILD)/arm64emu-a64: $(ARM64EMU_SRC) VERSION
 	$(ARM64EMU_A64_CC) -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter \
 	    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc/arm64emu -Ilib/arm64 \
-	    -fno-math-errno -o $@ $(ARM64EMU_SRC) -lm
+	    -fno-math-errno $(VERSION_DEFINE) -o $@ $(ARM64EMU_SRC) -lm
 
 -include $(ARM64EMU_OBJ:.o=.d) $(ARM64EMU_EMBED_OBJ:.o=.d)
 
@@ -216,6 +227,10 @@ $(OBJDIR)/arm64chroot/m32/%.o: %.c $(ARM64CHROOT_M32_CFG)
 $(OBJDIR)/arm64chroot/asim/%.o: %.c $(ARM64CHROOT_ASIM_CFG)
 	@mkdir -p $(@D)
 	$(CC) $(ARM64CHROOT_FLAGS) $(ARM64CHROOT_ASIMFLAGS) $(DEPFLAGS) -c $< -o $@
+
+ARM64CHROOT_VERSIONED := $(foreach v,native m32 asim,$(OBJDIR)/arm64chroot/$(v)/src/arm64chroot/main.o)
+$(ARM64CHROOT_VERSIONED): VERSION
+$(ARM64CHROOT_VERSIONED): ARM64CHROOT_FLAGS += $(VERSION_DEFINE)
 
 $(BUILD)/arm64chroot: $(ARM64CHROOT_OBJ)
 	$(CC) $(ARM64CHROOT_FLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread $(call arm64chroot_atomic,$(CC),)
@@ -337,6 +352,10 @@ $(OBJDIR)/chroot-ng/%.S.o: %.S $(CHROOTNG_CFG)
 # holds it against the build host's <asm/unistd.h>, and a number the two spell
 # differently is a macro redefinition — an error here, so it cannot be built past.
 $(OBJDIR)/chroot-ng/src/chroot-ng/rt/unistd_check.c.o: CHROOTNG_FLAGS += -Werror
+
+CHROOTNG_VERSIONED := $(addprefix $(OBJDIR)/chroot-ng/src/chroot-ng/,main.c.o run.c.o)
+$(CHROOTNG_VERSIONED): VERSION
+$(CHROOTNG_VERSIONED): CHROOTNG_FLAGS += $(VERSION_DEFINE)
 
 # The linker script shapes the image as much as the objects do (its PHDRS is
 # the whole program header table), so a change to it relinks.

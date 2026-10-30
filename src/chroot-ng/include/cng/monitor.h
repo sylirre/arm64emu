@@ -11,13 +11,11 @@
 #include "cng/path.h"
 #include "cng/ucontext.h"
 
-/* Shared by --version and the CNG_DEBUG startup banner (which also stamps the
- * build time: this repo is copied to devices by hand, so "am I running the
- * build I just made?" is a question every device-side trace has to answer). */
-/* 0.1.0 reversed -b to SRC:DST (host first), matching arm64chroot. This tree
- * reaches devices by hand-copy, so the version must distinguish a build that
- * carries the old GUEST:HOST order from one that does not. */
-#define CNG_VERSION "1.6.0"
+/* The version, printed by --version and by the CNG_DEBUG startup banner (which
+ * also stamps the build time: this tree is copied to devices by hand, so "am I
+ * running the build I just made?" is a question every device-side trace has to
+ * answer), is the repository's: its VERSION file, which the Makefile passes in
+ * as PROJECT_VERSION to the two units that print it, main.c and run.c. */
 
 /* The kernel identity the guest is told about, by uname(2) and by
  * /proc/version, which must agree — faking one and leaking the other through

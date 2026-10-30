@@ -1,0 +1,28 @@
+# Repository-level check on a release tag. All three programs take their
+# version from the VERSION file at the repository root (the Makefile passes it
+# in), so a tag vX.Y.Z is right only when that file reads X.Y.Z.
+
+name: version
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: tag matches VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare the tag with VERSION
+        run: |
+          want="v$(cat VERSION)"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($want)"
+            exit 1
+          fi

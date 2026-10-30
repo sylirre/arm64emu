@@ -22,7 +22,11 @@
 #include <unistd.h>
 #include <limits.h>
 
-#define PROGRAM_VERSION "1.0.0"
+/* The version is the repository's, defined once in its VERSION file, which
+ * the Makefile passes in. */
+#ifndef PROJECT_VERSION
+#error "PROJECT_VERSION is undefined: build with the Makefile, or define it from the VERSION file"
+#endif
 
 /* On SIGINT/SIGTERM (e.g. a wall-clock `timeout` during a long boot), restore
  * the terminal and flush the diagnostics so a killed run still yields a profile
@@ -85,7 +89,7 @@ static void usage(void) {
 
 /* Print the program version to stdout and exit 0 (-v/--version). */
 static void version(void) {
-    fputs("Version: " PROGRAM_VERSION "\n", stdout);
+    fputs("Version: " PROJECT_VERSION "\n", stdout);
     fputs("GitHub: https://github.com/sylirre/arm64emu\n", stdout);
     exit(0);
 }

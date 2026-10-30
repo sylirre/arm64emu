@@ -28,6 +28,11 @@
 #include "cng/uapi.h"
 #include "cng/unixsock.h"
 
+/* The version is the repository's (cng/monitor.h). */
+#ifndef PROJECT_VERSION
+#error "PROJECT_VERSION is undefined: build with the Makefile, or define it from the VERSION file"
+#endif
+
 
 /* --- the run + probe + self-test entry points (own translation units) ----- */
 int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
@@ -157,7 +162,7 @@ static void usage(int fd) {
 }
 
 static void version(void) {
-    cng_dprintf(1, "chroot-ng %s (built %s %s)\n", CNG_VERSION, __DATE__,
+    cng_dprintf(1, "chroot-ng %s (built %s %s)\n", PROJECT_VERSION, __DATE__,
                 __TIME__);
 }
 
