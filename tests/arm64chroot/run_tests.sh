@@ -20,6 +20,13 @@ mkdir -p build/tests/arm64chroot/asm build/tests/arm64chroot/c build/tests/arm64
     echo "SKIP: no oracle (install qemu-aarch64, or run on a host that executes AArch64 binaries)"
     exit 0; }
 echo "host $ARM64CHROOT_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
+# qemu-user hands a guest's execve of an AArch64 binary to the host kernel,
+# which runs it only through a binfmt_misc handler for qemu (what
+# qemu-user-binfmt registers; qemu-user-static did, where it still exists).
+# Without one, every test that re-executes fails on the oracle side with
+# ENOEXEC (errno 8) -- say why once, up front.
+[ "$ORACLE_KIND" != qemu ] || a64_native_exec_works ||
+    echo "WARN: this host cannot execve an AArch64 binary (no binfmt_misc handler): the qemu oracle fails every test that re-executes (install qemu-user-binfmt)"
 [ "$ARM64CHROOT_STATIC_OK" = 1 ] ||
     echo "WARN: $AGCC cannot link -static; most tests will skip (install the static libc)"
 

@@ -267,8 +267,13 @@ oracle_proot() {   # oracle_proot <proot args...>
     # Bounded: proot is ptrace-based and can wedge on hosts that half-support
     # it; a hanging oracle must fail the test, not the whole run. -k covers a
     # tracee parked with every signal blocked, where TERM alone never lands.
+    #
+    # PROOT_NO_SECCOMP under qemu: proot 5.4's seccomp acceleration kills
+    # qemu 10 (Ubuntu 26.04's pair) -- exit status 182 right after the loader's
+    # execve, before a single traced syscall -- so every Alpine-backed test
+    # was lost there. Plain ptrace runs it, for ~8% on an exec-heavy loop.
     if [ -n "$PROOT_QEMU" ]; then
-        timeout -k 5 60 proot -q "$PROOT_QEMU" "$@"
+        PROOT_NO_SECCOMP=1 timeout -k 5 60 proot -q "$PROOT_QEMU" "$@"
     else
         timeout -k 5 60 proot "$@"
     fi

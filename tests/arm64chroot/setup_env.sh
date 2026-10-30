@@ -253,9 +253,12 @@ else echo "nameserver 1.1.1.1" > "$ALPINE/etc/resolv.conf"; fi
 # Add bash (job-control test) and openssl (crypto coverage) using the oracle
 # stack, so building the fixture never depends on the emulator being correct.
 # -0 presents uid 0 so apk can write into the rootfs.
-if oracle_proot -0 -r "$ALPINE" /sbin/apk add --no-cache bash openssl >/dev/null 2>&1; then
+_apk_log=$(mktemp 2>/dev/null) || _apk_log=/dev/null
+if oracle_proot -0 -r "$ALPINE" /sbin/apk add --no-cache bash openssl >"$_apk_log" 2>&1; then
     echo "provisioned alpine env at $ALPINE"
 else
-    echo "SKIP: alpine env unavailable (apk add failed)"
+    echo "SKIP: alpine env unavailable (apk add failed, rc $?)"
+    [ "$_apk_log" = /dev/null ] || tail -n 3 "$_apk_log" | sed 's/^/     /'
 fi
+[ "$_apk_log" = /dev/null ] || rm -f "$_apk_log"
 exit 0
