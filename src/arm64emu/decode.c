@@ -1396,8 +1396,7 @@ static void branch_system(CPU *c, u32 insn) {
             return;
         }
         /* MSR(imm)/SYS/SYSL/MRS/MSR(reg) -> sysreg.c (M2) */
-        if (sysreg_exec) { sysreg_exec(c, insn); return; }
-        undefined(c, insn);
+        sysreg_exec(c, insn);
         return;
     }
     undefined(c, insn);

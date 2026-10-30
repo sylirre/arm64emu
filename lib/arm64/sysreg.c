@@ -1,26 +1,28 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* System registers: MSR/MRS/SYS/MSR-immediate, ID registers, generic-timer
- * register plumbing. */
+ * register plumbing. Shared by both emulators; the EL1-only instructions are
+ * compiled in only for a full system (ARM64_SYSTEM, arm64_config.h). */
 #include "sysreg.h"
 #include "esr.h"
 #include "mmu.h"
 #include <stdio.h>
 #include <string.h>
 
-/* Generic-timer hooks, provided by timer.c (M3). */
-u64 gt_count(CPU *c, bool virt) __attribute__((weak));
+/* Generic-timer hooks. gt_count is the program's (arm64emu devices/timer.c,
+ * arm64chroot loop.c). timer_update is arm64emu's timer device; arm64chroot
+ * has none, so it is weak and called only under a NULL check. */
+u64 gt_count(CPU *c, bool virt);
 void timer_update(struct Machine *m) __attribute__((weak));
 
-/* FPSR cumulative-flag fold, provided by exec_fpsimd.c (M4): host FP flags
- * and the software-raised bits accumulate lazily and are only folded into
- * c->fpsr when the guest touches FPSR (or on reset). Weak so M2 standalone
- * links without the FP unit. */
+/* FPSR cumulative-flag fold (exec_fpsimd.c): host FP flags and the
+ * software-raised bits accumulate lazily and are only folded into c->fpsr
+ * when the guest touches FPSR (or on reset). Weak so a build without the
+ * FP/SIMD unit links. */
 void fpsr_sync(CPU *c) __attribute__((weak));
 
 static u64 timer_count(CPU *c, bool virt) {
-    if (gt_count) return gt_count(c, virt);
-    return c->icount;   /* rough fallback for M2 standalone */
+    return gt_count(c, virt);
 }
 
 #define KEY(op0, op1, crn, crm, op2) \
@@ -45,9 +47,9 @@ static u64 timer_count(CPU *c, bool virt) {
  * timers CNTKCTL_EL1 keeps from it, the registers of features this CPU does
  * not implement (DIT, SSBS, TCO, RNDR, ...) -- and the ID registers: without
  * FEAT_IDST (ID_AA64MMFR2_EL1.IDS is 0 here) an EL0 read of one is UNDEFINED,
- * which is what a guest kernel's MRS emulation (Linux's emulate_mrs) is for.
- * Kept in step with the user-mode copy in arm64chroot, whose sole difference
- * is that last rule: there the emulator itself plays that kernel. */
+ * which is what a guest kernel's MRS emulation (Linux's emulate_mrs) is for;
+ * in arm64chroot the emulator itself plays that kernel (loop.c, from
+ * sysreg_id_read). */
 static bool el0_allowed(CPU *c, unsigned L, unsigned op0, unsigned op1,
                         unsigned CRn, unsigned CRm, unsigned op2, unsigned Rt) {
     u64 sctlr = c->sctlr[1], kctl = c->cntkctl_el1;
@@ -127,6 +129,7 @@ static void msr_immediate(CPU *c, u32 insn) {
 static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
                    unsigned op2, unsigned Rt) {
     if (CRn == 8) {                                      /* TLBI * */
+#if ARM64_SYSTEM
         /* EL1 VA forms — VAE1/VAAE1/VALE1/VAALE1, IS (CRm==3) and non-IS
          * (CRm==7) — invalidate a single page: Xt[43:0] holds VA[55:12],
          * rebuilt to a canonical VA by sign-extending bit 55. Every other
@@ -136,28 +139,28 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
             u64 va = (reg_x(c, Rt) & 0xFFFFFFFFFFFULL) << 12;
             if (va & (1ULL << 55)) va |= 0xFF00000000000000ULL;
             tlb_flush_page(va);
-        } else {
-            tlb_flush_all();
+            return;
         }
+#endif
+        tlb_flush_all();
         return;
     }
     if (CRn == 7) {
+#if ARM64_SYSTEM
         if (CRm == 8 && op1 == 0 && op2 <= 3) {          /* AT S1E1R/W, S1E0R/W */
             c->par_el1 = mmu_at_s1(c, reg_x(c, Rt), op2 & 1, op2 >= 2);
             return;
         }
+#endif
         if (CRm == 4 && op2 == 1) {                      /* DC ZVA: zero 64 bytes */
             u64 base = reg_x(c, Rt) & ~63ULL;
-            /* One D-TLB probe covers the line (64-aligned: never crosses a
-             * page): writable-RAM hit -> host memset. Miss/deny falls back
-             * to the 8x mem_write loop, which handles faults, MMIO,
-             * watchpoint runs (the D-TLB is empty then) and JIT code pages
-             * (W refused -> slow path keeps SMC invalidation) identically. */
-            DTlbEnt *de = dtlb_ent(base);
-            if (de->tag == dtlb_tag(c, base) && (de->pte & DTLB_W)) {
-                memset((u8 *)(uintptr_t)(de->pte & ~0xfffULL) + (base & 0xfffULL), 0, 64);
-                return;
-            }
+            /* One translation covers the line (64-aligned: never crosses a
+             * page): a writable host pointer -> memset. Otherwise the 8x
+             * mem_write loop raises the fault identically -- and in arm64emu
+             * handles MMIO, watchpoint runs (the D-TLB is empty then) and
+             * JIT code pages (W refused -> slow path keeps SMC invalidation). */
+            void *hp = mem_host_ptr(c, base, 64, ACC_WRITE);
+            if (hp) { memset(hp, 0, 64); return; }
             for (unsigned i = 0; i < 64; i += 8)
                 if (!mem_write(c, base + i, 8, 0)) return;
             return;
@@ -167,8 +170,8 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
     (void)insn; (void)op1;
 }
 
-/* MRS: read system register into Rt. */
-static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
+/* MRS: a system register's value. */
+static u64 mrs_value(CPU *c, unsigned key) {
     u64 v = 0;
     switch (key) {
         /* --- identification --- */
@@ -215,14 +218,10 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
         case KEY(3,0,4,2,0): v = c->sp_sel; break;           /* SPSel */
         case KEY(3,3,4,2,0): v = c->nzcv & 0xf0000000; break;/* NZCV */
         case KEY(3,3,4,2,1): v = c->daif & (PS_D|PS_A|PS_I|PS_F); break; /* DAIF */
-        /* FPCR/FPSR accesses trap under CPACR_EL1.FPEN too (EC 0x07). */
-        case KEY(3,3,4,4,0):
-            if (c->fp_trapped) { cpu_fp_trap(c); return; }
-            v = c->fpcr; break;                              /* FPCR */
-        case KEY(3,3,4,4,1):
-            if (c->fp_trapped) { cpu_fp_trap(c); return; }
+        case KEY(3,3,4,4,0): v = c->fpcr; break;             /* FPCR (do_mrs: trap) */
+        case KEY(3,3,4,4,1):                                 /* FPSR (do_mrs: trap) */
             if (fpsr_sync) fpsr_sync(c);                     /* fold pending flags */
-            v = c->fpsr; break;                              /* FPSR */
+            v = c->fpsr; break;
         case KEY(3,0,4,0,0): v = c->spsr[1]; break;          /* SPSR_EL1 */
         case KEY(3,0,4,0,1): v = c->elr[1]; break;           /* ELR_EL1 */
         case KEY(3,0,4,1,0): v = c->sp_el[0]; break;         /* SP_EL0 */
@@ -253,7 +252,29 @@ static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
             v = 0;
             break;
     }
-    set_x(c, Rt, v);
+    return v;
+}
+
+static void do_mrs(CPU *c, unsigned key, unsigned Rt) {
+    /* FPCR/FPSR accesses trap under CPACR_EL1.FPEN too (EC 0x07). */
+    if (c->fp_trapped && (key == KEY(3,3,4,4,0) || key == KEY(3,3,4,4,1))) {
+        cpu_fp_trap(c);
+        return;
+    }
+    set_x(c, Rt, mrs_value(c, key));
+}
+
+u64 sysreg_id_read(CPU *c, unsigned CRm, unsigned op2) {
+    return mrs_value(c, KEY(3, 0, 0, CRm, op2));
+}
+
+/* CPACR_EL1.FPEN trap: EC 0x07 with the A64 ISS (CV=1, COND=0b1110 — the
+ * encoding QEMU uses for trapped-from-AArch64 FP accesses). Shared by the
+ * interpreter dispatch guards, the sysreg FPCR/FPSR guards, and the
+ * predecoded tier's specialized vector load/store handlers -- all behind
+ * fp_trapped, which only arm64emu's guest can set. */
+void cpu_fp_trap(CPU *c) {
+    cpu_raise_sync(c, esr_make(EC_FP_SIMD_TRAP, 0x01E00000), 0);
 }
 
 /* MSR: write Rt to system register. */
@@ -337,12 +358,23 @@ void sysreg_exec(CPU *c, u32 insn) {
 }
 
 void sysreg_init(CPU *c) {
+#if ARM64_SYSTEM
     c->sctlr[1] = 0x00C50838;   /* RES1 bits set, MMU/caches off */
     /* CPACR_EL1 resets architecturally UNKNOWN; reset FPEN=0b11 (no trap) so
      * flat-loaded images and firmware that touch SIMD before programming
      * CPACR keep working — enforcement engages only when a guest explicitly
      * writes a trapping FPEN. */
     c->cpacr_el1 = 0x300000;
+#else
+    /* RES1 bits set, MMU/caches off. The rest is the kernel role's, and
+     * Linux's: MSCEn (EL0 MOPS, as it advertises HWCAP2_MOPS), DZE, UCT and
+     * UCI (DC ZVA, CTR_EL0 and cache maintenance by VA at EL0), never UMA;
+     * of the counters only the virtual one opened to EL0; and FP/SIMD
+     * untrapped (FPEN=0b11). */
+    c->sctlr[1] = 0x00C50838ULL | SCTLR_DZE | SCTLR_UCT | SCTLR_UCI | (1ULL << 33);
+    c->cntkctl_el1 = CNTK_EL0VCTEN;
+    c->cpacr_el1 = 0x300000;
+#endif
     cpu_refresh_fp_trap(c);
     c->mdscr_el1 = 0;
     if (fpsr_sync) { fpsr_sync(c); c->fpsr = 0; }  /* drop pre-reset FP flags */

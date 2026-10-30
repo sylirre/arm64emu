@@ -652,7 +652,7 @@ static void put_version(int fd) {
  * nothing here, on a kernel either), the Features line spelled from the same
  * HWCAP words the auxv carries (elf_hwcaps), in the kernel's own order and
  * names (arch/arm64/kernel/cpuinfo.c hwcap_str), and the MIDR fields of the
- * part MIDR_EL1 reads as (core/sysreg.c: 0x411fd070, a Cortex-A57). A real
+ * part MIDR_EL1 reads as (lib/arm64/sysreg.c: 0x411fd070, a Cortex-A57). A real
  * arm64 kernel prints no "model name" line, and neither does this. */
 static const char *const cpuinfo_hwcap_str[] = {
     "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32",
@@ -705,7 +705,7 @@ static void put_cpuinfo(int fd) {
     elf_hwcaps(&hwcap, &hwcap2);
     int ids[4096];
     int n = cpuinfo_online(ids, (int)(sizeof ids / sizeof ids[0]));
-    const u32 midr = 0x411fd070u;   /* as MRS MIDR_EL1 answers (core/sysreg.c) */
+    const u32 midr = 0x411fd070u;   /* as MRS MIDR_EL1 answers (lib/arm64/sysreg.c) */
     for (int i = 0; i < n; i++) {
         dprintf(fd, "processor\t: %d\nBogoMIPS\t: 100.00\nFeatures\t:", ids[i]);
         for (unsigned b = 0; b < sizeof cpuinfo_hwcap_str / sizeof *cpuinfo_hwcap_str; b++)

@@ -36,6 +36,15 @@ Makefile                  (repository root) `make arm64emu` -> build/arm64emu;
                           C11 + libc/POSIX + -lm only, no external deps.
                           CC/CFLAGS/ARM64EMU_OPT overridable
 lib/arm64/                shared with arm64chroot (compiled into both):
+  types.h                 u8..u64 / bool / small helpers; includes the
+                          program's arm64_config.h first
+  cpu.h                   CPU state struct, PSTATE bits, core interpreter API
+  sysreg.h                MSR/MRS + SMCCC hooks (smccc_conduit weak: only
+                          arm64emu has PSCI)
+  sysreg.c                system-register file: MSR/MRS/SYS/MSR-immediate, ID
+                          registers (what features the guest kernel probes),
+                          generic-timer registers, DC ZVA, TLBI, AT (the
+                          EL1-only ones under ARM64_SYSTEM), CPACR FP trap
   exec_fpsimd.c           A64 decoder/executor, part 2 — scalar FP, the full
                           Advanced-SIMD surface (three-same/-diff/-extra,
                           by-element, across-lanes, two-misc, shift-imm, copy,
@@ -46,8 +55,8 @@ src/arm64emu/
   main.c                  entry point: CLI parsing, --help text (the option and
                           env-var reference), image loading, the run loop,
                           signal-flush of diagnostics, ARM64EMU_* debug env vars
-  types.h                 u8..u64 / bool / small helpers
-  cpu.h                   CPU state struct, PSTATE bits, core interpreter API
+  arm64_config.h          how lib/arm64 is built here: ARM64_SYSTEM 1 (full
+                          system), and the -DANDROID_JNI exit -> _exit shadow
   cpu.c                   reset, cpu_step (fetch/decode/execute driver),
                           condition codes, cpu_dump, and the diagnostics:
                           SVC syscall trace, musl-heap tracker (ARM64EMU_HEAP),
@@ -59,14 +68,11 @@ src/arm64emu/
                           FEAT_MOPS, CRC32, AdvSIMD load/store.
                           exec_a64() is the top-level dispatch and the
                           correctness reference for all three engines
-  sysreg.h                MSR/MRS + SMCCC hooks (weak, so M1 links standalone)
-  sysreg.c                system-register file: MSR/MRS/SYS/MSR-immediate, ID
-                          registers (what features the guest kernel probes),
-                          generic-timer registers, DC ZVA, TLBI, AT
   exception.c             exception entry/return: VBAR vectors, ESR/FAR/ELR/
                           SPSR banking, DAIF masking, ERET
   mmu.h                   translation + typed guest memory access API,
-                          D-TLB layout (shared with the JIT fast path)
+                          D-TLB layout (shared with the JIT fast path),
+                          mem_host_ptr (lib/arm64's host-pointer seam)
   mmu.c                   stage-1 walk (EL1&0, 4 KB granule), software TLB,
                           instruction-fetch cache, guest load/store helpers
   machine.h               Machine struct + virt platform constants
@@ -191,7 +197,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the interpreter and JIT parts of emulator where possible.
 * Keep in sync the code and documentation (`docs/arm64emu/`).
 * Keep in sync the file structure in architecture section of `docs/arm64emu/README.md` and structure section of this file.
-* The decoder, CPU and JIT have near-verbatim twins in arm64chroot (`src/arm64chroot/core/`, `src/arm64chroot/jit/`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
+* The decoder, the step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64chroot (`src/arm64chroot/core/`, `src/arm64chroot/predecode.c`, `src/arm64chroot/jit/`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
 
 ## Testing
 

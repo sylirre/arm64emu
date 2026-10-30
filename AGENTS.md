@@ -35,11 +35,19 @@ build/                 everything the build makes (gitignored, see below)
 ```
 
 The parts of the emulation core that still differ between the two emulators
-(decoder, CPU state, sysregs, predecode, JIT) live in each emulator's tree for
-now and are kept diffable against each other; they move into `lib/` as they
-are unified. A file in `lib/` is compiled into every program that uses it, so
-a change there must pass every such program's suites, and `lib/` never
-includes a program's headers.
+(decoder, step driver, predecode, JIT) live in each emulator's tree for now and
+are kept diffable against each other; they move into `lib/` as they are
+unified. A file in `lib/` is compiled into every program that uses it, with
+that program's flags, so a change there must pass every such program's suites.
+
+What differs between the programs is configured, not forked. `lib/arm64` takes
+exactly two headers from the program, found on its include path:
+`arm64_config.h`, how the library is built there (`ARM64_SYSTEM`: 1 for
+arm64emu's full system, 0 for arm64chroot's user mode, where the guest never
+leaves EL0), and `mmu.h`, guest memory access (`mem_read`/`mem_write`,
+`mem_host_ptr`, `tlb_flush_all`, ...). Beyond those it calls functions the
+program defines (`exception_take`, `gt_count`, ...). It includes no other
+program header.
 
 ## Building
 

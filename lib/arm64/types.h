@@ -4,22 +4,18 @@
 #ifndef A64_TYPES_H
 #define A64_TYPES_H
 
+/* How the program compiling this library builds it (ARM64_SYSTEM, ...): each
+ * program has its own arm64_config.h in its source tree. Included first, by
+ * the header every other one includes, so all of the library and of the
+ * program see one configuration. */
+#include "arm64_config.h"
+#ifndef ARM64_SYSTEM
+#error "arm64_config.h must define ARM64_SYSTEM (1: full system, 0: user mode)"
+#endif
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-
-#ifdef ANDROID_JNI
-/* Embedded build (see main.c): the emulator is linked into a host process and
- * entered in a fork()ed child of it, so the atexit handlers and DSO destructors
- * registered in that process — an Android runtime's, say — are not ours to run.
- * A fatal path must therefore leave through _exit(). Shadowing the name here
- * covers every call site at once, present and future, which 40-odd scattered
- * edits would not. The system headers come first so that the declarations they
- * carry are made before the name is taken. */
-#include <stdlib.h>
-#include <unistd.h>
-#define exit(code) _exit(code)
-#endif
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -52,7 +48,8 @@ static inline u32 ror32(u32 x, unsigned n) { n &= 31; return n ? (x >> n) | (x <
 static inline u64 ror64(u64 x, unsigned n) { n &= 63; return n ? (x >> n) | (x << (64 - n)) : x; }
 
 /* High 64 bits of a 64x64 multiply (SMULH/UMULH). Native __int128 where the
- * compiler has it (64-bit hosts); 32-bit limb arithmetic otherwise. */
+ * compiler has it (64-bit hosts); 32-bit limb arithmetic otherwise (i386/arm32
+ * hosts). */
 static inline u64 umulh64(u64 a, u64 b) {
 #ifdef __SIZEOF_INT128__
     return (u64)(((unsigned __int128)a * b) >> 64);

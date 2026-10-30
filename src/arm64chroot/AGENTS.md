@@ -69,13 +69,15 @@ full on real armv7 silicon.
 ```
 Makefile                             (repository root) `make arm64chroot` -> build/arm64chroot; also arm64chroot32 (ILP32 host) and arm64chroot_asim (Android behavior)
 lib/arm64/                           Shared with arm64emu (compiled into both):
+  types.h cpu.h                      Fixed-width types; CPU state + core interpreter API
+  sysreg.h sysreg.c                  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers (sysreg_id_read), what EL0 may run
   esr.h                              ESR exception classes + syndrome construction
   exec_fpsimd.c                      FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
+  arm64_config.h                     How lib/arm64 is built here: ARM64_SYSTEM 0 (user mode, the guest stays at EL0)
   core/                              The user-mode variant of the rest of arm64emu's core, kept diffable against src/arm64emu until merged into lib/arm64:
-    types.h cpu.h sysreg.h           Fixed-width types, CPU state, sysregs
     decode.c                         A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
-    cpu.c sysreg.c                   Step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, what EL0 may run
+    cpu.c                            Step driver, reset, condition codes, debug dump
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
@@ -120,7 +122,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the code and documentation (`docs/arm64chroot/`).
 * Keep in sync the file structure in design section of `docs/arm64chroot/README.md` and structure section of this file.
 * New implemented syscalls must also be defined in `src/arm64chroot/strace.c` argdefs, so they can be decoded by `--strace-full`.
-* The decoder, CPU and JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
+* The decoder, the step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
 
 ## Testing
 
@@ -227,4 +229,4 @@ Tuning:
 * `ARM64CHROOT_JIT_MB`: per-thread JIT code-cache size in MiB (default 32, clamped 1–128).
 * `XDG_RUNTIME_DIR`, `TMPDIR`: first writable one holds the backing directories of emulated tmpfs mounts (removed when the session ends; a session killed before it could clean up is swept by the next one), plus the --shared-proc *fallback* registry file and the System V shm segment backings when the diskless broker (memfd) is unavailable and /dev/shm isn't writable (Termux). The shm backings are unlinked the moment they are created (the broker hands attachers the descriptor, never a name), so only the registry file has one — and it is refused unless it is a regular file owned by this user that nobody else can reach.
 
-Note: `src/arm64chroot/core/cpu.c` / `cpu.h` still document several source-inherited hooks — g_rtrace (compact register trace), g_prof/ARM64EMU_PROF (hot-PC profiler), g_ring/ARM64EMU_RING (recent-step ring buffer), g_tpc/ARM64EMU_TPC (dump state at a target PC), and g_cov/ARM64EMU_COV (coverage-divergence finder) — carried over from arm64emu's core (`src/arm64emu/cpu.c`). This codebase never wires those env vars up. They stay 0 unless you edit the source and rebuild.
+Note: `src/arm64chroot/core/cpu.c` / `lib/arm64/cpu.h` still document several source-inherited hooks — g_rtrace (compact register trace), g_prof/ARM64EMU_PROF (hot-PC profiler), g_ring/ARM64EMU_RING (recent-step ring buffer), g_tpc/ARM64EMU_TPC (dump state at a target PC), and g_cov/ARM64EMU_COV (coverage-divergence finder) — carried over from arm64emu's core (`src/arm64emu/cpu.c`). This codebase never wires those env vars up. They stay 0 unless you edit the source and rebuild.

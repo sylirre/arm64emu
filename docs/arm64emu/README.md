@@ -161,10 +161,10 @@ comparison.
 ```
 src/arm64emu/
   main.c        CLI, image loading, the run loop, signal-flush of diagnostics
-  cpu.{h,c}     CPU state, fetch/decode/execute driver, condition codes, dump,
+  arm64_config.h  how lib/arm64 is built here (full system; embedded _exit)
+  cpu.c         fetch/decode/execute driver, condition codes, dump,
                 hot-PC profiler / ring buffer / coverage-divergence finder
   decode.c      A64 decoder: integer/branch/load-store, CRC32, AdvSIMD ld/st
-  sysreg.c      MSR/MRS, ID registers, generic-timer registers, DC ZVA, TLBI
   mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB + fetch cache
   exception.c   exception entry/return (VBAR vectors, ESR/FAR/ELR/SPSR, ERET)
   memory.c      physical bus: RAM + NOR-flash CFI command set + MMIO dispatch
@@ -182,6 +182,9 @@ src/arm64emu/
   net/          usernet, the built-in user-mode NAT stack behind virtio-net
                 (core/udp/tcp; no TAP, TUN, privileges or external libraries)
 lib/arm64/      AArch64 emulation shared with arm64chroot:
+  types.h       fixed-width types and small helpers
+  cpu.h         CPU state, PSTATE bits, core interpreter API
+  sysreg.{h,c}  MSR/MRS, ID registers, generic-timer registers, DC ZVA, TLBI, AT
   exec_fpsimd.c FP/Advanced-SIMD execution (scalar FP + vector integer)
   esr.h         ESR_ELx exception classes + syndrome construction
 docs/arm64emu/  jit.md, pd.md, parity.md, todo/

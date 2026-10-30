@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* AArch64 CPU state and core interpreter interface. */
+/* AArch64 CPU state and core interpreter interface, shared by arm64emu and
+ * arm64chroot. A field only one of them uses costs the other nothing it would
+ * notice: most sit in padding. */
 #ifndef A64_CPU_H
 #define A64_CPU_H
 
@@ -51,8 +53,9 @@ typedef struct CPU {
     /* SIMD/FP */
     V128 v[32];
     u32 fpcr, fpsr;
-    bool fp_trapped;  /* set if CPACR/CPTR disables FP (kept simple) */
-    u8 ldst_unpriv;   /* transient: current data access is LDTR/STTR (EL0 view) */
+    bool fp_trapped;  /* CPACR_EL1.FPEN traps FP/SIMD at this EL (cpu_refresh_fp_trap) */
+    u8 ldst_unpriv;   /* transient: current data access is LDTR/STTR (EL0 view);
+                         read by arm64emu's MMU */
 
     /* Banked system registers (index by EL where meaningful) */
     u64 sctlr[4];
@@ -85,11 +88,16 @@ typedef struct CPU {
     u64 cntpct_base;   /* ARM64EMU_RTCLOCK mode: host ns at which the counter == 0 */
     u64 timer_skip;    /* deterministic mode: virtual ticks fast-forwarded over WFI idle */
 
-    /* Exclusive monitor (global, single-CPU). excl_valid is u32, not bool,
-     * so the JIT's 32-bit CPU-struct accesses to it are well-formed. */
+    /* Exclusive monitor. arm64emu has one CPU and matches on the address;
+     * arm64chroot runs guest threads on host threads, so excl_val/excl_val2
+     * hold the values LDXR/LDXP loaded and STXR/STXP do a real host
+     * compare-and-swap (SMP-correct on weakly ordered hosts), not just an
+     * address match. excl_valid is u32, not bool, so the JITs' 32-bit
+     * CPU-struct accesses to it are well-formed. */
     u32  excl_valid;
     u64  excl_addr;
     u64  excl_size;
+    u64  excl_val, excl_val2;
 
     /* Interrupt input lines (driven by the GIC). */
     bool irq_line;
@@ -97,9 +105,9 @@ typedef struct CPU {
 
     /* Run control */
     bool halted;       /* WFI/WFE: waiting for an event */
-    bool event;        /* WFE event register: set by SEV/SEVL, consumed by WFE */
     bool stop;         /* machine should terminate */
     bool reset;        /* PSCI SYSTEM_RESET: warm-reboot the machine, don't exit */
+    bool event;        /* WFE event register: set by SEV/SEVL, consumed by WFE */
     u64  icount;       /* retired instruction count */
     u64  cur_insn_pc;  /* address of the instruction currently executing */
 
@@ -144,8 +152,9 @@ void cpu_unpack_spsr(CPU *c, u32 spsr);
 
 /* Recompute the cached CPACR_EL1.FPEN trap predicate. Depends only on
  * (cpacr, el), so it is refreshed at the four points either can change:
- * CPACR MSR, exception entry, ERET (inside cpu_unpack_spsr), and reset.
- * FPEN: 0b11 no trap; 0b01 traps EL0 only; 0b00/0b10 trap EL0 and EL1.
+ * CPACR MSR, exception entry, ERET (inside cpu_unpack_spsr), and reset --
+ * in arm64chroot only the last: its guest never leaves EL0, where CPACR is
+ * out of reach, so fp_trapped stays as sysreg_init leaves it, false. FPEN: 0b11 no trap; 0b01 traps EL0 only; 0b00/0b10 trap EL0 and EL1.
  * EL2+ is outside CPACR's reach (CPTR_EL2/3 are not modeled). */
 static inline void cpu_refresh_fp_trap(CPU *c) {
     unsigned fpen = (unsigned)(c->cpacr_el1 >> 20) & 3;
@@ -153,7 +162,8 @@ static inline void cpu_refresh_fp_trap(CPU *c) {
                   : (c->el == 1) ? (fpen == 0 || fpen == 2) : false;
 }
 
-/* Raise the EC 0x07 FP/SIMD-access trap (A64 ISS: CV=1, COND=0b1110). */
+/* Raise the EC 0x07 FP/SIMD-access trap (A64 ISS: CV=1, COND=0b1110).
+ * sysreg.c. */
 void cpu_fp_trap(CPU *c);
 
 /* ---- Core API ---- */
@@ -176,7 +186,9 @@ void exec_a64(CPU *c, u32 insn);
 /* Condition code evaluation (cond 0..15) using current NZCV. */
 bool cond_holds(CPU *c, unsigned cond);
 
-/* Global trace flags (set from CLI). */
+/* Global trace flags (set from CLI). The environment knobs named below are
+ * arm64emu's; arm64chroot defines the variables (its cpu.c) but leaves the
+ * diagnostics among them unwired, at 0. */
 extern int g_trace;        /* per-instruction trace */
 extern int g_singlestep;   /* unused placeholder for parity with QEMU */
 extern int g_dbg;          /* targeted device/IRQ debug (env ARM64EMU_DBG) */

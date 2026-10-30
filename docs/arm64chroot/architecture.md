@@ -4,10 +4,13 @@
 
 `arm64chroot` is built around a decode/execute core it shares with its sibling,
 the arm64emu full-system emulator. What is already identical in both lives once,
-in `lib/arm64/` (`exec_fpsimd.c`, `esr.h`); the rest of the core, in
-`src/arm64chroot/core/`, is kept **diffable** against arm64emu's copy so fixes
-flow both ways until the two are merged into `lib/arm64/`. Everything below the
-memory seam and above the exception seam is rewritten for user mode.
+in `lib/arm64/` (`types.h`, `cpu.h`, `sysreg.c`, `exec_fpsimd.c`, `esr.h`),
+built in user mode (`ARM64_SYSTEM` 0, `src/arm64chroot/arm64_config.h`: the
+EL1-only instructions are left out, and `sysreg_init` sets EL1 up as Linux
+does); the rest of the core, in `src/arm64chroot/core/`, is kept **diffable**
+against arm64emu's copy so fixes flow both ways until the two are merged into
+`lib/arm64/`. Everything below the memory seam and above the exception seam is
+rewritten for user mode.
 
 ```
     shared (lib/arm64/, src/arm64chroot/core/)            new (src/arm64chroot/)
@@ -194,7 +197,8 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/arm64chroot/core/decode.c` | A64 integer/branch/load-store decode+exec; LSE atomics; exclusives as host CAS. |
 | `lib/arm64/exec_fpsimd.c` | Scalar FP, Advanced-SIMD, crypto; FPCR rounding; 32-bit-host-safe (no `__int128` in the hot paths). |
 | `src/arm64chroot/core/cpu.c` | `cpu_step` fetch/decode/execute driver; register/condition helpers; debug trace. |
-| `src/arm64chroot/core/sysreg.c` | `MRS`/`MSR`, ID registers, `FPCR`/`FPSR`, `DC ZVA`, generic-timer reads; which of them EL0 may execute. |
+| `lib/arm64/cpu.h` | CPU state (one struct for both emulators), register helpers, core API. |
+| `lib/arm64/sysreg.c` | `MRS`/`MSR`, ID registers, `FPCR`/`FPSR`, `DC ZVA`, generic-timer reads; which of them EL0 may execute. |
 | `src/arm64chroot/mmu.h`, `src/arm64chroot/mem.c` | Guest address space + the `mem_*` seam. |
 | `src/arm64chroot/exception.c` | Pending-exception recorder (the exception seam). |
 | `src/arm64chroot/loop.c` | Run loop + exception dispatch + signal delivery point; the kernel's EL0 `MRS` emulation of the ID registers. |

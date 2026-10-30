@@ -4,7 +4,7 @@
 #ifndef A64_FDT_H
 #define A64_FDT_H
 
-#include "../types.h"
+#include "types.h"
 #include <stddef.h>
 
 /* Rewrite the /memory node's `reg` to <base size> in the flattened device tree

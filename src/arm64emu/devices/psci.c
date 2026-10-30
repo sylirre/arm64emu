@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* PSCI over the SMC/HVC conduit (emulated firmware service). */
-#include "../cpu.h"
+#include "cpu.h"
 #include <stdio.h>
 
 #define PSCI_VERSION       0x84000000u

@@ -130,4 +130,18 @@ static inline DTlbEnt *dtlb_ent(u64 va) {
     return &g_dtlb[(va >> 12) & (DTLB_SIZE - 1)];
 }
 
+/* Host pointer for [va, va+size) if it lies within one page that a D-TLB
+ * entry maps for `acc` (ACC_READ or ACC_WRITE) at the current EL; NULL
+ * otherwise -- a miss, a fault to raise, MMIO, a watchpoint run (the D-TLB is
+ * empty then) or a JIT code page (W refused), all of which the caller leaves
+ * to mem_read/mem_write. The host-pointer seam of the shared core
+ * (lib/arm64), which arm64chroot's mem.c provides too. */
+static inline void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc) {
+    if ((va & 0xfffULL) + size > 0x1000 || acc == ACC_EXEC) return NULL;
+    DTlbEnt *de = dtlb_ent(va);
+    if (de->tag != dtlb_tag(c, va) || !(de->pte & (acc == ACC_WRITE ? DTLB_W : DTLB_R)))
+        return NULL;
+    return (u8 *)(uintptr_t)(de->pte & ~0xfffULL) + (va & 0xfffULL);
+}
+
 #endif /* A64_MMU_H */

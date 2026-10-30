@@ -1089,7 +1089,7 @@ static bool fe_sys_el0_refused(u32 insn) {
     unsigned CRn = (insn >> 12) & 0xf, Rt = insn & 31;
     if (!L && op0 == 0 && op1 == 3 && (CRn == 2 || CRn == 3) && Rt == 31)
         return false;                /* hints and barriers: decode.c's own */
-    return sysreg_el0_ok && !sysreg_el0_ok(g_fe_c, insn);
+    return !sysreg_el0_ok(g_fe_c, insn);
 }
 
 /* True if the instruction is FP/SIMD for CPACR.FPEN purposes: a specialized

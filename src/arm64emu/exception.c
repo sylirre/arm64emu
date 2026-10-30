@@ -76,11 +76,3 @@ void cpu_raise_sync(CPU *c, u64 esr, u64 far) {
     }
     exception_take(c, EXC_SYNC, esr, far, c->cur_insn_pc);
 }
-
-/* CPACR_EL1.FPEN trap: EC 0x07 with the A64 ISS (CV=1, COND=0b1110 — the
- * encoding QEMU uses for trapped-from-AArch64 FP accesses). Shared by the
- * interpreter dispatch guards, the sysreg FPCR/FPSR guards, and the
- * predecoded tier's specialized vector load/store handlers. */
-void cpu_fp_trap(CPU *c) {
-    cpu_raise_sync(c, esr_make(EC_FP_SIMD_TRAP, 0x01E00000), 0);
-}

@@ -21,7 +21,7 @@
 #ifndef A64_JIT_PREDECODE_H
 #define A64_JIT_PREDECODE_H
 
-#include "../cpu.h"
+#include "cpu.h"
 
 typedef struct {
     u32 insn;      /* the classified word; also the pd_run cache validation tag

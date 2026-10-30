@@ -355,14 +355,16 @@ host-portability pitfalls.
 
 ```
 lib/arm64/      AArch64 emulation shared with arm64emu:
+  types.h cpu.h fixed-width types; CPU state + core interpreter API
+  sysreg.{h,c}  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers, what EL0 may run
   esr.h         ESR exception classes + syndrome construction
   exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
+  arm64_config.h  how lib/arm64 is built here (user mode: the guest stays at EL0)
   core/         the user-mode variant of the rest of arm64emu's core, kept
                 diffable against it until the two are merged into lib/arm64:
-    types.h cpu.h sysreg.h   fixed-width types, CPU state, sysregs
     decode.c    A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
-    cpu.c sysreg.c   step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, what EL0 may run
+    cpu.c       step driver, reset, condition codes, debug dump
   mmu.h mem.c   NEW guest address space: 2-level software page table
                 (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect,
                 copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's
