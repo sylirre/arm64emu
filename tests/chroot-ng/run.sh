@@ -55,7 +55,7 @@ trap 'rm -rf "$CHROOTNG_TMP"' EXIT INT TERM
 cng_platform_banner
 if [ "$CHROOTNG_EMU_MISSING" = 1 ]; then
     echo "no qemu-aarch64 emulator found on a $HOST_ARCH host: install" \
-        "qemu-user-static, or set CHROOTNG_QEMU= if AArch64 binaries run here anyway" >&2
+        "qemu-user (qemu-aarch64[-static]), or set CHROOTNG_QEMU= if AArch64 binaries run here anyway" >&2
     exit 1
 fi
 echo
