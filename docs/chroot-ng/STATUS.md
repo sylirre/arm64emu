@@ -16,7 +16,7 @@ gaps that only a real fork+exec of a compiler exposes — see the entries below 
 handler-stack isolation, signal masking, the 0x400000 relocation, and the
 vfork/`posix_spawn` child-stack handling.
 
-At 1.6.0 the full test suite (`make test`) passes on this device (Zenfone 10)
+At 1.6.0 the full test suite (`make test-chroot-ng`) passes on this device (Zenfone 10)
 and on two older ones: Android 14 on kernel 4.19 (Pixel 5) and Android 8 on
 kernel 3.18 (Galaxy S7).
 
@@ -170,7 +170,7 @@ kernel 3.18 (Galaxy S7).
     reference. `linkat` resolves both endpoints (incl. real dirfds via
     `/proc/self/fd`, and `/proc/self/fd/N` O_TMPFILE via a content copy) to host
     paths and falls back to `cng_l2s_link`.
-  - All in `src/monitor/l2s.c`, freestanding (raw syscalls), gated by
+  - All in `src/chroot-ng/monitor/l2s.c`, freestanding (raw syscalls), gated by
     `cng_l2s_active` so there is **zero** extra cost until a hardlink actually
     falls back. Validated by `-t l2stest`: regular-file presentation, shared
     inode, nlink=2, `readlink`→EINVAL, shared content, EEXIST on a dup link,
@@ -202,7 +202,7 @@ kernel 3.18 (Galaxy S7).
   them via absolute targets, and a legacy name mv'ed to another directory is
   repointed afterwards (`cng_l2s_rename_prep`/`_fixup`).
   - Fidelity fixups on top of M9 (each with an `-t l2stest` check asserted by
-    `tests/m7_fidelity.sh`): `fstat` / `newfstatat(AT_EMPTY_PATH)` /
+    `tests/chroot-ng/m7_fidelity.sh`): `fstat` / `newfstatat(AT_EMPTY_PATH)` /
     `statx(AT_EMPTY_PATH)` patch `st_nlink` by fd; `statx` honors the guest's
     mask/flags and advertises `STATX_NLINK`; `readlinkat` refuses (`EINVAL`)
     through real dirfds too; `getdents64` hides data/marker entries everywhere
@@ -212,7 +212,7 @@ kernel 3.18 (Galaxy S7).
     file's `d_type`/`d_ino` — what `stat` of the name answers — so the readdir
     fast path of GNU `ls -F`/`find -type f`/`ls -i` sees a regular file
     (`cng_l2s_dirent`: one `readlinkat` per symlink listed under `-l`, one
-    `fstatat` more per link; `tests/guests/dents.c` diffs the raw records
+    `fstatat` more per link; `tests/chroot-ng/guests/dents.c` diffs the raw records
     against real hardlinks in M10); paths naming the
     machinery return `ENOENT` from every path syscall including execve
     (`cng_l2s_deny`); `fchownat`/`faccessat2` with `AT_SYMLINK_NOFOLLOW` land
@@ -224,7 +224,7 @@ kernel 3.18 (Galaxy S7).
     monitor by itself; `fstat` + `getdents64` are trapped only under `-l`
     (`l2s_syscalls[]` in seccomp.c). `CHROOTNG_L2S_FORCE=1` routes every `linkat`
     through the emulation (test aid mirroring arm64chroot's `A64_L2S_FORCE`).
-  - Acceptance: `tests/m10_l2s_shell.sh` runs 13 shell scenarios in an Alpine
+  - Acceptance: `tests/chroot-ng/m10_l2s_shell.sh` runs 13 shell scenarios in an Alpine
     rootfs under `chroot-ng -R -l` + `CHROOTNG_L2S_FORCE=1` and compares stdout +
     exit status **byte-for-byte** against stock arm64chroot creating REAL
     hardlinks from the same scripts: ln basics (nlink/inode equality),
@@ -324,7 +324,7 @@ kernel 3.18 (Galaxy S7).
   (notably gcc's `cc1`, `Type: EXEC` at `0x400000`) MAP_FIXED-overwrote our own
   monitor code, crashing early with `SEGV_ACCERR`. PIE guests were unaffected
   (kernel-picked high base). Link chroot-ng at `0x1000000000` (64 GiB) via an
-  explicit linker script (`scripts/chroot-ng.ld`) whose location counter starts
+  explicit linker script (`src/chroot-ng/chroot-ng.ld`) whose location counter starts
   the first segment there — clear of every guest's fixed vaddr and below the
   kernel's high mmap region. (A `-Ttext`/`-Ttext-segment`/`--image-base` flag
   does NOT relocate a `-no-pie` binary cleanly on lld: it keeps the segment at
@@ -458,7 +458,7 @@ kernel 3.18 (Galaxy S7).
     way (the fd's host path is `/proc`), because `ls /proc` and `ps` read the
     directory rather than probing names; it costs a readlink only for a batch
     that actually holds an all-digit name, which outside `/proc` is nothing.
-  - **PID registry** (`src/monitor/procreg.c`, ported from `proctab.c`): a
+  - **PID registry** (`src/chroot-ng/monitor/procreg.c`, ported from `proctab.c`): a
     `MAP_SHARED` table in which each guest process publishes its argv, environ,
     auxv, exe and cwd. By default the backing is one anonymous region inherited
     across fork (one invocation's view); with **`--shared-proc`** it is served
@@ -494,7 +494,7 @@ kernel 3.18 (Galaxy S7).
     need not make another traced syscall before something reads its `/proc`
     entry; a slot the child already stamped with its own exec is left alone.
     Threads still run untrapped.
-  - **Synthesized files** (`src/monitor/procfs.c`, from `sys_procfs.c`), served
+  - **Synthesized files** (`src/chroot-ng/monitor/procfs.c`, from `sys_procfs.c`), served
     from an in-memory copy on a read-only open, for any guest pid:
     `cmdline`, `environ`, `auxv` (the kernel's copies describe the chroot-ng
     invocation — we never execve), `mounts`/`mountinfo`/`mountstats` plus
@@ -527,7 +527,7 @@ kernel 3.18 (Galaxy S7).
   table, loadavg/uptime/stat shape and the refresh-on-rewind path through both
   `read` and `readv`, no host path in `maps`, fd-link and map_files
   untranslation, the fake-id status remap, `--no-proc`) and by
-  `tests/m11_proc.sh`, which reruns the same ground in an Alpine guest shell
+  `tests/chroot-ng/m11_proc.sh`, which reruns the same ground in an Alpine guest shell
   (`cat /proc/self/cmdline` shows the guest's argv, `ps` sees only guest
   processes, `/proc/1/stat` is absent, `comm` is `busybox`) and adds the
   two-invocation `--shared-proc` scenario: a backgrounded guest `sleep` shows
@@ -567,11 +567,11 @@ kernel 3.18 (Galaxy S7).
   app seccomp allow-list and SELinux forbids the class — so any guest that uses
   them (PostgreSQL, X clients, dpkg's plumbing, anything linked against a stock
   libc's shm functions) died on the first call. All four are now trapped and
-  served in-process from `src/monitor/shm.c`, with **no host SysV IPC syscall
+  served in-process from `src/chroot-ng/monitor/shm.c`, with **no host SysV IPC syscall
   and no `/dev/shm` anywhere in the path**. Trapped unconditionally, as in
   arm64chroot: the guest gets one shm namespace whatever the host's own IPC
   would have allowed.
-  - **The broker owns the segments** (`src/monitor/broker.c`). Somebody has to
+  - **The broker owns the segments** (`src/chroot-ng/monitor/broker.c`). Somebody has to
     hold each segment's backing fd for its lifetime, and it cannot be a guest
     process — host fd == guest fd here, so a held fd would be visible to and
     closable by the guest. The daemon holds it (an anonymous memfd, or a 0600
@@ -608,7 +608,7 @@ kernel 3.18 (Galaxy S7).
     the emulated `execve` detaches them all at its commit point, since a real
     one tears down the address space.
   - **Two fidelity gaps the oracle also has**, found by diffing corner cases
-    (`tests/guests/shm_edge.c`): `SHM_EXEC` is a *permission* request, so
+    (`tests/chroot-ng/guests/shm_edge.c`): `SHM_EXEC` is a *permission* request, so
     attaching a `0600` segment with it must fail `EACCES` the way the kernel
     checks `S_IXUGO` — the broker's permission triad grew an execute leg for
     it; and `SHM_LOCK`/`SHM_UNLOCK` succeed for the owner rather than answering
@@ -618,7 +618,7 @@ kernel 3.18 (Galaxy S7).
     segment up), where qemu's own `shmat` attaches anyway — and so did the
     emulation, until the first native run. The address rules now come first,
     in the kernel's order, ahead of the broker's lookup and permission check.
-  - **Tested differentially.** `tests/guests/shm_sysv.c` and `shm_stat.c`
+  - **Tested differentially.** `tests/chroot-ng/guests/shm_sysv.c` and `shm_stat.c`
     (arm64chroot's own, written for exactly this comparison) plus `shm_exec.c`
     run once under the emulation and once straight under qemu-aarch64, where
     the same code gets the genuine article — the host kernel's
@@ -627,7 +627,7 @@ kernel 3.18 (Galaxy S7).
     attachment-table programs, is refereed by a host-native build instead,
     since its attach-side answers are the ones qemu makes up. `-t shmtest`
     covers the dispatcher level in ten groups including a real fork and a
-    real broker, and `tests/guests/shm_key.c` pins the namespace scope, which
+    real broker, and `tests/chroot-ng/guests/shm_key.c` pins the namespace scope, which
     is the one part with no counterpart to diff against.
 
 - [x] **M13 — `-b SRC:DST[:ro]`: oracle-compatible bind syntax + read-only binds**
@@ -803,7 +803,7 @@ kernel 3.18 (Galaxy S7).
     zone rows are conditional and a bind's id depends on what precedes it.
   - Tests: `m5_xlate` covers the access half (whitelist, `console`, subpaths, the
     fd aliases, the non-whitelisted device staying in the rootfs, a bind
-    outranking the zone); new `tests/m14_dev.sh` covers the listing half in a
+    outranking the zone); new `tests/chroot-ng/m14_dev.sh` covers the listing half in a
     real Alpine guest — all fourteen names in `ls /dev` where the rootfs
     physically has only `null`, no duplicate for that one, the nodes actually
     readable/writable, `/dev/mem` unreachable, a spliced bind point listed with a
@@ -861,7 +861,7 @@ kernel 3.18 (Galaxy S7).
     pid is deliberately left alone; guest pid == host pid here.
   - `CNG_SECCOMP_MAX_INSNS` 128 → 256 for the ten new entries (filter is 89
     instructions; the kernel's own limit is 4096).
-  - Tests (`tests/m15_unixsock.sh`, guest `tests/guests/uxsock.c`) lean on facts
+  - Tests (`tests/chroot-ng/m15_unixsock.sh`, guest `tests/chroot-ng/guests/uxsock.c`) lean on facts
     that make them self-proving rather than tautological: the host `/run` is
     root-owned and unwritable, so `bind: ok` there is only reachable *through* the
     rootfs (the pre-fix binary answers `Permission denied` — verified), and the
@@ -922,7 +922,7 @@ kernel 3.18 (Galaxy S7).
   - Where even `socket(AF_NETLINK)` is refused, a dump degrades to an empty
     result: `getifaddrs` then succeeds with no interfaces instead of failing, and
     `ip addr` prints nothing instead of "Cannot open netlink socket".
-  - Tested **differentially**: the same guest (`tests/guests/netif.c`, exercising
+  - Tested **differentially**: the same guest (`tests/chroot-ng/guests/netif.c`, exercising
     `getifaddrs` plus a raw iproute2-style `RTM_GETLINK` dump) runs once straight
     under qemu against the real kernel and once under chroot-ng with
     `CHROOTNG_NETLINK_FORCE_BLOCK=1`, and the two must agree byte for byte. That is the
@@ -990,7 +990,7 @@ kernel 3.18 (Galaxy S7).
     compile-time fallback rather than the kernel's real answer. That is in direct
     tension with the ~4.5 KiB frame our own SIGSYS handler is delivered on. Now
     passed through.
-  - `tests/guests/auxprobe.c` asserts the identity entries agree with the
+  - `tests/chroot-ng/guests/auxprobe.c` asserts the identity entries agree with the
     credential syscalls under `--fake-id`, and that `AT_RANDOM` differs between
     two execs.
 
@@ -1019,7 +1019,7 @@ kernel 3.18 (Galaxy S7).
     still needs rewriting (our host socket is unbound, so the kernel addresses
     replies to port 0 while the client matches them against the port id
     `getsockname` reported).
-  - `tests/guests/nldone.c` now applies **iproute2's** filter rather than
+  - `tests/chroot-ng/guests/nldone.c` now applies **iproute2's** filter rather than
     glibc's: it asserts the terminator's length, that the source address is
     `nl_pid == 0`, that `nlmsg_pid` equals the port id from `getsockname`, that
     the sequence number matches, and that nothing was silently skipped — the
@@ -1059,7 +1059,7 @@ kernel 3.18 (Galaxy S7).
   - Forwarding the request verbatim looked obviously right and was the bug.
   - `SO_RCVTIMEO` is set on the relay socket, so a kernel that answers nothing
     cannot hang the guest.
-  - **Test gap closed:** `tests/guests/nldone.c` now sends iproute2's request
+  - **Test gap closed:** `tests/chroot-ng/guests/nldone.c` now sends iproute2's request
     byte for byte, `IFLA_EXT_MASK` and all. It previously sent the bare form —
     the one form that already worked — which is precisely why the suite passed
     while the device failed.
@@ -1166,7 +1166,7 @@ kernel 3.18 (Galaxy S7).
   prints the same three lines arm64chroot does.
   - The host/guest split is explicit in the code now: `cng_g_envp` — read by every
     `CNG_*` knob and by `cng_broker_env` — is `cng_g_host_envp`, and the guest's
-    vector is assembled by `build_guest_env` (`src/run.c`) and handed to
+    vector is assembled by `build_guest_env` (`src/chroot-ng/run.c`) and handed to
     `cng_build_stack`. The emulated `execve` is untouched: it carries the guest's
     own `envp`, exactly as a real one does.
   - An `-E` entry *replaces* rather than shadows, both for a repeated name and for
@@ -1177,7 +1177,7 @@ kernel 3.18 (Galaxy S7).
     no `getenv` could ever match — the oracle passes that string straight into
     `envp`. Nothing is synthesized for the guest either: a shell supplies its own
     default `PATH`, and inventing a `HOME` would be guessing.
-  - **Tests:** new `tests/m17_env.sh`, 30 legs. The entry *count* carries the
+  - **Tests:** new `tests/chroot-ng/m17_env.sh`, 30 legs. The entry *count* carries the
     scrubbing assertion (host `CNG_*`, `HOME` and `LD_LIBRARY_PATH` canaries are
     set on every run), and two exact-match legs make the Alpine guest's own
     `env(1)` and its `/proc/self/environ` agree on the same three entries. M3, M4
@@ -1203,7 +1203,7 @@ kernel 3.18 (Galaxy S7).
   - Oracle parity in all four combinations (absolute/relative x file/symlink):
     arm64chroot answers `exe=/bin/exeprobe comm=exeprobe` for each, and so do we
     now; two of the four used to abort and one was wrong.
-  - **Tests:** M7 gained five legs on a new `tests/guests/exeprobe.c` (reads its
+  - **Tests:** M7 gained five legs on a new `tests/chroot-ng/guests/exeprobe.c` (reads its
     own exe link and comm), including the reported form — identity rootfs plus a
     relative `<program>` — and a rootfs form whose relative path resolves against
     the guest root instead. Verified to fail on the pre-fix binary (`rc 134`,
@@ -1229,8 +1229,8 @@ kernel 3.18 (Galaxy S7).
     code the neighbouring resolve/load failures use; the oracle spells all of its
     setup failures 126). Quietly falling back to `/` would leave a guest running
     in the wrong tree, which nothing downstream can detect.
-  - **Tests:** new `tests/m17_workdir.sh`, 33 legs on a new
-    `tests/guests/cwdprobe.c` (prints `getcwd`, `/proc/self/cwd`, and the contents
+  - **Tests:** new `tests/chroot-ng/m17_workdir.sh`, 33 legs on a new
+    `tests/chroot-ng/guests/cwdprobe.c` (prints `getcwd`, `/proc/self/cwd`, and the contents
     of a file opened relative to the cwd — a working directory that only *prints*
     right is no working directory at all). Identity-rootfs legs run on every host;
     the rootfs legs need a live translation tier (`guest_xlate_ready`) because
@@ -1247,7 +1247,7 @@ kernel 3.18 (Galaxy S7).
   `getcwd(garbage, n)`, `rt_sigaction(sig, garbage, ...)` and
   `rt_sigprocmask(how, garbage, ...)` each turned an ordinary `-EFAULT` into the
   death of the guest, behind nothing more than a bare NULL check.
-  - New `src/monitor/uaccess.c`: `cng_user_readable` / `cng_user_writable` ask the
+  - New `src/chroot-ng/monitor/uaccess.c`: `cng_user_readable` / `cng_user_writable` ask the
     kernel whether a range is accessible rather than finding out by faulting —
     the move `dbg_str` already makes for the debug log, generalized from a C
     string to a byte range. The probe is a copy through a scratch memfd:
@@ -1270,7 +1270,7 @@ kernel 3.18 (Galaxy S7).
     audited list: `openat2`'s `open_how`, `sendmsg`/`recvmsg`'s `msghdr` and first
     iovec, and the `getcwd` output buffer. Path *strings* are a separate case (the
     resolver walks them component by component) and are left for their own change.
-  - **Tests:** new `tests/m17_fault.sh` on a new `-t faulttest`, which drives the
+  - **Tests:** new `tests/chroot-ng/m17_fault.sh` on a new `-t faulttest`, which drives the
     dispatcher directly — so the emulation is exercised on every host, not only
     where the seccomp tier is live. Eleven syscalls are called with a wild
     (non-NULL, unmapped) pointer and must answer `-EFAULT`; the test surviving to
@@ -1279,7 +1279,7 @@ kernel 3.18 (Galaxy S7).
     0 failed.
 
 - [x] **M17-9 — `seccomp(2)` and `prctl` are virtualized**
-  `docs/DESIGN.md` has listed this as required since M5 and it was never done: a
+  `docs/chroot-ng/DESIGN.md` has listed this as required since M5 and it was never done: a
   guest could install its own seccomp filter, and the kernel layers that filter
   over ours on the same thread — including over the syscalls the SIGSYS handler
   re-issues through the gate, which the guest's filter knows nothing about. A
@@ -1302,7 +1302,7 @@ kernel 3.18 (Galaxy S7).
     capability bounding set keep running natively. That matters on the hot path —
     bionic's allocator calls `PR_SET_VMA` on every mapping. The filter is 119 of
     256 instructions.
-  - **Tests:** new `tests/m17_seccomp.sh` on a new `-t prctltest`, which sets the
+  - **Tests:** new `tests/chroot-ng/m17_seccomp.sh` on a new `-t prctltest`, which sets the
     real `no_new_privs` bit first so "the guest sees 0" asserts the
     virtualization rather than an untouched process, and checks an unowned op
     (`PR_SET_NAME`) still reaches the kernel. Seven filter legs in
@@ -1443,7 +1443,7 @@ kernel 3.18 (Galaxy S7).
   - `nodename` and `domainname` stay the host's. They name the machine the guest
     is really on — `hostname` reports it either way, and inventing one would only
     confuse the user reading it.
-  - **Tests:** new `tests/m17_uname.sh`, 9 legs on a new `dtest uname`. Both
+  - **Tests:** new `tests/chroot-ng/m17_uname.sh`, 9 legs on a new `dtest uname`. Both
     readers are asserted to carry the fixed identity, and both to contain no
     occurrence of the *host's* actual release, which is the leak the change is
     about. Suite: 457 passed, 0 failed.
@@ -1504,7 +1504,7 @@ kernel 3.18 (Galaxy S7).
     emulated on either side and the ioctls pass straight through.
   - `SIOCSIF*` stays unemulated: it changes the host's network configuration,
     and the host refuses it to an unprivileged process anyway.
-  - **Tests:** `tests/guests/netif.c` gained the whole family, so the existing
+  - **Tests:** `tests/chroot-ng/guests/netif.c` gained the whole family, so the existing
     byte-for-byte differential against the real kernel covers it; plus 7 legs in
     `m16_netlink.sh` (including a relay-less run asserting the ioctl view is the
     same single interface `ip addr` shows) and 6 in `bpftest` pinning the band's
@@ -1536,7 +1536,7 @@ kernel 3.18 (Galaxy S7).
     looked at.
   - **Divergence from the oracle, deliberate:** arm64chroot gates the same shim
     on `fake_id && euid == 0`, framing it as part of the pretend-to-be-root
-    story (`src/sys_net.c`). Here it is gated on the host's refusal alone. The
+    story (`src/chroot-ng/sys_net.c`). Here it is gated on the host's refusal alone. The
     refusal is the policy's and does not depend on the guest's credentials —
     real or synthetic — so "this container has no audit subsystem" is equally
     true for every guest in it; the rest of `netlink.c` already answers the same
@@ -1544,7 +1544,7 @@ kernel 3.18 (Galaxy S7).
     gate's only live effect would be to leave `useradd` aborting in a rootfs
     whose files the invoking user already owns, which is the one case where it
     would otherwise have worked.
-  - **Tests:** `tests/guests/auditsock.c` prints `audit_help_open()`'s decision
+  - **Tests:** `tests/chroot-ng/guests/auditsock.c` prints `audit_help_open()`'s decision
     rule, not just the errno, so a run is judged the way the tools judge it.
     3 legs in `m16_netlink.sh`: the forced refusal reads as `errno=93
     survives=1`; it is that narrow (a `NETLINK_ROUTE` and an `AF_INET` socket in
@@ -1573,7 +1573,7 @@ kernel 3.18 (Galaxy S7).
   permission (Android denies it), no `/proc/pid/mem` and no `process_vm_readv`.
   Model ported from arm64chroot's `ptracetab.c`, with the register file coming
   from the frame the kernel hands us at a stop rather than from an emulated CPU:
-  - **The registry** (`src/monitor/ptrace.c`): one `MAP_SHARED` anonymous
+  - **The registry** (`src/chroot-ng/monitor/ptrace.c`): one `MAP_SHARED` anonymous
     mapping created before the guest's first fork, so every guest process has it
     at the same address. One link per traced *task* (keyed by tid, as the kernel
     keys tracing), holding the relationship, the current stop, and a futex
@@ -1599,7 +1599,7 @@ kernel 3.18 (Galaxy S7).
     narrow one over `wait4`/`waitid`/`kill`/`process_vm_*`. Both are installed
     on demand, so a guest that never traces — every guest — pays nothing, and in
     particular keeps a native, interruptible `wait4`.
-  - **Signals are mediated while traced** (`src/monitor/ptsig.c`): our handler is
+  - **Signals are mediated while traced** (`src/chroot-ng/monitor/ptsig.c`): our handler is
     installed for every catchable signal, mirroring the flags and mask the guest
     asked for (so `SA_RESTART`, `SA_ONSTACK` and the blocked set behave as it
     expects), the stop is reported, and only then is the signal handed to the
@@ -1626,7 +1626,7 @@ kernel 3.18 (Galaxy S7).
     not have and what gdb expects for the ones it merely probes (`NT_ARM_SVE`,
     `NT_ARM_HW_BREAK`/`WATCH` — so hardware watchpoints are unavailable and
     software breakpoints carry debugging).
-  - **`PTRACE_SINGLESTEP` in software** (`src/monitor/ptstep.c`), because
+  - **`PTRACE_SINGLESTEP` in software** (`src/chroot-ng/monitor/ptstep.c`), because
     hardware single-step is `PSTATE.SS` and only the kernel's own ptrace can arm
     it: decode the instruction at pc, evaluate the condition against the frame's
     NZCV and register-form branches against its registers, plant a `brk` at the
@@ -1643,7 +1643,7 @@ kernel 3.18 (Galaxy S7).
   - Fixed along the way: the SIGSYS tier's `clone` never published the child
     into the PID registry (only the `-R` tier did), so a forked guest process was
     invisible in `/proc` on the tier that runs on devices.
-  - **Tests:** `tests/guests/pt_probe.c` is built twice — as the AArch64 guest
+  - **Tests:** `tests/chroot-ng/guests/pt_probe.c` is built twice — as the AArch64 guest
     and for the host — and 15 scenarios must print the same lines both ways, so
     the oracle is the real kernel's ptrace: stops and resumption, syscall stops,
     `GET_SYSCALL_INFO`, cancellation with a substituted return value, memory
@@ -1718,7 +1718,7 @@ kernel 3.18 (Galaxy S7).
     an uninitialized `cng_sun_xlate`, which could close an arbitrary fd.
   - Two more filter entries (130 → 132 instructions of 256) and two more
     entries in the Android block-probe, since both are re-issued.
-  - **Tests:** `tests/guests/uxmmsg.c` binds a datagram socket at a guest path,
+  - **Tests:** `tests/chroot-ng/guests/uxmmsg.c` binds a datagram socket at a guest path,
     sends a batch to it with `sendmmsg` from a second named socket, and reads it
     back with `recvmmsg` — asserting the source of the **last** message as well
     as the first, because the containment is per element and a loop that only
@@ -1795,7 +1795,7 @@ kernel 3.18 (Galaxy S7).
     processes can rendezvous on like any other and is now tagged; only a genuinely
     unnamed (autobind) address, whose `addrlen` stops at `sun_family`, is left
     alone.
-  - **Tests** (`tests/guests/uxtrunc.c`): the address buffer sits at the end of a
+  - **Tests** (`tests/chroot-ng/guests/uxtrunc.c`): the address buffer sits at the end of a
     page whose successor is `PROT_NONE` and the bytes in front of it are poisoned,
     so an overread dies and an overwrite shows. The pre-fix binary segfaults
     before printing a line. With an abstract name the guest-visible address is
@@ -1810,7 +1810,7 @@ kernel 3.18 (Galaxy S7).
   arm64chroot's `sys_ipc.c` and the sem/msg half of its `proctab.c`. This is also
   the only way the guest has them at all on Android, where the whole SysV family
   is off the app seccomp allow-list.
-  - **All state lives in the daemon** (`src/monitor/ipcreg.c`), unlike shm, whose
+  - **All state lives in the daemon** (`src/chroot-ng/monitor/ipcreg.c`), unlike shm, whose
     payload is a memfd the guest maps. Every operation is an RPC, so mutation is
     single-threaded and needs no locking, a multi-operation `semop` is atomic for
     free, and a guest that dies mid-call cannot leave the registry torn. The
@@ -1861,7 +1861,7 @@ kernel 3.18 (Galaxy S7).
     directly in thirteen groups — including a real fork, a blocking wake, and
     SEM_UNDO across a child's death — so it runs on a host with no working SysV
     IPC of its own, which is exactly the target platform. The guest programs
-    (`tests/guests/sem_sysv.c`, `sem_block.c`, `sem_undo.c`) run once under the
+    (`tests/chroot-ng/guests/sem_sysv.c`, `sem_block.c`, `sem_undo.c`) run once under the
     emulation and once straight under qemu, and must agree byte for byte; unlike
     the shm differential, which leans on qemu's own `shmat`, nothing is emulated
     on the reference side here — every call is forwarded to the host kernel, so
@@ -1883,7 +1883,7 @@ kernel 3.18 (Galaxy S7).
   `PROT_EXEC` straight from the file, and on a true `MNT_NOEXEC` mount the
   kernel refuses. Every dynamically linked guest died in its interpreter, and
   there was no second place to fix it — the mapping request is where the
-  failure is visible. (`docs/DESIGN.md` has described this hook since M4; it
+  failure is visible. (`docs/chroot-ng/DESIGN.md` has described this hook since M4; it
   was the last piece of the design that had no code.)
   - `execmap.c`: on `EPERM`/`EACCES`, map the range anonymously RW, `pread` the
     file's bytes into it, and `mprotect` to what the guest asked for. Only
@@ -1906,7 +1906,7 @@ kernel 3.18 (Galaxy S7).
     the guest's linker, so it goes immediately outside the object's own load
     span (`MAP_FIXED_NOREPLACE`, both sides tried), and failing that wherever
     the kernel puts one; a pool nothing could reach is handed straight back.
-  - Validated by `tests/m23_execmap.sh`: the BPF band (four shapes of `mmap`,
+  - Validated by `tests/chroot-ng/m23_execmap.sh`: the BPF band (four shapes of `mmap`,
     through the interpreter), and a deliberately **dynamic** guest run with
     `CHROOTNG_MMAP_FORCE_ANON=1` — it starts with every library served from a copy,
     and its own libc `openat` lands in the rootfs. That last one is the case
@@ -1962,11 +1962,11 @@ kernel 3.18 (Galaxy S7).
     struct is `EINVAL`, above it a non-zero tail is `E2BIG`, and a zero tail
     makes the call identical to a sized one (which is what makes it safe to
     re-issue as one).
-  - Validated by `tests/m24_openat2.sh`. `-t o2test` drives everything decided
+  - Validated by `tests/chroot-ng/m24_openat2.sh`. `-t o2test` drives everything decided
     before the re-issue, which is where all the new judgement is, and so runs on
     every host — no qemu-user build implements `openat2`, and a cross host
     cannot reach the syscall at all. On a host that has it, the differential
-    runs `tests/guests/openat2.c` twice, once with no emulation, and demands the
+    runs `tests/chroot-ng/guests/openat2.c` twice, once with no emulation, and demands the
     host kernel's answers for all 21 cases byte for byte.
 
 - [x] **M25 — the three objects chroot-ng leaves where everyone can reach them**
@@ -2291,7 +2291,7 @@ kernel 3.18 (Galaxy S7).
   it; re-reading would cost `/proc` per trap, which is the whole thing this tier
   avoids. And a guest that `MAP_FIXED`s over a pool unmaps the trampolines its
   own code branches into — the same exposure the M8 and M23 pools have always
-  had, and the same answer: see the threat-model note in `docs/DESIGN.md`.
+  had, and the same answer: see the threat-model note in `docs/chroot-ng/DESIGN.md`.
   Validated by `-t rwtest`, which calls the patcher with the address a SIGSYS
   would have handed it — a copy of the test function mapped `r-xp`, both of its
   sites patched through the maps lookup, the pool placement and the `mprotect`
@@ -2316,7 +2316,7 @@ kernel 3.18 (Galaxy S7).
   The fix does not build the per-`mmap` table M32 ruled out. It asks the question
   the other way round — not *what did our loader map*, which cannot see a guest's
   own `mmap`, but *what in this address space was never the guest's* — and gives
-  back everything else. Two records answer it, in `src/monitor/ownmap.c`: a
+  back everything else. Two records answer it, in `src/chroot-ng/monitor/ownmap.c`: a
   **floor**, every mapping that exists at the moment `cng_run` is about to load
   the first program (our image, our stack, the heap, the kernel's pseudo
   mappings), and a **registry** of the dozen long-lived regions the monitor maps
@@ -2347,7 +2347,7 @@ kernel 3.18 (Galaxy S7).
   Measured after: **0 kB over 8 execs** for the static guest and 0 over 64
   (against 69,337,856 kB over 8 before), and for the dynamic one a chain of 64
   that finishes in 0.2 s where it used to abort after 21. Both are legs of
-  `tests/m6_execve.sh`; the dynamic one asserts survival plus a bound rather than
+  `tests/chroot-ng/m6_execve.sh`; the dynamic one asserts survival plus a bound rather than
   a kernel differential, because a dynamic bionic guest's `VmSize` swings ±80 MB
   between runs of the same binary and one leaked generation is three orders of
   magnitude above that. 814 passed and 0 failed on the dev host, where the
@@ -2387,7 +2387,7 @@ kernel 3.18 (Galaxy S7).
   lists and removes an object under `/dev/shm` (M14), the same guest proves the
   mount table's claim and the node agree, and a compiled glibc guest does a full
   `shm_open` → `ftruncate` → `mmap` → reopen-by-name → read-back → `shm_unlink`
-  round trip against the stand-in (M12, `tests/guests/shm_posix.c`). All of it
+  round trip against the stand-in (M12, `tests/chroot-ng/guests/shm_posix.c`). All of it
   runs on a host that has a real `/dev/shm` too, through `CHROOTNG_DEVSHM_FORCE_TMP`,
   and the last leg checks the objects landed under `$TMPDIR` and *not* in the
   host's own `/dev/shm`. The compiled leg skips on Termux, bionic having no
@@ -2404,11 +2404,11 @@ kernel 3.18 (Galaxy S7).
   ALLOW, so a guest on a newer kernel reached the host filesystem by the raw
   number: untranslated, unrefused, and with nothing to say so. The numbers are
   the stable ABI (arm64 takes the asm-generic table unchanged, and a number is
-  never reused), so they now live in `include/cng/unistd.h` beside the rest of
+  never reused), so they now live in `src/chroot-ng/include/cng/unistd.h` beside the rest of
   the local UAPI constants, generated from the 6.17 kernel's
   `scripts/syscall.tbl` and cross-checked against the cross toolchain's own
   header and the running kernel. Nothing else includes the system header; the
-  gates are gone, and `src/rt/unistd_check.c` holds the table against the
+  gates are gone, and `src/chroot-ng/rt/unistd_check.c` holds the table against the
   build host's `<asm/unistd.h>` where there is one — a differing value is a
   build error (`-Werror` on that one unit), a missing one is silence, which is
   exactly the host the table exists for.
@@ -2502,7 +2502,7 @@ kernel 3.18 (Galaxy S7).
   `-t stackguardtest` probes the guard and the usable bottom from a child (a
   store one word below the bottom dies of SIGSEGV, one at the bottom does
   not, the guard's own base faults, the sp lies above both, the recorded
-  extent is stack plus guard); `tests/guests/recurse.c` is the end-to-end
+  extent is stack plus guard); `tests/chroot-ng/guests/recurse.c` is the end-to-end
   half — 48 MiB of recursion returns, so the guard took nothing from the
   stack, and an unbounded one dies of SIGSEGV where it used to write into its
   neighbour.
@@ -2552,7 +2552,7 @@ kernel 3.18 (Galaxy S7).
   exits 1 before the guest has run an instruction. `-R` is the one exception,
   and a deliberate one — a rewritten `svc` site calls the dispatcher directly
   and needs no filter, which is what makes it the interception tier for hosts
-  that have none (`docs/DESIGN.md`). With `-R` the run goes ahead, and the
+  that have none (`docs/chroot-ng/DESIGN.md`). With `-R` the run goes ahead, and the
   warning now names exactly what it cannot reach: the `svc` sites in a
   library the guest's own ld.so maps from a mount that grants PROT_EXEC, and
   code no object carries.
@@ -2622,11 +2622,11 @@ kernel 3.18 (Galaxy S7).
   - `fchdir(open("/proc"))` used to leave the virtual cwd where it was, so
     `getcwd` answered `/` while `self/status` resolved under it; the zone's
     name now carries the cwd along.
-  - Validated by `tests/m25_fdview.sh`: `-t dtest outside` drives the
+  - Validated by `tests/chroot-ng/m25_fdview.sh`: `-t dtest outside` drives the
     dispatcher without the startup sanitization, so the refusals against an
     outside directory are observable (walk, `..`, `fchdir`, the magic link,
     a socket-delivered copy closed, `pidfd_getfd` refused) beside the file
-    that keeps the kernel's answers; `tests/guests/fdescape.c` runs as a
+    that keeps the kernel's answers; `tests/chroot-ng/guests/fdescape.c` runs as a
     guest with a leaked host directory and file in its table and takes every
     route out — `..` from the zones' dirfds, `..` and an absolute symlink
     through a dirfd's magic link and its `/dev/fd` spelling — landing on the
@@ -2660,7 +2660,7 @@ kernel 3.18 (Galaxy S7).
     through a writable name and is reopened for writing through its fd link
     while some `:ro` bind exists — and nothing else.
   - Validated by new legs of `-t dtest robind` and `l2sro` in
-    `tests/m5b_monitor.sh`: the fd link of a read-only and of an `O_PATH`
+    `tests/chroot-ng/m5b_monitor.sh`: the fd link of a read-only and of an `O_PATH`
     descriptor under the bind, reopened `O_WRONLY`, `O_TRUNC`, through
     `/dev/fd`, and named to `truncate` and `chmod`, all `EROFS` where the
     read-only reopen still works; the same through an l2s name; the rw
@@ -2703,7 +2703,7 @@ kernel 3.18 (Galaxy S7).
     reproduced.
   - `CNG_SECCOMP_MAX_INSNS` goes to 320: the largest configuration measures
     247 with the table in.
-  - Validated by new `-t dtest robind` legs in `tests/m5b_monitor.sh` (each
+  - Validated by new `-t dtest robind` legs in `tests/chroot-ng/m5b_monitor.sh` (each
     fd form `EROFS` under the bind and not under the rw control; the dedupe
     destination judged where the kernel has dedupe at all) and `-t bpftest`
     legs that simulate the filter with and without a `:ro` bind.
@@ -2730,8 +2730,8 @@ kernel 3.18 (Galaxy S7).
     and stay native — trapping `kill` for every guest is the cost the ptrace
     emulation stacks its filter on demand to avoid, and a signal to a hidden
     same-uid process is what a real chroot allows.
-  - Validated by the last section of `tests/guests/fdescape.c` in
-    `tests/m25_fdview.sh` (pid 1 `ESRCH` from both, a forked child reachable
+  - Validated by the last section of `tests/chroot-ng/guests/fdescape.c` in
+    `tests/chroot-ng/m25_fdview.sh` (pid 1 `ESRCH` from both, a forked child reachable
     by both — the latter sits out where the host has no `process_vm_readv`
     for the guest at all, as qemu-user has not) and a `-t bpftest` leg that
     simulates the filter with and without the view.
@@ -2760,7 +2760,7 @@ kernel 3.18 (Galaxy S7).
     closed: the pair is broken, which is what the guest did to it. A stale
     or closed relay socket is opened again on the next relay, since the
     ordinary way to lose it is the exec sweep and not the guest.
-  - `tests/guests/nlstale.c` in `tests/m16_netlink.sh`: sixteen files opened
+  - `tests/chroot-ng/guests/nlstale.c` in `tests/chroot-ng/m16_netlink.sh`: sixteen files opened
     onto the freed numbers survive the reclaim, and a socket inherited across
     an exec still dumps — relayed, on a relay socket of ours, counted in the
     debug trace where the host relays at all.
@@ -2798,7 +2798,7 @@ kernel 3.18 (Galaxy S7).
   open of the program, `-l`'s data files and markers, the `/proc` files a
   `-b DIR:/proc` serves, an AF_UNIX `sun_path`. It is the time-of-check to
   time-of-use of a string-based translator, and `proot` has it too.
-  - No host path reaches the kernel as a string any more (`src/monitor/pin.c`,
+  - No host path reaches the kernel as a string any more (`src/chroot-ng/monitor/pin.c`,
     `cng/pin.h`). The directory the walk reached is opened `O_PATH` and held
     for the call, verified to be that directory — the kernel's own name for
     it (its fd link read back) against the walk's symlink-free spelling, the
@@ -2850,11 +2850,11 @@ kernel 3.18 (Galaxy S7).
     `stat` 18 → 35 µs (open, readlink, close), an absolute `open` 28 → 39,
     a name against a dirfd 12.7 → 15.6 (the hot path pins nothing: the
     NOFOLLOW is all it gains).
-  - `tests/m26_pinned.sh`: `tests/guests/pathrace.c` flips a directory
+  - `tests/chroot-ng/m26_pinned.sh`: `tests/chroot-ng/guests/pathrace.c` flips a directory
     against an absolute symlink to a host directory under nine families for
     four seconds (12,000–17,000 host answers before, the host's files
     unlinked, made and truncated; none now, all intact), and
-    `tests/guests/uxreply.c` has two unrelated invocations exchange
+    `tests/chroot-ng/guests/uxreply.c` has two unrelated invocations exchange
     datagrams on their own bound names and read each other's back.
 
 - [x] **M50 — a scoped `openat2` was pinned, and the pin undid the scope**
@@ -2912,7 +2912,7 @@ kernel 3.18 (Galaxy S7).
     and never a hardlink denial to paper over, so the "ENOENT is only
     believable when the source is absent" reading stays on the path route.
     `CHROOTNG_L2S_FORCE` still routes every `linkat` through the emulation.
-  - `tests/guests/emptypath.c` gained `link_badflag` and `link_named_flag`;
+  - `tests/chroot-ng/guests/emptypath.c` gained `link_badflag` and `link_named_flag`;
     `m5b` runs it once more under `-u 0:0` for root's answers, and `m17`'s
     flagged-NULL needle is the oracle's own line.
 
@@ -2940,7 +2940,7 @@ kernel 3.18 (Galaxy S7).
   of ours holding every signal off for a moment is not mistaken for one. The
   status fields are read by streaming the file: a `Groups:` line of a process
   with many supplementary groups runs past any one buffer, and every field
-  wanted comes after it. `tests/guests/spawnexec.c` execs from 4500 parked
+  wanted comes after it. `tests/chroot-ng/guests/spawnexec.c` execs from 4500 parked
   threads and from sixteen chains that clone their successor at birth; the old
   binary reports 407 and ~20 threads after the exec, the kernel and the fix
   report 2 (qemu-user's own thread included) — the `m6` legs.
@@ -3060,9 +3060,9 @@ kernel 3.18 (Galaxy S7).
   does since the clamp now bounds a write into our buffer; `SO_PEERCRED`
   fills a ucred and a length word of ours with `sock_getsockopt`'s own
   length rules, so any length is remapped, not only a full one. Legs:
-  `tests/guests/leakrace.c` (one thread calls, another scans the buffer for
+  `tests/chroot-ng/guests/leakrace.c` (one thread calls, another scans the buffer for
   the host directory's name, a pid not its own, the real uid: 8k–5M
-  sightings on the previous build, none now), `tests/guests/peercred.c`
+  sightings on the previous build, none now), `tests/chroot-ng/guests/peercred.c`
   (the remap and the length rules against a plain run), and a `faulttest`
   leg for the put-back stream.
 
@@ -3091,9 +3091,9 @@ kernel 3.18 (Galaxy S7).
   time. What stays is the interval between the kernel's install and the
   close, which no in-process design can remove — `recvmsg`, `pidfd_getfd`
   and a scoped `openat2` landing on a hidden process all install first, and
-  the table is the guest's; `docs/DESIGN.md` states it in the threat model
-  and beside the fd-admission rule. `tests/guests/fdimport.c` receives from
-  a host Python (`tests/send_fds.py`) a directory outside the rootfs, a
+  the table is the guest's; `docs/chroot-ng/DESIGN.md` states it in the threat model
+  and beside the fd-admission rule. `tests/chroot-ng/guests/fdimport.c` receives from
+  a host Python (`tests/chroot-ng/send_fds.py`) a directory outside the rootfs, a
   file outside it and the rootfs itself — closed, file, dir — by `recvmsg`,
   by `recvmmsg`, and through a 16 KiB buffer that takes the family check,
   then an AF_INET `IP_PKTINFO` record through the same buffer (m25).
@@ -3191,7 +3191,7 @@ kernel 3.18 (Galaxy S7).
   from exactly that state (`slot_claim`), the verdict asked once more under
   the claim (`slot_retire`); a slot retired for reuse stays claimed rather
   than passing through FREE, and a lookup goes on past a retired slot. m16
-  leg: `tests/guests/nlchurn.c`, eight threads opening, binding, naming and
+  leg: `tests/chroot-ng/guests/nlchurn.c`, eight threads opening, binding, naming and
   closing 3600 sockets — about twenty went wrong a run, none now.
 
 - [x] **M63 — two threads relaying on one netlink socket lost a descriptor**
@@ -3203,7 +3203,7 @@ kernel 3.18 (Galaxy S7).
   so the loser could overwrite the winner's record: the published socket
   then failed its own identity check, was taken for stale by the next call
   and replaced without a close — a monitor descriptor lost per race, in the
-  guest's table (`tests/guests/nlrace.c` measures ~270 over 60 rounds of
+  guest's table (`tests/chroot-ng/guests/nlrace.c` measures ~270 over 60 rounds of
   eight threads on the previous build). Shared, the socket was also shared
   by the threads' dumps: the kernel runs one dump per socket (a second is
   `EBUSY`), each thread's reads took the other's replies, and a dump that
@@ -3239,7 +3239,7 @@ kernel 3.18 (Galaxy S7).
   retired, skipping that refresh), and a read that retires a stale entry
   goes on looking for the live one. Legs: `-t proctest` "synth fd reused
   by another kind" (a number moved from loadavg to uptime refreshes, as
-  uptime), and `tests/guests/procrace.c` in m11 (reader threads pread the
+  uptime), and `tests/chroot-ng/guests/procrace.c` in m11 (reader threads pread the
   whole range while batches of uptime files are opened into it; a rewind
   that reads an unmoved clock is a lost refresh — the previous build loses
   one in some runs, the window being a few instructions wide).
@@ -3345,7 +3345,7 @@ kernel 3.18 (Galaxy S7).
   Both parsers now take a number the way procfs names it (`0` itself, or
   no leading zero), and `proc_magic` asks `parse_int_run` too, so a digit
   run procfs has no entry for is an ordinary lookup rather than an fd link
-  `RESOLVE_NO_MAGICLINKS` would refuse. `tests/guests/procnum.c` in m11,
+  `RESOLVE_NO_MAGICLINKS` would refuse. `tests/chroot-ng/guests/procnum.c` in m11,
   differential against the same guest with nothing in the way (the previous
   build reads the cmdline, exe and cwd of `/proc/0<pid>` and runs the
   program from `/proc/self/fd/0<n>`).
@@ -3400,10 +3400,10 @@ kernel 3.18 (Galaxy S7).
   (handed back at the exec). What remains is a sibling thread changing that
   very page within the patch's few syscalls, whose change the restore can
   overwrite — in-process-inherent, stated in the threat model in
-  `docs/DESIGN.md`. `-t lazytest stale` in m8: gone, shared, prot and full,
+  `docs/chroot-ng/DESIGN.md`. `-t lazytest stale` in m8: gone, shared, prot and full,
   one leg each (the previous build dies on gone and full, writes the memfd,
   and leaves the text read-only). The same four through real traps, where
-  a filter is live: `tests/guests/lazystale.c` writes its own code, as a
+  a filter is live: `tests/chroot-ng/guests/lazystale.c` writes its own code, as a
   JIT does, and moves the mapping under the record — the race leg a thread
   unmapping and replacing the page while sites in it trap. On the native
   VM (6.8) the previous build fails the first three and dies in the race,
@@ -3430,7 +3430,7 @@ kernel 3.18 (Galaxy S7).
   caller left. `put_nladdr` is
   `move_addr_to_user` for the synthesized address, getpeername asks it for
   port id 0, and the three receives hand the source back only after a
-  receive that worked. `tests/guests/nladdr.c` in m16, compared on every
+  receive that worked. `tests/chroot-ng/guests/nladdr.c` in m16, compared on every
   host with the kernel's text and, where rtnetlink works, with the kernel
   itself (the previous build: all thirteen lines differ).
 
@@ -3451,7 +3451,7 @@ kernel 3.18 (Galaxy S7).
   `msg_flags` (never MSG_CTRUNC for data the guest was not offered), then
   `msg_controllen` 0, the stand-in carrying no ancillary data. recvmmsg
   receives each message through it and writes `msg_len` after its header,
-  as `do_recvmmsg` does. `tests/guests/nlhdr.c` in m16, the kernel's text
+  as `do_recvmmsg` does. `tests/chroot-ng/guests/nlhdr.c` in m16, the kernel's text
   and the kernel (the previous build differs on six of seven lines; a
   header with no iovec at all is left out, since qemu-user answers it
   without asking the kernel).
@@ -3482,7 +3482,7 @@ kernel 3.18 (Galaxy S7).
     the name. A process that is gone keeps the memfd's.
   - `CHROOTNG_PROC_DENY_STAT=1` answers every such call as if the host had refused
     it, so a host that allows them (the dev machine, CI) takes the same
-    path. `tests/guests/procstat.c` in m11 puts every form to each of the four
+    path. `tests/chroot-ng/guests/procstat.c` in m11 puts every form to each of the four
     files and checks one shape and one identity across them, with and
     without the knob; on the device the first run is the real refusal (the
     previous build fails on its first `stat`). The m11 leg that compared a
@@ -3509,7 +3509,7 @@ kernel 3.18 (Galaxy S7).
     way skipped synthesis whatever the absolute spelling did.
   - `CHROOTNG_OVERFLOWID_SYNTH=1` forces the fallback where the host can read
     the files (listed in `--help`). `-t proctest` forces it and checks the
-    content and the memfd behind it; `tests/guests/procstat.c` now covers
+    content and the memfd behind it; `tests/chroot-ng/guests/procstat.c` now covers
     both names (0644, and a dirfd-relative open as well as stat) with and
     without the stat refusal forced; m11 reads them from a guest shell with
     the fallback forced, and checks with `CHROOTNG_DEBUG=1` that a readable host
@@ -3550,7 +3550,7 @@ kernel 3.18 (Galaxy S7).
     as they always did.
   - Tests: `-t bpftest` has the mprotect cases (trap with `PROT_EXEC`, native
     without, the gate's own re-issue allowed); `-t stackswtest` checks the
-    permissions of the page on each side of a slot; `tests/guests/execstack.c`
+    permissions of the page on each side of a slot; `tests/chroot-ng/guests/execstack.c`
     (m5b) maps one region, starts a thread on the top of it and makes the first
     page RWX and R+X, on the -R tier and, where the filter is live, without.
     On the device the original binary answers -13 for both (and for the
@@ -3575,7 +3575,7 @@ kernel 3.18 (Galaxy S7).
     they were. Neither is a call the filter traps, so left native they do what
     they always did; the exit's scratch-slot release in the trampoline is not
     missed (a slot of a dead thread is taken over when the table fills).
-  - `tests/guests/unmapself.c` writes the sequence out as libc has it (both
+  - `tests/chroot-ng/guests/unmapself.c` writes the sequence out as libc has it (both
     spellings) and runs twenty threads, each on a fresh stack made with a bare
     clone, since a glibc handed a thread's stack keeps the descriptor on it
     in a list. m8 runs it under -R: it was a SEGV on the first thread before.
@@ -3596,7 +3596,7 @@ kernel 3.18 (Galaxy S7).
   - The four requests (`TCGETS2`, `TCSETS2`, `TCSETSW2`, `TCSETSF2`) are now
     trapped by the filter, always — a short list of `JEQ`s behind the SIOCxIF
     band test, beside the mount writers a `:ro` bind adds — and the dispatcher
-    answers them (`src/monitor/tty.c`, `cng_tty_ioctl`). The host is asked
+    answers them (`src/chroot-ng/monitor/tty.c`, `cng_tty_ioctl`). The host is asked
     first, with the guest's own pointer, so a host that implements them serves
     them itself and answers `EFAULT` for a bad one as it should. On `EACCES`
     or `ENOTTY` (a kernel too old for them is in the same position, and so is
@@ -3626,7 +3626,7 @@ kernel 3.18 (Galaxy S7).
     ioctl reaches the kernel untouched unless the filter traps it.
   - Tests: `-t bpftest` has the four requests (trap, with and without a `:ro`
     bind; `TCGETS`, `TCSETS` and `TIOCGWINSZ` still native; the gate's own
-    re-issue allowed). `tests/guests/termios2.c` (m27) runs over a real pty:
+    re-issue allowed). `tests/chroot-ng/guests/termios2.c` (m27) runs over a real pty:
     the 44 bytes come back whole and no further, agree with `TCGETS` on the
     first 36, each setter carries all of them in, a rate set through the master
     is read through the slave, a bad buffer is `EFAULT` both ways and a pipe is
@@ -3660,7 +3660,7 @@ kernel 3.18 (Galaxy S7).
     same names. The dispatcher hands it the request as the kernel reads it, an
     `unsigned int`, as the filter does, rather than the sign-extended register
     a bionic `ioctl(int, int, ...)` leaves.
-  - Test: `tests/guests/ioctlband.c` (m16, forced block, `-R`) makes a band
+  - Test: `tests/chroot-ng/guests/ioctlband.c` (m16, forced block, `-R`) makes a band
     request and then `FIOCLEX`, `FIONCLEX` and `FIONREAD` into the last word
     of a mapping; the text is a kernel's, and the host's own run is compared
     on the three that do not depend on its policy. Removing the guard fails
@@ -3699,7 +3699,7 @@ kernel 3.18 (Galaxy S7).
   - Not covered: `TIOCGPGRP` on a pipe is still the host's `EACCES` where a
     kernel says `ENOTTY`.
   - Tests: `-t bpftest` has `TIOCGSID` (trap, `TIOCGPGRP` native, the gate's
-    re-issue allowed). `tests/guests/tiocgsid.c` (m27) runs over a real pty
+    re-issue allowed). `tests/chroot-ng/guests/tiocgsid.c` (m27) runs over a real pty
     with the text of a native kernel: `ENOTTY` with no session, a child that
     `setsid()`s and takes the pty reads its own pid from the slave and from
     the master, the parent reads it from the master and is `ENOTTY` of the
@@ -3728,7 +3728,7 @@ kernel 3.18 (Galaxy S7).
     that arrives meanwhile is taken once the table is written. A per-call
     buffer was the alternative, and a re-entrant lock is not one: the nested
     reader would rewrite the snapshot under the outer one's emission.
-  - Test: `tests/guests/mntsig.c` (m11, `-R`) reads `/proc/self/mountinfo` in
+  - Test: `tests/chroot-ng/guests/mntsig.c` (m11, `-R`) reads `/proc/self/mountinfo` in
     a loop, arming before each read a one-shot timer whose handler reads it
     too, the delay swept across the time one read takes; every read must be
     the first one's table. The previous build hangs in every run. An interval
@@ -3804,9 +3804,9 @@ kernel 3.18 (Galaxy S7).
     left it held by the child's copy: every later change, by any process,
     waited until that child exec'd or exited. The lock is given back with
     `LOCK_UN` before the close.
-  - Tests: `tests/guests/l2ssig.c` (M10, `-R -l`) links and unlinks a name in a
+  - Tests: `tests/chroot-ng/guests/l2ssig.c` (M10, `-R -l`) links and unlinks a name in a
     loop under a one-shot timer, swept as `mntsig.c` sweeps its own, whose
-    handler does the same; the previous build hangs. `tests/guests/l2sfork.c`
+    handler does the same; the previous build hangs. `tests/chroot-ng/guests/l2sfork.c`
     (M10) forks children that do not exec beside a loop of links; the previous
     build held a link up for the child's whole life (8 s against 38 ms with
     real hardlinks).
@@ -3836,7 +3836,7 @@ kernel 3.18 (Galaxy S7).
     probe and trapped by our own filter, as Android's would deliver them.
   - Tests: `-t blocktest`'s `setid` rows (each through a trap and through `-R`,
     refused and as measured; the previous build answers -38 to all 64), and
-    `tests/guests/setid.c` in M9 on every tier the host has, with and without
+    `tests/chroot-ng/guests/setid.c` in M9 on every tier the host has, with and without
     the knob, against a kernel's own text (libc's setxid broadcast to a second
     thread included). nettest's default-branch leg used `setgid` as its
     blocked syscall, which never reached that branch; it uses
@@ -3881,7 +3881,7 @@ kernel 3.18 (Galaxy S7).
     a shell could not signal its own jobs. `pidfd_send_signal` stays native,
     because `pidfd_open` only gives a pidfd for a process the view shows.
   - Tests: `-t bpftest`'s `hidden-pid signals` row. In M25,
-    `tests/guests/sigview.c` runs against two host `sigholder` processes,
+    `tests/chroot-ng/guests/sigview.c` runs against two host `sigholder` processes,
     one in the guest's group and one leading its own; each counts the
     SIGURGs that reach it. Every call, the parent, and the group and
     broadcast forms are checked on each tier the host has. A `--no-proc`
@@ -4023,7 +4023,7 @@ kernel 3.18 (Galaxy S7).
     too early sees the exec and exits in `cng_sig_note_mask`. Past the 100-round
     grace such a thread is still left alone while it is running or runnable
     (not asleep in a syscall), for up to a second.
-  - Test: `tests/guests/dtstall.c` runs the chain shape under ptrace and holds
+  - Test: `tests/chroot-ng/guests/dtstall.c` runs the chain shape under ptrace and holds
     each request at its delivery for 2 ms, as a loaded scheduler does. The
     previous build died 10 runs in 10 on the S7 and 5 in 5 on the arm64 VM,
     and this one passes every run. It needs a host that runs the guest's
@@ -4067,7 +4067,7 @@ kernel 3.18 (Galaxy S7).
     in the registry). A fake root cannot name another pid, since the host
     grants it no CAP_SYS_ADMIN. Where chroot-ng itself runs as root, a refused
     claim is ESRCH instead of EPERM.
-  - Test: m7, `tests/guests/scmcred.c`, on both tiers as fake root, as fake
+  - Test: m7, `tests/chroot-ng/guests/scmcred.c`, on both tiers as fake root, as fake
     1234 and without `-u`, against the kernel's own answers. The previous build
     fails the 15 rows a claim or a remap decides. qemu-user drops MSG_CTRUNC
     from a cut record, so the flag is checked natively only.
@@ -4089,7 +4089,7 @@ kernel 3.18 (Galaxy S7).
     (`cng_fd_reopen_script`), so a number since handed to another file is not
     it.
   - Test: `fd_reopen` in faketest (the refusal, the script, the same mode, a
-    script's number reused), and m7's `tests/guests/memfdro.c` on both tiers: a
+    script's number reused), and m7's `tests/chroot-ng/guests/memfdro.c` on both tiers: a
     read-only reopen is read-only or refused, never writable; a same-mode one
     reads from the start; a script runs from one by either exec spelling; a
     close-on-exec one is gone for its interpreter. The previous build fails 5
@@ -4119,7 +4119,7 @@ kernel 3.18 (Galaxy S7).
     once is not recorded again; a guest that unmaps part of its own image
     leaves a stale record (munmap is not trapped); the copies execmap makes of
     a guest's own mmaps are not recorded.
-  - Test: m23's `tests/guests/dontunmap.c` against the kernel's own move of a
+  - Test: m23's `tests/chroot-ng/guests/dontunmap.c` against the kernel's own move of a
     private mapping of the same program's file, on -R, seccomp and -F, with
     anonymous memory still reading back zeroed; bpftest checks that only the
     flag traps.
@@ -4196,7 +4196,7 @@ kernel 3.18 (Galaxy S7).
     the host's own answer. Its stderr is /dev/null, so the relayed/synthesized
     trace comes back in the sync reply and is printed by the guest's side
     (`nl served fd=N: …`). Broker protocol `cng-ipc.v4`.
-  - Test: `tests/guests/nlrw.c` — `write`+`read` (the crate's whole
+  - Test: `tests/chroot-ng/guests/nlrw.c` — `write`+`read` (the crate's whole
     conversation), `write`+`poll`+`read`, `writev`, `sendmmsg` naming the
     kernel, each under its own alarm — in m16 under `-R` and, where the filter is
     live, the seccomp tier, against the kernel where rtnetlink works. The
@@ -4234,7 +4234,7 @@ kernel 3.18 (Galaxy S7).
     relay still gets that ACK alone, the oracle's answers both. That ACK was
     built unflagged, a pre-4.12 kernel's, on every host. It is `put_ack`'s
     now, NLM_F_CAPPED and all.
-  - Test: `tests/guests/nlack.c` — getlink and getroute with and without
+  - Test: `tests/chroot-ng/guests/nlack.c` — getlink and getroute with and without
     NLM_F_ACK, and a dump asking for one, every message counted; in m16
     relayed and with CHROOTNG_NETLINK_DENY_GETLINK (synthesized), against the
     kernel where rtnetlink works. The previous build: `acks=0` on both gets.
@@ -4274,7 +4274,7 @@ kernel 3.18 (Galaxy S7).
     descriptor is looked at, then `EBADF` / `ENOTDIR`, and `EACCES` for a
     directory from outside the view, as every other route refuses it.
   - `CHROOTNG_OPENAT2_DENY=1` takes `openat2` as refused on any host.
-  - Test: `tests/guests/openat2.c` gained 21 cases — the validation, the
+  - Test: `tests/chroot-ng/guests/openat2.c` gained 21 cases — the validation, the
     scope's own errors, and tar's opens (the parent with a trailing slash, a
     create under it, and a planted absolute or climbing symlink, both
     `EXDEV`) — and turns a filter's SIGSYS into the "unsupported" a kernel
@@ -4347,7 +4347,7 @@ kernel 3.18 (Galaxy S7).
     stands. And the lent mode is a real mode for as long as the call takes:
     a process outside the session can see it, and a SIGKILL in that window
     leaves it lent.
-  - Test: `tests/guests/dacroot.c` runs 44 cases — names made, moved and
+  - Test: `tests/chroot-ng/guests/dacroot.c` runs 44 cases — names made, moved and
     removed in a 0500 directory (relative to a dirfd too, as tar names its
     members), files opened for what their mode refuses, a walk through two
     levels of directories with no x bit with a symlink in one, four
@@ -4387,7 +4387,7 @@ kernel 3.18 (Galaxy S7).
   - Not this (M100 fixed it): `/proc/<pid>/cmdline` is the registry's
     copy from exec time, so a title written over argv does not show there,
     as it would under the kernel.
-  - Test: `tests/guests/argvlayout.c` checks every adjacency (each argv
+  - Test: `tests/chroot-ng/guests/argvlayout.c` checks every adjacency (each argv
     string right after the one before it, envp right after argv, AT_EXECFN
     right after envp, then a zero word) and libuv's arithmetic, then
     re-execs itself with more arguments and a fresh environment. m3 runs it
@@ -4451,7 +4451,7 @@ kernel 3.18 (Galaxy S7).
     the opener's, not the new program's.
   - `CHROOTNG_MM_MAP_DENY=1` takes the call as refused, so the memory-reading
     path can be run on a host that allows it.
-  - Test: `tests/guests/proctitle.c` re-execs itself with a known argv and
+  - Test: `tests/chroot-ng/guests/proctitle.c` re-execs itself with a known argv and
     environment and checks its own files and a forked child's: as exec'd,
     after an environment byte is rewritten, a short title padded with
     zeros, and a title run past argv into the environment.
@@ -4504,8 +4504,8 @@ kernel 3.18 (Galaxy S7).
     (id shape, keys, stores in both directions, no `nattch`, a removed
     segment served until its last detach, an unknown id unanswered) plus the
     backing check, over both tiers. On Termux, m12 builds
-    `tests/guests/ashv_attach.c` against Termux's own libandroid-shmem and
-    runs it outside chroot-ng against `tests/guests/shm_ashv.c`. Verified on
+    `tests/chroot-ng/guests/ashv_attach.c` against Termux's own libandroid-shmem and
+    runs it outside chroot-ng against `tests/chroot-ng/guests/shm_ashv.c`. Verified on
     the Pixel 5 with mpv under termux-x11.
 
 - [x] **M102 — a socket peer was the run's identity whatever ids it had**
@@ -4541,10 +4541,10 @@ kernel 3.18 (Galaxy S7).
   - The broker namespace tag is now `cng-ipc.v5` and the registry file
     `chroot-ng-procreg.v3`, since `struct proc_ent` changed (M100 had changed
     it without a bump).
-  - Test: m7, `tests/guests/peerid.c`, on both tiers: a server and a client
+  - Test: m7, `tests/chroot-ng/guests/peerid.c`, on both tiers: a server and a client
     take their ids (1234/1234, 0/1234, 1234/0) and each prints what
     `SO_PEERCRED` and both kinds of record say of the other. The old build
-    reports 0 in each row where the peer is 1234. `tests/guests/scmcred.c`
+    reports 0 in each row where the peer is 1234. `tests/chroot-ng/guests/scmcred.c`
     adds a full drop (implicit record and own claim after it), and fake
     root's claims of another uid or gid are now asserted as the kernel's.
     On the Pixel 5, as sylirre, `xfconf-query` reaches xfconfd and `gdbus`
@@ -4573,7 +4573,7 @@ kernel 3.18 (Galaxy S7).
   - Not exact: a change is not recorded, so a fake root that drops its
     capabilities still has them all, and a change of ids gives the set the
     new euid implies (no `SECBIT_KEEP_CAPS`, no file capabilities).
-  - Test: m7, `tests/guests/capset.c`, on both tiers, as fake root and
+  - Test: m7, `tests/chroot-ng/guests/capset.c`, on both tiers, as fake root and
     dropped to 1234, each row in a child of its own; every row is the
     kernel's answer to real root and to root dropped to 1234 (arm64 VM, row
     for row). The old build refuses the empty set. On the Pixel 5, headless
@@ -4615,7 +4615,7 @@ kernel 3.18 (Galaxy S7).
     leader stays hidden, as before.
   - The broker namespace tag is now `cng-ipc.v6` and the registry file
     `chroot-ng-procreg.v4`, since `struct proc_ent` changed.
-  - Test: m7, `tests/guests/peerid.c` again: each side also prints the
+  - Test: m7, `tests/chroot-ng/guests/peerid.c` again: each side also prints the
     other's groups by `SO_PEERGROUPS` (and its `ERANGE`), the `Uid:`, `Gid:`
     and `Groups:` lines of its status and its thread's, and the owner of its
     `/proc/<pid>` by stat, fstat, fstatat (`task`, relative to `/proc`) and
@@ -4670,7 +4670,7 @@ kernel 3.18 (Galaxy S7).
       attach to it hangs the tracer.
     - The kick has no `SA_RESTART`, so an attach makes the tracee's
       interrupted syscall fail with EINTR where the kernel restarts it.
-  - Test: m18 `ptrace fpregs` (`tests/guests/pt_probe.c`). The tracee holds
+  - Test: m18 `ptrace fpregs` (`tests/chroot-ng/guests/pt_probe.c`). The tracee holds
     a marker in v8 (xmm8 on the x86-64 oracle) across a blocking read. The
     tracer reads the marker at the attach stop and at the read's entry stop
     and writes a new one at each, and once the read returns the tracee
@@ -4755,13 +4755,13 @@ kernel 3.18 (Galaxy S7).
     it, and crashpad waited in its waitpid for good with every other thread
     parked in its attach stop. The kernel attaches with SIGSTOP, which no
     mask holds back.
-  - Tests: m6 `tests/guests/blkcall.c` blocks in accept, recvfrom, a FIFO
+  - Tests: m6 `tests/chroot-ng/guests/blkcall.c` blocks in accept, recvfrom, a FIFO
     open and an AF_UNIX recvfrom that wants the sender's address, signals
     the thread with and without `SA_RESTART`, and checks SIGTERM against a
     blocked accept. On the SIGSYS tier it also checks that the handler ran
     on the thread's own stack. It matches the kernel on both tiers (arm64
     VM). The old build ran every handler only after the call, gave no EINTR,
-    and SIGTERM did not kill. m18 `ptrace blocked` (`tests/guests/pt_probe.c`) attaches
+    and SIGTERM did not kill. m18 `ptrace blocked` (`tests/chroot-ng/guests/pt_probe.c`) attaches
     to a thread blocked in a read and in an accept through one svc of known
     address. It checks that pc is where the kernel shows a blocked call
     (arm64 rewinds before the stop, x86-64 after), that arg0 is the fd and
@@ -4885,13 +4885,13 @@ kernel 3.18 (Galaxy S7).
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
-- `make` builds (cross on x86_64, native on AArch64/Termux); `make run
+- `make` builds (cross on x86_64, native on AArch64/Termux); `make run-chroot-ng
   ARGS="..."` runs the result, under qemu-aarch64 only where the host needs it.
-- `make test` runs `tests/run.sh`. It runs on x86_64 (cross + qemu), on native
-  AArch64 Linux, and under Termux; `tests/lib.sh` resolves every host
+- `make test-chroot-ng` runs `tests/chroot-ng/run.sh`. It runs on x86_64 (cross + qemu), on native
+  AArch64 Linux, and under Termux; `tests/chroot-ng/lib.sh` resolves every host
   difference (emulator, guest toolchain and link mode, which translation tier is
   live, rootfs images) and the milestone scripts assert against what it found.
-  See `tests/README.md`.
+  See `tests/chroot-ng/README.md`.
 - M16 is the one milestone whose subject exists only on the target, so it asks
   the unemulated guest which host it is on and asserts a different thing on each:
   where raw rtnetlink works it must be reproduced byte-for-byte and must not

@@ -1610,7 +1610,7 @@ static char task_state_view(s32 tid, s32 tgid, char host) {
  *   Seccomp    a guest filter is evaluated here and never installed on the
  *              host (sys_seccomp.c), so a filtered guest reads 0; and where the
  *              emulator itself runs under a filter the guest never asked for
- *              (Android, `make test-seccomp`), an unfiltered guest reads 2.
+ *              (Android, `make test-arm64chroot-seccomp`), an unfiltered guest reads 2.
  *   Sig*       the capture layer's dispositions and mask, not the guest's: it
  *              installs host handlers by its own rules and blocks/unblocks
  *              around delivery.

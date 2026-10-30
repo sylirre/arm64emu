@@ -17,7 +17,7 @@
  * which follows the link, so a guest was answered about the target of the
  * symlink it named, and about nothing at all for a dangling one.
  *
- * Run under tests/arm64chroot/seccomp_wrap.c (make test-seccomp) this test is on that
+ * Run under tests/arm64chroot/seccomp_wrap.c (make test-arm64chroot-seccomp) this test is on that
  * fallback; run plainly it is on faccessat2. Both must agree with the oracle,
  * so the row covers the tier it is on either way.
  *

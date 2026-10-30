@@ -118,7 +118,7 @@ for s in tests/arm64chroot/asm/*.S; do
     b="build/tests/arm64chroot/asm/$(basename "$s" .S).bin"
     skip_unsupported "asm/$(basename "$s" .S)" "$s" && continue
     # -DUSERMODE selects the Linux-exit variant of the dual-mode m19-m22
-    # batteries shared with the ARM64_Emulator repo (their .arch directives
+    # batteries shared with arm64emu's suite (their .arch directives
     # override -march per file); the other tests ignore the define.
     # A replay host has no assembler: "building" is the pack's inventory check
     # (see tests/arm64chroot/replay_cc.sh), and a binary the pack did not ship -- or one a

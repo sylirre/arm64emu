@@ -1,6 +1,9 @@
-# ARM64Chroot
+# arm64chroot
 
-Guidelines for AI agents when working with this codebase.
+Guidelines for AI agents when working with arm64chroot (`src/arm64chroot/`).
+The repository-wide ones — layout, build, test discipline, conventions, commit
+messages — are in the root `AGENTS.md`; this file adds what is particular to
+arm64chroot.
 
 ## Overview
 
@@ -14,7 +17,7 @@ Contains extra features: directory binding, fake user id, hardlink emulation via
 
 ## Tooling
 
-The suite runs on an x86_64 host and on a real AArch64 one; `tests/hostenv.sh`
+The suite runs on an x86_64 host and on a real AArch64 one; `tests/arm64chroot/hostenv.sh`
 decides what each provides. Packages required either way:
 
 * make
@@ -25,11 +28,11 @@ On an x86_64 host (the primary development one), additionally:
 
 * aarch64-linux-gnu-gcc (aarch64-linux-gnu-gcc-13) — builds the guest programs
 * qemu-aarch64, qemu-aarch64-static — the differential oracle
-* gcc-multilib — the `make test32` ILP32-host build
+* gcc-multilib — the `make test-arm64chroot32` ILP32-host build
 
 On an AArch64 host the system `cc` already builds guest programs and the CPU
 is itself the oracle, so none of the three are needed (`qemu-aarch64` is still
-used when installed; `ARM64CHROOT_ORACLE=native` forces hardware). `make test32` there
+used when installed; `ARM64CHROOT_ORACLE=native` forces hardware). `make test-arm64chroot32` there
 wants an armhf cross compiler and an AArch64 CPU that implements AArch32 at
 EL0, and skips with a reason when either is missing.
 
@@ -39,7 +42,7 @@ with an armhf cross compiler — the emulator is ARM32 code under emulation whil
 the oracle still runs natively, so the differential comparison is intact:
 
 ```sh
-make M32CC=arm-linux-gnueabihf-gcc "M32FLAGS=-static" test32-jit
+make ARM64CHROOT_M32CC=arm-linux-gnueabihf-gcc "ARM64CHROOT_M32FLAGS=-static" test-arm64chroot32-jit
 ```
 
 Static matters: `QEMU_LD_PREFIX` is contended between the aarch64 guest sysroot
@@ -48,7 +51,7 @@ armhf emulator needs); a static emulator needs neither. That checks the emitter;
 only a real armv7 device checks that the silicon agrees with what it emits.
 **Both tiers gate at zero failures in either engine** — the qemu-arm one used to
 be read against a ~44-failure baseline, but every one of those turned out to be
-an emulator bug rather than the tier's slowness (see docs/jit.md). The rows
+an emulator bug rather than the tier's slowness (see docs/arm64chroot/jit.md). The rows
 qemu-arm itself cannot run — it asserts on `mremap(old_size=0)` (the
 emulator's own use of it, and the guest's), writes nothing for
 `getsockopt(SO_RCVTIMEO)`, ignores `waitid`'s rusage argument, drops an iovec
@@ -57,18 +60,21 @@ an int option, refuses the subreaper/THP prctls, installs every SCM_RIGHTS
 descriptor into a short control buffer, ignores `MADV_REMOVE`, grows no stack
 from a system call's copy, hands an `F_SETSIG` signal no descriptor, aborts on
 a select past descriptor 1023, answers ENOTTY for `TCGETS2` on a tty, copies an ioctl's argument in before the kernel can refuse the descriptor, and cannot start where `vm.mmap_min_addr` reads
-0 (the full list is in tests/hostenv.sh) — carry a `NEEDS-HOST-SYSCALL:` marker (in a C
+0 (the full list is in tests/arm64chroot/hostenv.sh) — carry a `NEEDS-HOST-SYSCALL:` marker (in a C
 test or a fixture alike) and skip there, naming what is missing; they run in
 full on real armv7 silicon.
 
 ## Project structure
 
 ```
-src/
-  core/                              COPIED from ARM64EMU_System (kept diffable):
-    types.h esr.h cpu.h sysreg.h     Fixed-width types, ESR, CPU state, sysregs
+Makefile                             (repository root) `make arm64chroot` -> build/arm64chroot; also arm64chroot32 (ILP32 host) and arm64chroot_asim (Android behavior)
+lib/arm64/                           Shared with arm64emu (compiled into both):
+  esr.h                              ESR exception classes + syndrome construction
+  exec_fpsimd.c                      FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
+src/arm64chroot/
+  core/                              The user-mode variant of the rest of arm64emu's core, kept diffable against src/arm64emu until merged into lib/arm64:
+    types.h cpu.h sysreg.h           Fixed-width types, CPU state, sysregs
     decode.c                         A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
-    exec_fpsimd.c                    FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
     cpu.c sysreg.c                   Step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, what EL0 may run
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
@@ -102,66 +108,45 @@ src/
   machine.h thread.h                 Per-process shared Machine state + per-thread state (CPU is per-thread; Machine is shared)
   guest_abi.h                        ARM64 syscall numbers + explicit guest struct layouts
   main.c                             CLI, rootfs setup, initial exec
-tests/                               Asm + C differential tests, run_tests.sh; hostenv.sh picks the compiler and the oracle (qemu-aarch64, or an AArch64 host's own CPU)
-docs/                                Project documentation
-README.md                            User-facing project introduction and usage information
+tests/arm64chroot/                   Asm + C differential tests, run_tests.sh; hostenv.sh picks the compiler and the oracle (qemu-aarch64, or an AArch64 host's own CPU)
+docs/arm64chroot/                    Project documentation; README.md is the user-facing introduction and usage information
 ```
 
 ## Conventions and rules
 
-General:
+In addition to the root `AGENTS.md`:
 
-* Be thorough in reasoning and concise in output.
-* Do not re-read files unless they were changed.
-* Do not switch branches, do not look up changes on other branches unless explicitly were asked for this.
-* Think about best approach when implementing a requested feature. Ask clarifying questions before making architectural changes and propose solution variants, especially if there are caveats and unintended side effects of requested changes.
-* New command line options and environment variables must be added into utility built-in help information.
 * Keep in sync the interpreter and JIT parts of emulator where possible.
-* Keep in sync the code and documentation (`./docs/`).
-* Keep in sync the file structure in design section of README.md and structure section of AGENTS.md.
-* New implemented syscalls must also be defined in ./src/strace.c argdefs, so they can be decoded by `--strace-full`.
-* Ensure that code comments are up-to-date after made changes.
-* Compiler warnings or errors must be resolved.
-* Do not give up chasing bugs. You know the code better than anyone.
-* Run test suite after finishing changes.
-* Never make a failing test pass by weakening it. Investigate the root cause of test failure. If the test indeed faulty, ask the project owner first before making changes.
-* If all tests passed and there are no already staged files, commit your changes to current branch.
-* Never run `git push`.
-
-Commit messages:
-
-* Each commit must consist of header and description.
-* The header must follow this format: `scope: brief description of change`, where scope can be `ci` (CI/CD change), `main` (program entrypoint, base), `interp` (interpreter change), `jit`, `fpsimd`, `syscall`, `proc` (/proc emulation), etc.
-* The commit body must be detailed and explain why change was necessary, what was the story behind it. If that's a new feature, explain what it does. If that's a bugfix, explain what was the bug and how it was fixed.
-* Wrap each line of the commit body at 72 characters.
-* Add `Co-Authored-By` footer with explanation who you are.
-* It is forbidden to include `Claude-Session` reference in the commit message.
+* Keep in sync the code and documentation (`docs/arm64chroot/`).
+* Keep in sync the file structure in design section of `docs/arm64chroot/README.md` and structure section of this file.
+* New implemented syscalls must also be defined in `src/arm64chroot/strace.c` argdefs, so they can be decoded by `--strace-full`.
+* The decoder, CPU and JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
 
 ## Testing
 
 Basic testing which enough for most cases to ensure no regressions:
 
-* `make test`: full suite vs the oracle, interpreter mode.
-* `make test-jit`: FP jit-vs-interpreter consistency + entire suite with --jit.
-* `make test32`: suite against the 32-bit ILP32-host build (skips, with the reason named, where the host has no runnable 32-bit toolchain).
-* `make test32-jit`: the same build with `--jit` — the gate for the 32-bit code generators (and, where there is none yet, for the interpreter fallback).
+* `make test-arm64chroot`: full suite vs the oracle, interpreter mode.
+* `make test-arm64chroot-jit`: FP jit-vs-interpreter consistency + entire suite with --jit.
+* `make test-arm64chroot32`: suite against the 32-bit ILP32-host build (skips, with the reason named, where the host has no runnable 32-bit toolchain).
+* `make test-arm64chroot32-jit`: the same build with `--jit` — the gate for the 32-bit code generators (and, where there is none yet, for the interpreter fallback).
 
 The oracle is `qemu-aarch64`, or on an AArch64 host the CPU itself when qemu
 is not installed; `ARM64CHROOT_ORACLE=qemu|native|recorded` pins it and `ARM64CHROOT_CC`
-overrides the compiler. `make test-pack` records a full run (binaries + every
-oracle answer) into `arm64chroot-testpack.tar.gz`; a host with no toolchain
+overrides the compiler. `make test-arm64chroot-pack` records a full run (binaries + every
+oracle answer) into `build/arm64chroot-testpack.tar.gz`; a host with no toolchain
 and no possible oracle — a 32-bit ARM device — unpacks it at the same commit
-and replays with `ARM64CHROOT_ORACLE=recorded make test` (host-state tests skip; the
+and replays with `ARM64CHROOT_ORACLE=recorded make test-arm64chroot` (host-state tests skip; the
 Alpine-backed sections want any aarch64 rootfs symlinked at
-tests/.cache/rootfs/alpine). Against hardware, a test needing an optional extension the CPU lacks
+build/cache/arm64chroot/rootfs/alpine). Against hardware, a test needing an optional extension the CPU lacks
 skips instead of failing — it declares what it needs in a `REQUIRES:` marker
-naming HWCAP strings (see `tests/hostenv.sh`). Add one to any new test that
+naming HWCAP strings (see `tests/arm64chroot/hostenv.sh`). Add one to any new test that
 uses an instruction outside ARMv8.0-A.
 
 Specialized tests focused at Android OS compatibility:
 
-* `make test-android-sim`: Android-behavior build (statx ENOSYS fallback + Bionic keyring gate + the emulated-hardlink scheme, which is compiled and forced only here). It also runs the proot-group rows (`tests/l2s_proot.sh`: a rootfs installed through proot — proot-distro's — read, presented and kept by `--link2symlink`, and the hostile layouts around it; `ARM64CHROOT_L2S_BUILD=1` tells the harness the scheme is in).
-* `make test-seccomp`: suite with the emulator under an Android-Oreo SECCOMP_RET_TRAP filter (no device).
+* `make test-arm64chroot-android-sim`: Android-behavior build (statx ENOSYS fallback + Bionic keyring gate + the emulated-hardlink scheme, which is compiled and forced only here). It also runs the proot-group rows (`tests/arm64chroot/l2s_proot.sh`: a rootfs installed through proot — proot-distro's — read, presented and kept by `--link2symlink`, and the hostile layouts around it; `ARM64CHROOT_L2S_BUILD=1` tells the harness the scheme is in).
+* `make test-arm64chroot-seccomp`: suite with the emulator under an Android-Oreo SECCOMP_RET_TRAP filter (no device).
 
 **Important**: do not run any of tests above in parallel with each other.
 
@@ -186,7 +171,7 @@ Acceptance criteria:
 Command line options:
 
 * `--strace`: log every guest system call in format `PID name(nr,a0..a5) = ret`, also does a full register dump when the guest dies from a fatal signal.
-* `--strace-full`: the same trace decoded strace-style — symbolic flags, quoted strings, `execve` argv/envp arrays, read/write buffer contents and output strings (`getcwd`, `readlinkat`), errno-named returns, and `{field=...}` common-struct pretty-printing (decoder in `src/strace.c`). Plain `--strace` keeps its compact qemu-diffable layout.
+* `--strace-full`: the same trace decoded strace-style — symbolic flags, quoted strings, `execve` argv/envp arrays, read/write buffer contents and output strings (`getcwd`, `readlinkat`), errno-named returns, and `{field=...}` common-struct pretty-printing (decoder in `src/arm64chroot/strace.c`). Plain `--strace` keeps its compact qemu-diffable layout.
 * `--debug`: per-instruction trace in format `<pc>: <insn-word>  [elN nzcv=....]`, disables JIT.
 * `--no-predecode`: disable decoded-instruction cache, use it to decide whether a bug lives in the predecode fast path or the real decoder.
 
@@ -203,9 +188,9 @@ JIT debugging environment variables:
 
 Behavior fallbacks:
 
-* `ARM64CHROOT_PATHFAST_OFF`: resolves every guest path by walking it component by component (a readlink each) instead of folding it lexically and letting the pin certify that no component was a symlink. Same answers, more syscalls — the suite runs the path-race test over both routes. (The fold declines any path whose `..` cancels a component: the pin certifies only what the fold left, and `link/..` climbs from the link's target — `tests/c/pathdotdot.c`.)
-* `ARM64CHROOT_PATHFAST_VERIFY`: resolves every guest path BOTH ways and aborts on any disagreement. Development knob, and only for a quiescent tree: the two walks run at different instants, so a guest racing its own mounts/renames (tests/fixtures/bindrace.c) makes them differ for a reason that is not a bug.
-* `ARM64CHROOT_PINWALK_FORCE_LOOP`: pins a resolved path's parent one component at a time (openat/O_NOFOLLOW) instead of in a single `openat2(RESOLVE_NO_SYMLINKS)` — the tier a host kernel older than 5.6 is served by, and the one a seccomp filter over openat2 puts a modern host on. Same containment, one syscall per component instead of one per path — and two descriptors open at once instead of one, which is why the guest's `RLIMIT_NOFILE` is judged from the walk's first allocation and not its last (`tests/c/fdlimit.c`, whose `(loop-tier)` row runs over this).
+* `ARM64CHROOT_PATHFAST_OFF`: resolves every guest path by walking it component by component (a readlink each) instead of folding it lexically and letting the pin certify that no component was a symlink. Same answers, more syscalls — the suite runs the path-race test over both routes. (The fold declines any path whose `..` cancels a component: the pin certifies only what the fold left, and `link/..` climbs from the link's target — `tests/arm64chroot/c/pathdotdot.c`.)
+* `ARM64CHROOT_PATHFAST_VERIFY`: resolves every guest path BOTH ways and aborts on any disagreement. Development knob, and only for a quiescent tree: the two walks run at different instants, so a guest racing its own mounts/renames (tests/arm64chroot/fixtures/bindrace.c) makes them differ for a reason that is not a bug.
+* `ARM64CHROOT_PINWALK_FORCE_LOOP`: pins a resolved path's parent one component at a time (openat/O_NOFOLLOW) instead of in a single `openat2(RESOLVE_NO_SYMLINKS)` — the tier a host kernel older than 5.6 is served by, and the one a seccomp filter over openat2 puts a modern host on. Same containment, one syscall per component instead of one per path — and two descriptors open at once instead of one, which is why the guest's `RLIMIT_NOFILE` is judged from the walk's first allocation and not its last (`tests/arm64chroot/c/fdlimit.c`, whose `(loop-tier)` row runs over this).
 * `ARM64CHROOT_PROCSTAT_FORCE_SYNTH`: forces the synthetic /proc/stat fallback.
 * `ARM64CHROOT_PROCFS_FORCE_OLD`: hides from the host's own /proc what a kernel older than the advertised one does not have — `/proc/<pid>/stat` past field 44 (start_data..exit_code are 3.3) and `status`'s RssAnon/RssFile/RssShmem lines (4.5) — so the synthesized views must supply them rather than rewrite them; the tier an Android 7 device (3.1) is permanently on, where a guest could otherwise not find its own argv, its own brk, or the parts of its own resident set. The suite's `vmreport (old-procfs tier)` rows run over it.
 * `ARM64CHROOT_PROCSTAT_HOTPLUG_SIM`: walks the online-CPU count down on every
@@ -242,4 +227,4 @@ Tuning:
 * `ARM64CHROOT_JIT_MB`: per-thread JIT code-cache size in MiB (default 32, clamped 1–128).
 * `XDG_RUNTIME_DIR`, `TMPDIR`: first writable one holds the backing directories of emulated tmpfs mounts (removed when the session ends; a session killed before it could clean up is swept by the next one), plus the --shared-proc *fallback* registry file and the System V shm segment backings when the diskless broker (memfd) is unavailable and /dev/shm isn't writable (Termux). The shm backings are unlinked the moment they are created (the broker hands attachers the descriptor, never a name), so only the registry file has one — and it is refused unless it is a regular file owned by this user that nobody else can reach.
 
-Note: `src/core/cpu.c` / `cpu.h` still document several source-inherited hooks — g_rtrace (compact register trace), g_prof/ARM64EMU_PROF (hot-PC profiler), g_ring/ARM64EMU_RING (recent-step ring buffer), g_tpc/ARM64EMU_TPC (dump state at a target PC), and g_cov/ARM64EMU_COV (coverage-divergence finder) — carried over from the [ARM64EMU_System](https://github.com/sylirre/arm64emu-system) core. This codebase never wires those env vars up. They stay 0 unless you edit the source and rebuild.
+Note: `src/arm64chroot/core/cpu.c` / `cpu.h` still document several source-inherited hooks — g_rtrace (compact register trace), g_prof/ARM64EMU_PROF (hot-PC profiler), g_ring/ARM64EMU_RING (recent-step ring buffer), g_tpc/ARM64EMU_TPC (dump state at a target PC), and g_cov/ARM64EMU_COV (coverage-divergence finder) — carried over from arm64emu's core (`src/arm64emu/cpu.c`). This codebase never wires those env vars up. They stay 0 unless you edit the source and rebuild.

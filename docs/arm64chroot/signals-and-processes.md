@@ -1,6 +1,6 @@
 # Signals & the process model
 
-Files: `src/signal.c` (delivery), `src/sys_sig.c` (syscalls), `src/sys_proc.c`
+Files: `src/arm64chroot/signal.c` (delivery), `src/arm64chroot/sys_sig.c` (syscalls), `src/arm64chroot/sys_proc.c`
 (fork/exec/clone/wait).
 
 ## Signal delivery
@@ -27,7 +27,7 @@ loop restores the default and re-raises — and this used to be done only under
 `ptrace` or while the signal was blocked. Every disposition is mirrored at
 startup (`sig_inherit_host_dispositions`), not at the guest's first `sigaction`
 on it: a `SIGTERM` the guest never mentioned used to die at the host default
-with none of that performed (`tests/fixtures/robustdeath.c`, the `child_sigterm`
+with none of that performed (`tests/arm64chroot/fixtures/robustdeath.c`, the `child_sigterm`
 row). The same pass takes the dispositions the emulator was started with —
 `execve` keeps `SIG_IGN` and resets the rest — so a guest launched under `nohup`
 reads `SIGHUP` back as `SIG_IGN`, as it would from a kernel, instead of `SIG_DFL`
@@ -35,7 +35,7 @@ while the host went on ignoring it. A guest's own `execve` does what
 `flush_signal_handlers` does (`sig_reset_for_exec`): a handler goes back to the
 default, an ignored signal stays ignored, and every disposition loses its flags
 and its mask — a default `SIGCHLD`'s `SA_NOCLDSTOP` used to outlive the exec
-(`tests/fixtures/execsigflags.c`).
+(`tests/arm64chroot/fixtures/execsigflags.c`).
 
 `SIGCHLD` carries two flags the kernel acts on as it sends a child's notice,
 and the host gets them with the rest of the disposition (`sig_chld_host`):
@@ -44,7 +44,7 @@ child reaped at its death, never to be waited for — at `SIG_DFL` too — thoug
 a handler still hears of it); `SIG_IGN` means both, and no notice at all. Both
 flags used to be dropped: an `SA_NOCLDWAIT` parent's children stayed zombies
 its waits found, and an `SA_NOCLDSTOP` one's handler ran for every stop and
-continue (`tests/fixtures/sigchldflags.c`). The one part the host cannot always
+continue (`tests/arm64chroot/fixtures/sigchldflags.c`). The one part the host cannot always
 be given is the reaping, which the kernel does only for a child whose death
 signal is `SIGCHLD` — see *Clone children, and pidfds*. And a host may ignore
 both flags outright — qemu-user installs a handler of its own with flags of
@@ -67,7 +67,7 @@ reason positive), so the nets that own these numbers for the process lifetime
 sent one for the guest's disposition and restore the default for a fault.
 Before that a guest with a `SIGSEGV` handler died of `kill(SIGSEGV)` at the
 host's default, and a sent `SIGBUS` was swallowed by the bus-error net — the
-process lived on (`tests/fixtures/sentsync.c`).
+process lived on (`tests/arm64chroot/fixtures/sentsync.c`).
 
 ### The pending queue
 
@@ -138,14 +138,14 @@ Three things are never held at the gate: the control-channel kick (it is the
 wake that gets a parked thread to a consumer at all, so blocking it deadlocks
 rather than delays), `SIGSYS` (a seccomp trap that arrives blocked force-kills
 the process), and the synchronous fault numbers (the emulator's own nets need
-them deliverable at every instant). `tests/c/sigqdepth.c` covers all of it,
+them deliverable at every instant). `tests/arm64chroot/c/sigqdepth.c` covers all of it,
 including a real cross-process flood onto a parked receiver, and the suite
 runs it a second time under `ARM64CHROOT_SIGQ_MAX=32` so every flood in it has to go
 through the gate and back.
 
 `SIGBUS` is the one whose *host* disposition the emulator keeps for itself, like
 `SIGSYS`: `sig_host_update` leaves it alone so the bus-error recovery net
-(`mem.c`, see docs/memory.md) is never replaced by a guest `sigaction`. A file
+(`mem.c`, see docs/arm64chroot/memory.md) is never replaced by a guest `sigaction`. A file
 truncated from outside the address space raises a real host `SIGBUS` on the
 emulator, and that net turns it into the guest's own abort — or, when the fault
 came from a syscall's own copy rather than from guest code, into the `EFAULT`
@@ -164,7 +164,7 @@ is empty, leaves it raised while one of those is still unserved
 (`sig_callout_waiting`): lowered, a kick that arrived between the boundary's
 service and the delivery went unseen by the check at the next `SVC`, and a
 tracee went back into its `pause()` with a `PTRACE_INTERRUPT` its tracer then
-waited for forever (a quarter of `tests/ptrace/execstopped.c`'s runs under
+waited for forever (a quarter of `tests/arm64chroot/ptrace/execstopped.c`'s runs under
 qemu-user). The frame:
 
 - 128-byte guest `siginfo`,
@@ -197,7 +197,7 @@ kernel's vDSO one) reads the saved registers of the frame whose `pc` *is* the
 trampoline at its CFA, which there is the outer sigcontext's own address, so a
 `pthread_cancel` unwinding out of the inner handler jumped to garbage — one run
 in ten, under load, of any program whose handler returned with another signal
-on its way (`tests/fixtures/sigtramp.c`).
+on its way (`tests/arm64chroot/fixtures/sigtramp.c`).
 
 `SA_RESTART` is honored by rewinding to the `SVC` and re-running it when the
 interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`) — for the
@@ -219,7 +219,7 @@ to be sixteen syscall numbers with no rule at all: `accept4`, `flock`,
 `F_SETLKW` and the open of a FIFO came back `EINTR` under an `SA_RESTART`
 handler where a kernel resumes them (the FIFO open then left a writer blocked
 forever), and a timed futex wait was restarted where a kernel reports it
-(`tests/fixtures/sarestart.c`; qemu-user has a restart list of its own).
+(`tests/arm64chroot/fixtures/sarestart.c`; qemu-user has a restart list of its own).
 
 #### The emulator's own interruptions are invisible to the guest
 
@@ -240,7 +240,7 @@ restarting via `ERESTART_RESTARTBLOCK`, returned `0`.
 
 So `sig_kick_net` flags every one of its *own* uses of that signal
 (`g_sig_selfintr`), and a dispatch that ended in `EINTR` with that flag set
-rewinds instead of reporting (`syscall_restart_internal`, `src/syscall.c`),
+rewinds instead of reporting (`syscall_restart_internal`, `src/arm64chroot/syscall.c`),
 after signal delivery so a real guest signal's own disposition — a frame, or the
 `SA_RESTART` rewind above — decides first. The PC test distinguishes "just
 returned from that syscall" from a stale flag.
@@ -256,7 +256,7 @@ the call no longer looked interrupted: a `SEIZE` whose kick rewound a tracee's
 `epoll_wait`, followed at once by an `INTERRUPT`, trapped ahead of the call,
 which the `SVC` then made anew and ran to its timeout — where the kernel,
 whose `SEIZE` interrupts nothing, answers the `INTERRUPT`'s stop with `EINTR`
-(`tests/ptrace/interrupt_blocked.c`, `tests/ptrace/attachorder.c`).
+(`tests/arm64chroot/ptrace/interrupt_blocked.c`, `tests/arm64chroot/ptrace/attachorder.c`).
 
 The mark itself (`g_sig_selfintr`) is claimed only while a syscall dispatch is
 on the thread (`sig_selfintr`): one of the emulator's own signals handled
@@ -270,7 +270,7 @@ no-handler rule outright (`sig_taken_quietly`), whatever mark of ours its
 tracer then suppressed, ran on to its timeout when a kick — or the capture
 kick's timer — reached the thread around that stop: rarely on a kernel, every
 time under qemu-user, which hands signals on late
-(`tests/ptrace/suppressed_eintr.c`).
+(`tests/arm64chroot/ptrace/suppressed_eintr.c`).
 
 ##### A signal caught on the way into a syscall
 
@@ -306,13 +306,13 @@ the host had already queued is ignored: a stop taken there parks the thread,
 and a timer still firing through it marked the call it had interrupted as the
 emulator's to restart after the stop had settled that it answers `EINTR` —
 a traced thread's `epoll_wait`, interrupted by a signal its tracer then
-suppressed, ran on to its timeout every time (`tests/ptrace/suppressed_eintr.c`).
+suppressed, ran on to its timeout every time (`tests/arm64chroot/ptrace/suppressed_eintr.c`).
 The emulator's own call-outs arm the timer in that window too — a tracer's
 kick, a tracee's wake of its tracer, `execve`'s `de_thread` — since each exists
 to get the thread out of a host wait, and one that lands there interrupts
 nothing: a tracer's `INTERRUPT`, sent as its tracee's blocked `read` was being
 rewound after the `SEIZE`'s own kick, was never seen, and the tracer waited
-for a stop that never came (`tests/ptrace/interrupt_blocked.c`; about one run
+for a stop that never came (`tests/arm64chroot/ptrace/interrupt_blocked.c`; about one run
 in three under the JIT, whose re-entry into the call is the quicker). The timer is per
 thread, made before the thread runs guest code and deleted as it ends, and a
 fork child makes its own (no POSIX timer is inherited).
@@ -321,7 +321,7 @@ Narrow as those windows are, glibc's setxid broadcast walks straight into
 them: every `setresuid` signals every other thread and waits for each to run
 its handler, and a thread returning from that handler re-enters the futex it
 was interrupted in — `pthread_join`, the setxid lock — in the same microseconds
-the next broadcast reaches it. `tests/fixtures/sigsvc.c` (four threads
+the next broadcast reaches it. `tests/arm64chroot/fixtures/sigsvc.c` (four threads
 spinning on a syscall, two calling `setresuid(-1, -1, -1)` in turn) wedged in
 three runs of three in either engine; a threaded program dropping privileges
 is the everyday shape of it.
@@ -337,7 +337,7 @@ saturates: the guest's seconds are 64 bits wide, and a span that does not fit
 in nanoseconds means "never", not whatever the product wraps to. Multiplied
 out, 2^60 seconds is exactly 0 mod 2^64, so a `nanosleep` of that span
 restarted by a tracer's attach was handed a span of 0 and returned at once
-(`tests/ptrace/attach_hugesleep.c`). Absolute deadlines —
+(`tests/arm64chroot/ptrace/attach_hugesleep.c`). Absolute deadlines —
 `clock_nanosleep(TIMER_ABSTIME)`, `FUTEX_WAIT_BITSET` and the PI futex ops — are
 exact under a plain restart and declare nothing. `rt_sigsuspend` and
 `rt_sigtimedwait` sleep in their host namesakes and loop over the `EINTR` of
@@ -351,10 +351,10 @@ and it sleeps on, the kernel's `ERESTARTNOHAND` — while `rt_sigtimedwait`
 serves it and restarts them unless the stop it made ends them with `EINTR`,
 as the kernel's do (neither is ever restarted). Slept through, the attach stop
 never came: `strace -p` on a shell waiting for its children in `sigsuspend`
-waited for it forever (`tests/ptrace/attachwait.c`). The `de_thread` call-out
+waited for it forever (`tests/arm64chroot/ptrace/attachwait.c`). The `de_thread` call-out
 they *do* report is never cancelled — the thread goes on to its death at the
 safepoint, or (the main thread) to the new image. Covered by
-`tests/ptrace/attach_no_eintr.c`, which asserts both halves: the sleep returns
+`tests/arm64chroot/ptrace/attach_no_eintr.c`, which asserts both halves: the sleep returns
 `0`, and it still ends when the guest asked rather than one interruption-point
 later.
 
@@ -365,7 +365,7 @@ about the pointer rather than about the signal. Discarding that error and
 reporting a bare `EINTR` left a caller that loops on `EINTR` re-sleeping from a
 `rem` it never received, which is the one thing the field exists for.
 `TIMER_ABSTIME` has no remainder to write and never touches the pointer
-(`tests/c/remfault.c` covers both, qemu agreeing with the host kernel).
+(`tests/arm64chroot/c/remfault.c` covers both, qemu agreeing with the host kernel).
 
 `ppoll` and `pselect6` write their remainder back too, and not only when
 interrupted: `poll_select_finish` updates the caller's timespec on *every*
@@ -381,7 +381,7 @@ which now holds the time left, exactly as a kernel's restart re-reads it — so 
 wait whose remainder was written back charges nothing to `sc_waited_ns`, and
 one whose write-back faulted keeps the stopwatch and the subtraction. A caller
 that loops on `EINTR` with the time it has left relied on the update; given the
-whole timeout each time it never finished (`tests/fixtures/pwaittmo.c`; qemu
+whole timeout each time it never finished (`tests/arm64chroot/fixtures/pwaittmo.c`; qemu
 updates the timespec only on success).
 
 ### Synchronous consumption: `rt_sigtimedwait` (`sigwait`/`sigwaitinfo`)
@@ -409,7 +409,7 @@ status, and the child's user and system time in clock ticks, which
 handler's siginfo and from `sigwaitinfo`, where a `signalfd` record, the
 host's own, had them) — for `SIGCHLD`, and for the other signal a clone child
 may die with, whose 48 bytes a 64-bit kernel hands over as they were built
-(`tests/fixtures/chldinfo.c`).
+(`tests/arm64chroot/fixtures/chldinfo.c`).
 
 ### `signalfd(2)`
 
@@ -444,7 +444,7 @@ unmarks it explicitly. `readv` with **no bytes** in it (`iovcnt == 0`, or every
 segment empty) is 0, not the `EINVAL` a buffer too small for one record earns:
 a vector of no bytes never reaches the file, since `do_iter_read` returns as
 soon as the imported total is zero — the kernel's own asymmetry.
-`tests/c/sigmaskmirror.c` reads one from a worker while the main thread sits
+`tests/arm64chroot/c/sigmaskmirror.c` reads one from a worker while the main thread sits
 in a `read` with the signal blocked.
 
 ### `sigaltstack(2)` and `SA_ONSTACK`
@@ -476,7 +476,7 @@ with every refusal but an unreadable frame ignored, so a handler that edited
 alternate stack changes nothing (`EPERM`). It used to stay armed, so a nested
 delivery from a handler that had switched off it — a coroutine library's whole
 reason for the flag — landed on top of the frame in use.
-`tests/fixtures/altstackflags.c` holds the frame words and the disarm rows;
+`tests/arm64chroot/fixtures/altstackflags.c` holds the frame words and the disarm rows;
 qemu-user knows no `SS_AUTODISARM`.
 
 ### The temporary mask of `ppoll` / `pselect6` / `epoll_pwait`
@@ -497,7 +497,7 @@ a signal its tracer suppressed at the stop, or one ignored after it — before
 the call is restarted, which installs the temporary mask anew. Given back by a
 frame only, it outlived such a stop: the restarted call took the temporary mask
 for the caller's, and the caller's own was gone once the wait was over
-(`tests/ptrace/stopmask.c`). Handing the mask to the host alone used to
+(`tests/arm64chroot/ptrace/stopmask.c`). Handing the mask to the host alone used to
 leave `g_tls.sigmask` gating delivery: the wait was interrupted and the run
 loop then declined to run the handler, leaving the guest with a bare `EINTR`
 and no signal. The enter path also
@@ -518,7 +518,7 @@ first; before the mask itself, so a bad size beats an unreadable mask; and, for
 bounce buffer being capped instead since a call answered with fewer events than
 asked is indistinguishable from one on a quieter queue. `ppoll`'s `nfds` is
 likewise bounded by the guest's own `RLIMIT_NOFILE`, as `do_sys_poll` bounds
-it, and not by an array of ours (`tests/c/pwait_sigsetsize.c`); `pselect6`'s is
+it, and not by an array of ours (`tests/arm64chroot/c/pwait_sigsetsize.c`); `pselect6`'s is
 not bounded at all but *clamped* to the fd table's size, as `core_sys_select`
 clamps it — the table is the host process's own (guest fd == host fd), and its
 size is the `FDSize` line of its status, consulted only for an `nfds` past what
@@ -534,7 +534,7 @@ of its own below the kernel's, which is the `int` the id is: it is 25 segments
 of doubling size (64, 128, …), each allocated on first use and never moved, so
 the capture handler's lookup stays a plain load through a pointer published
 with a release store — a fixed table of 64 used to answer `EAGAIN` to the 65th
-timer where a kernel keeps allocating (`tests/fixtures/timers_many.c`; qemu-user
+timer where a kernel keeps allocating (`tests/arm64chroot/fixtures/timers_many.c`; qemu-user
 holds 32 of its own, so it is no oracle here). Notification passes
 through — signal numbers are shared, a `SIGEV_THREAD_ID` tid is the host tid,
 and the fired `SI_TIMER` siginfo rides the capture ring like any other
@@ -580,14 +580,14 @@ call-out). They are taken from the top of the RT range because nothing in
 practice sends `SIGRTMAX` and the host libcs reserve from the bottom (32/33).
 
 Which three is a question for the host, not a constant. `sig_probe_reserved`
-(`src/signal.c`, called by `main` before any handler is installed or any process
+(`src/arm64chroot/signal.c`, called by `main` before any handler is installed or any process
 is forked) queues each candidate to itself and checks a handler runs, then takes
 the three highest that answer — the kick first, since losing it deadlocks the
 emulator rather than the guest. On a host with nothing in the way those are
 `SIGRTMAX`, `SIGRTMAX-1`, `SIGRTMAX-2`, exactly what used to be compiled in; the
 probe only matters where a number can be installed but not delivered, which is
 what `qemu-user` does to the top three (see *A signal the host accepts is not a
-signal the host delivers* in `docs/portability-and-pitfalls.md`). Every process
+signal the host delivers* in `docs/arm64chroot/portability-and-pitfalls.md`). Every process
 of a session reaches the same answer without sharing it, because the answer is a
 property of the host. `ARM64CHROOT_SIGRT_MAX=N` caps the search, which is how the suite
 exercises the low-RT tier on a host that has no hole of its own.
@@ -647,11 +647,11 @@ own interruption and the syscall rewinds (`g_sig_selfintr`,
 `syscall_restart_internal`), the same way the kick is hidden. The gate
 (`sigq_gate`) may add bits of its own on top and takes them away again itself.
 
-`tests/c/sigmaskmirror.c` covers the read that completes, the death at the
+`tests/arm64chroot/c/sigmaskmirror.c` covers the read that completes, the death at the
 unblock of a blocked default-terminate signal, the routing to the unblocked
 worker, the `sigwait` and `signalfd` workers, `rt_sigtimedwait`,
 `rt_sigsuspend` and the `pthread_cancel` of a worker that blocked everything;
-`tests/fixtures/sentsync.c` the held-out `SIGSEGV`, which
+`tests/arm64chroot/fixtures/sentsync.c` the held-out `SIGSEGV`, which
 qemu-user gets wrong (it hands the read an `EINTR`).
 
 ### What a thread caught but will not take
@@ -760,30 +760,30 @@ process under it queues 34 and /proc shows 37 — so there a real-time slot is
 reclaimed only when its receiver is gone. A sender that finds no slot at all
 sends what the host can carry, as for a receiver with no inbox, so what the
 host loses returns past 64 undelivered posts
-(`tests/fixtures/carrystale.c`). The remaining job-control carriers go as `SI_QUEUE` with a
+(`tests/arm64chroot/fixtures/carrystale.c`). The remaining job-control carriers go as `SI_QUEUE` with a
 tagged descriptor of the signal, its kind and its sender's code in `si_value`
 (`sig_jc_desc`), which loses nothing for a `kill`'s or a `tgkill`'s. A
 receiver with no registry entry is sent what the host can carry, and loses
 what it lost before: the payload of a sigqueue'd job-control signal, the
 thread of a thread-directed one, and `si_errno`, which is qemu's own doing.
 `ARM64CHROOT_SICODE_FORCE_KNOWN` forces the tier; the suite runs the stopping ptrace
-tests over it (`(known-layout-tier)`), with `tests/ptrace/jcqueue.c`'s queued
-job-control signals, `tests/fixtures/sqiread.c` and `carrystale.c`.
+tests over it (`(known-layout-tier)`), with `tests/arm64chroot/ptrace/jcqueue.c`'s queued
+job-control signals, `tests/arm64chroot/fixtures/sqiread.c` and `carrystale.c`.
 
 One siginfo goes through the inbox on every tier: on an ILP32 host, one whose
 value is wider than the host's 4-byte sigval. A 32-bit kernel carries the
 code, the `si_errno` and the thread as they are, but only the low half of the
 guest's 8-byte value, so a real 32-bit device used to hand a `sigqueue`'d
 pointer — to itself, a thread, another process or a `signalfd` — on without
-its high half. The slot holds the value whole (`tests/c/sigqwide.c`, whose
-rows the i386 build of `make test32` failed before).
+its high half. The slot holds the value whole (`tests/arm64chroot/c/sigqwide.c`, whose
+rows the i386 build of `make test-arm64chroot32` failed before).
 
 The held-out numbers are not handed back while the thread lives — the host
 would deliver them straight to it again — only when it exits, having blocked
 everything first. An exiting thread also no longer opens the pending-signal
 gate on its way out: that pulled what the gate had left in the kernel's queue
 into the ring of a thread about to drop it, where the kernel would have given
-it to another thread. `tests/c/sigretarget.c` has the handler that exits and
+it to another thread. `tests/arm64chroot/c/sigretarget.c` has the handler that exits and
 the one that waits, a `SIGCHLD` whose siginfo must survive the trip, three
 instances of a real-time signal that must arrive in order, and the `tgkill`ed
 and `pthread_sigqueue`d signals that must not — each sent after a `SIGUSR1`
@@ -820,7 +820,7 @@ has been read, so an unreadable pointer is `EFAULT` rather than `EINVAL`; readin
 their disposition, with no `act`, is allowed. The new action's mask also loses
 `SIGKILL` and `SIGSTOP` at install (`sigdelsetmask`) rather than at use, which is
 what makes the `oldact` a later call reads back the kernel's answer instead of
-the bits the caller passed in. `tests/fixtures/sigactorder.c` covers all of it
+the bits the caller passed in. `tests/arm64chroot/fixtures/sigactorder.c` covers all of it
 against the raw syscall; qemu-user is not the oracle there (it locks both user
 structs up front, and keeps the two unblockable signals in the mask).
 
@@ -843,8 +843,8 @@ an `si_code` whose layout the kernel does not know, the compat conversion of
 its own host call keeps only `si_pid` and `si_uid`, so the rest of the union
 does not arrive; a native kernel of either width copies all of it.) A stop
 signal to a traced process, or `SIGCONT` to a listening one,
-takes the ptrace routing `kill(2)` and `tgkill(2)` take. `tests/c/tgsigqueue.c`
-(differential) and `tests/fixtures/sqiread.c` (self-checking: qemu-user locks
+takes the ptrace routing `kill(2)` and `tgkill(2)` take. `tests/arm64chroot/c/tgsigqueue.c`
+(differential) and `tests/arm64chroot/fixtures/sqiread.c` (self-checking: qemu-user locks
 all 128 bytes, copies only the fields it knows, and drops `si_errno`).
 
 ### `_sigpoll`: `si_band` and `si_fd`
@@ -858,7 +858,7 @@ LP64 host they lie over a child's notice's pid, uid and status, which is how
 they used to be handed on, and on an ILP32 host, whose `long` is 4 bytes, the
 guest read the fd in the band's high half and an fd of 0. A guest's queued
 `SI_SIGIO` rides as an `SI_QUEUE`'s pid, uid and value under the origin mark
-(below), and is laid out from those (`tests/fixtures/sigpoll.c`).
+(below), and is laid out from those (`tests/arm64chroot/fixtures/sigpoll.c`).
 
 ### Whose a signal is: `si_pid` and `si_uid`
 
@@ -902,7 +902,7 @@ everywhere: the siginfo
 the inbox and the job-control carriers bring, which only a guest sends, with
 the sender's real uid in it for a `kill`. And the siginfos a ptrace stop
 makes up — a trap's, the tracee's own uid; a substituted signal's, the
-tracer's; an attach's `SIGSTOP`'s, its sender's. `tests/fixtures/sigident.c`
+tracer's; an attach's `SIGSTOP`'s, its sender's. `tests/arm64chroot/fixtures/sigident.c`
 runs every kind as the invoking user and as a fake root whose children each
 take another real uid first, and a `SIGUSR1` from outside the guest.
 
@@ -937,7 +937,7 @@ Guest tid is host tid the same way, so a thread's CPU affinity is real:
 Rust's `available_parallelism`, libuv and the JVM size their pools from. They
 used to answer one CPU for every task and ignore every `setaffinity`, from
 before `CLONE_THREAD` threads existed, so all of those ran on one core while
-`/proc/cpuinfo` listed the machine (`tests/fixtures/affinity.c`).
+`/proc/cpuinfo` listed the machine (`tests/arm64chroot/fixtures/affinity.c`).
 
 The same identity decides `prctl(2)` (`sys_proc.c`): what is a property of the
 host task is the guest's, and passes through — `PR_SET/GET_CHILD_SUBREAPER`
@@ -954,14 +954,14 @@ own `set_tid_address` recorded, which the emulator keeps to serve
 (`PR_SET/GET_DUMPABLE`, reset to 1 by an exec and to 0 by a secure one, as
 `setup_new_exec` does) but never applied to the host, whose `/proc/self` the
 emulator has to keep reading to reopen its own descriptors
-(`tests/fixtures/prctlset.c`).
+(`tests/arm64chroot/fixtures/prctlset.c`).
 
 ### Target containment
 
 That identity cuts both ways: an id the guest supplies addresses **any** host
 task of the invoking user, guest or not. Every syscall that names another task
 by id therefore checks it against the PID registry first (`proctab_has_task`,
-`src/proctab.c`) — `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
+`src/arm64chroot/proctab.c`) — `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
 `rt_tgsigqueueinfo`,
 `getpriority`/`setpriority`, the `sched_*setparam`/`*scheduler`/`*affinity`/
 `rr_get_interval` family, `getpgid`/`setpgid`/`getsid`, and `capget`'s header
@@ -983,7 +983,7 @@ The other direction — an id the kernel *reports* — takes the pid-namespace
 answer: `getppid` (and the `PPid:` line and stat field of the synthesized
 `/proc` views) is 0 when the parent is not a guest process, which the
 top-level guest's is not, and a lock owner, a socket peer or an fd's async
-owner the guest cannot see reads as 0 (`proctab_pid_view`, `docs/syscalls.md`).
+owner the guest cannot see reads as 0 (`proctab_pid_view`, `docs/arm64chroot/syscalls.md`).
 `getpgid(0)`/`getsid(0)` are the exception and stay the host's: the guest
 hands those back to `setpgid` and `tcsetpgrp`, so job control needs them real.
 
@@ -1004,7 +1004,7 @@ task is gone and the next reservation that passes it takes the slot back. Such
 a slot, and one a process killed outright left, still names a pid the host may
 hand out again; a lookup by pid takes the first slot that names it, so a new
 process registering under that pid clears any older slot below its own, which
-would otherwise hide it (`ESRCH`) — `tests/fixtures/pidreuse.c`, run in a
+would otherwise hide it (`ESRCH`) — `tests/arm64chroot/fixtures/pidreuse.c`, run in a
 bubblewrap pid namespace whose `ns_last_pid` steers the number round. A kernel's zombie is
 there for `kill(pid, 0)`, `getpgid`, `getsid` and `/proc/<pid>` until it is
 reaped, and is what its own signals and the notice of its death name; the
@@ -1016,7 +1016,7 @@ nothing of it having run to say so): an empty `cmdline`, `maps`, `smaps` and
 `environ`, `auxv`, `mem` and `pagemap`, `ESRCH` for `smaps_rollup`, `EINVAL`
 for `mounts`, `ENOENT` for `exe`, `cwd` and `root` — where one killed outright
 used to be shown alive, with the command line and sizes it had. `ptrace`
-refuses to attach one (`EPERM`). `tests/fixtures/zombieproc.c`.
+refuses to attach one (`EPERM`). `tests/arm64chroot/fixtures/zombieproc.c`.
 
 What counts as a guest task: our own thread group (a process must be able to
 signal itself even with no registry slot — and one `tgkill(getpid(), tid, 0)`
@@ -1042,7 +1042,7 @@ result is 0 if any target took the signal, else the last error. `nice`'s
 `PRIO_PGRP`/`PRIO_USER` are answered the same way (every guest process runs under
 the one host uid, so `PRIO_USER` of the guest's own uid *is* the whole guest).
 
-`tests/fixtures/sigcontain.c` checks both halves. `qemu-user` is the
+`tests/arm64chroot/fixtures/sigcontain.c` checks both halves. `qemu-user` is the
 counter-example rather than the oracle here: it passes every id through, so it
 answers `ok` for exactly the cases that must be `ESRCH`.
 
@@ -1057,7 +1057,7 @@ table → host pages, fd table, register file, credentials) is inherited by copy
 `fork(2)` duplicates **the calling thread alone**. A mutex some *other* guest
 thread held at that instant therefore crosses into the child locked, owned by a
 thread that does not exist there, and the next acquirer waits forever. This is
-not theoretical: `tests/c/timers.c` forks while a 5 ms timer is live and libc's
+not theoretical: `tests/arm64chroot/c/timers.c` forks while a 5 ms timer is live and libc's
 `SIGEV_THREAD` helper thread is running, and the child wedged in
 `mem_ifetch_slow` → `translate()` → `as_lock()` on a lock its vanished sibling
 still owned — intermittently, roughly one run in fifteen, and only on a host
@@ -1113,7 +1113,7 @@ sorting five lines that looked like a list of equals was enough to deadlock ever
 fork, with nothing at the call site to say so. One triple states the order
 outright instead.
 
-`tests/fixtures/forklock.c` is the guard, and it earns that description: with
+`tests/arm64chroot/fixtures/forklock.c` is the guard, and it earns that description: with
 `mem`'s locks left out of the walk it hangs 3 runs of 3 — where `timers.c` caught
 the same bug about one run in fifteen — and with the walk inverted it deadlocks in
 5 runs of 6 (15 s of wall clock for 0.2 s of CPU, the signature of a deadlock
@@ -1217,7 +1217,7 @@ Two mechanisms close that, both in `path.c` and both stated in `machine.h`
 The blocking-IPC socket had a registry of its own of the same shape before
 (`ipc_wait_fd`, closed by `ipc_fork_child`); it is held like the rest now. The
 JIT's W^X code-cache `memfd` is closed the moment both views are mapped, for
-the same reason. `tests/fixtures/forkfds.c` forks under three kinds of sibling
+the same reason. `tests/arm64chroot/fixtures/forkfds.c` forks under three kinds of sibling
 activity — path pinners, a thread blocked in the open of a FIFO with its pin
 held, a thread parked in `semop` — and counts the strangers in each child: zero
 in every row, where the old code showed 126/200 and 50/50 for the first two.
@@ -1232,7 +1232,7 @@ First the combinations a kernel refuses before it creates anything
 `CLONE_NEWIPC` with `CLONE_SYSVSEM` — all `EINVAL`. The namespace flags are
 otherwise faked (below), but the rules about combining them are validation, not
 namespaces; a `clone(CLONE_THREAD|CLONE_VM)` without `CLONE_SIGHAND` got a
-thread here where every kernel says `EINVAL` (`tests/fixtures/cloneflags.c`,
+thread here where every kernel says `EINVAL` (`tests/arm64chroot/fixtures/cloneflags.c`,
 against a 6.x host row by row).
 
 Then what a process clone may ask for that a fork-based child cannot be given.
@@ -1293,7 +1293,7 @@ still be on its way to a thread when the wait reaps it; an ordinary child's
 goes at its reap, or — reaped where no wait saw it — when a wait next finds it
 no child any more, or a new child finds its pid gone. Only a table so full of
 live children that an ordinary one found no slot leaves such a wait to the
-host as before, and it says so, once (`tests/fixtures/waitany.c`). Nor may the host reap a
+host as before, and it says so, once (`tests/arm64chroot/fixtures/waitany.c`). Nor may the host reap a
 clone child: a parent that ignores `SIGCHLD` or set `SA_NOCLDWAIT` has its
 children reaped at their death — by the kernel, only those whose death signal
 is `SIGCHLD`, and by the host, which knows every child as one of those, all of
@@ -1303,7 +1303,7 @@ rather than handed to the host to act on, the capture reaps the ordinary
 children itself, and a wait that gets to one first passes it by
 (`chld_autoreaped`), as a kernel's wait never sees it. The clone child used to
 be reaped by the host with the rest: its signal never came, and its wait was
-`ECHILD` (`tests/fixtures/sigchldflags.c`).
+`ECHILD` (`tests/arm64chroot/fixtures/sigchldflags.c`).
 
 A clone child's signal is its parent's only while the parent runs the program
 that forked it. Once the parent has called `execve`, `do_notify_parent` sends
@@ -1314,7 +1314,7 @@ child it is. So each entry keeps the parent's `image_gen` from the fork, and
 `ck_notice_sig` answers `SIGCHLD` once the two differ: the capture reports the
 death as an ordinary child's, `clonekids_signalling` no longer counts it, and
 the emulated reaping takes it (`chld_autoreaped`). The emulator sent the signal
-the child was cloned with, and kept the child (`tests/fixtures/clonenotice.c`).
+the child was cloned with, and kept the child (`tests/arm64chroot/fixtures/clonenotice.c`).
 
 All of that is decided where the host's `SIGCHLD` is *taken*, and a guest that
 blocks `SIGCHLD` takes none: the host holds it pending. That is right for a
@@ -1409,8 +1409,8 @@ containment: only a guest process is reached, and in it only a number a guest
 can hold, below every descriptor the emulator keeps for itself
 (`guest_fd_ceiling`; `EBADF` above). The permission is the host's
 `ptrace_may_access`, so a host whose Yama scope refuses a non-descendant says
-`EPERM`, and one without the call says `ENOSYS` (`tests/c/pidfdgetfd.c`).
-`tests/c/pidfd.c` (differential) and `tests/fixtures/clonepidfd.c`
+`EPERM`, and one without the call says `ENOSYS` (`tests/arm64chroot/c/pidfdgetfd.c`).
+`tests/arm64chroot/c/pidfd.c` (differential) and `tests/arm64chroot/fixtures/clonepidfd.c`
 (self-checking: qemu-user writes no descriptor for a vfork child and turns exit
 signals into its own).
 
@@ -1430,7 +1430,7 @@ Both halves are kept now (`sys_proc.c`, *vfork*). The parent sleeps inside the
 `clone` until the child has execed, exited or died — where a kernel's
 `wait_for_vfork_done` sleeps — and what the child wrote is carried back byte for
 byte: the child's stores were tracked page by page from its first instruction
-(`docs/memory.md`, *A vfork child's writes are tracked*), and at its exec
+(`docs/arm64chroot/memory.md`, *A vfork child's writes are tracked*), and at its exec
 (`do_execve`'s point of no return, where `exec_mmap` releases the parent), its
 exit (`process_exit`) or its death by a signal (`guest_terminate_by_signal`) it
 sends each stack it grew below where it started (`VF_GROW`: the vma the two
@@ -1460,7 +1460,7 @@ map is a program that is already broken by the standard's terms; and a sibling
 thread of the parent writing the very bytes the child writes loses to the child,
 as it would in any race. A nested vfork works (the grandchild's bytes reach the
 child, which forwards them with its own), and a plain `fork` from a vfork child
-gives the grandchild a space of its own. `tests/fixtures/vforkback.c` covers
+gives the grandchild a space of its own. `tests/arm64chroot/fixtures/vforkback.c` covers
 `posix_spawn` of a missing program, writes to a global, the heap and the
 parent's frame, the exec / exit / signal endings, both kinds of grandchild, 300
 KB of pages, and the wait itself; self-checking, since qemu-user's vfork is a
@@ -1492,7 +1492,7 @@ One host thread per guest thread over the shared `Machine`/address space:
   publishes that set to the PID registry, and strikes it out of what the guest
   is shown: the `/proc/<pid>/task` listing, `Threads:`, and `execve`'s wait for
   the last sibling to leave. The set is empty on every host we ship on, and one
-  entry under `qemu-user`. See `proc_foreign_sample` (`src/sys_proc.c`);
+  entry under `qemu-user`. See `proc_foreign_sample` (`src/arm64chroot/sys_proc.c`);
 - exclusives and LSE atomics are SMP-correct host CAS, and guest barriers are host
   fences (see [memory.md](memory.md)) — this is what makes pthread mutexes/condvars
   and lock-free code correct even on weakly-ordered ARM hosts;
@@ -1522,7 +1522,7 @@ One host thread per guest thread over the shared `Machine`/address space:
   so its non-PI robust mutexes are left locked (a kernel walks them), and in
   the group walk a sibling that locks a robust mutex in the microseconds
   between its list being walked and `_exit` goes unmarked
-  (`tests/fixtures/robustdeath.c`).
+  (`tests/arm64chroot/fixtures/robustdeath.c`).
 
 ### exit
 
@@ -1560,7 +1560,7 @@ the obvious one: with no `exit_group` involved the parent sees the code of the
 thread that exits **last**, not the leader's, so every `exit(2)` overwrites
 `m->group_exit_code` and the last writer wins.
 
-## ptrace(2) (`src/ptracetab.c`, `src/sys_ptrace.c`)
+## ptrace(2) (`src/arm64chroot/ptracetab.c`, `src/arm64chroot/sys_ptrace.c`)
 
 The emulator emulates guest `ptrace(2)` so in-rootfs `strace` and `gdb` work,
 **without** using host `ptrace` (denied under Android SELinux/seccomp) and
@@ -1590,7 +1590,7 @@ requests about itself**, the same way it already mediates every other syscall:
   the old leader's tracees and moves its own to the pid it is renumbered to.
   A `PTRACE_TRACEME` names the parent's thread that forked the child — the
   kernel's `real_parent` — or, that thread gone, any thread of the parent
-  (`tests/ptrace/tracer_thread.c`).
+  (`tests/arm64chroot/ptrace/tracer_thread.c`).
 - When a tracee reaches a stop point it publishes the stop, wakes the tracer,
   then **parks in a service loop**. There it answers `PEEK`/`POKE`/`GETREGSET`/
   `SETREGSET`/`GETSIGINFO`/`CONT`/`SYSCALL`/`DETACH`/… using its own `CPU` and
@@ -1625,16 +1625,16 @@ requests about itself**, the same way it already mediates every other syscall:
   (`__import_iovec`), so the same segment passes alone and is `EFAULT` beside
   another; that is an artifact of the current import path (older kernels
   checked every segment) and the walk reports `EFAULT` for a range it cannot
-  reach anyway. `tests/fixtures/pvriov.c` covers all of it, self-checking:
+  reach anyway. `tests/arm64chroot/fixtures/pvriov.c` covers all of it, self-checking:
   qemu-user answers `ENOSYS` for both syscalls.
 
 **Stop points** (only active when the thread is traced — a near-always-zero
 thread-local `g_ptrace_*` int gates the hot paths):
 
-- *syscall-entry / syscall-exit* stops in `syscall_dispatch` (`src/syscall.c`)
+- *syscall-entry / syscall-exit* stops in `syscall_dispatch` (`src/arm64chroot/syscall.c`)
   when `PTRACE_SYSCALL`-armed. The tracer may rewrite the syscall number/args at
   entry (including `-1` to cancel), or the return value at exit.
-- *signal-delivery* stop in `sig_deliver_pending` (`src/signal.c`): the tracer
+- *signal-delivery* stop in `sig_deliver_pending` (`src/arm64chroot/signal.c`): the tracer
   sees `WSTOPSIG == sig` and may suppress it (`data = 0`) or substitute another.
   A stop signal is one like any other here: a plain signal-delivery-stop,
   whatever the attach — the group stop it may bring is a trap of its own,
@@ -1644,7 +1644,7 @@ thread-local `g_ptrace_*` int gates the hot paths):
   signal dequeued (`ptrace_signal`'s `JOBCTL_STOP_DEQUEUED`), so a `SIGSTOP`
   the tracer puts in place of a `SIGUSR1` begins a group stop, unless a
   `SIGCONT` came while the stop lasted — the emulator used to judge by the
-  signal first taken and drop the substitute (`tests/ptrace/substop.c`).
+  signal first taken and drop the substitute (`tests/arm64chroot/ptrace/substop.c`).
 
   What such a stop hands on is what the kernel's `ptrace_signal` delivers: the
   signal the tracer resumed it with, or nothing for 0. Every stop that is a
@@ -1660,9 +1660,9 @@ thread-local `g_ptrace_*` int gates the hot paths):
   `ptrace_event` has it.) A stop signal that a traced thread then takes the
   default action of is a **group stop**, below — not a host stop, which froze
   the thread where its tracer's mailbox could not reach it and was never
-  reported (`tests/ptrace/tracer_death.c`, `groupstop` and `selfstop`).
-- *synchronous-fault* stop in `sig_deliver_fault` (`src/signal.c`): a guest
-  `SIGTRAP`/`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` raised by the CPU (`src/loop.c`
+  reported (`tests/arm64chroot/ptrace/tracer_death.c`, `groupstop` and `selfstop`).
+- *synchronous-fault* stop in `sig_deliver_fault` (`src/arm64chroot/signal.c`): a guest
+  `SIGTRAP`/`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` raised by the CPU (`src/arm64chroot/loop.c`
   dispatch of `EC_BRK64`, the data/instruction aborts, etc.) is reported to the
   tracer *before* any guest handler or the fatal default action, with precise
   siginfo (`si_code`, and `si_addr` for the fault families). The tracer may
@@ -1671,7 +1671,7 @@ thread-local `g_ptrace_*` int gates the hot paths):
   `EC_BRK64` it raises stops the tracee with `si_code == TRAP_BRKPT` and the PC
   at the breakpoint (`cpu_raise_sync` rewinds the PC to the faulting instruction).
   Writing the `BRK` into a read-only code page uses `copy_to_guest_code`
-  (`src/mem.c`), which bypasses the software write-permission bit (the host
+  (`src/arm64chroot/mem.c`), which bypasses the software write-permission bit (the host
   backing of anon/`MAP_PRIVATE` code is always RW) and drops any JIT translations
   over the patched line — the same self-modifying-code coherence path guest
   `IC IVAU` uses. The predecode interpreter needs no invalidation: its `NEXT`
@@ -1694,7 +1694,7 @@ thread-local `g_ptrace_*` int gates the hot paths):
   waits for the publication and adopts it: the kernel attaches the child at
   clone time, and gdb waits for the new child's first stop by the pid
   `GETEVENTMSG` gave it — which, while the child claimed its own link once it
-  ran, a quick tracer was told `ECHILD` for (`tests/ptrace/forkwait.c`). The kernel fixes a
+  ran, a quick tracer was told `ECHILD` for (`tests/arm64chroot/ptrace/forkwait.c`). The kernel fixes a
   child's tracer atomically at clone time; here the child may not run until after
   the parent has published its event stop, and a tracer that answers that stop
   with `PTRACE_DETACH` frees the parent's link — leaving a child that reads it a
@@ -1760,7 +1760,7 @@ leaves a stop, or a synthetic or dead-tracee exit, to be reported again, and a
 host wait takes a tracee's link with it only when it reaps the child, never at
 a stop, a continue or a `WNOWAIT` look. The kernel's argument checks
 (`kernel_wait4`, `kernel_waitid`) are made before the registry is asked, since
-it answers before any host wait could refuse them (`tests/ptrace/waitid_tracer.c`).
+it answers before any host wait could refuse them (`tests/arm64chroot/ptrace/waitid_tracer.c`).
 
 Which tracees a wait asks about is the kernel's `eligible_pid` too (a
 `PtWaitSel`): one pid; a process group — `wait4(-pgid)`, `waitid(P_PGID)`, and
@@ -1774,7 +1774,7 @@ its last stop or death, stamped into its link, once it is not. The registry
 used to take every one of these but the pid for "any": a tracer waiting for
 one process group was handed a stop from another, and `waitid(P_PIDFD)` the
 first stop of any tracee, whatever the descriptor was
-(`tests/ptrace/waitsel.c`).
+(`tests/arm64chroot/ptrace/waitsel.c`).
 
 **`rusage` at a stop.** `wait4`/`waitid` fill their `rusage` argument at a ptrace
 stop, not only at a death — the kernel's `wait_task_stopped()` ends in
@@ -1816,7 +1816,7 @@ kernel's figure is: zeroed in a fork child, kept across exec. Another
 process reading this one's stat file gets the net children's time from the
 registry slot, published at each reap once anything was charged
 (`proctab_ctime_republish`), so an unaffected process costs its reaps nothing
-extra and the host's fields stand exactly (`tests/fixtures/helperusage.c`).
+extra and the host's fields stand exactly (`tests/arm64chroot/fixtures/helperusage.c`).
 
 Every other child the emulator reaps is charged the same way: the
 `SA_NOCLDWAIT` probe's, on a host that leaves it to be reaped, and — the one
@@ -1877,7 +1877,7 @@ its tracer on two channels at once:
   status and times in `si_errno` and `si_value` (`sig_send_cld`, or the
   receiver's inbox where the host cannot carry that), which every receiver
   makes the kernel's notice again. It used to be a bare `kill(SIGCHLD)`:
-  `SI_USER`, no status, no times (`tests/fixtures/tracerchld.c`);
+  `SI_USER`, no status, no times (`tests/arm64chroot/fixtures/tracerchld.c`);
 - the reserved kick signal carrying `PT_WAKE_MAGIC` (`pt_wake_tracer`) — its
   permanent handler
   (`sig_kick_net`, no `SA_RESTART`) is a deliberate no-op whose `EINTR` knocks
@@ -1928,7 +1928,7 @@ point and `rt_sigtimedwait` both use). So a thread-directed signal of a lower
 number pending with the attach is reported before the `SIGSTOP`, and anything
 sent to the process after it. It used to be a stop taken on the spot, ahead of
 everything; and what piled up while a tracee sat in a stop was taken oldest
-first, whatever its number (`tests/ptrace/attachorder.c`, which finds its
+first, whatever its number (`tests/arm64chroot/ptrace/attachorder.c`, which finds its
 window in a vfork parent: its wait for the child ends only with the child, in
 the kernel and the emulator alike, so the attach and the signals after it all
 wait there together). The call a tracer's stop cut short — the attach's
@@ -1940,7 +1940,7 @@ ptrace trap before it dequeues one: `ptrace(SEIZE)` has attached by the time it
 returns, so a signal its caller sends next is one the tracer must see stopped
 for — and it arrives with the kick, a standard signal being taken ahead of the
 real-time one. Delivered first, it ran its handler untraced while the tracer
-waited for a stop that never came (`tests/ptrace/seize_signal.c`). A task can
+waited for a stop that never came (`tests/arm64chroot/ptrace/seize_signal.c`). A task can
 be claimed before it has run at all: `clone(2)` returns a fork child's pid to
 the parent while the child is still on its way out of the emulator's fork path,
 which clears the flag it inherited (a kick aimed at the parent's link) — so the
@@ -1952,7 +1952,7 @@ a fault for each page it crossed — some 5 per fork, a few percent of a
 fork-heavy run.
 Cleared with the rest, the kick of a `SEIZE` that won that race was lost: the
 attach succeeded, and the child ran untraced, a fault killing it that should
-have stopped it (`tests/ptrace/seize_newborn.c`). The syscall
+have stopped it (`tests/arm64chroot/ptrace/seize_newborn.c`). The syscall
 the kick interrupted is then **restarted**, so a `SEIZE` does not perturb the
 tracee at all — see "The emulator's own interruptions are invisible to the
 guest" above — and the stop an `ATTACH` or an `INTERRUPT` brings only as a
@@ -1982,7 +1982,7 @@ poll (above) would hang. Two mechanisms close this:
   traced — `ptrace_traced()`, a process-level count, since dispositions are
   process-wide — every other signal that can be caught has one too, below). The signal is then mediated: the tracee reports the
   signal-delivery-stop, the tracer injects it, and the tracee terminates through
-  `guest_terminate_by_signal` (`src/signal.c`) — which marks the robust
+  `guest_terminate_by_signal` (`src/arm64chroot/signal.c`) — which marks the robust
   futexes every thread held (`robust_list_exit_group`), publishes the
   `WIFSIGNALED` status to the tracer for **every** traced thread of the group
   (`ptrace_report_exit_group`; the signal kills them all), then restores the
@@ -2017,7 +2017,7 @@ own — 32 up to its `SIGRTMIN` (`sig_helper_mask`): glibc's set*id broadcast
 and wait for each to answer, and a thread that blocks it never does, so a
 traced process's `setgid` never returned (`strace` of busybox, which drops its
 ids as it starts, hung there once the tracee was forked from a tracer that ran a
-watchdog of its own: `tests/ptrace/setxid.c`). It never ends: once no thread is
+watchdog of its own: `tests/arm64chroot/ptrace/setxid.c`). It never ends: once no thread is
 traced it goes dormant, asleep on a futex until it is wanted again
 (`helper_dormant`), and whoever wants it wakes it rather than make another. And
 across a fork it is asleep: the atfork prepare asks the emulator's own threads
@@ -2029,7 +2029,7 @@ takes a lock of its own as a thread starts and as one exits (`clone_lock`) and
 forks without it: a process that forked as one of these threads was ending —
 the SIGCHLD watcher, its clone child just reaped — handed the child that lock
 held, and the child's first thread waited for it forever
-(`tests/fixtures/helperfork.c`). The thread holds no descriptor, and is in the
+(`tests/arm64chroot/fixtures/helperfork.c`). The thread holds no descriptor, and is in the
 process's foreign-task set, so the guest never sees it (not in
 `/proc/<pid>/task` or `Threads:`, not waited for by `de_thread`, not a `tgkill`
 target). The liveness test also compares the
@@ -2039,12 +2039,12 @@ number, which may be a later one (`pt_tracer_gone`). A link nobody will collect
 parent reaps it, or when the registry needs the slot. `EXITKILL` used to be taken
 as `1 << 8`, a bit no kernel has, the real one masked away, and nothing done with
 either; a running tracee of a dead tracer stayed traced, its `TracerPid` the
-dead tracer's, until it next stopped (`tests/ptrace/exitkill.c`). The liveness test has to be the same one `ptrace_reap_dead` applies in the
+dead tracer's, until it next stopped (`tests/arm64chroot/ptrace/exitkill.c`). The liveness test has to be the same one `ptrace_reap_dead` applies in the
 other direction and for the same reason: `kill(tracer, 0)` succeeds on a
 **zombie** tracer — one whose own parent has not reaped it yet — so a tracee that
 trusted `kill` alone stayed parked for as long as the corpse lingered, re-kicking
 a tracer that would never wait for it again. That is a guest process wedged in a
-stop with nothing left to resume it, burning no CPU (`tests/ptrace/tracer_zombie.c`
+stop with nothing left to resume it, burning no CPU (`tests/arm64chroot/ptrace/tracer_zombie.c`
 holds the line). The two directions do take opposite views of an unreadable
 `/proc`: the tracer-side test has already waited out a mailbox timeout, so
 unreadable means dead, while the tracee-side one must answer "not a zombie" or a
@@ -2063,7 +2063,7 @@ tracer all the same, but by `__ptrace_unlink`'s re-arming of
 case: a tracee whose tracer was killed by the same `SIGTERM` it had just been
 stopped for (a shell's `timeout` signals the whole group) ran on, parked in
 whatever it had been doing, with nobody left to end it
-(`tests/ptrace/tracer_death.c`).
+(`tests/arm64chroot/ptrace/tracer_death.c`).
 
 **A traced child's death, to its real parent.** A process whose leader is
 traced by another process dies to its tracer first: the kernel sends the tracer
@@ -2076,7 +2076,7 @@ under `WNOHANG`: a child with nothing to report. The host knows the tracee
 for the real parent's ordinary child, and the parent was sent `SIGCHLD` at the
 death and reaped the child at once — under `strace -f`, a shell's wait
 returned before `strace` had heard of its child's exit. So
-(`src/ptracetab.c`, "a traced child's death"):
+(`src/arm64chroot/ptracetab.c`, "a traced child's death"):
 
 - *The link knows the real parent* (`rparent`): a guest process other than
   the tracer's, set by the attach (whose kick tells the parent at once, and
@@ -2123,7 +2123,7 @@ returned before `strace` had heard of its child's exit. So
   ignores `SIGCHLD` must keep the zombie for the release rather than have the
   host reap it (`sig_chld_reap_emulated`).
 
-`tests/fixtures/heldzombie.c` has the parent catching `SIGCHLD`, blocked in
+`tests/arm64chroot/fixtures/heldzombie.c` has the parent catching `SIGCHLD`, blocked in
 its wait, blocking `SIGCHLD` (sigpending, a `signalfd`), and ignoring it; the
 tracer reaping, leaving, and killed; a death by `SIGKILL`; and a followed fork.
 Its tracer-killed case runs a second time with every host notice the parent
@@ -2152,7 +2152,7 @@ queued again, to stop again once unblocked. The emulator used to answer
 `GETSIGINFO` with the signal number, a code of 0 and, for a fault, the
 address — no sender, no payload, nothing a tracer could tell a `kill` from a
 `sigqueue` by, and `strace` printed every signal as `si_code=SI_USER` from pid
-0 — and `SETSIGINFO` was `EIO` (`tests/ptrace/siginfo.c`).
+0 — and `SETSIGINFO` was `EIO` (`tests/arm64chroot/ptrace/siginfo.c`).
 
 **Ignored signals are a tracer's too.** The kernel discards a signal its target
 ignores — `SIG_IGN`, or a default of ignore (`SIGWINCH`, `SIGURG`, `SIGCHLD`,
@@ -2170,14 +2170,14 @@ but those that answer a plain `EINTR`, which a stop leaves with it
 (`sc_restart_nohandler`, above). What the kernel never sends stays unsent: a
 child's death notice to a parent ignoring `SIGCHLD` is dropped at capture, and
 the child is reaped. The emulator used to leave the host to ignore them all,
-and a tracer never saw them (`tests/ptrace/ignored.c`). And a queued one is
+and a tracer never saw them (`tests/arm64chroot/ptrace/ignored.c`). And a queued one is
 due wherever the emulator asks whether a signal is (`sig_pending_deliverable`
 — every wait it serves itself, the JIT's re-check before a block, the SVC
 check): an ignored signal ends no wait, unless the thread is traced and no
 stop has been through it yet (`PendSig.ptraced`). Taken for one nobody would
 act on, it left `sigsuspend`, `wait4` and `sigtimedwait` asleep with it queued,
 and the JIT running on into the next blocking call — a stop its tracer waited
-for in vain (`tests/ptrace/ignoredwait.c`).
+for in vain (`tests/arm64chroot/ptrace/ignoredwait.c`).
 
 **Pre-exit stop (`PTRACE_O_TRACEEXIT`).** A traced process about to exit
 (`exit`/`exit_group`, or a fatal signal) reports a `PTRACE_EVENT_EXIT` stop first,
@@ -2191,13 +2191,13 @@ includes `SETOPTIONS`, `GETEVENTMSG`, `GETSIGINFO`, `DETACH` and `LISTEN`, which
 used to be answered from the registry link whatever the tracee was doing.
 `INTERRUPT` and `LISTEN` are a `SEIZE`d tracee's alone (`EIO` for an `ATTACH`ed
 one), and `LISTEN` wants a `PTRACE_EVENT_STOP` trap, told by the stop's siginfo:
-at a signal-delivery-stop it is `EIO` (`tests/ptrace/reqstate.c`).
+at a signal-delivery-stop it is `EIO` (`tests/arm64chroot/ptrace/reqstate.c`).
 
 **Job control under ptrace.** A process a tracer holds threads of cannot be
 stopped by the host: a traced thread's stops are ptrace traps it serves its
 tracer from, and a host stop would freeze it where the tracer cannot reach it.
 So the kernel's group stop is the emulator's to run for such a process, as the
-kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
+kernel runs it (`src/arm64chroot/signal.c`, "group stop"; `src/arm64chroot/ptracetab.c`,
 `pt_jobctl_trap`):
 
 - *The signals.* While a thread is traced every signal that can be caught is,
@@ -2231,7 +2231,7 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   to run straight through the stop. A detach, or a tracer's death, leaves the
   thread to take part again untraced, and once no thread is traced at all the
   stop is the host's (`sig_jc_untraced`): the process stays stopped, its real
-  parent is told, and any `SIGCONT` ends it (`tests/ptrace/mtjobctl.c`).
+  parent is told, and any `SIGCONT` ends it (`tests/arm64chroot/ptrace/mtjobctl.c`).
 - *The traps.* `PTRACE_INTERRUPT` asks for a `PTRACE_EVENT_STOP` trap: a
   running tracee is kicked to it, one in a stop takes it after that stop, and
   a listening one traps again at once. A change of group-stop state tells a
@@ -2241,7 +2241,7 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   signal, as `get_signal` takes it. `PTRACE_LISTEN` leaves the tracee in its
   trap, no stop to `ptrace(2)` or `wait(2)`, until a notify or an interrupt
   has it trap again — at once if a notify came during the trap
-  (`tests/ptrace/listen.c`, `tests/ptrace/jobctl.c`).
+  (`tests/arm64chroot/ptrace/listen.c`, `tests/arm64chroot/ptrace/jobctl.c`).
 - *Attaching.* The kernel's attach is done when `ptrace()` returns, so the
   tracer waits, briefly, for the tracee to adopt it and catch everything:
   a `SIGTSTP` sent right after a `SEIZE` used to find the host's default still
@@ -2256,7 +2256,7 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   of anything the process runs. Sent after, it raced the process the wake had
   just set going — on a slow host (qemu-user) a first attach lost one time in
   ten, and the child ran on from its `raise(SIGSTOP)` to exit where it should
-  have stayed stopped (`tests/ptrace/seize_stopped.c`, which runs every round
+  have stayed stopped (`tests/arm64chroot/ptrace/seize_stopped.c`, which runs every round
   as a process's first attach).
 
 - *The real parent.* Such a group stop is no host stop, so the real parent's
@@ -2285,7 +2285,7 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   leader's context-switch count, which does not move while it stays stopped
   (`proctab_jc_hcons`). `/proc` shows a tracee in a stop as `t (tracing
   stop)` and a thread parked in such a group stop as `T (stopped)`, where the
-  host shows them asleep (`task_state_view`; `tests/fixtures/rpjobctl.c`). A
+  host shows them asleep (`task_state_view`; `tests/arm64chroot/fixtures/rpjobctl.c`). A
   host parent — the shell the first guest process was started from — is told
   nothing of it.
 
@@ -2301,7 +2301,7 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   tracee's notice is sent, once, unless the host sends it (the tracer is its
   parent); a host-stopped one is woken with a `SIGCONT` of the host's
   (`PT_FOREIGN_MAGIC`) its capture turns into that `SIGSTOP` — from nobody the
-  guest can see — to be reported (`tests/fixtures/tracerwatch.c`, whose
+  guest can see — to be reported (`tests/arm64chroot/fixtures/tracerwatch.c`, whose
   `SIGSTOP` the suite sends from outside). The host's stop and continue are not
   shown to the real parent (above); a host continue of the emulator's making is
   marked before it is made (`JCA_CONT_*`), for when the parent asks after the
@@ -2320,7 +2320,7 @@ kernel runs it (`src/signal.c`, "group stop"; `src/ptracetab.c`,
   capture answers from `waitid(WNOWAIT)`, the report left as it was
   (`pt_peek_stop`, `PT_PEEKSTOP_MAGIC`). A host parent — the shell the first
   guest process was started from — cannot be asked, and such an attach
-  reports `SIGSTOP` (`tests/fixtures/attachstopped.c`). The stop signal could
+  reports `SIGSTOP` (`tests/arm64chroot/fixtures/attachstopped.c`). The stop signal could
   have been written down by the process itself, its default-stop signals
   caught for it and the stop raised again; but a signal taken off the host's
   queue is one a `SIGCONT` sent meanwhile no longer flushes, and only a caught
@@ -2334,7 +2334,7 @@ individually; `strace -p` attaches "with N threads", `gdb -p` lists them in
 `TRACECLONE` — including thread creation, `TRACEEXEC`, `TRACEVFORKDONE`,
 `TRACEEXIT`, `TRACESECCOMP`, `EXITKILL`, and `SUSPEND_SECCOMP` for a
 privileged tracer — `EPERM` otherwise; any other bit is `EINVAL`, and `EIO` on a
-`SEIZE`, as the kernel answers: `tests/ptrace/options.c`),
+`SEIZE`, as the kernel answers: `tests/arm64chroot/ptrace/options.c`),
 `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
 (writable *and* read-only code pages — software breakpoints),
@@ -2357,7 +2357,7 @@ only woken to re-check. A tracer of the main thread alone therefore hears
 nothing of an exec a sibling made. A main thread that `exit(2)`s while others
 run is likewise not reported dead until the group is empty
 (`delay_group_leader`; `ptrace_leader_zombie`), and an exec that revives it
-releases that link unreported too (`tests/ptrace/execleader.c`, `mtexec.c`).
+releases that link unreported too (`tests/arm64chroot/ptrace/execleader.c`, `mtexec.c`).
 
 Remaining simplification: only the exiting thread reports the
 `PTRACE_EVENT_EXIT` pre-exit stop on a group exit.

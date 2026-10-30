@@ -2,7 +2,7 @@
  *
  * sendfile, splice, copy_file_range, getrandom, add_key and setxattr all take
  * a count that is a *guest* 64-bit size_t, and the emulator has to turn it
- * into a host one -- which is 32 bits wide in the ILP32 build (`make test32`).
+ * into a host one -- which is 32 bits wide in the ILP32 build (`make test-arm64chroot32`).
  * Cast before it is clamped and a count at or above 4 GB becomes an unrelated
  * small one: zero for an exact multiple, so the transfer moves nothing at all,
  * the entropy read hands back no bytes, the keyring payload that should be

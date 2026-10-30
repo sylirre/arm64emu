@@ -3,14 +3,14 @@
 Opt-in, off by default. Translates guest basic blocks to host native code
 (x86-64 first-class; the AArch64 backend passes the full suite and
 byte-identical consistency checkpoints under qemu-user emulation —
-`make test-jit-a64` — but has not run on real ARM hardware).
+`make test-arm64emu-jit-a64` — but has not run on real ARM hardware).
 The interpreter remains the default execution mode and the reference
 semantics: anything the translator does not handle inline executes by
-calling `exec_a64`, and `make test-jit` requires interpreter-vs-JIT
+calling `exec_a64`, and `make test-arm64emu-jit` requires interpreter-vs-JIT
 byte-identical CPU state on a deterministic-clock boot (`ARM64EMU_RTCLOCK=0`, which
 the gate pins; the runtime default is now the host wall clock).
 
-Measured on the firmware+Linux boot used by `tests/run_jit_consist.sh`:
+Measured on the firmware+Linux boot used by `tests/arm64emu/run_jit_consist.sh`:
 ~36 MIPS interpreted, ~370 MIPS with `--jit` (≈10×). Steady state runs
 >99.9% of instructions natively; the remaining helper residue
 (~0.04% over the full 1.6B-instruction boot) is IC IVAU, TLBI and cold
@@ -34,11 +34,11 @@ The lesson for anyone reading `ARM64EMU_JIT_STATS` output: rank by what the targ
 *workload* runs, not by what looks unfinished.
 
 Ported from the arm64chroot user-mode emulator (same author; its CPU core
-is a copy of this repo's). Its `docs/jit.md` describes the pipeline in
-depth — predecode classifier (`src/jit/predecode.c`) → linear IR
-(`src/jit/ir.h`, built by `src/jit/frontend.c`) → single-pass backend with
+is a copy of this repo's). Its `docs/arm64chroot/jit.md` describes the pipeline in
+depth — predecode classifier (`src/arm64emu/jit/predecode.c`) → linear IR
+(`src/arm64emu/jit/ir.h`, built by `src/arm64emu/jit/frontend.c`) → single-pass backend with
 per-block greedy register allocation and lazy NZCV in host flags
-(`src/jit/backend_*.c`) — plus block chaining, the bump-allocated code
+(`src/arm64emu/jit/backend_*.c`) — plus block chaining, the bump-allocated code
 cache, and the W^X fallback (RWX mmap → dual-mapped memfd → interpreter).
 This document covers what is *different* here.
 
@@ -162,7 +162,7 @@ decode.c remains authoritative for it.
   iterations; the JIT at block/slice boundaries. Both modes are
   individually deterministic, but deep in a boot the guest can observe
   timer values at slightly different icounts — visible as shifted printk
-  timestamps. `tests/run_jit_consist.sh`'s checkpoints (through 300M
+  timestamps. `tests/arm64emu/run_jit_consist.sh`'s checkpoints (through 300M
   instructions, past many timer IRQs) are byte-identical; a divergence
   there is a real bug, not this deviation.
 - **Same-page self-modification.** A store into the *currently running*
@@ -194,9 +194,9 @@ decode.c remains authoritative for it.
 
 ## Verification
 
-`make test-jit` runs the m1–m12 suite under `--jit` (the SIMD/crypto
+`make test-arm64emu-jit` runs the m1–m12 suite under `--jit` (the SIMD/crypto
 batteries were built as QEMU differentials, so they double as the FP
-oracle) and `tests/run_jit_consist.sh`: the deterministic firmware+Linux
+oracle) and `tests/arm64emu/run_jit_consist.sh`: the deterministic firmware+Linux
 boot (the harness pins `ARM64EMU_RTCLOCK=0`) stopped at 1M/4M/16M/64M/300M
 instructions, requiring byte-identical
 serial output *and* final CPU state between modes. Divergence playbook:
@@ -209,7 +209,7 @@ the login prompt.
 
 One gate is mandatory for any frontend change: the **full 1.6B-insn boot
 log compared against the interpreter's** — scripted as
-`tests/run_bootlog_gate.sh` (`make test-jit-full`; also takes `--pd`). It
+`tests/arm64emu/run_bootlog_gate.sh` (`make test-arm64emu-jit-full`; also takes `--pd`). It
 strips the `[ ts ]` printk prefixes and the clock-derived audit stamps;
 anything still differing fails the gate. The consistency
 checkpoints all sit inside the UEFI phase, and a translation bug in an
@@ -217,12 +217,12 @@ instruction UEFI doesn't lean on sails straight past them — a mistyped
 sysreg encoding (CNTVCT misread as DCZID, freezing the guest's clock)
 once passed 5/5 checkpoints and was caught only by this comparison.
 
-`make test-jit-a64` cross-builds the AArch64-backend binary (clang +
+`make test-arm64emu-jit-a64` cross-builds the AArch64-backend binary (clang +
 lld + the Debian cross libc) and runs the suite plus a consistency
 checkpoint under qemu-user — the standing guard that keeps the second
 backend executable, not merely compilable.
 
-`make fuzz-engines` runs the cross-engine differential fuzzer over the
+`make fuzz-arm64emu` runs the cross-engine differential fuzzer over the
 inlined surface (random blocks, interpreter vs the predecoded tier vs `--jit`
-and its SLOWMEM/NOFUSE/NOVRA variants). See `docs/parity.md` for the full parity
+and its SLOWMEM/NOFUSE/NOVRA variants). See `docs/arm64emu/parity.md` for the full parity
 audit, verification matrix, and the bugs this fuzzer has caught.

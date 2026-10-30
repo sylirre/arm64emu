@@ -20,24 +20,24 @@ well-documented target for EDK2 and Linux on AArch64.
   interactive **BusyBox shell**.
 
 ```sh
-make                       # builds ./arm64emu  (C11, libc only)
-make test                  # runs the assembly self-tests
+make arm64emu              # builds build/arm64emu  (C11, libc only)
+make test-arm64emu         # runs the assembly self-tests
 
 # Boot the EDK2 firmware to the UEFI shell (serial -> your terminal):
-./arm64emu --bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd
+build/arm64emu --bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd
 
 # Boot Linux via fw_cfg (the EDK2 --kernel path, no disk needed):
-./arm64emu --bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+build/arm64emu --bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
            --kernel Image --initrd initramfs \
            --append "console=ttyAMA0 earlycon=pl011,0x9000000"
 
 # Share host directories into the guest over virtio-9p (repeatable):
-./arm64emu --bios .../QEMU_EFI.fd --kernel Image --initrd initramfs \
+build/arm64emu --bios .../QEMU_EFI.fd --kernel Image --initrd initramfs \
            --virtfs /path/to/project,tag=proj \
            --virtfs /srv/data,tag=data,ro
 
 # virtio-console on hvc0, so the guest terminal size tracks the host window:
-./arm64emu --bios .../QEMU_EFI.fd --kernel Image --initrd initramfs \
+build/arm64emu --bios .../QEMU_EFI.fd --kernel Image --initrd initramfs \
            --console virtio \
            --append "console=hvc0 earlycon=pl011,0x9000000"
 ```
@@ -51,7 +51,7 @@ read-only and advertises VIRTIO_BLK_F_RO), `--net` user-mode networking
 (default `pl011`) and create N virtio-consoles (`hvc0`..`hvcN-1`), each a
 separate guest terminal, `--console-fd DEV=RFD[:WFD]` bind `ttyAMA0`/`hvcN` to
 inherited descriptors instead of the terminal (with `--ctrl-fd FD` carrying
-their window sizes — see `tests/scripts/console_mux.c`),
+their window sizes — see `tests/arm64emu/scripts/console_mux.c`),
 `--bin FILE[@ADDR]` load a flat binary (bare-metal tests), `-d/--trace`
 per-instruction trace, `--reg-trace` register trace, `--max-insn N` stop after N
 instructions. `arm64emu --help` is the full reference, reflowed to your
@@ -69,18 +69,18 @@ them with `--console-fd hvc0=<fd>` (and `--console-fd ttyAMA0=<fd>` for the
 UART) to descriptors the process inherited: a socketpair per terminal, plus
 `--ctrl-fd` carrying their window sizes, since a socketpair has no
 `TIOCGWINSZ`. Run a `getty` on each inside the guest and every terminal is an
-independent login. `tests/scripts/console_mux.c` is a working host driver.
+independent login. `tests/arm64emu/scripts/console_mux.c` is a working host driver.
 
 **Embedding.** Built with `-DANDROID_JNI`, `main()` becomes `arm64emu_main()`
 and fatal paths leave through `_exit()`, so a host process can link the
 emulator in and enter it in a `fork()`ed child — no `exec`, which is what
-Android's W^X rule requires. `make test-embed` builds that configuration and
+Android's W^X rule requires. `make test-arm64emu-embed` builds that configuration and
 runs the suite against it.
 
 Build it as its own shared object with `-fvisibility=hidden`: `arm64emu_main`
 is the only symbol marked visible, and it is the whole interface. That matters
 when the host also carries this emulator's user-mode sibling
-([arm64chroot](https://github.com/sylirre/arm64emu-user)) — the two share an
+([arm64chroot](../arm64chroot/README.md)) — the two share an
 ancestor and so share around sixty global names (`cpu_step`, `exec_a64`,
 `g_jit`, …), which linked into one object collide, and left visible across two
 objects would let the dynamic linker bind one engine's calls into the other's
@@ -153,18 +153,17 @@ Debug/bring-up env vars (all off by default, no runtime cost when unset):
 The generic timer and PL031 RTC follow the host wall clock by default. Set
 `ARM64EMU_RTCLOCK=0` to switch both to a deterministic instruction-count clock and a
 fixed RTC epoch, giving a bit-for-bit reproducible boot — the mode the test gates
-(`make test`, `test-pd`, `test-jit`, `fuzz-engines`) pin for cross-engine
+(`make test-arm64emu`, `test-arm64emu-pd`, `test-arm64emu-jit`, `fuzz-arm64emu`) pin for cross-engine
 comparison.
 
 ## Architecture
 
 ```
-src/
+src/arm64emu/
   main.c        CLI, image loading, the run loop, signal-flush of diagnostics
   cpu.{h,c}     CPU state, fetch/decode/execute driver, condition codes, dump,
                 hot-PC profiler / ring buffer / coverage-divergence finder
   decode.c      A64 decoder: integer/branch/load-store, CRC32, AdvSIMD ld/st
-  exec_fpsimd.c FP/Advanced-SIMD execution (scalar FP + vector integer)
   sysreg.c      MSR/MRS, ID registers, generic-timer registers, DC ZVA, TLBI
   mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB + fetch cache
   exception.c   exception entry/return (VBAR vectors, ESR/FAR/ELR/SPSR, ERET)
@@ -182,8 +181,11 @@ src/
                 backend_x86_64.c, backend_a64.c
   net/          usernet, the built-in user-mode NAT stack behind virtio-net
                 (core/udp/tcp; no TAP, TUN, privileges or external libraries)
-docs/           jit.md, pd.md, parity.md, todo/
-tests/          self-checking assembly tests + QEMU differential helpers
+lib/arm64/      AArch64 emulation shared with arm64chroot:
+  exec_fpsimd.c FP/Advanced-SIMD execution (scalar FP + vector integer)
+  esr.h         ESR_ELx exception classes + syndrome construction
+docs/arm64emu/  jit.md, pd.md, parity.md, todo/
+tests/arm64emu/ self-checking assembly tests + QEMU differential helpers
 ```
 
 ### What is implemented
@@ -253,13 +255,13 @@ an exception-return bug (instruction-abort ELR pointing at the wrong PC).
 - **Remaining work**: the advertised instruction surface (baseline + FP16 +
   crypto + the v8.1–8.4 ecosystem extensions) is complete and
   differential-tested; what remains unimplemented is deliberately unadvertised
-  (PAuth/BTI/MTE/SVE — see `docs/todo/TODO_OPCODES.md`). Engine
+  (PAuth/BTI/MTE/SVE — see `docs/arm64emu/todo/TODO_OPCODES.md`). Engine
   **performance** is ~90 MIPS by default (the predecoded interpreter tier),
   ~40 with `--no-pd` (the plain interpreter), and ~370 with `--jit`, so a full
   distro boot is slow (see *Performance notes* below for why a
   decoded-instruction cache did **not** help).
 - **Devices**: **virtio-blk** (`--drive`, disk-backed rootfs), **virtio-net**
-  (`--net`, user-mode NAT via the built-in usernet stack in `src/net/`: DHCP,
+  (`--net`, user-mode NAT via the built-in usernet stack in `src/arm64emu/net/`: DHCP,
   DNS redirect, TCP/UDP proxying and `--netfwd` port forwarding over plain
   host sockets — IPv4 only, no TAP/TUN, no external libraries), **virtio-9p**
   (`--virtfs`, host directory sharing), and **virtio-console** (`--console
@@ -284,11 +286,11 @@ translates guest code to host x86-64 (an AArch64 backend is included,
 validated under qemu-user emulation but untested on real hardware):
 **~370 MIPS (≈10×)** on the Linux-boot workload, >99.9% of instructions
 native in steady state. The interpreter stays the
-default and the reference — `make test-jit` requires byte-identical CPU
+default and the reference — `make test-arm64emu-jit` requires byte-identical CPU
 state between the modes on a deterministic-clock boot (`ARM64EMU_RTCLOCK=0`, which the
 gate pins). Design, full-system
 coherence (SMC store-tracking, block/context keying, IRQ safepoints) and
-debug knobs: [docs/jit.md](docs/jit.md).
+debug knobs: [docs/arm64emu/jit.md](jit.md).
 
 ### Decoded-instruction cache — evaluated, not adopted
 
@@ -317,12 +319,12 @@ experiment isn't blindly repeated:
   `switch`, so a hit skips operand extraction too, not just classification. That
   is exactly the **predecoded tier**, now the default engine (`--no-pd` opts out
   to the plain interpreter): a direct-threaded executor over such a cache,
-  ~2.46× the plain interpreter. See [docs/pd.md](docs/pd.md). A function-pointer
+  ~2.46× the plain interpreter. See [docs/arm64emu/pd.md](pd.md). A function-pointer
   decode cache, by contrast, is not the path forward.
 
 ## License
 
-**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+**Apache License 2.0** — see [LICENSE](../../LICENSE) and [NOTICE](../../NOTICE).
 
 arm64emu is original, clean-room code (C11, libc/POSIX only) and shares no
 source with QEMU, EDK2, or the Linux kernel; it interoperates with them purely
@@ -330,5 +332,5 @@ through their public hardware/software interfaces. EDK2 firmware and Linux
 kernel/initramfs images are supplied by you at runtime and are neither bundled
 nor distributed here. Apache-2.0 was chosen for its permissive terms plus an
 explicit patent grant. Each source file carries an `SPDX-License-Identifier:
-Apache-2.0` tag; `src/fdt/virt.dts` is QEMU-generated device-tree data and is
+Apache-2.0` tag; `src/arm64emu/fdt/virt.dts` is QEMU-generated device-tree data and is
 exempt (see NOTICE).

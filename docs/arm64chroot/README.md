@@ -21,8 +21,8 @@ Emulator has 2 modes:
   execmem, emulator falls back to memfd dual-mapping or to the interpreter.
 
 If you are interested in a system-mode emulator that can actually boot
-AArch64 Linux disk image, see this repository:
-https://github.com/sylirre/arm64emu-system
+AArch64 Linux disk image, see its sibling in this repository:
+[arm64emu](../arm64emu/README.md).
 
 ## Benchmark
 
@@ -265,22 +265,22 @@ byte-for-byte identical.
 ## Building
 
 ```sh
-make                 # native build (./arm64chroot)
-make m32             # 32-bit build (gcc -m32 on x86-64, armhf on an ARM host)
-make test            # differential test suite
-make test-seccomp    # same suite with the emulator under an Android-Oreo
-                     # seccomp mimic (no device needed)
+make arm64chroot                # native build (build/arm64chroot)
+make arm64chroot32              # 32-bit build (gcc -m32 on x86-64, armhf on an ARM host)
+make test-arm64chroot           # differential test suite
+make test-arm64chroot-seccomp   # same suite with the emulator under an Android-Oreo
+                                # seccomp mimic (no device needed)
 ```
 
 The suite runs on an x86-64 host and on a real AArch64 one, and works out for
-itself what each provides (`tests/hostenv.sh`):
+itself what each provides (`tests/arm64chroot/hostenv.sh`):
 
 | | x86-64 host | AArch64 host |
 |---|---|---|
 | guest compiler | `aarch64-linux-gnu-gcc` | the system `cc` |
 | oracle | `qemu-aarch64` | `qemu-aarch64` if installed, else the CPU |
-| `make test32` | `gcc -m32` | armhf cross gcc, or SKIP |
-| `make test32-jit` | the same, with `--jit` | the same, with `--jit` |
+| `make test-arm64chroot32` | `gcc -m32` | armhf cross gcc, or SKIP |
+| `make test-arm64chroot32-jit` | the same, with `--jit` | the same, with `--jit` |
 
 `ARM64CHROOT_CC` overrides the compiler and `ARM64CHROOT_ORACLE=qemu|native|recorded` the
 oracle. Running against hardware is the stricter check of the two live modes
@@ -294,20 +294,21 @@ A host that can neither build the guest programs nor run any oracle — a
 32-bit ARM device, whose CPU cannot execute AArch64 and for which no
 `qemu-aarch64` exists (qemu-user cannot fit a 64-bit guest address space
 into a 32-bit host one) — replays a **recorded** oracle instead:
-`make test-pack` on a dev box runs the suite once with every oracle answer
+`make test-arm64chroot-pack` on a dev box runs the suite once with every oracle answer
 captured and bundles it with the built test binaries; unpacked on the target
-at the same commit, `ARM64CHROOT_ORACLE=recorded make test` runs everything portable
+at the same commit, `ARM64CHROOT_ORACLE=recorded make test-arm64chroot` runs everything portable
 against the recorded answers (tests that compare live host state skip, with
 the reason named). See
-[docs/android-termux.md](docs/android-termux.md).
+[docs/arm64chroot/android-termux.md](android-termux.md).
 
-`make test` provisions the Alpine (busybox/bash) and glibc rootfs it needs
-from scratch into a repo-local cache (`tests/.cache/`) on first run. The
+`make test-arm64chroot` provisions the Alpine (busybox/bash) and glibc rootfs it needs
+from scratch into a repo-local cache (`build/cache/arm64chroot/`) on first run;
+the programs it builds go to `build/tests/arm64chroot/`. The
 glibc tree is built offline, from the cross sysroot or from the host's own
 runtime. The Alpine tree needs a one-time network fetch.
 
 The suite ends with a differential instruction fuzzer
-(`tests/fixtures/insnfuzz.c`), which runs guest code against a varying
+(`tests/arm64chroot/fixtures/insnfuzz.c`), which runs guest code against a varying
 register/vector state and compares a digest of the result. It has three modes
 because the useful comparisons have different oracles. `conform` replays a
 table of real, allocated encodings one instruction at a time and requires an
@@ -323,13 +324,13 @@ block-local vector-register cache — none of which a single-instruction stub
 can exercise.
 
 Override the location of test environment with variable `ARM64CHROOT_TEST_ROOT`.
-Wipe test environment with `make clean-testenv`.
+Wipe test environment with `make clean-testenv` (`make clean` keeps it).
 
 Cross-compile for a specific host (static, no runtime deps):
 
 ```sh
-make CC=arm-linux-gnueabihf-gcc -static arm64chroot     # 32-bit ARM host
-make CC=aarch64-linux-gnu-gcc  -static arm64chroot      # 64-bit ARM host
+make CC=arm-linux-gnueabihf-gcc LDFLAGS=-static arm64chroot   # 32-bit ARM host
+make CC=aarch64-linux-gnu-gcc LDFLAGS=-static arm64chroot     # 64-bit ARM host
 ```
 
 Requires only a C11 compiler and libc (`-lm -lpthread`, plus `-latomic`
@@ -339,7 +340,7 @@ where the host needs it for wide atomics — added automatically).
 
 ```sh
 pkg install clang make
-make CC=clang
+make CC=clang arm64chroot
 ```
 
 The emulator is engineered to survive Android's app seccomp configuration
@@ -347,17 +348,20 @@ and includes `--link2symlink` to workaround hardlink restriction.
 
 ## Design
 
-Deeper architecture notes live under [`docs/`](docs/README.md): the copied-core
+Deeper architecture notes live under [`docs/arm64chroot/`](internals.md): the shared-core
 seams, the guest memory model and host-ordering discipline, the syscall layer
 and `--fake-id`, signal/job-control and the process model, and a catalog of
 host-portability pitfalls.
 
 ```
-src/
-  core/         COPIED from ARM64EMU_System (kept diffable):
-    types.h esr.h cpu.h sysreg.h   fixed-width types, ESR, CPU state, sysregs
+lib/arm64/      AArch64 emulation shared with arm64emu:
+  esr.h         ESR exception classes + syndrome construction
+  exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
+src/arm64chroot/
+  core/         the user-mode variant of the rest of arm64emu's core, kept
+                diffable against it until the two are merged into lib/arm64:
+    types.h cpu.h sysreg.h   fixed-width types, CPU state, sysregs
     decode.c    A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
-    exec_fpsimd.c  FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
     cpu.c sysreg.c   step driver; MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, what EL0 may run
   mmu.h mem.c   NEW guest address space: 2-level software page table
                 (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect,
@@ -408,7 +412,8 @@ src/
   thread.h      per-thread state (CPU is per-thread; Machine is shared)
   guest_abi.h   arm64 syscall numbers + explicit guest struct layouts
   main.c        CLI, rootfs setup, initial exec
-tests/          asm + C differential tests, run_tests.sh; hostenv.sh picks the
+tests/arm64chroot/
+                asm + C differential tests, run_tests.sh; hostenv.sh picks the
                 compiler and the oracle (qemu-aarch64, or an AArch64 host's CPU)
 ```
 
@@ -417,11 +422,11 @@ tests/          asm + C differential tests, run_tests.sh; hostenv.sh picks the
 a per-thread, per-PC cache of the *decoded* form that self-validates against the
 fetched word, so self-modifying/remapped code needs no flush — and everything else
 falls back to `exec_a64`. `--no-predecode` and any per-instruction debug flag select
-the plain `exec_a64` step. The optional `--jit` (`src/jit/`, AArch64, x86-64, i686 and ARM32 hosts
+the plain `exec_a64` step. The optional `--jit` (`src/arm64chroot/jit/`, AArch64, x86-64, i686 and ARM32 hosts
 only) adds a translating tier above both: it compiles guest basic blocks to native
 host code and falls back to `exec_a64` for anything it does not emit. It is off by
 default and the interpreter stays the source of truth. See
-[`docs/jit.md`](docs/jit.md) and [`docs/architecture.md`](docs/architecture.md).
+[`docs/arm64chroot/jit.md`](jit.md) and [`docs/arm64chroot/architecture.md`](architecture.md).
 
 **Guest memory model.** A 47-bit guest address space is mapped by a two-level
 page table whose leaves are `host_pointer | R/W/X` flag bits. Because guest
@@ -431,7 +436,7 @@ caches one page's host pointer per thread.
 
 **Portability.** No 128-bit host types are required (64×64→128 multiply and
 the saturating-SIMD helpers use pure 64-bit arithmetic); little-endian host
-assumed (all four targets qualify). The `make m32` build runs natively on
+assumed (all four targets qualify). The `make arm64chroot32` build runs natively on
 x86-64 so ILP32-host correctness — struct conversions, `uintptr_t` leaves,
 wide atomics — is exercised continuously, not just on real 32-bit hardware.
 
@@ -448,7 +453,7 @@ wide atomics — is exercised continuously, not just on real 32-bit hardware.
   hardware does the flushing and `--jit` goes on inlining floating point;
   elsewhere it is done in software and `--jit` leaves floating point to the
   interpreter for as long as either bit is set (see
-  [`docs/jit.md`](docs/jit.md)). FPSR cumulative exception flags stay
+  [`docs/arm64chroot/jit.md`](jit.md)). FPSR cumulative exception flags stay
   best-effort in denormal corners; normal values and NaN
   generation/propagation match hardware.
 - No vDSO (`AT_SYSINFO_EHDR` absent) — libc falls back to real syscalls.
@@ -456,12 +461,11 @@ wide atomics — is exercised continuously, not just on real 32-bit hardware.
 
 ## License
 
-**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+**Apache License 2.0** — see [LICENSE](../../LICENSE) and [NOTICE](../../NOTICE).
 
 arm64chroot is original, clean-room C11 code (libc/POSIX only). The instruction
 set, FP/Advanced-SIMD, reciprocal estimates, and cryptographic extensions are
 implemented from the *Arm Architecture Reference Manual* pseudocode;
 `qemu-aarch64` is used only as a differential-testing oracle and is neither
-included nor linked. The `src/core/` interpreter is shared, near-verbatim, with
-the sibling [ARM64EMU_System](https://github.com/sylirre/arm64emu-system)
-emulator under the same license.
+included nor linked. The interpreter core (`lib/arm64`, `src/arm64chroot/core/`)
+is shared with the sibling [arm64emu](../arm64emu/README.md) system emulator.

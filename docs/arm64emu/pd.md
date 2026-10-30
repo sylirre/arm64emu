@@ -10,7 +10,7 @@ reference. `--jit`, where a native backend is available, supersedes it.
 Each instruction is classified once into a `PDEnt` (dense opcode id +
 pre-extracted operands) by `pd_fill` and cached in `g_pdcache`, a direct-mapped
 table indexed by `(pc>>2)`. Execution is a **computed-goto direct-threaded loop**
-(`pd_run`/`pd_step` in `src/jit/predecode.c`): each handler ends in a `NEXT` that
+(`pd_run`/`pd_step` in `src/arm64emu/jit/predecode.c`): each handler ends in a `NEXT` that
 bumps `icount`, runs the per-instruction rare-event checks, fetches the next word
 via `mem_ifetch`, validates the cache entry, and `goto`s the next handler. The
 per-handler dispatch gives each site its own branch-predictor slot.
@@ -52,9 +52,9 @@ backend). `--jit` supersedes it when given.
 
 `icount` is exact (every instruction, including fetch-aborted ones). Verified
 byte-identical against the plain interpreter (`--no-pd`) at 1M/4M/16M/64M/300M via
-`tests/run_pd_consist.sh` (`make test-pd`), across the full asm suite run as the
-default engine, by the full-boot log gate (`make test-pd-full`), and by the
-cross-engine fuzzer (`make fuzz-engines`) — see `docs/parity.md`. These gates pin
+`tests/arm64emu/run_pd_consist.sh` (`make test-arm64emu-pd`), across the full asm suite run as the
+default engine, by the full-boot log gate (`make test-arm64emu-pd-full`), and by the
+cross-engine fuzzer (`make fuzz-arm64emu`) — see `docs/arm64emu/parity.md`. These gates pin
 the deterministic clock (`ARM64EMU_RTCLOCK=0`); the runtime default is the host wall
 clock (`ARM64EMU_RTCLOCK=1`).
 Like `--jit`, the only accepted deviation is tick-cadence: timer-IRQ delivery

@@ -1,7 +1,7 @@
 # Syscall layer
 
-Files: `src/syscall.c` (dispatcher), `src/sys_*.c` (handlers), `src/guest_abi.h`
-(numbers + guest struct layouts), `src/path.c` (containment), `src/sys.h`
+Files: `src/arm64chroot/syscall.c` (dispatcher), `src/arm64chroot/sys_*.c` (handlers), `src/arm64chroot/guest_abi.h`
+(numbers + guest struct layouts), `src/arm64chroot/path.c` (containment), `src/arm64chroot/sys.h`
 (shared helpers).
 
 ## ABI and dispatch
@@ -39,7 +39,7 @@ that resolve to `-ENOSYS` (`rseq`, `clone3`, `openat2`, …), which have no hand
 name at all (a gap in the defines, or `>= G_NR_MAX`) prints `syscall_<nr>` rather
 than a bare `?`.
 
-The decoder lives in `src/strace.c`: a per-syscall argument-type table drives a set of
+The decoder lives in `src/arm64chroot/strace.c`: a per-syscall argument-type table drives a set of
 small formatters, and input strings/arrays are snapshotted *before* the handler runs so
 `execve` still shows its program path and argv after the address space is replaced.
 Kernel-output structs and buffers are only decoded on success (a failed call prints
@@ -50,7 +50,7 @@ back to hex, so coverage grows one table row at a time.
 ### Small facts a kernel states and a guest may read
 
 A sweep against a real kernel turned up a handful of answers the emulator had
-invented, each now the kernel's (`tests/fixtures/smallabi.c` holds them; qemu
+invented, each now the kernel's (`tests/arm64chroot/fixtures/smallabi.c` holds them; qemu
 is not the oracle for most, so the expected block is a native run's):
 
 - `uname`'s `domainname` is the host's, `"(none)"` where no NIS domain was set —
@@ -68,14 +68,14 @@ is not the oracle for most, so the expected block is a native run's):
   Its `count` is an `unsigned int` in the kernel's own prototype, so the
   register's high half is not part of it: `getdents64(fd, buf, 2^32 + 5)` is a
   count of 5 and `EINVAL`, where the emulator read the whole register and, on a
-  64-bit host, a megabyte of the directory (`tests/fixtures/hugecount.c`).
+  64-bit host, a megabyte of the directory (`tests/arm64chroot/fixtures/hugecount.c`).
 - `statx` refuses both sync bits at once, a reserved mask bit and a flag it does
   not take (`EINVAL`, after the name is read); `fchownat` refuses a flag other
   than `AT_SYMLINK_NOFOLLOW`/`AT_EMPTY_PATH` before it reads the name; and
   `sigaltstack`'s modes are `SS_DISABLE`, `SS_ONSTACK` and 0 with
-  `SS_AUTODISARM` on top, anything else `EINVAL` (`docs/signals-and-processes.md`
+  `SS_AUTODISARM` on top, anything else `EINVAL` (`docs/arm64chroot/signals-and-processes.md`
   has the rest of `sigaltstack`, `SS_AUTODISARM` included;
-  `tests/fixtures/altstackflags.c`).
+  `tests/arm64chroot/fixtures/altstackflags.c`).
 - The rest of the path family judges its flags the same way, before the name
   is read or looked up and so before any effect: `newfstatat` takes
   `AT_SYMLINK_NOFOLLOW`/`AT_NO_AUTOMOUNT`/`AT_EMPTY_PATH` and the
@@ -92,7 +92,7 @@ is not the oracle for most, so the expected block is a native run's):
   all and is `EFAULT` at `AT_FDCWD`; a pair of `UTIME_OMIT`s succeeds before
   the flags or the path are looked at; and a bad `tv_nsec` is `EINVAL` only
   after the lookup, judged on the guest's 64-bit value rather than on what a
-  32-bit host's `long` makes of it (`tests/c/atflags.c`).
+  32-bit host's `long` makes of it (`tests/arm64chroot/c/atflags.c`).
 - The `SIOCGIF*` interface ioctls are answered on a socket alone — they reach
   `dev_ioctl` only through `sock_do_ioctl`, and a file's ioctl op answers them
   `ENOTTY` — and a pointer they cannot copy through (null included) is
@@ -105,7 +105,7 @@ is not the oracle for most, so the expected block is a native run's):
   (newer glibc's `tcgetattr`) got `unhandled ioctl 0x802c542a` and an `ENOTTY`
   for a terminal that was there. The table zeroes the bounce buffer first and
   copies exactly 44 bytes back, so nothing past the struct is written
-  (`tests/fixtures/termios2.c`). They are answered by `tty_termios2`
+  (`tests/arm64chroot/fixtures/termios2.c`). They are answered by `tty_termios2`
   (`sys_file.c`), which asks the host first and falls back to the classic
   `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` when the host refuses with `EACCES` or
   `ENOTTY`: Android's SELinux policy whitelists the ioctls an app may issue on
@@ -143,7 +143,7 @@ is not the oracle for most, so the expected block is a native run's):
   a member's `/proc` stat after — a group outlives its leader), `ENOTTY` when
   the slave has no group. The ids are the host's, as `getsid(2)` and
   `TIOCGPGRP` report them. `ARM64CHROOT_TIOCGSID_FORCE_DENY` forces the tier on any
-  host and the suite runs `tests/fixtures/tiocgsid.c` over it.
+  host and the suite runs `tests/arm64chroot/fixtures/tiocgsid.c` over it.
 - A terminal command refused with `EACCES` on a descriptor that is no terminal
   (`ioctl_refused`, `sys_file.c`) is answered `ENOTTY`. Android's SELinux
   policy refuses nearly every terminal ioctl ahead of the file on a pipe, a
@@ -157,7 +157,7 @@ is not the oracle for most, so the expected block is a native run's):
   does so on a memfd) are served by `F_SETFD`, which is all a kernel does for
   them; an `O_PATH` or closed descriptor is the host's `EBADF` before any policy
   is asked. `ARM64CHROOT_TTYIOCTL_FORCE_DENY` makes any host refuse the same way, and
-  the suite runs `tests/fixtures/ttynotty.c` over it.
+  the suite runs `tests/arm64chroot/fixtures/ttynotty.c` over it.
 - On a pty slave the policy allows only `TCGETS`, `TCSETS*`, `TCFLSH`,
   `TIOCSCTTY`, `TIOC[GS]PGRP`, `TIOC[GS]WINSZ` and `TIOCOUTQ`. A slave has no
   ioctl, break, modem lines, output queue or xchar of its own
@@ -180,7 +180,7 @@ is not the oracle for most, so the expected block is a native run's):
   room), and `EINVAL` for anything else; `TIOCNOTTY` is `ENOTTY` on a slave
   that is not the caller's controlling terminal (`TIOCGPGRP` tells). Two stay
   refused, since nothing allowed can do them: `TCXONC`'s `TCOOFF` and
-  `TIOCNOTTY` on the caller's own terminal. `tests/fixtures/ptsioctl.c` runs
+  `TIOCNOTTY` on the caller's own terminal. `tests/arm64chroot/fixtures/ptsioctl.c` runs
   over `ARM64CHROOT_TTYIOCTL_FORCE_DENY`, background, ignoring and orphaned process
   groups included.
 - `TIOCOUTQ` (on a socket `SIOCOUTQ`, the bytes not yet sent) and `TCSBRKP`
@@ -197,9 +197,9 @@ is not the oracle for most, so the expected block is a native run's):
   0 instead of being answered `EFAULT` up front: the kernel reads it only once
   the file has taken the command, after `EBADF` (not open, `O_PATH`) and the
   file's own `ENOTTY`, and says `EFAULT` itself where it does read it
-  (`tests/fixtures/ioctlorder.c`; `qemu-user` locks the argument first, hence
+  (`tests/arm64chroot/fixtures/ioctlorder.c`; `qemu-user` locks the argument first, hence
   its `ioctl-ptr-late` gate).
-- `mremap(MREMAP_DONTUNMAP)` is served (`docs/memory.md`).
+- `mremap(MREMAP_DONTUNMAP)` is served (`docs/arm64chroot/memory.md`).
 
 ## Struct marshalling: always convert
 
@@ -252,7 +252,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   Two of the scalar ones are not plain pass-throughs either: `F_SETOWN` and
   `F_SETOWN_EX` name the task that will be sent `SIGIO`, so their id is
   contained exactly as `kill`'s is (see *Target containment* in
-  `docs/signals-and-processes.md`), and `F_SETSIG`'s argument is a **guest**
+  `docs/arm64chroot/signals-and-processes.md`), and `F_SETSIG`'s argument is a **guest**
   signal number, which for 32/33 has to ride a host carrier like every other one
   the guest sends (`F_GETSIG` maps it back). What `F_GETOWN`/`F_GETOWN_EX`
   report is held to the hidden-process view the same way (`owner_view`): a
@@ -264,7 +264,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   composed from the typed `F_GETOWN_EX` answer as `f_getown` composes it —
   pid, or `-pgid` for a group — because the scalar forward treated every
   negative return as an error and reported a stale errno for every
-  group-owned descriptor (`tests/fixtures/peerpid.c`).
+  group-owned descriptor (`tests/arm64chroot/fixtures/peerpid.c`).
 - *An optval is not always opaque bytes.* `setsockopt` passes most option
   buffers through unchanged, but `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF`
   take a `struct sock_fprog` whose second field is a **pointer** to the
@@ -275,7 +275,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   re-issued via a host-side `sock_fprog` (itself half the guest's size on an
   ILP32 host). A NULL program still goes through un-bounced, preserving the
   kernel's error order: a locked filter answers `EPERM` before the NULL
-  answers `EINVAL` (`tests/c/sockfilter.c`).
+  answers `EINVAL` (`tests/arm64chroot/c/sockfilter.c`).
 - *And an optlen does not always bound the answer.* Reading that filter back
   with **`SO_GET_FILTER`** (the same option number, 26) is the one `getsockopt`
   whose reply is not measured in the units it was asked in: `sk_get_filter`
@@ -291,7 +291,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   sibling guest thread could invalidate — and handed back as the same
   bytes-in/instructions-out answer the kernel gives, including the `optlen`-0
   enquiry, which writes nothing and only reports the count.
-  `tests/fixtures/sockfilter_get.c` is the regression test: `qemu-user` answers
+  `tests/arm64chroot/fixtures/sockfilter_get.c` is the regression test: `qemu-user` answers
   `EINVAL` for the option and is no oracle for it.
 - *`SO_RCVTIMEO`/`SO_SNDTIMEO` carry a `struct timeval`* — 16 bytes in the
   guest's LP64 ABI but 8 in an ILP32 host's old-style one, and a time64 32-bit
@@ -300,7 +300,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   `struct timeval`, which by definition agree with the host kernel; on an LP64
   host the gate folds to a compile-time identity and the raw pass-through
   stays. One kernel detail worth pinning: an out-of-range `tv_usec` answers
-  **`EDOM`**, not `EINVAL` (`tests/c/socktimeo.c`).
+  **`EDOM`**, not `EINVAL` (`tests/arm64chroot/c/socktimeo.c`).
 - *A byte count is a guest `u64`, and it is the guest's to choose.* A kernel
   never allocates for one — it copies between the file and the caller's own
   pages — and neither, for a large transfer, does this emulator any more (see
@@ -316,8 +316,8 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   the *emulator* had to find room for. What the fault *means* is the file's
   business (*a buffer the guest has only part of*, below), so the rest is not
   dropped: it goes to the host as a fault in the same place
-  (`tests/fixtures/bigcount.c`, `tests/fixtures/xferfault.c`,
-  `tests/fixtures/rwfault.c`).
+  (`tests/arm64chroot/fixtures/bigcount.c`, `tests/arm64chroot/fixtures/xferfault.c`,
+  `tests/arm64chroot/fixtures/rwfault.c`).
 - *A buffer the guest has only part of, or none of* (`XferCut`, `sys.h`;
   `xfer_begin`, `sys_file.c`). A kernel's answer to such a call is not one
   answer — measured against one: a regular file reports the short transfer; a
@@ -346,7 +346,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   `PROT_NONE` guard (`guardbuf_map`) that begins where the guest's memory
   ends, and past `XFER_STAGE_MAX` of it it is a short transfer instead. A
   signalfd read takes as many records as reach the guest's memory, plus the
-  one whose copy faults. `tests/fixtures/rwfault.c` pins 35 such cases against
+  one whose copy faults. `tests/arm64chroot/fixtures/rwfault.c` pins 35 such cases against
   a real kernel; the old code got 27 of them wrong.
 - *The same count, on the calls that never build a bounce buffer.* `sendfile`,
   `splice` and `copy_file_range` hand the guest's count straight to the host,
@@ -362,7 +362,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   too (`do_sendfile` and `generic_copy_file_checks` cap at `MAX_RW_COUNT`,
   `import_ubuf` caps `getrandom`'s iterator); `getrandom` also bounds the fill
   by `rw_room`, since it fills a bounce buffer of its own and a kernel stops
-  where the caller's memory ends. `tests/fixtures/hugecount.c` covers the six,
+  where the caller's memory ends. `tests/arm64chroot/fixtures/hugecount.c` covers the six,
   and is self-checking for the same reason `bigcount.c` is.
 - *The vector calls need the same bound, per segment* (`iov_import`,
   `sys_file.c`). `readv`/`writev` and the `p*v*` family used to stage the whole
@@ -384,11 +384,11 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   both, which made a `readv` of a large buffer fail where a `read(2)` of the
   same buffer on the same fd went through: the scalar path has always clamped
   to that same `MAX_RW_COUNT` and staged the same bounce for it, so the
-  ceiling bought no headroom either. `tests/fixtures/iovroom.c` pins all
+  ceiling bought no headroom either. `tests/arm64chroot/fixtures/iovroom.c` pins all
   fourteen cases against a real kernel; `qemu-user` disagrees with the kernel
   on nine of them (it validates each segment's whole range up front), so it is
   not the oracle here — nor, for the same reason, a host this can run on
-  (the `iov-fault` probe, `tests/hostenv.sh`).
+  (the `iov-fault` probe, `tests/arm64chroot/hostenv.sh`).
 - *Where a transfer's bytes go* (`xfer_begin`/`xfer_end`, `sys_file.c`, and
   `guest_lend`, `mem.c`). The host syscall needs host memory to move a
   transfer through, and it used to be a bounce buffer the size of the whole of
@@ -401,7 +401,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   blocks. Now a transfer of `XFER_BOUNCE_MAX` (64 KiB) or less is still
   bounced, which is the cheapest thing for it, and a larger one is **lent**:
   the runs of host memory under the guest's buffer become the host call's
-  iovecs, **pinned** for the duration (`docs/memory.md` has why a pin is
+  iovecs, **pinned** for the duration (`docs/arm64chroot/memory.md` has why a pin is
   needed and what it holds back), and the host kernel moves the bytes
   exactly as the guest's kernel would — a datagram whole, a regular-file
   write atomic against its neighbours, a peek or an `SO_RCVLOWAT` wait as
@@ -414,7 +414,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   what its disk can DMA to (ext4's and xfs's: as little as four bytes on an
   NVMe or SCSI disk of an x86 host), and a bounce at malloc's sixteen bytes
   made every `O_DIRECT` transfer of 64 KiB or less `EINVAL` there however
-  the guest had aligned it (`tests/fixtures/odirect.c`, which the suite runs
+  the guest had aligned it (`tests/arm64chroot/fixtures/odirect.c`, which the suite runs
   on the first directory it finds that does it, against the same program
   built for the host). What is
   still staged is capped at `XFER_STAGE_MAX` (2 MiB) a call:
@@ -440,7 +440,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
     keeps referencing what it was handed after the call returns — a freed
     bounce buffer would have been reused under it — and one that would
     need any staging is refused with the `ENOBUFS` a zero-copy send may
-    always get (`tests/fixtures/zcsend.c`);
+    always get (`tests/arm64chroot/fixtures/zcsend.c`);
   - `FS_IOC_FIEMAP` and a large option value (below) are lent when they are
     one run, and otherwise staged in front of a `PROT_NONE` guard
     (`guardbuf_map`, `sys.h`): a kernel that goes past the staged part faults
@@ -456,7 +456,7 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
     file first (`EOPNOTSUPP` before the header is read, which a probe with no
     buffer has the host give).
 
-  `tests/fixtures/xferlend.c` measures the emulator's own peak RSS across
+  `tests/arm64chroot/fixtures/xferlend.c` measures the emulator's own peak RSS across
   256 MB transfers out of untouched memory (flat now; the whole size before)
   and checks straddling buffers, the iovec overflow and a buffer unmapped or
   grown with a transfer in flight; `xferfault.c` covers the fault paths and
@@ -466,14 +466,14 @@ present 64-bit `off_t`/`time_t`, collapsing most conversions to field copies.
   nr_segs` and it is truncated there, so `readv(fd, iov, 1ULL<<32)` really is a
   read of zero segments; a socket's `msg_iovlen` is checked as a full 64-bit
   value and answers **`EMSGSIZE`** above `UIO_MAXIOV`. The emulator reproduces
-  both (`tests/fixtures/iovcnt.c`), and again `qemu-user` does not.
+  both (`tests/arm64chroot/fixtures/iovcnt.c`), and again `qemu-user` does not.
 
-## Rootfs path containment (`src/path.c`)
+## Rootfs path containment (`src/arm64chroot/path.c`)
 
 Because the emulator sees every syscall, containment needs no host `ptrace`
 (unlike proot) and no privilege (unlike `chroot(2)`). (The emulator does
 *emulate* guest `ptrace(2)` so in-rootfs `strace`/`gdb` work — see
-`docs/signals-and-processes.md` — but that is a guest-facing feature, not part of
+`docs/arm64chroot/signals-and-processes.md` — but that is a guest-facing feature, not part of
 containment.) `path_resolve` walks the guest path
 **component by component**, resolving each against `rootfs + sofar`:
 
@@ -487,7 +487,7 @@ containment.) `path_resolve` walks the guest path
   is the directory the walk starts in (the cwd, or the dirfd's directory): a
   kernel climbs out of it through its dentry's parent whether or not it still
   exists, so `../x` from a directory since removed is still `x`
-  (`tests/c/pathdotdot.c`, rows `xx_*` and `cwd_*`);
+  (`tests/arm64chroot/c/pathdotdot.c`, rows `xx_*` and `cwd_*`);
 - `ELOOP` after 40 hops;
 - a **trailing slash** (or a final `.`/`..`) demands that the final component be
   a directory, and is checked after bind translation against the host path the
@@ -526,10 +526,10 @@ root, so `ln -s / dir` in that window reaches the whole filesystem with the
 emulator's own uid — and it does not even take a symlink of the guest's making,
 since an ordinary rootfs is full of absolute ones (Alpine's `/var/run -> /run`)
 and renaming one into place does just as well.
-`tests/fixtures/pathrace.c` wins that race thousands of times per second against
+`tests/arm64chroot/fixtures/pathrace.c` wins that race thousands of times per second against
 the string form.
 
-So `path_pin` (`src/path.c`) re-walks the finished canonical path's **parent**
+So `path_pin` (`src/arm64chroot/path.c`) re-walks the finished canonical path's **parent**
 one component at a time with `O_PATH|O_NOFOLLOW`, starting from a directory the
 guest cannot rewrite, and hands the caller that descriptor plus the final
 component (`PathPin` in `machine.h`). Every handler then runs the syscall in its
@@ -591,7 +591,7 @@ question decides the answer, because `link/..` is not the link's parent: the
 kernel resolves the link and climbs from its *target*. With `a/b -> ../c`,
 `a/b/../x` is `/x` on a kernel and `/a/x` to a fold, which is a different
 existing file; the same shape gives a spurious `ENOENT` for the ordinary
-`bin -> real/bin` layout that names `../lib`. `tests/c/pathdotdot.c` is the
+`bin -> real/bin` layout that names `../lib`. `tests/arm64chroot/c/pathdotdot.c` is the
 differential record, and a `..` at the guest root cancels nothing (it is
 clamped) so it stays on the fast route.
 
@@ -599,7 +599,7 @@ clamped) so it stays on the fast route.
 over both it and the two pin tiers. `ARM64CHROOT_PATHFAST_VERIFY` resolves every path
 both ways and aborts on disagreement — a development knob for a *quiescent*
 tree, since the two walks run at different instants and a guest racing its own
-mounts (`tests/fixtures/bindrace.c`) makes them differ for a reason that is not
+mounts (`tests/arm64chroot/fixtures/bindrace.c`) makes them differ for a reason that is not
 a bug; the suite runs one such check over a deliberately quiescent workload.
 
 ### What the pin costs the guest: `RLIMIT_NOFILE`
@@ -637,7 +637,7 @@ used to cross into the child for good (a kernel's path walk holds dentries,
 not descriptors, so its children carry none). Every pin is held against fork
 now, and so is every other descriptor the emulator opens for itself on a guest
 thread — see "A child inherits no descriptor of the emulator's own" in
-`docs/signals-and-processes.md` and `machine.h`, "the emulator's own
+`docs/arm64chroot/signals-and-processes.md` and `machine.h`, "the emulator's own
 descriptors".
 
 `dup3` is also the one call that *replaces* a descriptor the emulator may be
@@ -649,7 +649,7 @@ than `O_CLOEXEC` and `oldfd == newfd` are `EINVAL`, newfd at the soft limit and
 an oldfd that is not open are `EBADF` — so a refused call leaves newfd exactly
 what it was, bookkeeping included. It used to unmark newfd before the host had
 judged anything, and `dup3(-1, sfd, 0)` then left the signalfd open but reading
-as the bare eventfd underneath it (`tests/c/dup3fail.c`).
+as the bare eventfd underneath it (`tests/arm64chroot/c/dup3fail.c`).
 
 `openat` refuses *before* it opens anything rather than after: the kernel takes
 its descriptor first (`get_unused_fd_flags`, ahead of the lookup), so an open
@@ -663,7 +663,7 @@ The hard limit is not ours to raise, so a host whose hard limit equals its soft
 one — or a guest that has raised its own to the hard ceiling — has no headroom
 to take and is back to being one descriptor tighter than a kernel. That is the
 old behaviour rather than a new failure, and it is the only case left.
-`tests/c/fdlimit.c` is the differential record.
+`tests/arm64chroot/c/fdlimit.c` is the differential record.
 
 Net cost of containment, measured against a build from before any of it: `go
 build` and `node` unchanged, and a `find /` that does nothing but path syscalls
@@ -772,7 +772,7 @@ leaves it consistent, and a call that is about to *change* the group does the
 same for a chain a killed process left cut. A reader that finds the chain cut
 looks a few times and then sees an ordinary symlink; a call that adds a name
 waits (and never takes "cannot tell" for "not a group" — it used to, and the
-name it made was one nothing counted). `tests/l2s_proot.sh` stresses this with
+name it made was one nothing counted). `tests/arm64chroot/l2s_proot.sh` stresses this with
 six processes on one group.
 
 A program run through a name sees the name, as it does through a hardlink:
@@ -852,7 +852,7 @@ unlinked cwd is `ENOENT` from `getcwd`, flagged for the walk — the names in it
 answer `ENOENT` whatever a directory created at the old path holds by now, `.`
 pins as the host's own `AT_FDCWD` (the inode the name no longer reaches), `..`
 climbs to the parent's *current* path, read off an `O_PATH` descriptor of it —
-and named `<path> (deleted)` by the `/proc/self/cwd` link (`tests/c/cwdinode.c`,
+and named `<path> (deleted)` by the `/proc/self/cwd` link (`tests/arm64chroot/c/cwdinode.c`,
 with qemu doing real `chdir`s as the oracle). The suffix is `readlinkat`'s to
 append, bounded: `d_path` answers `ENAMETOOLONG` when the ten extra bytes do
 not fit the `PATH_MAX` the link is read into, which a canonical path of
@@ -863,7 +863,7 @@ onto a `PATH_MAX` stack buffer. The walk never sees the suffix: following
 the way a relative path does, with the last known path as a trusted prefix and
 the unlinked flag answering the rest (`stat("/proc/self/cwd")` and the `.`
 forms succeed, a name in it is `ENOENT`), where it used to walk a path spelled
-with the suffix and answer `ENOENT` for all of them (`tests/c/cwdlong.c`).
+with the suffix and answer `ENOENT` for all of them (`tests/arm64chroot/c/cwdlong.c`).
 Another process's `cwd` link is served from the registry, which records no
 unlinking: it reports the path last published. The guest starts at `/`, or where the
 host was launched if that lies inside the rootfs, or at `-w/--work-dir dir`
@@ -961,7 +961,7 @@ guest could still *obtain* a writable descriptor, or a writable alias, under a
   source's was locked — or the guest could bind the invoker's read-only tree
   somewhere writable — but without the unmount lock (`do_loopback` clears
   `MNT_LOCKED`), since the guest made it. A guest's own mounts are never
-  locked. `tests/fixtures/robind.c` runs all of it, as an unprivileged guest
+  locked. `tests/arm64chroot/fixtures/robind.c` runs all of it, as an unprivileged guest
   and as fake root.
 
 Binds are listed in the
@@ -1010,7 +1010,7 @@ is; a target that is not there is `ENOENT` whatever the call would have done at
 it, a propagation change included. The tmpfs branch used to be the only reader
 of the options, into 256 bytes, falling back to the defaults for a pointer it
 could not read, and nothing read them for any other flavor
-(`tests/fixtures/mountargs.c`). `MS_BIND` with no source, or an empty one, is
+(`tests/arm64chroot/fixtures/mountargs.c`). `MS_BIND` with no source, or an empty one, is
 `EINVAL` (`do_loopback`); a new filesystem with no type is `EINVAL`
 (`do_new_mount`) and one on a file is `ENOTDIR` (`graft_tree`).
 
@@ -1034,7 +1034,7 @@ left to fail as it always did, and `UMOUNT_NOFOLLOW` names the link itself.
 Whether an operand exists (and is a directory, where it must be) is asked with
 an `O_PATH` open, `O_DIRECTORY` for the directory test, and not a `stat`: a
 kernel's mount lookup does no getattr, and Android's policy denies one on
-nodes an app can still name (`/dev/full`). `tests/fixtures/sandbox_probe.c`
+nodes an app can still name (`/dev/full`). `tests/arm64chroot/fixtures/sandbox_probe.c`
 pins it (`pivot_fd`, `fdlink`).
 
 **The name a descriptor was opened under.** A descriptor is a host object and
@@ -1071,7 +1071,7 @@ about to be detached — which is what makes the cwd it sets the right thing for
 `umount2(".")`. With this, `bwrap --unshare-all --bind / / --proc /proc --dev
 /dev CMD` runs with Alpine's bubblewrap 0.12 as it does with 0.9, and so do
 `--tmpfs`, `--ro-bind` and a further `--bind` after a whole-root one.
-`tests/fixtures/sandbox_probe.c` pins it (`fdname_*`).
+`tests/arm64chroot/fixtures/sandbox_probe.c` pins it (`fdname_*`).
 
 The bind table is **process-shared** — a `MAP_SHARED` region created before the
 first fork (`path.c` `bindtab_init`), not per-`Machine` state — so a bind made by
@@ -1151,10 +1151,10 @@ faked network namespace, this is enough to run **bubblewrap** unmodified:
 `--tmpfs`, `--ro-bind` and pid-namespace monitor. It is emulation, not
 containment: the sandbox is a rearranged view of the same rootfs, enforced only
 because the emulator mediates every syscall, and a faked `CLONE_NEWPID` leaves
-the guest's pids alone. `tests/fixtures/sandbox_probe.c` pins the whole stack
+the guest's pids alone. `tests/arm64chroot/fixtures/sandbox_probe.c` pins the whole stack
 down (qemu cannot be the oracle: the real kernel refuses all of it unprivileged).
 
-**`seccomp(2)`** (`src/sys_seccomp.c`) is *enforced*, not faked. A guest filter
+**`seccomp(2)`** (`src/arm64chroot/sys_seccomp.c`) is *enforced*, not faked. A guest filter
 is classic BPF over `struct seccomp_data` and is meant to constrain **guest**
 syscalls — guest numbers, guest arguments, `AUDIT_ARCH_AARCH64`. Handing it to
 the host would apply it to something else entirely (the emulator's own host
@@ -1183,7 +1183,7 @@ the 3642nd does not, exactly as on a 6.x kernel. What runs runs as the kernel's 
 program does: a division by a zero `X` ends the program with 0 (a kill), and a
 shift by an `X` of 32 or more shifts by `X & 31` — the interpreter's own
 masking since its undefined-behaviour fix, and what the JITs' shift instructions
-do by themselves; it used to end the program here (`tests/fixtures/smallabi.c`).
+do by themselves; it used to end the program here (`tests/arm64chroot/fixtures/smallabi.c`).
 `SECCOMP_RET_ALLOW`/`LOG`, `ERRNO` (with the kernel's `MAX_ERRNO` clamp),
 `TRAP` (SIGSYS carrying `si_call_addr`/`si_syscall`/`si_arch`, plus the filter's
 own `SECCOMP_RET_DATA` in `si_errno` — that is how one filter tells its several
@@ -1210,7 +1210,7 @@ push onto the chain head is made under the task lock (`sys_proc.c`, the
 stand-in for the kernel's `siglock` here), the head is stored with release
 semantics and every dispatcher takes it with an acquire load, nodes are
 immutable once linked and never freed — so eight threads installing at once
-leave every filter on the chain (`tests/fixtures/seccomp_threads.c`), where a
+leave every filter on the chain (`tests/arm64chroot/fixtures/seccomp_threads.c`), where a
 plain pointer lost one of two that met, and a weakly ordered host could walk
 a node whose contents had not arrived. And user notification does not exist
 here — servicing a notification fd would mean parking guest syscalls on an
@@ -1230,12 +1230,12 @@ has set `no_new_privs` — so a check that put `EACCES` first told it that no
 flag exists, `TSYNC` included, and `seccomp_attr_set(SCMP_FLTATR_CTL_TSYNC)`
 failed with `EOPNOTSUPP` in every guest that was not fake root. `GET_ACTION_AVAIL`
 compares the whole word as the kernel does: an action with data bits set is not
-one it knows. `tests/fixtures/seccomp_probe.c` holds the rows. Note this is
+one it knows. `tests/arm64chroot/fixtures/seccomp_probe.c` holds the rows. Note this is
 entirely separate from the emulator's *own* SIGSYS net, which absorbs the
 **host** seccomp filter Android imposes on the emulator process.
 
 **AF_UNIX pathname sockets** carry a filesystem path in `sun_path`, so it is
-contained like any other path (`src/sys_net.c`): `bind`/`connect`/`sendto`/
+contained like any other path (`src/arm64chroot/sys_net.c`): `bind`/`connect`/`sendto`/
 `sendmsg` route it through `path_resolve` (`bind` keeps the final component
 literal, the rest follow symlinks), and `getsockname`/`getpeername`/`accept`/
 `recvfrom`/`recvmsg` strip the rootfs prefix back off so the guest never sees a
@@ -1279,7 +1279,7 @@ result pointer is bad it never learns the two numbers, so nothing it does can
 ever close them — and every descriptor here is one of the guest's own (guest
 fd == host fd), so a caller looping on a bad pointer emptied the process's fd
 table two at a time. Both are closed on that path, as `pipe2` already did
-(`tests/fixtures/netfault.c`).
+(`tests/arm64chroot/fixtures/netfault.c`).
 
 The `(addr, addrlen)` pair those calls write back has one shared
 implementation (`sock_addr_out`, used by the netlink emulation too so the two
@@ -1362,7 +1362,7 @@ never by a number the guest merely named:
   `sock_cmsg_send`, `ip_cmsg_send`), so a message whose ancillary data is
   malformed never goes out. Treating a bad element as a place to *stop*
   instead sent the message with that element and everything after it silently
-  dropped, and reported success. `tests/fixtures/cmsgvalid.c` covers it, and is
+  dropped, and reported success. `tests/arm64chroot/fixtures/cmsgvalid.c` covers it, and is
   self-checking: qemu-user re-parses the control buffer with a walk of its own,
   accepting `cmsg_len` 0, 1 and 17 where a kernel answers `EINVAL`, and dies
   outright on a `msg_controllen` past `INT_MAX`.
@@ -1389,9 +1389,9 @@ never by a number the guest merely named:
   iovec, then the control buffer (its size, then its contents), then the
   destination address, and the data last of all.
 
-`tests/c/msgbig.c` covers all four against the oracle — including a descriptor
+`tests/arm64chroot/c/msgbig.c` covers all four against the oracle — including a descriptor
 passed through an 8 KB control buffer whose `SCM_RIGHTS` element begins past
-the old 4 KB mark — and `tests/fixtures/sockoptlen.c` covers the `optlen` edges
+the old 4 KB mark — and `tests/arm64chroot/fixtures/sockoptlen.c` covers the `optlen` edges
 qemu-user cannot arbitrate, since it never passes `optlen` to the host at all.
 
 `getsockopt`'s `(optval, optlen)` pair is validated the same way and for the
@@ -1401,7 +1401,7 @@ whatever was asked for, and `optval` is written only once the clamped length
 leaves something to write. Taking a missing `optlen` for "length 0" and
 bouncing a missing `optval` through a local buffer made both a silent success.
 The `SO_RCVTIMEO`/`SO_SNDTIMEO` conversion path an ILP32 host takes is held to
-the same rule (`tests/fixtures/netfault.c` covers both).
+the same rule (`tests/arm64chroot/fixtures/netfault.c` covers both).
 
 **A length the kernel cannot use is refused, not trimmed.** `addrlen` is an
 `int`: `move_addr_to_kernel` takes a negative one and one past
@@ -1435,14 +1435,14 @@ back is the end of time minus now; the waits use the same deadline in
 nanoseconds, saturating the same way, and one further off than `poll`'s `int`
 of milliseconds can say is waited for in pieces. The plain multiplication
 this replaced wrapped — 2^60 seconds is exactly 0 mod 2^64 — and the call came
-back empty, its deadline "already passed". `tests/fixtures/recvmmsg_tmo.c`
+back empty, its deadline "already passed". `tests/arm64chroot/fixtures/recvmmsg_tmo.c`
 covers every case the kernel terminates in; `qemu-user` hangs on that program,
 so it is not the oracle either.
 
 **Interface-query ioctls.** The read-only `SIOCGIF*` family that `ifconfig` /
 net-tools issue on an `AF_INET` socket — `SIOCGIFCONF` (enumerate) plus the
 per-interface `SIOCGIF{INDEX,NAME,FLAGS,ADDR,NETMASK,BRDADDR,DSTADDR,MTU,METRIC,
-HWADDR,TXQLEN,MAP}` — is answered in `src/sys_netlink.c` (`nl_maybe_siocgifconf`
+HWADDR,TXQLEN,MAP}` — is answered in `src/arm64chroot/sys_netlink.c` (`nl_maybe_siocgifconf`
 / `nl_maybe_ifreq_ioctl`, dispatched from the `sys_file.c` ioctl handler) from
 the host's own interface table via `getifaddrs(3)` plus best-effort host ioctls,
 with a synthesized loopback fallback (index 1, `127.0.0.1/8`, MTU 65536,
@@ -1463,7 +1463,7 @@ already assumes it. For anything else the refusal is **reported**, because the
 alternative is to invent one — this used to return success with `sa_family` 0, a
 value no kernel produces and a guest cannot tell from a real answer.
 
-**`AF_NETLINK` / `NETLINK_ROUTE`** (`src/sys_netlink.c`, ported from Termux
+**`AF_NETLINK` / `NETLINK_ROUTE`** (`src/arm64chroot/sys_netlink.c`, ported from Termux
 PRoot) is emulated in two independent tiers, because two different things can
 go wrong:
 
@@ -1567,7 +1567,7 @@ go wrong:
   afterwards: consuming it for a read the kernel treats as a no-op threw the
   answer away, and rebuilding the reply slot for a send that never happened
   replaced it with an ack for a message the guest never sent, carrying
-  sequence number zero. `tests/fixtures/netns_ack.c` (`zerolen=`) holds both
+  sequence number zero. `tests/arm64chroot/fixtures/netns_ack.c` (`zerolen=`) holds both
   tiers to it.
 
   The reply is handed back one datagram at a time, with the `NLMSG_DONE` that
@@ -1613,7 +1613,7 @@ go wrong:
   An untracked copy sent its request to the AF_UNIX stand-in itself — which
   refused the `sockaddr_nl` — and on a real socket went unnoted, so the
   kernel's refusal came back where the faked namespace was owed its ack
-  (`tests/fixtures/netns_ack.c`, `dup=`). Both tables grow as needed; a
+  (`tests/arm64chroot/fixtures/netns_ack.c`, `dup=`). Both tables grow as needed; a
   stand-in that could not be tracked is closed and the `socket()` refused
   with `ENOMEM`, since an untracked stand-in is a bare AF_UNIX socket.
 - **The host grants netlink, but the guest has no `CAP_NET_ADMIN` in it.**
@@ -1680,7 +1680,7 @@ then make the consequences the caller depends on true:
   `deny` followed by whitespace alone (`denyx` used to pass); `deny` is refused
   once `gid_map` is written, `allow` once `deny` stands, and `allow` is
   otherwise a no-op that succeeds — after `gid_map` too, which used to be
-  refused. `tests/fixtures/idmapparse.c` holds all of it, verdicts read off
+  refused. `tests/arm64chroot/fixtures/idmapparse.c` holds all of it, verdicts read off
   the kernel source since no oracle can take the writes. The maps are
   *reported*, not applied: they change no id the guest sees — `--fake-id` is
   how a guest becomes root here.
@@ -1773,7 +1773,7 @@ then make the consequences the caller depends on true:
   the emulator does not implement, which a feature detector reading the line
   would then execute. Being host-global but the wrong ISA's, it is denied
   rather than passed through where no anonymous backing exists
-  (`tests/fixtures/cpuinfo.c`). `/proc/stat`
+  (`tests/arm64chroot/fixtures/cpuinfo.c`). `/proc/stat`
   is try-host-first: the readable real file is strictly richer (per-CPU
   jiffies, intr, ctxt) and passes through; where the host denies it (Android
   again) a fallback is synthesized — CPU time estimated by integrating the
@@ -1803,14 +1803,14 @@ then make the consequences the caller depends on true:
   share one open file, so a rewind through either refreshes for both, and a
   write of an id map through the copy reaches the namespace state exactly as
   one through the original does rather than the backing memfd, which is what
-  an untracked copy did (`tests/fixtures/sandbox_probe.c` writes `uid_map`
+  an untracked copy did (`tests/arm64chroot/fixtures/sandbox_probe.c` writes `uid_map`
   through an `F_DUPFD` copy with the original closed). An open the guest's
   `RLIMIT_NOFILE` refuses *after* the view was built drops its row before
   closing the descriptor, in that order: once the number is closed it is
   anyone's, and a row left behind would aim the next refresh's `ftruncate` at
   whatever opened next — and when the table held eight rows, that many of
   them stopped every later view from being tracked at all
-  (`tests/c/procfsrefresh.c`). Every synthesized view is in that table, not
+  (`tests/arm64chroot/c/procfsrefresh.c`). Every synthesized view is in that table, not
   only the time-varying and the written-through ones, because the table is
   also where the **access mode** lives: the memfd behind a view is `O_RDWR`
   whatever the guest asked for, so the mode the guest opened it in
@@ -1828,13 +1828,13 @@ then make the consequences the caller depends on true:
   passthrough ones included), `EBADF` for the modes, then `EOPNOTSUPP`
   (procfs has no `remap_file_range`) — rather than reaching the backing,
   which on a reflinking host filesystem the host used to clone straight into
-  (`reflink_denied`, `tests/fixtures/reflinkobj.c`); and `mmap` of one answers,
+  (`reflink_denied`, `tests/arm64chroot/fixtures/reflinkobj.c`); and `mmap` of one answers,
   in `do_mmap`'s order, `EACCES` for a mode the mapping needs and the
   descriptor lacks, then `ENODEV` for a per-process file (no mmap operation)
   or `EIO` for a `proc_create`d global (`proc_reg_mmap` with no `proc_mmap`)
   — asked before the address-space lock, whose rank is below the table's. A
   view the table cannot take is withheld with `ENOMEM`, since an unenforced
-  one would be a silent lie (`tests/fixtures/procmode.c`). The guest program's name is also set as the process `comm`
+  one would be a silent lie (`tests/arm64chroot/fixtures/procmode.c`). The guest program's name is also set as the process `comm`
   (`PR_SET_NAME` in `load_elf`), so `comm` and `stat`'s command field are right
   for every guest process. `status` is rebuilt line by line instead
   (`put_status`): most of it — `State`, `PPid`, `FDSize`, `Threads`, the
@@ -1844,9 +1844,9 @@ then make the consequences the caller depends on true:
 
   | line | why the host file is wrong |
   |---|---|
-  | the `Vm`/`Rss` block | it measures the *emulator's* address space — its code, software page tables, JIT cache and malloc, at its own foreign-ISA addresses. Synthesized from the guest's region list (see `docs/memory.md`), together with all of `statm` and the address fields of `stat`, which are the two files `ps` and `top` actually read. Another guest process's sizes come from what it published in the shared PID registry; only its *resident* set stays the host's, being the one figure no reader can sample inside another address space — and it is bounded by that process's own size, since a resident set larger than the space holding it is something no kernel reports |
+  | the `Vm`/`Rss` block | it measures the *emulator's* address space — its code, software page tables, JIT cache and malloc, at its own foreign-ISA addresses. Synthesized from the guest's region list (see `docs/arm64chroot/memory.md`), together with all of `statm` and the address fields of `stat`, which are the two files `ps` and `top` actually read. Another guest process's sizes come from what it published in the shared PID registry; only its *resident* set stays the host's, being the one figure no reader can sample inside another address space — and it is bounded by that process's own size, since a resident set larger than the space holding it is something no kernel reports |
   | `TracerPid` | the emulated `ptrace` never host-attaches, so the host task reports no tracer even while a guest `gdb` has it stopped |
-  | `Seccomp`, `Seccomp_filters` | a guest filter is evaluated in the dispatcher and never installed on the host, so a filtered guest reads 0 — and where the emulator itself carries a filter the guest never asked for (Android, `make test-seccomp`), an unfiltered guest reads 2 |
+  | `Seccomp`, `Seccomp_filters` | a guest filter is evaluated in the dispatcher and never installed on the host, so a filtered guest reads 0 — and where the emulator itself carries a filter the guest never asked for (Android, `make test-arm64chroot-seccomp`), an unfiltered guest reads 2 |
   | `SigPnd`/`ShdPnd`/`SigBlk`/`SigIgn`/`SigCgt` | the capture layer's dispositions and mask, not the guest's |
   | `NoNewPrivs` | answered from the recorded guest intent, like `PR_GET_NO_NEW_PRIVS`: an inherited host flag (the Android zygote sets one) is not something the guest asked for |
   | `Uid`/`Gid`/`Groups` | under `--fake-id`, the real invoking ids, which `ps`/`top` read to name the user |
@@ -1868,7 +1868,7 @@ then make the consequences the caller depends on true:
   through, and only "there is no host file at all" falls through, since the
   caller's own open then fails in exactly the same way.
   `ARM64CHROOT_PROCSYNTH_FORCE_FAIL` forces the no-backing tier so the suite can check
-  all of that (`tests/fixtures/procsynth_tier.c`).
+  all of that (`tests/arm64chroot/fixtures/procsynth_tier.c`).
 
   **`stat`, `statx`, `access` and `statfs` of a synthesized name** are the
   host's to answer, until it refuses. Android's SELinux policy denies an app
@@ -1893,7 +1893,7 @@ then make the consequences the caller depends on true:
   the guest's identity, `statfs` is the `/proc` filesystem's, and a name that
   is not synthesized, or whose open a guest would be refused, keeps the host's
   own answer — nothing is invented. `ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY` makes any
-  host refuse these, so the suite runs `tests/fixtures/procsynth_stat.c` over
+  host refuse these, so the suite runs `tests/arm64chroot/fixtures/procsynth_stat.c` over
   it, with and without the synthesized-open tiers and `--fake-id`. (A
   descriptor on a view reports the memfd behind it, as it always did; only
   the path forms are answered as procfs files.)
@@ -1919,7 +1919,7 @@ then make the consequences the caller depends on true:
   through `pread`/a `dup` (the offset the guest owns never moves), and an
   `O_RDONLY` `open` of a memfd-backed path returns a sealed-memfd snapshot of
   its contents (writes keep failing, as they would on the sealed original;
-  `proc_own_fd_path` in `src/path.c`, fallback in `sys_file.c` openat). The
+  `proc_own_fd_path` in `src/arm64chroot/path.c`, fallback in `sys_file.c` openat). The
   snapshot copies the file's **data extents** (`SEEK_DATA`/`SEEK_HOLE`,
   `snapshot_data`) and sets the length once at the end, so it costs what the
   guest itself wrote: a memfd is sparse, and a guest can `ftruncate` one to a
@@ -1927,7 +1927,7 @@ then make the consequences the caller depends on true:
   into a terabyte of zeros read and written — minutes, and every hole made
   real in the host's memory — on a request the guest could repeat at will. A
   filesystem that cannot answer `SEEK_DATA` is copied through as before
-  (`tests/fixtures/ownfdexec.c`, leg 5, over every tier). The
+  (`tests/arm64chroot/fixtures/ownfdexec.c`, leg 5, over every tier). The
   execute-permission check (`exec_perm_check`, `sys_proc.c`) makes the same
   turn: with the path refused it applies the kernel's rule to the mode the
   descriptor reported rather than re-asking the path through `access(2)`, which
@@ -1979,7 +1979,7 @@ then make the consequences the caller depends on true:
   serves it the process directory's entries for that task; its per-task
   files, `status`, `stat`, `comm`, `personality`, are that thread's host
   file, rewritten like any other; `proc_self_tail` does the same for our own
-  threads; `tests/fixtures/proctid.c`), and a registry
+  threads; `tests/arm64chroot/fixtures/proctid.c`), and a registry
   lookup that comes up dry — the entry is mid-rewrite, or its process raced
   away — yields an empty file, or `ENOENT` for `exe`/`cwd`, as the kernel does
   for a process whose data is gone. Falling through on either would hand the
@@ -2005,7 +2005,7 @@ then make the consequences the caller depends on true:
   they are refused with `EACCES` — the same refusal a host running yama
   `ptrace_scope=1` already gives between siblings. A guest **zombie** — exited,
   not yet reaped, which the registry keeps until its reaper's wait
-  (`docs/signals-and-processes.md`, *Target containment*) — is listed and
+  (`docs/arm64chroot/signals-and-processes.md`, *Target containment*) — is listed and
   answered as a kernel answers one: no `cmdline`, no address space (empty
   `maps`/`smaps`/`numa_maps`, zero sizes, `smaps_rollup` `ESRCH`), `environ`
   and `auxv` root's alone, `mounts` `EINVAL`, its `exe`/`cwd`/`root` `ENOENT`
@@ -2023,7 +2023,7 @@ then make the consequences the caller depends on true:
   outside the caller's pid namespace — which the top-level guest's parent
   (whatever started the emulator) and the host init or subreaper an orphan
   is reparented to are not; the raw host pid used to come back
-  (`tests/fixtures/hostprobe.c`). The process group and session ids stay the
+  (`tests/arm64chroot/fixtures/hostprobe.c`). The process group and session ids stay the
   host's (`pid_visible`): those the guest hands back to `setpgid` and
   `tcsetpgrp`, so job control needs them real. The ids the **kernel
   reports** to the guest are held to the same view (`proctab_pid_view`): the
@@ -2035,17 +2035,17 @@ then make the consequences the caller depends on true:
   shown with pid 0, an OFD lock's `-1` stands, and the numbering keeps the
   gaps the kernel's iterator leaves. A host process holding a lock on a
   shared file used to be named by both faces, with nothing else about it
-  visible (`tests/fixtures/lockspid.c`, with `tests/hostlock.c` as the holder
+  visible (`tests/arm64chroot/fixtures/lockspid.c`, with `tests/arm64chroot/hostlock.c` as the holder
   on the host side). Limits: beyond the registry cap extra guest processes
   fall back to the emulator cmdline and are hidden, and `stat`/`status`
   memory/state fields still describe the emulator process.
 
-## System V IPC (`src/sys_ipc.c`)
+## System V IPC (`src/arm64chroot/sys_ipc.c`)
 
 `shmget`/`shmat`/`shmdt`/`shmctl`, `semget`/`semop`/`semtimedop`/`semctl` and
 `msgget`/`msgsnd`/`msgrcv`/`msgctl` are emulated **without** the host's SysV
 IPC syscalls (SELinux/seccomp deny them on Android) and without `/dev/shm`. The
-unified IPC broker — an extension of the proctab broker (`src/proctab.c`) — is
+unified IPC broker — an extension of the proctab broker (`src/arm64chroot/proctab.c`) — is
 the authoritative registry: a detached per-rootfs (or, without `--shared-proc`,
 per-invocation) daemon owns every shm segment's backing (handed to attachers
 over `SCM_RIGHTS`) and all semaphore/message-queue state.
@@ -2105,7 +2105,7 @@ index (and aggregate page total), and `SHM_STAT` maps an index to a segment, so
 `ipcs -m` lists the guest's segments (not the host's). Note that with an isolated
 per-invocation namespace, the segment ids and totals are the guest's own.
 `SHM_LOCK`/`SHM_UNLOCK` are `shmctl_do_lock`'s, charged to the locker's user
-against its `RLIMIT_MEMLOCK` (`docs/memory.md`, *Locked memory*); they used to
+against its `RLIMIT_MEMLOCK` (`docs/arm64chroot/memory.md`, *Locked memory*); they used to
 be `EINVAL`.
 
 Related: `mmap(MAP_SHARED | MAP_ANONYMOUS)` is backed the same way — an anonymous
@@ -2266,13 +2266,13 @@ write-sealed memfd mapped writable — and the respawn that found it was made
 from under `mmap`'s `as_lock`, a fork the fork barrier aborts on. An exchange
 made under an emulator lock now never spawns (`shm_connect`): the daemon it
 finds missing is one that was killed, and it fails as against any daemon that
-is gone. `tests/fixtures/memfd_idle.c` sleeps past the grace and asks again.
+is gone. `tests/arm64chroot/fixtures/memfd_idle.c` sleeps past the grace and asks again.
 `ARM64CHROOT_MEMFD_FORCE_FILE=1` forces the file tier on
-any host; `tests/c/memfd_seals.c` runs the whole matrix against the qemu
+any host; `tests/arm64chroot/c/memfd_seals.c` runs the whole matrix against the qemu
 oracle both ways, and run_tests.sh re-runs the memfd tests through the tier
 (`(memfd-tier)` rows). `MFD_HUGETLB` is refused (`EINVAL`) on the tier —
 there is nothing to build a hugetlb mapping from on such a host. The two tiers
-compose, and `tests/fixtures/ownfdexec.c` is run over the cross product: the
+compose, and `tests/arm64chroot/fixtures/ownfdexec.c` is run over the cross product: the
 descriptor fallback for a re-open has to recognise a tier memfd's backing file
 where it recognised `"/memfd:…"`, and build its sealed snapshot from another
 one — with the seals in the registry, since the host will not refuse a write to
@@ -2296,7 +2296,7 @@ on a system with no AArch32 at EL0 — and this one runs A64 alone.
 |---|---|
 | `UNAME26` | `uname`'s release reads `2.6.61-arm64chroot` (`override_release`: `2.6.<60 + patchlevel>` and the rest of the real string) |
 | `READ_IMPLIES_EXEC` | a readable mapping is executable: `mmap`, `mprotect`, the heap `brk` grows (`VM_DATA_DEFAULT_FLAGS`), `shmat`. There is no noexec mount here to be the kernel's exception |
-| `STICKY_TIMEOUTS` | `ppoll`/`pselect6` leave the caller's timeout as given, and a stop and continue during the wait is `EINTR` rather than a restart (`poll_select_finish`). The write-back is the emulator's; the restart is the host kernel's to refuse across a host stop, so this one bit is carried on the host thread's own personality — none of the rest could be: `READ_IMPLIES_EXEC` there would make the emulator's own mappings executable, which Android's SELinux denies — and the emulator's to refuse across a stop of its own, a tracee's (`sc_restart_nohandler`; `tests/ptrace/stickystop.c`) |
+| `STICKY_TIMEOUTS` | `ppoll`/`pselect6` leave the caller's timeout as given, and a stop and continue during the wait is `EINTR` rather than a restart (`poll_select_finish`). The write-back is the emulator's; the restart is the host kernel's to refuse across a host stop, so this one bit is carried on the host thread's own personality — none of the rest could be: `READ_IMPLIES_EXEC` there would make the emulator's own mappings executable, which Android's SELinux denies — and the emulator's to refuse across a stop of its own, a tracee's (`sc_restart_nohandler`; `tests/arm64chroot/ptrace/stickystop.c`) |
 | `MMAP_PAGE_ZERO` | the next exec maps page zero read+exec, where `vm.mmap_min_addr` allows a mapping there at all (it never does on a stock kernel) |
 | `ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT` | nothing to change: the guest layout is never randomized, and mappings are placed bottom-up |
 
@@ -2318,14 +2318,14 @@ a refusal there is left for the guest to meet on the host file.
 
 This used to be one static word shared by every thread of a process, consulted
 by nothing and kept whole across `execve`
-(`tests/c/personality.c` against the oracle for the per-thread, inheritance,
-exec, `/proc` and `STICKY_TIMEOUTS` rows; `tests/fixtures/personality.c` for the
+(`tests/arm64chroot/c/personality.c` against the oracle for the per-thread, inheritance,
+exec, `/proc` and `STICKY_TIMEOUTS` rows; `tests/arm64chroot/fixtures/personality.c` for the
 rest, which qemu-user hands to its host kernel and does not apply to the
 guest).
 
 ## `execve`
 
-`do_execve` (`src/sys_proc.c`) resolves the target through `path.c`, checks that
+`do_execve` (`src/arm64chroot/sys_proc.c`) resolves the target through `path.c`, checks that
 the guest may **execute** it, handles a `#!` shebang loop (depth 4, rebuilding
 argv), and for an ELF64/AArch64 file performs an **in-process reload**: tear down
 the address space, close CLOEXEC fds, reset signal handlers, and `load_elf`.
@@ -2342,7 +2342,7 @@ Trailing blanks come off the line, the argument is everything after the first
 blank run (blanks included), an embedded NUL ends it as it ends any C string,
 and a name that comes out empty (`#!` alone, or with blanks) is `EACCES`, not
 `ENOENT` — a kernel-side lookup of `""` lands on the working directory, and a
-directory is no executable (`tests/fixtures/shebang.c`).
+directory is no executable (`tests/arm64chroot/fixtures/shebang.c`).
 
 **The image is opened once** (`exec_open_pinned`, `elf.c`), in the resolution
 loop, and every question after that is asked of *that descriptor*: the file
@@ -2393,7 +2393,7 @@ in the syscall entry point as they used to be, the `E2BIG` of a long list and
 the `EFAULT` of an argv the guest could not back came back for a file that was
 missing or unrunnable, where a kernel answers for the file; measured after the
 format was judged, that same `E2BIG` lost to `ENOEXEC`.
-`tests/fixtures/execorder.c` pins the whole sequence.
+`tests/arm64chroot/fixtures/execorder.c` pins the whole sequence.
 
 Within the vectors the order is the kernel's too, and it decides the answer
 whenever a list has more than one thing wrong with it. `count()` walks argv's
@@ -2407,11 +2407,11 @@ So an unreadable envp array is `EFAULT` however far argv overruns, an overrun
 in envp is `E2BIG` ahead of an unreadable argv string, and within a vector the
 later entry answers first. `exec_vecs_import` follows that sequence; it used to
 import argv whole and then envp whole, each first to last, and every one of
-those precedences came back reversed (`tests/fixtures/execvecorder.c`, measured
+those precedences came back reversed (`tests/arm64chroot/fixtures/execvecorder.c`, measured
 against a kernel).
 
 The shared budget is also what bounds the emulator's staging.
-`exec_arg_room` (`src/elf.c`) is exactly what the strings may add up to once
+`exec_arg_room` (`src/arm64chroot/elf.c`) is exactly what the strings may add up to once
 the pointer table is set aside, the import holds the running total to it
 string by string, and nothing past the point a kernel refuses is ever copied.
 Each vector is **packed** — its pointer table and its strings in a single
@@ -2446,7 +2446,7 @@ uutils' coreutils takes its utility from `argv[0]` only when
 `basename(AT_EXECFN) == basename(argv[0])`, and otherwise from `AT_EXECFN`, so
 every name of its multicall binary (Ubuntu 26.04's `/usr/bin/ls`, a symlink to a
 hardlink of `coreutils`) answered "Security violation: Requested utility …"
-(`tests/fixtures/execfn.c`).
+(`tests/arm64chroot/fixtures/execfn.c`).
 
 The **argument budget** is measured there too, and for the same reason. A
 kernel sizes it in `bprm_stack_limits`, before it reaches a binary handler at
@@ -2484,7 +2484,7 @@ while this writes strings and vector into one mapping that has to hold both.
 `exec_arg_room` folds this test into the same running bound, so a list the
 stack cannot hold is refused at the string where the growth would have
 failed, in the order above.
-`tests/fixtures/execarglimit.c` pins every boundary, and prints the same lines
+`tests/arm64chroot/fixtures/execarglimit.c` pins every boundary, and prints the same lines
 when it is built for the host and run on a real kernel.
 
 Everything else the loader can refuse is refused there too, by `elf_probe`
@@ -2536,9 +2536,9 @@ own limit can recurse into the room it was granted, and one that lowers it
 stops growing there. The vectors `create_elf_tables` writes below the
 strings grow it like any other store, and a stack that cannot grow to hold
 them — an `RLIMIT_AS` with no room left — is that function's `EFAULT`, which
-past the point of no return is death by `SIGSEGV`. `tests/fixtures/stackrlimit.c`
+past the point of no return is death by `SIGSEGV`. `tests/arm64chroot/fixtures/stackrlimit.c`
 checks the depth a new image reaches at every limit, within one frame of a
-kernel, and `tests/fixtures/growsdown.c` the size it starts at and a limit
+kernel, and `tests/arm64chroot/fixtures/growsdown.c` the size it starts at and a limit
 changed after the exec (`qemu-user` is no oracle here: it sizes the guest stack
 from its own `-s` option).
 
@@ -2547,7 +2547,7 @@ GCC marks a program whose nested functions put trampolines on the stack), as
 `setup_arg_pages` makes it, and never otherwise: the interpreter's is not
 consulted, and arm64's default is executable only under `READ_IMPLIES_EXEC`,
 which every exec clears. The loader used to ignore the header, so a call
-through such a trampoline faulted (`tests/c/execstack.c`). Being
+through such a trampoline faulted (`tests/arm64chroot/c/execstack.c`). Being
 `VM_GROWSDOWN` is also what `mprotect(PROT_GROWSDOWN)` names when glibc makes
 the stack executable later, for a library that needs it (see
 [memory.md](memory.md)).
@@ -2623,7 +2623,7 @@ stopped at the entry of is never made, a signal it was stopped delivering is not
 delivered, and the tracer hears of the thread the way the kernel's tracer does,
 as an exit with status 0 — or, for the main thread, not at all: it takes over
 the image, the kernel's old leader is released unreported, and the exec stop
-is the exec'ing thread's, under the pid (`tests/ptrace/execstopped.c`). What is left is a host call
+is the exec'ing thread's, under the pid (`tests/arm64chroot/ptrace/execstopped.c`). What is left is a host call
 nothing interrupts, which the kernel waits for as well; after 5 s the wait says
 once on stderr which guest threads it is still waiting for, and goes on waiting.
 Two waits of the emulator's own that swallowed the kick's `EINTR` were fixed for
@@ -2647,7 +2647,7 @@ siginfo tells apart), and the whole pending set of an exec'ing thread that is
 not the main one — its ring and what the host holds for it blocked — since the
 kernel's exec'ing thread becomes the leader and keeps its own. The main thread,
 for its part, drops what was sent to *it* (`sig_leader_takeover`): that was
-sent to the old leader, which the kernel kills (`tests/fixtures/execsigs.c`).
+sent to the old leader, which the kernel kills (`tests/arm64chroot/fixtures/execsigs.c`).
 The ENOSYS path it replaced also lost those signals: an exec'ing thread's ring
 went with it.
 
@@ -2705,13 +2705,13 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   `/proc` — takes the set out whole (`cred_get`) and judges the copy. Field by
   field it was neither: `setreuid` wrote the whole struct back over a sibling's
   `setfsgid`, and a `getresuid` could return a triple no setter ever wrote
-  (`tests/fixtures/credrace.c`).
+  (`tests/arm64chroot/fixtures/credrace.c`).
 - **setuid/setgid bit on exec**: `do_execve` reads the file's mode; `S_ISUID`
   sets `euid/suid/fsuid` to the file owner's *remapped* id, `S_ISGID` the group
   — but only with group execute beside it (`S_ISGID` alone is the old
   mandatory-locking mark, which `bprm_fill_uid` does not treat as setgid), and
   neither once the process has set `no_new_privs`. `AT_SECURE` follows a real
-  transition (`euid != ruid`) (`tests/fixtures/setidexec.c`). The raise is applied
+  transition (`euid != ruid`) (`tests/arm64chroot/fixtures/setidexec.c`). The raise is applied
   past the point of no return, where a kernel's `commit_creds` runs: the one
   refusal still ahead of it (`de_thread`) returns to the *old* image, which must
   not go on running with privilege it never exec'd into.
@@ -2730,7 +2730,7 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   it stands for, and any credentials received (including the ones `SO_PASSCRED`
   makes the kernel attach) come back through the remap. A third party's ids
   stay the host's refusal — a fake root has `CAP_SETUID` in its own eyes and
-  the host has not (`tests/fixtures/fakecred.c`). The **pid** in both is held
+  the host has not (`tests/arm64chroot/fixtures/fakecred.c`). The **pid** in both is held
   to the hidden-process view whether or not `--fake-id` is on
   (`proctab_pid_view`): the peer's number when it names a guest task, 0 for a
   host process — `pid_vnr`'s answer for a peer outside the caller's pid
@@ -2739,7 +2739,7 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   its peer's pid, so a guest client that exited before the server asked is
   still named, as on a kernel. Each field is translated on its own, since
   the kernel hands out as much of the struct as was asked for
-  (`tests/fixtures/peerpid.c`, with `tests/hostsock.c` as the peer on the
+  (`tests/arm64chroot/fixtures/peerpid.c`, with `tests/arm64chroot/hostsock.c` as the peer on the
   host side).
 - **`/proc/<pid>/status`** (`sys_procfs.c`): the `Uid:`/`Gid:`/`Groups:` lines
   of the host file carry the real invoking uid, but `ps`/`top` read them (not
@@ -2764,7 +2764,7 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   model cannot know — whether the file is there at all, and the refusals that
   are not about ownership (`EROFS`, `ELOOP`, `ENAMETOOLONG`); a plain `EACCES`
   or `EPERM` from it is an answer about the wrong identity and is discarded.
-  (`tests/fixtures/fakeidacc.c`.)
+  (`tests/arm64chroot/fixtures/fakeidacc.c`.)
 - **Fail-soft `chown`/`chmod`**, plus
   `capget` reporting the full capability set for fake-root — its header protocol
   is answered too: an unrecognised version is written back as the preferred one

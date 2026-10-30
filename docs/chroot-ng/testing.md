@@ -1,10 +1,10 @@
 # chroot-ng test harness
 
 ```sh
-make test          # or: sh tests/run.sh
+make test-chroot-ng          # or: sh tests/chroot-ng/run.sh (after make chroot-ng arm64chroot)
 ```
 
-The suite runs on three hosts. `tests/lib.sh` resolves every difference between
+The suite runs on three hosts. `tests/chroot-ng/lib.sh` resolves every difference between
 them at startup and prints what it found; the milestone scripts (`m*.sh`) assert
 against that rather than against a hardcoded devbox.
 
@@ -52,7 +52,7 @@ expected failure:
   and gid setters are refused too (all but `setresuid`), and
   answered from the real ids as the kernel would answer an app's process (m9;
   `CHROOTNG_SETID_DENY=1` takes them as refused anywhere, and
-  `tests/guests/ambtrap.c` installs such a filter where seccomp is live).
+  `tests/chroot-ng/guests/ambtrap.c` installs such a filter where seccomp is live).
 * **SELinux hides or refuses what a kernel would allow**: hardlinks (`ln` is
   `EACCES`, so the l2s fallback is what runs), `stat` and `open` of
   `/proc/{loadavg,uptime,stat,version}` and `/proc/sys/kernel/overflow{u,g}id`
@@ -104,7 +104,7 @@ expected failure:
   SELinux refuses `accept` on a netlink socket before the family answers it.
   Termux ships `<sys/sem.h>` in a package of its own
   (`libandroid-sysv-semaphore`) and `libandroid-shmem` turns the shm calls
-  into macros for an in-process emulation; `tests/guests/sysvipc.h` builds
+  into macros for an in-process emulation; `tests/chroot-ng/guests/sysvipc.h` builds
   the SysV guests on raw syscalls either way.
 
 ## Environment knobs
@@ -113,13 +113,13 @@ expected failure:
 |---|---|
 | `CHROOTNG_BIN` | binary under test (default `build/chroot-ng`) |
 | `CHROOTNG_QEMU` | emulator command. Unset = auto-detect (none on an AArch64 host). Set **empty** to force direct execution on a cross host that runs AArch64 binaries another way (a `binfmt_misc` handler) |
-| `CHROOTNG_GUESTCC` | compiler for `tests/guests/*.c`. Unset = probe a candidate list |
+| `CHROOTNG_GUESTCC` | compiler for `tests/chroot-ng/guests/*.c`. Unset = probe a candidate list |
 | `CHROOTNG_GUESTLD` | link mode for those guests: `-static-pie`, `-static`, or empty for dynamic. Unset = try each in that order and keep the first that both links an AArch64 binary and runs here |
 | `CHROOTNG_GUEST_BINDS` | extra `-b SRC:DST` args a dynamic guest needs to find its ELF interpreter inside a synthetic rootfs. Auto-derived (`/system`, `/apex`, `/linkerconfig`, …) when the guest is not static |
-| `CHROOTNG_ROOTFS_DIR` | where the `alpine/` and `debian/` rootfs images are provisioned (default `tests/.cache/rootfs`) |
+| `CHROOTNG_ROOTFS_DIR` | where the `alpine/` and `debian/` rootfs images are provisioned (default `build/cache/chroot-ng/rootfs`) |
 | `CHROOTNG_ROOTFS_FETCH` | `0` = never download a rootfs tarball; one already in `$CHROOTNG_ROOTFS_DIR/downloads/` is still unpacked |
 | `CHROOTNG_ALPINE`, `CHROOTNG_DEBIAN` | individual rootfs paths, used as they are instead of provisioning one |
-| `CHROOTNG_ORACLE` | `arm64chroot` binary for M10's real-hardlink differential. Unset = `../arm64emu-user/arm64chroot` (the monorepo sibling; `make -C ../arm64emu-user arm64chroot`), else `../arm64chroot/arm64chroot` beside a standalone checkout. Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
+| `CHROOTNG_ORACLE` | `arm64chroot` binary for M10's real-hardlink differential. Unset = `build/arm64chroot`, which `make test-chroot-ng` builds first (a bare `sh tests/chroot-ng/run.sh` uses it only if present). Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
 | `CHROOTNG_SYSROOT` | sysroot holding the AArch64 ELF interpreter for M4 (cross host default `/usr/aarch64-linux-gnu`; empty on an AArch64 host, where it is on the system paths) |
 
 `cng_dyn_binds` sets `GUEST_DYN_BINDS`, the same list for a guest that is
@@ -128,7 +128,7 @@ since the noexec `.so` path only exists for a guest whose own `ld.so` maps
 libraries.
 
 The suite provisions its rootfs images itself, under `$CHROOTNG_ROOTFS_DIR`. Each one
-is a pinned tarball (`cng_rootfs_pin` in `tests/lib.sh`) that is downloaded
+is a pinned tarball (`cng_rootfs_pin` in `tests/chroot-ng/lib.sh`) that is downloaded
 once into `downloads/`, checked against its sha256, and unpacked under its own
 name:
 
@@ -148,7 +148,7 @@ hosted Linux AArch64 runner) caches `downloads/` between runs.
 
 ## Adding a milestone script
 
-Source-level contract for a new `tests/mNN_*.sh`:
+Source-level contract for a new `tests/chroot-ng/mNN_*.sh`:
 
 - `run` / `run_t SECS` — invoke chroot-ng; `emu` / `emu_t SECS` — invoke any
   other AArch64 program. Never spell `$CHROOTNG_QEMU` or `build/chroot-ng` directly.

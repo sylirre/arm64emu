@@ -7,17 +7,17 @@ per-instruction debug flag) `--jit` prints a notice and the interpreter runs
 instead. Everything below describes the 64-bit backends unless it says
 otherwise; what an ILP32 host does differently is its own section at the end. The interpreter stays the source of truth: anything the translator
 does not handle natively is executed by calling `exec_a64`, and the whole
-differential test suite must pass with `--jit` on (`make test-jit`).
+differential test suite must pass with `--jit` on (`make test-arm64chroot-jit`).
 
-The core (`src/core/`) is a diffable copy of the sibling system emulator and is
-**not** touched. The JIT lives entirely in `src/jit/` plus a handful of small
+The core (`src/arm64chroot/core/`) is a diffable copy of the sibling system emulator and is
+**not** touched. The JIT lives entirely in `src/arm64chroot/jit/` plus a handful of small
 hooks in the editable files (run-loop rung, option parsing, mm invalidation
 hooks, the signal catcher, thread/fork lifecycle).
 
 ## What you get
 
 Measured on an x86-64 host with small static AArch64 kernels
-(`tests/bench/`), wall-clock vs. the interpreter:
+(`tests/arm64chroot/bench/`), wall-clock vs. the interpreter:
 
 | kernel   | speedup | notes                                       |
 |----------|---------|---------------------------------------------|
@@ -32,7 +32,7 @@ Real workloads land near the top of that range once translation warms up:
 `gzip` and `find` over a Debian rootfs retire **99.9%+ of their instructions
 natively** (`ARM64CHROOT_JIT_STATS`, below).
 
-Run `tests/bench/run_bench.sh ./arm64chroot` to reproduce (also times
+Run `tests/arm64chroot/bench/run_bench.sh build/arm64chroot` to reproduce (also times
 `qemu-aarch64` for scale). `ARM64CHROOT_JIT_MB=N` sets the per-thread code-cache
 size (default 32, max 128).
 
@@ -40,7 +40,7 @@ size (default 32, max 128).
 
 **Pipeline.** For each guest basic block, on first execution:
 `mem_ifetch` → `pd_fill` (the predecode classifier, reused as the JIT's
-decoder) → a small linear IR (`src/jit/ir.h`) → one backward liveness pass
+decoder) → a small linear IR (`src/arm64chroot/jit/ir.h`) → one backward liveness pass
 (dead-flag elimination, producer/consumer flag fusion) → single-pass emission
 with greedy per-block register allocation (`backend_x86_64.c` /
 `backend_a64.c`). Anything the frontend does not recognize becomes a call to
@@ -140,7 +140,7 @@ across the four forms, which defeats `-ffp-contract`). FP **arithmetic** is
 therefore *NaN-gated*: the inline code computes the result, and a NaN result
 discards it and re-runs the instruction in the interpreter — every non-NaN
 result is order-independent IEEE arithmetic and stays inline. The gate makes
-the equivalence robust against toolchain changes; `tests/run_consist.sh`
+the equivalence robust against toolchain changes; `tests/arm64chroot/run_consist.sh`
 (random bit patterns through every inline FP class, jit vs. interpreter on
 the same host) enforces it on both backends.
 
@@ -181,7 +181,7 @@ it a second time — it retires once and counts twice. `vop_self_counted()`
 it takes the instruction word rather than just the class because `VC_F1` is
 only partly gated: FSQRT is (a negative operand is an invalid operation and
 the host's DefaultNaN has the wrong sign), FMOV/FABS/FNEG are pure sign-bit
-ops that never need the interpreter. `tests/fixtures/icount_gate.S` pins it,
+ops that never need the interpreter. `tests/arm64chroot/fixtures/icount_gate.S` pins it,
 built twice from one source so the only difference is whether the gate fires.
 
 Inlined per a per-host fidelity table (`be_vop_ok`):
@@ -289,7 +289,7 @@ call-out) and returns to the loop if the answer is yes. A signal caught while
 the thread was in the emulator's own code, after the loop's delivery point had
 looked, used to be cleared away with the flag, and a thread spinning in a block
 chained to itself then went on spinning until some other signal arrived
-(`tests/c/sigpaced.c`).
+(`tests/arm64chroot/c/sigpaced.c`).
 
 **Self-modifying / remapped code.** The guest must execute `IC IVAU` before
 running written code (this CPU advertises `CTR_EL0.{DIC,IDC}=0`), so the JIT
@@ -306,7 +306,7 @@ the file's own code for a patched private file mapping — and a kernel owes
 the guest coherence for that with no `IC IVAU` on its part, the pages being
 faulted in afresh. Left out, a block translated from the discarded code went
 on running it where the interpreter took the zeroed page's SIGILL
-(`tests/fixtures/madvcode.c`). A global sticky "this page ever held code"
+(`tests/arm64chroot/fixtures/madvcode.c`). A global sticky "this page ever held code"
 bitmap decides whether other threads must be interrupted. Each thread drops its own affected blocks at
 a safepoint and re-syncs its D-TLB (generated fast paths skip the interpreter's
 per-access generation check — the retired-backing quarantine in `mem.c` keeps a
@@ -316,7 +316,7 @@ cache, and a range too wide to visit page-by-page (a large `munmap`) is dropped
 by walking the bounded block arena rather than flushing every translation — so a
 data-region unmap no longer evicts unrelated hot code. A page rewritten in a
 tight loop trips a **thrash guard** and is run purely interpreted, so a
-self-modifying loop cannot dominate the translator (e.g. `tests/c/smc.c` runs
+self-modifying loop cannot dominate the translator (e.g. `tests/arm64chroot/c/smc.c` runs
 at interpreter speed rather than retranslating every iteration).
 
 The code cache itself is a bump allocator with no partial eviction: an arena,
@@ -341,30 +341,29 @@ the same pages; the descriptor is closed as soon as both are mapped — guest fd
 neither works — `memfd_create` may itself be seccomp-blocked
 on old Android, which the process-lifetime SIGSYS net turns into `-ENOSYS` —
 `--jit` warns once and the interpreter runs. Any new raw syscall here is subject
-to the same Android Oreo allow-list audit as the rest of the tree; `make
-test-seccomp` gates it. On AArch64 hosts every emitted or patched range is
+to the same Android Oreo allow-list audit as the rest of the tree; `make test-arm64chroot-seccomp` gates it. On AArch64 hosts every emitted or patched range is
 flushed with `__builtin___clear_cache` (both views when dual-mapped).
 
 ## Testing
 
-- `make test-jit` first runs `tests/run_consist.sh` (random-input FP
+- `make test-arm64chroot-jit` first runs `tests/arm64chroot/run_consist.sh` (random-input FP
   consistency, jit vs. interpreter on the same host — the FP corner semantics
   are host-C by design and have no qemu oracle), then the entire differential
   suite (bit-exact vs. `qemu-aarch64`) with `--jit` on — the same wrapper
-  trick as `make test-seccomp`. `tests/asm/round3.S` and `tests/asm/round4.S`
+  trick as `make test-arm64chroot-seccomp`. `tests/arm64chroot/asm/round3.S` and `tests/arm64chroot/asm/round4.S`
   are the targeted vectors for everything inlined in rounds 3–4 (addressing
   forms, bitfields, DC ZVA, LSE min/max, the vector classes, scalar SIMD,
   the ADC/SBC family through every x86 flag state, and fused-run page
-  straddles). `tests/fpconsist.c` additionally exercises cached-operand
+  straddles). `tests/arm64chroot/fpconsist.c` additionally exercises cached-operand
   NaN-gated FMLA.
-- `make test32-jit` is the same pair for the ILP32-host build (`arm64chroot32`).
+- `make test-arm64chroot32-jit` is the same pair for the ILP32-host build (`arm64chroot32`).
   It skips, naming the reason, where the host has no runnable 32-bit toolchain.
   Until a 32-bit code generator exists it still runs end to end and covers the
   other half of the `--jit` contract — the notice plus the interpreter takeover
   — which nothing else does, since both 64-bit hosts have a backend.
-- `make test` (interpreter) must stay green: the JIT only adds a run-loop rung
+- `make test-arm64chroot` (interpreter) must stay green: the JIT only adds a run-loop rung
   and leaves the default path untouched.
-- AArch64-host coverage means running `make test-jit` on an AArch64 machine —
+- AArch64-host coverage means running `make test-arm64chroot-jit` on an AArch64 machine —
   that is the only configuration in which `backend_a64.c` is compiled in and
   therefore the only one that executes it (CI job `build + test (aarch64
   host)`). There, guest programs are built by the system `cc` and the
@@ -410,7 +409,7 @@ Debug/bisection knobs (all off by default):
 
 ## 32-bit hosts (i686 / ARM32)
 
-Both have backends: `backend_x86_32.c` and `backend_arm32.c`. `make test32-jit`
+Both have backends: `backend_x86_32.c` and `backend_arm32.c`. `make test-arm64chroot32-jit`
 is the gate for either — the whole differential suite against the oracle, on the
 ILP32 build, with `--jit` on.
 
@@ -554,7 +553,7 @@ timing difference was drift. A 64-bit producer also declines whenever the
 condition reads Z, since the host's ZF describes the high word alone — which is
 most compares. The eager recipe stands.
 
-**Measured payoff** (`tests/bench/run_bench.sh ./arm64chroot32`), i686 JIT vs
+**Measured payoff** (`tests/arm64chroot/bench/run_bench.sh build/arm64chroot32`), i686 JIT vs
 the i686 interpreter:
 
 | kernel   | speedup | |
@@ -626,12 +625,12 @@ makes chaining simpler than on x86: the patch site is one instruction, so
 `JBlock::stub_word0` restores it verbatim.
 
 **Testing.** No CI can execute it — the AArch64 runners do not implement AArch32
-at EL0 — so its gate is `make test32-jit` pointed at an armhf toolchain, plus a
+at EL0 — so its gate is `make test-arm64chroot32-jit` pointed at an armhf toolchain, plus a
 real armv7 device. On an x86-64 development host that gate runs through
 binfmt/`qemu-arm`:
 
 ```sh
-make M32CC=arm-linux-gnueabihf-gcc "M32FLAGS=-static" test32-jit
+make ARM64CHROOT_M32CC=arm-linux-gnueabihf-gcc "ARM64CHROOT_M32FLAGS=-static" test-arm64chroot32-jit
 ```
 
 Build it **static**, and not for tidiness: `QEMU_LD_PREFIX` is contended. The
@@ -688,7 +687,7 @@ The `procview:` and `shared-proc:` rows were in that list too, blamed on a
 that read *its own* `/proc/<pid>/stat` got qemu's synthesized answer rather than
 the kernel's, so the starttime it registered as its identity token was one no
 other process could reproduce, and the PID registry declared a live process
-stale — see the `proc_starttime` comment in `src/proctab.c`. `other-pid cmdline`
+stale — see the `proc_starttime` comment in `src/arm64chroot/proctab.c`. `other-pid cmdline`
 failed 30/30 before the fix and 0/30 after.
 
 Four separate emulator bugs, then, no other tier in the tree could see, all of
@@ -740,10 +739,10 @@ reproducible in a few lines that never touch the emulator:
 | an ioctl with an unreadable argument on a file that does not take the command | `EFAULT`: it locks the argument before asking | `ENOTTY` (or `EBADF`) ahead of reading it |
 | starting a program where `vm.mmap_min_addr` reads 0 (a sandbox's bind mount) | "Unable to find a guest_base": it reserves its guest's space from address 0 | starts it |
 
-`tests/c/mremapsem.c`, `tests/fixtures/mremapdup.c` (the guest's own
+`tests/arm64chroot/c/mremapsem.c`, `tests/arm64chroot/fixtures/mremapdup.c` (the guest's own
 `mremap(old_size=0)`, which the emulator serves by duplicating the host
-mapping the same way), `tests/fixtures/dontunmap.c` (whose shared rows are
-served the same way), `tests/c/socktimeo.c`, `tests/ptrace/wait_rusage.c`,
+mapping the same way), `tests/arm64chroot/fixtures/dontunmap.c` (whose shared rows are
+served the same way), `tests/arm64chroot/c/socktimeo.c`, `tests/arm64chroot/ptrace/wait_rusage.c`,
 `timers_many`, `sockfilter_get`, `prctlset`, `scmfit`, `madvremove`, `sigpoll`, `pselectwide`, `termios2`, `ioctlorder` and the
 real-socket tier of `netns_ack` (its bad-tail send) declare what they need with a `NEEDS-HOST-SYSCALL:` marker; `personality`'s
 `mmap_min_addr` 0 row starts a program built the way the emulator is in its
@@ -755,7 +754,7 @@ direct-I/O rows running alone. `hostenv.sh`
 answers it by **building and running a probe the way the emulator itself was
 built** — same compiler, same ABI flags, so the same interpreter picks it up.
 The question is what the emulator's own process can do, not what this machine
-can do, and only a probe built that way asks it (`test32`/`test32-jit` pass
+can do, and only a probe built that way asks it (`test-arm64chroot32`/`test-arm64chroot32-jit` pass
 `M32CC` down for exactly this). On an ordinary host, and on real armv7 silicon,
 every probe passes and every gated row runs in full; under `qemu-arm` they
 skip naming the missing capability, so the zero-failure gate keeps its meaning

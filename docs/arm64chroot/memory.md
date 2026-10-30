@@ -1,6 +1,6 @@
 # Guest memory & the memory model
 
-Files: `src/mmu.h` (interface + fetch fast path), `src/mem.c` (implementation).
+Files: `src/arm64chroot/mmu.h` (interface + fetch fast path), `src/arm64chroot/mem.c` (implementation).
 
 ## Design constraint
 
@@ -44,7 +44,7 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
   node's `/proc/self/maps` ran to ten thousand lines where a kernel shows a
   hundred — and every `mmap`/`munmap`/`brk` walked that list several times over
   (twenty thousand `mmap`/`munmap` pairs took thirty times longer in a 40 MB
-  image than in a small one; `tests/fixtures/regionmerge.c`). Its bookkeeping
+  image than in a small one; `tests/arm64chroot/fixtures/regionmerge.c`). Its bookkeeping
   fails **loudly**: the region array's `realloc`, an
   L2 table's `calloc`, the `HostMap` record and a region's path label all end
   the process rather than continue with a hole in the address space's own
@@ -123,7 +123,7 @@ buffer went through with the ABI off — and refused where the kernel ignores it
 taken for part of an `munmap`'s address. And a read into no user memory at all
 — a kernel-half pointer — reached the host as a fault at address 0, which the
 host takes for a user address: it waited on an empty pipe before it failed
-(`tests/fixtures/tagged.c`).
+(`tests/arm64chroot/fixtures/tagged.c`).
 
 ## Mapping operations
 
@@ -163,7 +163,7 @@ afterwards, but the refusals are the guest's — `EINVAL` for a mapping without
 the permission asked, `EFAULT` for a file page past end-of-file, `ENOMEM` for a
 hole), and the rest are hints about paging and dumping that a kernel is free
 to ignore and that are ignored here. `MADV_REMOVE` and the two populates used
-to be among the ignored (`tests/fixtures/madvremove.c`). Two groups are deliberately absent: `MADV_HWPOISON` /
+to be among the ignored (`tests/arm64chroot/fixtures/madvremove.c`). Two groups are deliberately absent: `MADV_HWPOISON` /
 `MADV_SOFT_OFFLINE` need `CONFIG_MEMORY_FAILURE`, which this kernel does not
 offer, and `MADV_GUARD_INSTALL` / `MADV_GUARD_REMOVE` are 6.13. Neither pair is
 a hint — one poisons a page, the other installs a faulting guard PTE — so
@@ -172,7 +172,7 @@ where `EINVAL` tells it plainly that this kernel has no such thing. Answering
 `0` to *every* unknown advice, which is what this did before, turned every
 guest feature probe into a false "supported". The third argument is an `int`,
 so the high half of the register carries no advice: `0x1_0000_0004` is
-`MADV_DONTNEED`. `tests/fixtures/madvadvice.c` covers the lot.
+`MADV_DONTNEED`. `tests/arm64chroot/fixtures/madvadvice.c` covers the lot.
 
 The discard itself has to match the kernel's zero-on-reuse guarantee, not
 merely free memory: Go's page allocator treats a scavenged span as
@@ -185,7 +185,7 @@ sized, since a bigger one would take neighbouring guest pages with it. Either
 way the discard is then published to the JIT like a mapping change
 (`jit_invalidate_range`): the bytes under a translated block may just have
 become zeroes, or the file's own code again, and a kernel owes the guest that
-without any cache maintenance on its part (`docs/jit.md`).
+without any cache maintenance on its part (`docs/arm64chroot/jit.md`).
 
 The fork-inheritance advice is not a hint either: a kernel copies an address
 space vma by vma, leaving out one marked `VM_DONTCOPY` and handing the child an
@@ -203,13 +203,13 @@ one is zeroed — by discarding the host-page-aligned interior of its anonymous
 backing (`MADV_DONTNEED` on the host: a fresh zero page on the next touch, no
 copy-on-write broken now) and writing only the partial host pages at either end
 — and keeps its flag, as the kernel's does. A vfork child shares the parent's
-space and gets neither, here as there. `tests/fixtures/madvfork.c` holds every
+space and gets neither, here as there. `tests/arm64chroot/fixtures/madvfork.c` holds every
 row to a real kernel's answers.
 
 ### A vfork child's writes are tracked, and carried back
 
 A vfork child shares its parent's address space until it execs or exits, but
-here it runs on a fork copy (`docs/signals-and-processes.md`, *vfork*, has why
+here it runs on a fork copy (`docs/arm64chroot/signals-and-processes.md`, *vfork*, has why
 a host thread cannot stand in), so what it writes has to be carried back. The
 child's PTEs lose `PTE_W` over every private mapping before its first
 instruction (`as_vfork_track_begin`; a `MAP_SHARED` mapping is the same file
@@ -240,7 +240,7 @@ further lost what it wrote there. A fork child of a tracked process starts
 clean (`as_vfork_fork_child`) — the heal path still mends the PTEs it
 inherited, recording nothing — and a process applying its own vfork child's
 bytes while itself tracked records them first (`as_vfork_note_write`), so a
-grandchild's writes reach the grandparent. `tests/fixtures/vforkback.c`.
+grandchild's writes reach the grandparent. `tests/arm64chroot/fixtures/vforkback.c`.
 
 `msync` used to answer 0 to every call — no flag or range check, and no
 write-back, so a guest that asked for `MS_SYNC` durability was told it had it.
@@ -255,7 +255,7 @@ there is the `vfs_fsync_range` the kernel would issue for the vma — with the
 address-space lock dropped for the duration, as the kernel drops `mmap_lock`
 during the fsync. `MS_ASYNC` has been nothing but the walk since 2.6.19 and
 `MS_INVALIDATE` only refuses a locked mapping (`EBUSY`, the mappings before it
-synced), so neither reaches the host (`tests/c/msync.c`).
+synced), so neither reaches the host (`tests/arm64chroot/c/msync.c`).
 
 ### Locked memory: `mlock(2)` and its kin
 
@@ -319,7 +319,7 @@ than the guest's, can tip it over — gets the pages populated instead. A
 `SHM_LOCK`ed segment's pages are locked as they are faulted in, in the mappings
 of it this process holds when it locks it and attaches later
 (`Region.shm_lock`); another process's mapping of it made before the lock is
-that process's, and is not reached. `tests/fixtures/mlockvm.c` holds every
+that process's, and is not reached. `tests/arm64chroot/fixtures/mlockvm.c` holds every
 row, with the change each makes to `VmLck`, against a native kernel, and the
 rows a fake root's capability changes.
 
@@ -342,7 +342,7 @@ it — a 4 GiB + 4 KiB anonymous mapping became one page, and the guest's write 
 host cannot name with `ENOMEM`, which is both the honest answer and one every
 caller is allowed to give; on an LP64 host the test can never fire, and it is
 compiled in on both so the same code runs everywhere.
-`tests/fixtures/hugemap.c` covers it, and is deliberately host-independent:
+`tests/arm64chroot/fixtures/hugemap.c` covers it, and is deliberately host-independent:
 mapped-and-coherent and `ENOMEM` are both correct answers, so each row asserts
 only that what came back behaves like the mapping it claims to be.
 
@@ -421,13 +421,13 @@ Waiting for `as->nthreads` to fall to 1 was the earlier rule, and for anything
 multithreaded that meant *never*: a guest with two threads mapping and unmapping
 in a loop grew the emulator's address space by ~15 GB per second and a `fork`
 out of it eventually failed with `ENOMEM`, once the doubled private-anon commit
-charge passed RAM+swap. `tests/fixtures/forklock.c` is the regression test —
+charge passed RAM+swap. `tests/arm64chroot/fixtures/forklock.c` is the regression test —
 it churns from a sibling thread while forking, and used to need 15 GB where it
 now peaks under 500 MB.
 
 ### Backing lent to a host syscall is pinned
 
-A large read or write does not go through a bounce buffer (`docs/syscalls.md`,
+A large read or write does not go through a bounce buffer (`docs/arm64chroot/syscalls.md`,
 *where a transfer's bytes go*): the host syscall is handed the guest's own
 backing, as the runs of host memory under the guest's buffer (`guest_lend`,
 `mem.c`). That is only safe because of the **pin**. The quarantine above is
@@ -476,7 +476,7 @@ copy to the destination, and the source's discard to zeroes, are two steps a
 kernel's page-table move is not). Only a program racing its own `munmap` or
 `mremap` against its own `read` can tell, and it is the one case the design
 gives up.
-`tests/fixtures/xferlend.c` checks the part that matters: with a transfer
+`tests/arm64chroot/fixtures/xferlend.c` checks the part that matters: with a transfer
 parked in a buffer that is unmapped and reserved away, none of the memory mapped
 afterwards receives its bytes, and a mapping grown with a transfer in flight
 has them.
@@ -543,7 +543,7 @@ goes to it as the hole under a `MAP_GROWSDOWN` mapping of its own
 (`xfer_scratch`: an inaccessible floor that keeps no guard gap, the run's pages
 free, one page on top), which its kernel grows or refuses exactly as the
 guest's would grow the stack, and the stack grows if the scratch did
-(`tests/fixtures/odirect.c`, on a filesystem of each kind, held to the same
+(`tests/arm64chroot/fixtures/odirect.c`, on a filesystem of each kind, held to the same
 program built for the host and run natively over the same directory).
 
 **The backing has to be there to grow into.** A region's host backing is one
@@ -577,7 +577,7 @@ kernel out of memory answers too. Pages a `munmap` took off a stack's bottom
 keep their bytes in the allocation (backing is released whole), so growing back
 over them zeroes them first: a grown page is the zero page.
 `ARM64CHROOT_STACKGROW_FORCE_PIECE` reserves no room and never extends, putting every
-growth on that last tier; the suite runs `tests/fixtures/growsdown.c` and
+growth on that last tier; the suite runs `tests/arm64chroot/fixtures/growsdown.c` and
 `growsnomove.c` over it too.
 
 **Where a stack is placed.** A kernel's top-down layout gives a
@@ -598,13 +598,13 @@ all; layout decides that there, and the fixture does not ask it.)
 `[stack]` name in `/proc/<pid>/maps` stays the kernel's: the region holding the
 initial stack.
 
-`tests/fixtures/growsdown.c` takes every row from a native kernel: the initial
+`tests/arm64chroot/fixtures/growsdown.c` takes every row from a native kernel: the initial
 size, a limit raised and lowered after the exec, the guard gap against an
 accessible, a `PROT_NONE` and a growsdown mapping below, `RLIMIT_STACK` and
 `RLIMIT_AS`, a `read` into the hole and the transfers that move nothing there,
 a tracer's `PEEK` against
 `process_vm_readv`, `mincore`, a regrown page, the permission faults, a signal
-frame, a fork child's copy, and the accounting. `tests/fixtures/growsnomove.c`
+frame, a fork child's copy, and the accounting. `tests/arm64chroot/fixtures/growsnomove.c`
 has the rows a stack moved to grow could not give: another thread growing it,
 an atomic as its first touch, and one transfer the host makes into its pages
 and the hole below at once — and `mprotect(PROT_GROWSDOWN)` reaching through
@@ -634,10 +634,10 @@ refuses, so does this, with the `EINVAL` a kernel before 5.13 answers: a fresh
 private mapping of the file for the range left behind would need its
 descriptor, which nothing keeps (guest fd == host fd). The guest used to be told
 `EINVAL` for the flag itself, as a kernel before 5.7 was.
-`tests/fixtures/dontunmap.c` (qemu passes the call to its host with its own
+`tests/arm64chroot/fixtures/dontunmap.c` (qemu passes the call to its host with its own
 address bookkeeping and fails it) carries `NEEDS-HOST-SYSCALL:
 mremap-dontunmap-file` for the file row, so a host older than 5.13 skips it by
-name (`tests/hostenv.sh`), and `mremap-dup` for the shared rows, which
+name (`tests/arm64chroot/hostenv.sh`), and `mremap-dup` for the shared rows, which
 `qemu-arm` aborts on.
 
 ### The page table gives its second level back
@@ -673,11 +673,11 @@ from the SIGBUS handler and therefore counts the PTEs it clears but never calls
 `free` — an emptied table there is reclaimed by the next unmap that touches it,
 or at `as_destroy`.
 
-`tests/fixtures/vachurn.c` is the regression test, and it has to be measured
+`tests/arm64chroot/fixtures/vachurn.c` is the regression test, and it has to be measured
 from outside: the guest's own view of its memory is correct throughout, so
 nothing the guest can print would show this. The harness runs it twice with
 different mapping counts and compares the emulator's peak RSS
-(`tests/maxrss.c`, one `wait4`), which measures growth *per mapping* and
+(`tests/arm64chroot/maxrss.c`, one `wait4`), which measures growth *per mapping* and
 cancels every constant — the emulator's own footprint, the JIT cache, whatever
 the host libc reserves — so one threshold holds on a phone and a server alike.
 The regression it guards against showed as 28 MB across 900 extra mappings.
@@ -715,7 +715,7 @@ the churn test above meaningful.)
 The table is written under the task lock (`rlim_set`, `sys_misc.c` — where
 `do_prlimit` writes under `task_lock`), and `prlimit64` reads the old pair and
 installs the new one in the same critical section, so two calls racing cannot
-both be told the same "old" (`tests/c/rlimchain.c`: across 3200 calls from
+both be told the same "old" (`tests/arm64chroot/c/rlimchain.c`: across 3200 calls from
 eight threads every installed value is returned as the previous one exactly
 once). A single field is read without the lock, atomically, the way
 `task_rlimit` reads one — the address-space checks ask under `as_lock`, and on
@@ -795,7 +795,7 @@ footprint reads repeatedly and misses nothing between its own reads. A host
 that cannot answer `mincore` — a sandbox or a seccomp policy between the
 emulator and the kernel — falls back to the host file's own figures, bounded
 as below; `ARM64CHROOT_MINCORE_FORCE_FAIL=1` selects that tier anywhere, and the suite
-runs `tests/fixtures/vmreport.c` over both. One approximation is named rather
+runs `tests/arm64chroot/fixtures/vmreport.c` over both. One approximation is named rather
 than hidden:
 a System V shm attachment is backed by a memfd mapped like any other file, so
 its pages land in `RssFile` where a kernel would say `RssShmem` — `VmRSS` and
@@ -950,7 +950,7 @@ marked for it. arm64 has no `VM_GROWSUP`, so `PROT_GROWSUP` is `EINVAL` (or
 before anything else. The flag travels with the region through splits and moves
 the way `vm_flags` do, and a region only merges with one that has it too. It is
 also what lets the region grow ([below](#stacks-grow-down-to-meet-a-fault)).
-(`tests/c/mprotectprot.c`, and `tests/fixtures/mprotectgrows.c` for the rows
+(`tests/arm64chroot/c/mprotectprot.c`, and `tests/arm64chroot/fixtures/mprotectgrows.c` for the rows
 qemu-user gets wrong: it truncates the protection to an `int`, validates it
 ahead of the zero length, and knows no `VM_GROWSDOWN` but the main stack's.)
 
@@ -978,7 +978,7 @@ the answer: its "is the old range mapped" walk ran from `old_addr` while
 `old_addr + old_len` had already wrapped below it, so it ran zero times, a range
 nobody owned passed for fully mapped, and a shrinking `mremap` of it unmapped
 whatever the wrapped end landed on and returned the bogus address as a success.
-`tests/fixtures/mmwrap.c` is the regression test, self-checking against a real
+`tests/arm64chroot/fixtures/mmwrap.c` is the regression test, self-checking against a real
 kernel's answers — qemu-user makes its own `mremap` range checks and gets these
 wrong, so it is not the oracle for them.
 
@@ -1036,7 +1036,7 @@ mapping's length at `mmap` time) so the fault path holds the added pages to it
 even where the memfd, rounded up to a host page, runs further. This used to
 rebuild the mapping on a fresh, larger memfd, on the belief that a kernel grows
 the object: the new pages read as zeroes where they fault, and every earlier
-sharer was left on the old pages (`tests/c/mremapsem.c`).
+sharer was left on the old pages (`tests/arm64chroot/c/mremapsem.c`).
 
 An **old length of zero** is the kernel's own special case ("`mremap(0, 0, 0,
 0)` is legal", kept for DOS-emu) and the documented way to *duplicate* a
@@ -1059,10 +1059,10 @@ answer is `ENOMEM`; with `MREMAP_FIXED` the destination is cleared first, the
 source itself included if the two touch (a source *strictly inside* the
 destination is `EINVAL`; one *at* it is not, and is then gone by the time it is
 looked up again, which is `EFAULT` — a kernel does the same). It used to be
-refused outright as `EINVAL`; `tests/fixtures/mremapdup.c` holds every row to a
+refused outright as `EINVAL`; `tests/arm64chroot/fixtures/mremapdup.c` holds every row to a
 real kernel's answers, gated on the emulator's own host being able to
 duplicate a mapping (`NEEDS-HOST-SYSCALL: mremap-dup`, which `qemu-arm` cannot
-— `docs/jit.md`).
+— `docs/arm64chroot/jit.md`).
 
 `MREMAP_FIXED` is honored — the destination comes from the fifth argument,
 replaces whatever was mapped there (all of it, not just the part the move
@@ -1086,7 +1086,7 @@ model; the emulator must reproduce that model on the host — including on
 **weakly-ordered hosts (ARM)**, where the naive "just `memcpy`" approach lets the
 host CPU reorder accesses that the guest ordered.
 
-Four rules, all in `src/core/decode.c`:
+Four rules, all in `src/arm64chroot/core/decode.c`:
 
 1. **Barriers are real fences.** Guest `DMB`/`DSB` emit
    `__atomic_thread_fence(__ATOMIC_SEQ_CST)`. Without this, a weak host reorders

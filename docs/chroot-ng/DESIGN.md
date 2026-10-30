@@ -63,9 +63,9 @@ What that does and does not buy:
 
 One rule follows for the implementation: chroot-ng must never be the instrument.
 Wherever a **guest-chosen address** reaches a `MAP_FIXED` of ours — an `ET_EXEC`
-guest's link-time vaddr (`src/loader/elf.c`), `shmat(SHM_REMAP)`
-(`src/monitor/shm.c`) and the mmap hook's anonymous stand-in
-(`src/monitor/execmap.c`) — the range is checked against everything that is the
+guest's link-time vaddr (`src/chroot-ng/loader/elf.c`), `shmat(SHM_REMAP)`
+(`src/chroot-ng/monitor/shm.c`) and the mmap hook's anonymous stand-in
+(`src/chroot-ng/monitor/execmap.c`) — the range is checked against everything that is the
 monitor's and refused (`ENOEXEC` / `EINVAL` / the kernel's own answer):
 `cng_hits_monitor()` covers the image `[__cng_image_start, __cng_image_end)`,
 every region the own-map registry records (the floor, the registries, the argv
@@ -73,7 +73,7 @@ snapshot an exec stands on) and the scratch stacks with the signal frame a
 dispatch returns through — the same three answers the exec sweep uses to tell
 the monitor's memory from the outgoing program's. A monitor mapped over by its
 own hand has nothing left to report the failure with. That is what the 64 GiB
-link base (see the 0x400000 entry in `docs/STATUS.md`) moved out of the way of,
+link base (see the 0x400000 entry in `docs/chroot-ng/STATUS.md`) moved out of the way of,
 and `p_vaddr` is a field in a file, so the base alone is not a guarantee — and
 the image is not the only mapping a file can name.
 
@@ -138,7 +138,7 @@ comm is with `PR_SET_NAME`: where the kernel accepts `PR_SET_MM_MAP` its record
 is pointed at the guest's strings, and where it does not (Android) the ranges
 the loader recorded are read out of guest memory under the kernel's rules, so a
 title written over argv shows either way (M100).
-See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
+See `src/chroot-ng/monitor/procfs.c` (synthesis) and `src/chroot-ng/monitor/procreg.c` (the
 fork-inherited registry that tells a guest pid from a host one). The calls that
 name a process by pid rather than by path follow the same rule: a hidden pid
 is ESRCH to `process_vm_readv`/`writev`, `pidfd_open` (M46) and the signal
@@ -151,7 +151,7 @@ then, and between the walk and the call the tree is the guest's to change: a
 directory on the way swapped for an absolute symlink is followed from the host
 root, and the call lands outside the rootfs — the time-of-check-to-time-of-use
 of every string-based translator, `proot` included. So every host path is
-*pinned* for its syscall (`src/monitor/pin.c`): the directory the walk reached
+*pinned* for its syscall (`src/chroot-ng/monitor/pin.c`): the directory the walk reached
 is opened `O_PATH` and verified to be that directory (the kernel's own name for
 it, read back through its fd link, against the walk's symlink-free spelling;
 where the two differ in spelling alone, as on a case-insensitive filesystem,
@@ -179,7 +179,7 @@ or one of the two zones — and the walk from it is ours. A descriptor on a
 directory the guest cannot name is never let into its table: the launcher's
 are closed before the first program loads, and one arriving later over a
 socket or from `pidfd_getfd` is closed on arrival (`cng_fd_admit`,
-`src/monitor/dispatch.c`). On arrival is as early as it can be — the kernel
+`src/chroot-ng/monitor/dispatch.c`). On arrival is as early as it can be — the kernel
 has installed the descriptor by then, and for the interval up to the close it
 is in the shared table for any thread of the guest to use; the threat model
 above says what that is worth. The numbers judged are the kernel's own: the
@@ -203,7 +203,7 @@ host file does not hand it the descriptor.
 
 ### Shared component 3 — the IPC broker
 
-A detached per-namespace daemon (`src/monitor/broker.c`) that owns shared state
+A detached per-namespace daemon (`src/chroot-ng/monitor/broker.c`) that owns shared state
 no guest process can hold itself, because **host fd == guest fd** here: anything
 we keep open is visible to — and closable by — the guest. Over one abstract-socket
 rendezvous it serves the `--shared-proc` PID table (as a memfd) and the whole of
@@ -214,11 +214,11 @@ Shared memory needs only an owner for the pages: each segment is an ashmem
 region (where `/dev/ashmem` opens) or an anonymous memfd the daemon holds and
 hands to attachers over `SCM_RIGHTS`, and `shmat` maps it `MAP_SHARED` — into our
 own address space, which is also the guest's — then closes the fd at once, so a
-process holds a segment only as a mapping (`src/monitor/shm.c`). Host processes
+process holds a segment only as a mapping (`src/chroot-ng/monitor/shm.c`). Host processes
 reach it too, through libandroid-shmem's protocol: a shmid's high half names a
 `"/dev/shm/%08x"` socket the daemon answers on, which is how a Termux X server
 attaches the segment a guest X client hands it in `XShmAttach`. Semaphore sets and message queues instead live *entirely*
-in the daemon (`src/monitor/ipcreg.c`), because they need an arbiter rather than
+in the daemon (`src/chroot-ng/monitor/ipcreg.c`), because they need an arbiter rather than
 a landlord: with every operation an RPC, all mutation is single-threaded, a
 multi-operation `semop` is atomic for free, and a guest that dies mid-call cannot
 leave the registry torn. An operation that must sleep parks its connection there
@@ -227,7 +227,7 @@ removed, or when the caller cancels it — which is how a blocking `semop` stays
 interruptible even though our SIGSYS handler runs with every other signal masked.
 
 It is also the far end of every **emulated rtnetlink socket**
-(`src/monitor/netlink.c`). The guest's socket is one end of an AF_UNIX
+(`src/chroot-ng/monitor/netlink.c`). The guest's socket is one end of an AF_UNIX
 sequenced-packet pair and the daemon holds the other, polls it, and answers each
 request the moment it arrives — the kernel answers inside the `sendmsg` that
 carries one, and a client may `write(2)` a request and `read(2)` the reply with no
@@ -267,7 +267,7 @@ the registers back (`sigsys.c`, the bounce).
 dynamically-loaded code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from
 the `noexec` rootfs (which fails natively), we intercept it, read+map the file
 into anon RW→RX, and rewrite its `svc` sites before flipping to RX
-(`src/monitor/execmap.c`). The filter tests the arguments rather than the
+(`src/chroot-ng/monitor/execmap.c`). The filter tests the arguments rather than the
 syscall — `PROT_EXEC` set, `MAP_ANONYMOUS` clear — so every anonymous
 allocation a guest makes stays untrapped and only a library's text mapping
 reaches the handler. The conversion runs *after* the kernel has refused, so an
@@ -384,7 +384,7 @@ syscall (the base filter only traps the path-bearing set, and strace must see
 all of them), and while traced its signals are mediated by handlers of ours that
 mirror the guest's own flags and mask — which is what makes a gdb breakpoint, a
 `brk` poked into read-only text, arrive as a stop rather than kill the guest.
-See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
+See `src/chroot-ng/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
 
 A running task is reached by a kick signal of ours, and the kick lands wherever
 the thread is — which, for a thread blocked in a call made on its behalf, is
@@ -468,8 +468,8 @@ qemu.
 
 The binary is freestanding (`-nostdlib`, own `_start`, own syscall gate) so it
 never depends on libc and the SIGSYS handler has no re-entrancy hazards. Its
-syscall numbers are its own table too (`include/cng/unistd.h`, the stable
+syscall numbers are its own table too (`src/chroot-ng/include/cng/unistd.h`, the stable
 AArch64 ABI spelled out) rather than the build host's `<asm/unistd.h>`: what
 the filter traps and refuses must not depend on how old the headers were where
-the binary happened to be built, and `src/rt/unistd_check.c` holds the table
+the binary happened to be built, and `src/chroot-ng/rt/unistd_check.c` holds the table
 against those headers at build time where the host has them.

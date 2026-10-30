@@ -1,7 +1,7 @@
 /* A read/write count is a guest 64-bit value, and the emulator has to turn it
  * into a host size_t and a bounce buffer -- neither of which a kernel needs.
  * Cast blindly, a count above 4 GB became an unrelated small one on a 32-bit
- * host (only `make test32` sees that), and on a 64-bit host it was handed to
+ * host (only `make test-arm64chroot32` sees that), and on a 64-bit host it was handed to
  * malloc as-is, so a guest could name a buffer size the emulator had to find
  * room for. The kernel clamps to MAX_RW_COUNT and copies as far as the
  * caller's own memory goes; both of those are observable, so both are checked

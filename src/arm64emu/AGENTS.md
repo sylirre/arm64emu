@@ -1,6 +1,9 @@
-# ARM64EMU
+# arm64emu
 
-Guidelines for AI agents when working with this codebase.
+Guidelines for AI agents when working with arm64emu (`src/arm64emu/`). The
+repository-wide ones — layout, build, test discipline, conventions, commit
+messages — are in the root `AGENTS.md`; this file adds what is particular to
+arm64emu.
 
 ## Overview
 
@@ -29,9 +32,17 @@ Packages required to compile the program and run test suite:
 ## Project structure
 
 ```
-Makefile                  build (C11 + libc/POSIX + -lm only, no external deps)
-                          and every test target; CC/OPT/CFLAGS overridable
-src/
+Makefile                  (repository root) `make arm64emu` -> build/arm64emu;
+                          C11 + libc/POSIX + -lm only, no external deps.
+                          CC/CFLAGS/ARM64EMU_OPT overridable
+lib/arm64/                shared with arm64chroot (compiled into both):
+  exec_fpsimd.c           A64 decoder/executor, part 2 — scalar FP, the full
+                          Advanced-SIMD surface (three-same/-diff/-extra,
+                          by-element, across-lanes, two-misc, shift-imm, copy,
+                          permute/TBL/EXT, scalar AdvSIMD), FP16, ARMv8 crypto
+                          (AES/PMULL/SHA1/SHA256/SHA512/SHA3), FPSR flag fold
+  esr.h                   ESR_ELx exception classes + syndrome construction
+src/arm64emu/
   main.c                  entry point: CLI parsing, --help text (the option and
                           env-var reference), image loading, the run loop,
                           signal-flush of diagnostics, ARM64EMU_* debug env vars
@@ -48,16 +59,10 @@ src/
                           FEAT_MOPS, CRC32, AdvSIMD load/store.
                           exec_a64() is the top-level dispatch and the
                           correctness reference for all three engines
-  exec_fpsimd.c           A64 decoder/executor, part 2 — scalar FP, the full
-                          Advanced-SIMD surface (three-same/-diff/-extra,
-                          by-element, across-lanes, two-misc, shift-imm, copy,
-                          permute/TBL/EXT, scalar AdvSIMD), FP16, ARMv8 crypto
-                          (AES/PMULL/SHA1/SHA256/SHA512/SHA3), FPSR flag fold
   sysreg.h                MSR/MRS + SMCCC hooks (weak, so M1 links standalone)
   sysreg.c                system-register file: MSR/MRS/SYS/MSR-immediate, ID
                           registers (what features the guest kernel probes),
                           generic-timer registers, DC ZVA, TLBI, AT
-  esr.h                   ESR_ELx exception classes + syndrome construction
   exception.c             exception entry/return: VBAR vectors, ESR/FAR/ELR/
                           SPSR banking, DAIF masking, ERET
   mmu.h                   translation + typed guest memory access API,
@@ -86,7 +91,7 @@ src/
     psci.c                PSCI over the SMC/HVC conduit, incl. SYSTEM_RESET
     fwcfg.c               QEMU fw_cfg: data port + DMA, legacy kernel keys
     virtio_blk.c          --drive, repeatable (disks take slots 1,2,3…)
-    virtio_net.c          --net / --netfwd, backed by src/net/ (slot 0)
+    virtio_net.c          --net / --netfwd, backed by src/arm64emu/net/ (slot 0)
     virtio_9p.c           --virtfs host directory share (9P2000.L)
     virtio_console.c      --console virtio / ,count=N: hvc0..hvcN-1, one guest
                           terminal per device, each on its own host endpoint
@@ -117,7 +122,7 @@ src/
     usernet_udp.c         DHCP server, UDP NAT flow table, DNS redirect
     usernet_tcp.c         terminating TCP proxy over host sockets
 
-tests/
+tests/arm64emu/
   run_tests.sh            builds and runs the asm suite (ARM64EMU_EMU_FLAGS picks the
                           engine; ARM64EMU_EMU/ARM64EMU_RUNNER pick an alternate binary)
   run_pd_consist.sh       predecoded tier vs interpreter: identical serial
@@ -181,47 +186,32 @@ tests/
 
 ## Conventions and rules
 
-General:
+In addition to the root `AGENTS.md`:
 
-* Be thorough in reasoning and concise in output.
-* Do not re-read files unless they were changed.
-* Do not switch branches, do not look up changes on other branches unless explicitly were asked for this.
-* Think about best approach when implementing a requested feature. Ask clarifying questions before making architectural changes and propose solution variants, especially if there are caveats and unintended side effects of requested changes.
-* New command line options and environment variables must be added into utility built-in help information.
 * Keep in sync the interpreter and JIT parts of emulator where possible.
-* Keep in sync the code and documentation (`./docs/`).
-* Keep in sync the file structure in architecture section of README.md and structure section of AGENTS.md.
-* Ensure that code comments are up-to-date after made changes.
-* Compiler warnings or errors must be resolved.
-* Do not give up chasing bugs. You know the code better than anyone.
-* Run test suite after finishing changes.
-* Never make a failing test pass by weakening it. Investigate the root cause of test failure. If the test indeed faulty, ask the project owner first before making changes.
-* If all tests passed and there are no already staged files, commit your changes to current branch.
-* Never run `git push`.
-
-Commit messages:
-
-* Each commit must consist of header and description.
-* The header must follow this format: `scope: brief description of change`.
-* The commit body must be detailed and explain why change was necessary, what was the story behind it. If that's a new feature, explain what it does. If that's a bugfix, explain what was the bug and how it was fixed.
-* Wrap each line of the commit body at 72 characters.
-* Add Co-Authored-By footer with explanation who you are.
+* Keep in sync the code and documentation (`docs/arm64emu/`).
+* Keep in sync the file structure in architecture section of `docs/arm64emu/README.md` and structure section of this file.
+* The decoder, CPU and JIT have near-verbatim twins in arm64chroot (`src/arm64chroot/core/`, `src/arm64chroot/jit/`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
 
 ## Testing
 
 Basic testing which enough for most cases to ensure no regressions:
 
-* `make test`: asm base suite, predecoded tier disabled
-* `make test-pd`: asm suite on the default predecoded tier
-* `make test-jit`: asm suite under JIT mode
+* `make test-arm64emu`: asm base suite, predecoded tier disabled
+* `make test-arm64emu-pd`: asm suite on the default predecoded tier
+* `make test-arm64emu-jit`: asm suite under JIT mode
 
 Extras:
 
-* `make test-pd-full`: the above plus run_bootlog_gate.sh (full 1.6B-insn boot log diff)
-* `make test-jit-full`: same as previous but under JIT
-* `make fuzz-engines`: 200 random-block seeds across interpreter/pd/jit/jit-slowmem/nofuse/novra
-* `make test-jit-a64`: cross-builds a static aarch64 binary (clang+lld) and runs the JIT suite under qemu-aarch64
-* `make test-embed`: builds the `-DANDROID_JNI` embedded configuration (`arm64emu_main`, `_exit` on fatal paths) behind a stub main and runs the asm suite against it
+* `make test-arm64emu-pd-full`: the above plus run_bootlog_gate.sh (full 1.6B-insn boot log diff)
+* `make test-arm64emu-jit-full`: same as previous but under JIT
+* `make fuzz-arm64emu`: 200 random-block seeds across interpreter/pd/jit/jit-slowmem/nofuse/novra
+* `make test-arm64emu-jit-a64`: cross-builds a static aarch64 binary (clang+lld) and runs the JIT suite under qemu-aarch64
+* `make test-arm64emu-embed`: builds the `-DANDROID_JNI` embedded configuration (`arm64emu_main`, `_exit` on fatal paths) behind a stub main and runs the asm suite against it
+
+The consistency and full-boot log gates boot firmware + Linux and want a kernel
+and initrd (`ARM64EMU_KERNEL`, `ARM64EMU_INITRD`; default `$HOME/Image.gz`,
+`$HOME/initrd`); without them they report SKIP and only the asm suites run.
 
 **Important**: do not run any of tests above in parallel with each other.
 

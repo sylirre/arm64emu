@@ -14,7 +14,7 @@
  * Not a gate — it needs firmware and a guest image, so it is run by hand:
  *
  *   cc -O1 -o console_mux tests/arm64emu/scripts/console_mux.c
- *   ./console_mux 3 -- ./arm64emu --jit --bios QEMU_EFI.fd --drive alpine.iso,ro
+ *   ./console_mux 3 -- build/arm64emu --jit --bios QEMU_EFI.fd --drive alpine.iso,ro
  *
  * stdin is forwarded to ttyAMA0, except lines of the form
  *   @size <dev> <cols> <rows>     send a control-channel winsize message

@@ -4,7 +4,7 @@
  * these two options through the host libc's own macro and struct, so the
  * roundtrip and the timed recv below behave identically on every host tier
  * (LP64 hosts were already right by identity; the ILP32 build is what this
- * test exercises, via make test32).
+ * test exercises, via make test-arm64chroot32).
  *
  * NEEDS-HOST-SYSCALL: sockopt-timeo
  * The ILP32 build is exercised under qemu-user, whose getsockopt answers

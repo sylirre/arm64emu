@@ -17,7 +17,7 @@
  *     -fno-stack-protector -no-pie -Os -march=armv8.2-a+fp16 -s \
  *     -Wl,--build-id=none -Wl,-z,max-page-size=4096 -o fusedfuzz fusedfuzz.c
  *   qemu-aarch64 ./fusedfuzz > ref.out
- *   ./arm64chroot / ./fusedfuzz | diff - ref.out
+ *   build/arm64chroot / ./fusedfuzz | diff - ref.out
  *
  * A byte-match is required wherever the fused sites are host-independent:
  * an armv7 host (the a64_fma/fused_eval derive path), any host built with

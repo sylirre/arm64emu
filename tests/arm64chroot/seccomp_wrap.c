@@ -4,7 +4,7 @@
  * survives the exec) for the host-arch numbers of the full Android-8 (Oreo)
  * blocked set — categories A (blacklisted), B (whitelist gaps) and C
  * (post-Oreo) of the analyzed Bionic Oreo seccomp policy — then execs its argv.
- * `make test-seccomp` runs the ENTIRE differential suite with the emulator
+ * `make test-arm64chroot-seccomp` runs the ENTIRE differential suite with the emulator
  * under this filter: it proves no handler forwards a blocked syscall, and
  * that the SIGSYS net converts anything that still slips through into
  * -ENOSYS — on an ordinary Linux CI box, no device needed.

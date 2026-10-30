@@ -55,7 +55,7 @@ for src in "$ASM"/*.S; do
         *)      run=(${ARM64EMU_RUNNER:-} "$EMU" ${ARM64EMU_EMU_FLAGS:-} --bin "$bin@$LOAD" --max-insn 100000) ;;
     esac
     # </dev/null like the boot harnesses: an idle stdin inherited from the
-    # caller (a pipe from a CI runner, `producer | make test`) is a wake source
+    # caller (a pipe from a CI runner, `producer | make test-arm64emu`) is a wake source
     # the UART RX poll of a --bios test will wait on.
     out="$(timeout -k 5 "$ARM64EMU_TIMEOUT" "${run[@]}" </dev/null 2>&1)"; rc=$?
     res="$(printf '%s\n' "$out" | grep -oE 'x0=0x[0-9a-f]+' | head -1)"

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* M23 test: engine-parity regressions shared with the ARM64_Emulator repo
- * (found there by cross-engine fuzzing, 2026-07-19). Both bugs were
+/* M23 test: engine-parity regressions shared with arm64emu's suite
+ * (tests/arm64emu/asm; found there by cross-engine fuzzing, 2026-07-19). Both bugs were
  * x86 --jit only; the test is engine-agnostic and runs under the
  * interpreter, predecode and --jit suites alike.
  *

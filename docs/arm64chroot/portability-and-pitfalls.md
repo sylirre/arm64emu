@@ -52,8 +52,8 @@ all four targets.
   (`sys_proc.c`), `host_sigtimedwait` and `host_futex_wait` (`signal.c`). A
   guest `sigtimedwait` with a timeout under a second used to return `EAGAIN` at
   once on such a host, and a vfork parent spun on its child's mailbox
-  (`tests/c/sigtimedwait_tmo.c`). A zero timeout is zero either way.
-- **`make m32`** builds the i386 binary natively on the x86-64 dev host, so ILP32
+  (`tests/arm64chroot/c/sigtimedwait_tmo.c`). A zero timeout is zero either way.
+- **`make arm64chroot32`** builds the i386 binary natively on the x86-64 dev host, so ILP32
   correctness is on every test run.
 - **Raw `syscall(SYS_*)` calls must be audited against the Android seccomp
   allow-list.** Android 8+ runs every app process (including Termux and
@@ -63,8 +63,7 @@ all four targets.
   Any new raw `syscall(SYS_*)` must appear in the Oreo (8.0) app seccomp
   allow-list or be `__BIONIC__`-gated to a safe alternative (precedent: the
   keyring family, which is `-ENOSYS` everywhere unless `--host-keyring` asks
-  for the passthrough, and unconditionally so on Bionic). The rule is checked by `make
-  test-seccomp`, which runs the whole differential suite with the emulator under
+  for the passthrough, and unconditionally so on Bionic). The rule is checked by `make test-arm64chroot-seccomp`, which runs the whole differential suite with the emulator under
   a trap filter for the Oreo-blocked set — run by the committed CI on both the
   x86_64 and the arm64 host (see [android-termux.md](android-termux.md)).
 - **A signal handler must never be a thread's first access to a `__thread`
@@ -188,8 +187,7 @@ the kernel's layout explicitly (`KRusage` in `sys_proc.c`) whenever a raw syscal
 returns a struct a wrapper would have translated.
 
 *Visible on:* i386 and armhf **glibc/musl** only — Bionic's 32-bit `time_t` makes
-the two layouts coincide, and on LP64 they are the same 144 bytes, so `make
-test32` is the only tier that can catch this. Symptom: an *intermittently*
+the two layouts coincide, and on LP64 they are the same 144 bytes, so `make test-arm64chroot32` is the only tier that can catch this. Symptom: an *intermittently*
 absurd guest `rusage` (4 of 6 runs), because a small `tv_usec` landing in the
 high half of a 64-bit `tv_sec` still looks like a plausible number.
 
@@ -199,7 +197,7 @@ high half of a 64-bit `tv_sec` still looks like a plausible number.
 host thread for a vfork breaks `wait4` (`ECHILD`) and lets the child `execve`
 tear down the shared address space (crash → jump to `pc=0`). Gate the thread
 path on `CLONE_THREAD`; run vfork as a `fork` — with the parent's wait and the
-child's writes put back on top (`docs/signals-and-processes.md`, *vfork*), since
+child's writes put back on top (`docs/arm64chroot/signals-and-processes.md`, *vfork*), since
 a plain fork makes `posix_spawn` of a missing program return 0.
 
 *Visible on:* all hosts, when running busybox `adduser`/`passwd` and similar.
@@ -233,7 +231,7 @@ enough to matter. `/proc/<pid>/task/<tid>/...` is *not* claimed.
 
 That asymmetry is only a problem for a value the owner records about itself and
 others re-check from outside, which is exactly what `proc_starttime` in
-`src/proctab.c` is: the PID registry's identity token, the thing that catches
+`src/arm64chroot/proctab.c` is: the PID registry's identity token, the thing that catches
 PID reuse. Registering the faked number made every reader see a live process as
 stale, so `/proc/<pid>/{exe,cwd,cmdline}` answered `ENOENT` for a running guest
 and a re-registering process had its recorded id maps cleared. So: **read a
@@ -261,7 +259,7 @@ that never fires. The entire `ptrace:` tier of the suite deadlocked this way on
 the armhf-under-`qemu-arm` host, for months, filed as "the tier is 20× slower,
 these time out". They were not slow — they used 0.1 s of CPU in 5 minutes.
 
-So `sig_probe_reserved` (`src/signal.c`) **asks**: queue each candidate to
+So `sig_probe_reserved` (`src/arm64chroot/signal.c`) **asks**: queue each candidate to
 ourselves and check a handler runs. It takes the three highest RT numbers that
 answer, which on a host with nothing in the way are the three it used to
 hardcode. `ARM64CHROOT_SIGRT_MAX=N` caps the search so the low-RT tier is exercised
@@ -340,7 +338,7 @@ what makes the gap visible instead of theoretical.
 Two ownership rules come with the lazy model, and both were learned the hard
 way. The pending set is **per thread** — `fpsr_sync` clears what it folds, so
 a set shared between guest threads does not merely show one thread flags it
-never raised, it takes them away from the thread that did (`tests/c/
+never raised, it takes them away from the thread that did (`tests/arm64chroot/c/
 fpsr_threads.c`; the host's own status word is per host thread already and
 needs no help). And **anything that reads or writes `c->fpsr` behind the
 guest's back has to fold first** — a signal frame and a ptrace `NT_PRFPREG`
@@ -349,11 +347,11 @@ regset both do, and both were working with a value as of the guest's last
 cleared FPSR in the frame had it come back at `sigreturn` because what was
 pending outlived the write. `feholdexcept`/`fesetenv` are exactly how a guest
 asks for that. The rule is on the declaration in `machine.h`;
-`tests/c/fpsr_sigframe.c` and `tests/ptrace/fpregs.c` pin both ends.
+`tests/arm64chroot/c/fpsr_sigframe.c` and `tests/arm64chroot/ptrace/fpregs.c` pin both ends.
 
 Where the host has the same modes — an AArch64 host — the guest's FZ/FZ16 are
 mirrored into the host's own FPCR and the hardware does the flushing, which is
-what lets the JIT go on inlining floating point (`docs/jit.md`). That puts a
+what lets the JIT go on inlining floating point (`docs/arm64chroot/jit.md`). That puts a
 standing obligation on this file: **the interpreter must not perform a host FP
 operation on a value it has deliberately not flushed**, because the host will
 flush it. Every widen from single to double here is applied to an operand that
@@ -376,7 +374,7 @@ that tininess before rounding too, exactly as VFP does. Measured against
 `qemu-aarch64`, the three cases (below, on, above the boundary) agree flag for
 flag on an x86-64 host. So the test is "result is exactly the smallest normal
 AND this operation raised Underflow", and it needs no recomputation — only the
-per-operation isolation `fz_bank` already provides. `tests/c/fpcr_ftz_tiny.c`
+per-operation isolation `fz_bank` already provides. `tests/arm64chroot/c/fpcr_ftz_tiny.c`
 pins all three cases for every operation that can reach the corner (FMUL,
 FDIV and the fused multiplies; FADD and FSUB cannot, because a subnormal
 difference of two normals is exact and rounds to itself).
@@ -401,7 +399,7 @@ are convenient to compute by widening to double — and the widen quiets a
 signaling NaN (raising IOC for it) and, once the host is doing the flushing,
 turns a denormal operand into zero. Both engines had it: the interpreter
 widened, and the JIT's NaN gate then raised IOC from its own compare on the
-way to deferring to that wrong answer. `tests/c/fp_absneg.c` runs every form
+way to deferring to that wrong answer. `tests/arm64chroot/c/fp_absneg.c` runs every form
 over operands that can tell the difference. The rule generalizes — a form that
 does not unpack must not be handed a conversion.
 
@@ -457,7 +455,7 @@ round-to-nearest result and the flags from an exact integer decomposition
 (`fused_eval` in `exec_fpsimd.c`), with no libm or fenv call at all.
 Building any host with `-DA64_FMA_DERIVE_FORCE` routes the fused sites
 through the same path, which is how it is validated: the full suite over the
-qemu oracle, plus `tests/fixtures/fusedfuzz.c` (byte-match required) and a
+qemu oracle, plus `tests/arm64chroot/fixtures/fusedfuzz.c` (byte-match required) and a
 16M-case differential against x86-64 FMA hardware.
 
 A file mapping's pages past end-of-file are kept out of the page table so
@@ -486,19 +484,19 @@ by what the guest mapped, since a resident set larger than the address space
 holding it is something no kernel can report. That is the same tier every
 reader of *another* process is permanently on, so it is not an exotic path;
 `ARM64CHROOT_MINCORE_FORCE_FAIL=1` selects it for the reader's own process too, and the
-suite runs `tests/fixtures/vmreport.c` over both tiers against one set of
+suite runs `tests/arm64chroot/fixtures/vmreport.c` over both tiers against one set of
 expectations.
 
 ## Testing discipline
 
-The differential suite (`tests/run_tests.sh`) runs each asm/C test under an
+The differential suite (`tests/arm64chroot/run_tests.sh`) runs each asm/C test under an
 oracle and under `arm64chroot`, requiring identical stdout+exit. What the
-oracle is depends on the host, and `tests/hostenv.sh` is the only place that
+oracle is depends on the host, and `tests/arm64chroot/hostenv.sh` is the only place that
 knows: `qemu-aarch64` where the host cannot execute AArch64 code, the CPU
 itself where it can. The committed CI runs the suite on both an `x86_64` and
 an `arm64` runner — the latter with no qemu installed, so it is checked
 against silicon; before a release the maintainer also runs the `i386` (native,
-via `make m32`) and `armhf` (cross-built, under `qemu-arm`) builds. Behaviors
+via `make arm64chroot32`) and `armhf` (cross-built, under `qemu-arm`) builds. Behaviors
 qemu does not model — `--fake-id`, interactive job control — are self-checking
 cases instead. The rule that caught most of the bugs above: **a green run on
 x86-64 is necessary but not sufficient; the ARM and 32-bit builds are where

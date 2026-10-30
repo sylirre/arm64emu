@@ -1,6 +1,6 @@
 #!/bin/bash
 # Provision the test rootfs trees the differential suite needs, FROM SCRATCH,
-# into a repo-local cache — so `make test` exercises the full suite on a clean
+# into a repo-local cache — so `make test-arm64chroot` exercises the full suite on a clean
 # machine with no hand-staged prerequisites under $HOME.
 #
 #   glibc  — the aarch64 glibc runtime (dynamic-linking C tests). Built OFFLINE

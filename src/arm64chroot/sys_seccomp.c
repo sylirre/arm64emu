@@ -411,7 +411,7 @@ static void assign_mode(struct Machine *m, u8 mode) {
  * The host file cannot answer this. A guest filter is never installed on the
  * host -- that is the whole point of evaluating it here -- so a filtered guest
  * reads 0 there; and where the emulator itself runs under a filter it never
- * asked for (Android, and `make test-seccomp`), an unfiltered guest reads 2.
+ * asked for (Android, and `make test-arm64chroot-seccomp`), an unfiltered guest reads 2.
  * Both directions are wrong, so the guest's numbers come from its own chain.
  *
  * Publishing to the shared registry on every install keeps the answer available

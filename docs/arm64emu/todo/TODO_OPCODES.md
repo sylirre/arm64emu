@@ -203,12 +203,12 @@ What remains, all deliberate:
   dual-mode trick: build the self-test with `-DUSERMODE` (exit code = x0) and
   run it under `qemu-aarch64 -cpu max` to validate every hand-computed constant
   against real semantics before trusting it as the emulator's reference.
-  Regression anchors: `tests/asm/m4_fpsimd.S`, `m8_simd.S`, `m9_simd_int.S`,
+  Regression anchors: `tests/arm64emu/asm/m4_fpsimd.S`, `m8_simd.S`, `m9_simd_int.S`,
   `m10_simd_scalar.S`, `m7_crypto.S`, `m13_lse.S`, `m19_v84ext.S`,
   `m20_ext_simd.S`, **`m21_mops.S`** (per-stage MOPS state pins; the EC 0x27
   ISS checks are emulator-only since qemu-user turns the exception into
   SIGILL), **`m22_fpsr.S`** (FPSR flag battery), and the FP16 battery
-  (arm64chroot `tests/c/fp16_*`).
+  (arm64chroot `tests/arm64chroot/c/fp16_*`).
   Known oracle flaw: qemu ≤ 8.2 decodes the LDAPUR/STLUR imm9 as unsigned
   (fixed upstream), so those negative-offset checks are emulator-only.
 - Any §2 extension: implement, differential-test the full encoding group, **then**

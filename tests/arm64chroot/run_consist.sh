@@ -19,7 +19,7 @@ cflags=$(grep -m1 -o 'BUILDFLAGS:[^*]*' tests/arm64chroot/fpconsist.c | sed 's/^
     # to abort the run before the suite proper. Any real compiler failing is
     # still a failure.
     if [ "${ARM64CHROOT_ORACLE:-auto}" = recorded ]; then
-        echo "SKIP fpconsist: not in this test pack (re-record with make test-pack)"
+        echo "SKIP fpconsist: not in this test pack (re-record with make test-arm64chroot-pack)"
         exit 0
     fi
     echo "FAIL build fpconsist"; exit 1; }

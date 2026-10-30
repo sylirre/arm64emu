@@ -8,10 +8,10 @@ static / Go / Rust / raw-syscall binaries.
 Instead of a ptrace tracer, chroot-ng intercepts only the path-bearing syscalls
 in-process via **seccomp `RET_TRAP` → `SIGSYS`**, and runs guest programs with
 its own **userland ELF loader** so it can also execute binaries off `noexec`
-mounts. See [docs/DESIGN.md](docs/DESIGN.md) for the full rationale and
-[docs/STATUS.md](docs/STATUS.md) for the milestone roadmap.
+mounts. See [docs/chroot-ng/DESIGN.md](DESIGN.md) for the full rationale and
+[docs/chroot-ng/STATUS.md](STATUS.md) for the milestone roadmap.
 
-> Status: early development. See `docs/STATUS.md` for what works today.
+> Status: early development. See `docs/chroot-ng/STATUS.md` for what works today.
 
 ## Target
 
@@ -20,7 +20,7 @@ mounts. See [docs/DESIGN.md](docs/DESIGN.md) for the full rationale and
 - Works for glibc/musl (dynamic & static) and Go/Rust without version pinning.
 - Containment, not a sandbox: the monitor shares the guest's address space, so
   it confines a guest's mistakes, not a guest's malice. See
-  [Threat model](docs/DESIGN.md#threat-model--containment-not-a-sandbox).
+  [Threat model](DESIGN.md#threat-model--containment-not-a-sandbox).
 
 ## Build
 
@@ -29,16 +29,20 @@ for running what it builds. On an AArch64 host (native Linux, or Termux with
 `clang`): just the native compiler — no emulator is involved.
 
 ```sh
-make                       # -> build/chroot-ng
-make run ARGS="--version"  # run it (under qemu only where the host needs one)
-make test                  # run the test harness
+make chroot-ng                                # -> build/chroot-ng
+make run-chroot-ng CHROOTNG_ARGS="--version"  # run it (under qemu only where the host needs one)
+make test-chroot-ng                           # run the test harness
 ```
 
-Override the compiler/emulator if needed:
+A plain `make` builds chroot-ng only where it finds an AArch64 compiler (and
+says so when it does not). Override the compiler/emulator if needed:
 
 ```sh
-make CC=aarch64-linux-gnu-gcc-12 CHROOTNG_QEMU=qemu-aarch64
+make CHROOTNG_CC=aarch64-linux-gnu-gcc-12 CHROOTNG_QEMU=qemu-aarch64 chroot-ng
 ```
+
+`make test-chroot-ng` also builds [arm64chroot](../arm64chroot/README.md), the
+oracle the differential `--link2symlink` legs compare against.
 
 The test harness runs on all three hosts and adapts to each: it picks the
 emulator (or none), finds an AArch64 guest toolchain and the link mode that
@@ -47,7 +51,7 @@ the seccomp/SIGSYS tier only exists on a real AArch64 kernel, so on a cross
 host `-R` svc-rewriting is what carries translation. Legs that a host cannot
 support (no guest toolchain, no rootfs image, no SysV shm to diff against) are
 reported as `skip` and counted separately from passes. See
-[tests/README.md](tests/README.md) for the environment knobs.
+[docs/chroot-ng/testing.md](testing.md) for the environment knobs.
 
 ## Usage (evolving)
 
@@ -243,12 +247,11 @@ design depends on the SELinux `execmem` permission being granted.
 
 ## License
 
-**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+**Apache License 2.0** — see [LICENSE](../../LICENSE) and [NOTICE](../../NOTICE).
 
 chroot-ng is original, freestanding (no libc) AArch64 C and assembly. The
 guest-PID registry, the synthesized `/proc` files, the System V IPC layer, the
 guest `ptrace` model and the help renderer are ported from the sibling
-[arm64chroot](https://github.com/sylirre/arm64emu-user) emulator, which has the
-same copyright holder and the same license. chroot-ng is functionally comparable
+[arm64chroot](../arm64chroot/README.md) emulator in this repository. chroot-ng is functionally comparable
 to `proot` but shares no code with it; `qemu-aarch64` is used only as a
 differential-testing oracle and is neither included nor linked.

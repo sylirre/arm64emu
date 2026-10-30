@@ -99,7 +99,7 @@ EOF
     [ "$ARM64CHROOT_NATIVE_EXEC" = 1 ]
 }
 
-# Recorded-oracle support: make test-pack runs the suite with ARM64CHROOT_RECORD=1,
+# Recorded-oracle support: make test-arm64chroot-pack runs the suite with ARM64CHROOT_RECORD=1,
 # saving every oracle answer keyed by its invocation (binary + args) next to
 # the built test binaries. A host that can neither build the guests nor run
 # any oracle — a 32-bit ARM device: the CPU cannot execute AArch64, and
@@ -140,7 +140,7 @@ case "${ARM64CHROOT_ORACLE:-auto}" in
             if [ -f "$ARM64CHROOT_RECORD_DIR/COMMIT" ] &&
                _hc=$(git rev-parse HEAD 2>/dev/null) && [ -n "$_hc" ] &&
                [ "$_hc" != "$(cat "$ARM64CHROOT_RECORD_DIR/COMMIT")" ]; then
-                echo "WARN: test pack recorded at commit $(cut -c1-12 "$ARM64CHROOT_RECORD_DIR/COMMIT"), tree is at $(printf '%.12s' "$_hc") — regenerate with make test-pack if tests changed" >&2
+                echo "WARN: test pack recorded at commit $(cut -c1-12 "$ARM64CHROOT_RECORD_DIR/COMMIT"), tree is at $(printf '%.12s' "$_hc") — regenerate with make test-arm64chroot-pack if tests changed" >&2
             fi
         else
             ORACLE_KIND=none
@@ -645,7 +645,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #
 #   pidfd           pidfd_open works: a kernel since 5.3, and no sandbox that
 #                   refuses it -- the Android app sandbox's seccomp filter
-#                   does, and so does `make test-seccomp`'s, under which the
+#                   does, and so does `make test-arm64chroot-seccomp`'s, under which the
 #                   probes run too (ARM64CHROOT_EMU_WRAP). Where it is refused the
 #                   emulator answers the guest's pidfd_open ENOSYS, and a test
 #                   of what a pidfd does has nothing to compare.
@@ -1142,7 +1142,7 @@ a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
             if printf '%s\n' "$_s" | $ARM64CHROOT_EMU_CC $ARM64CHROOT_EMU_CFLAGS -O1 -x c - \
                    -o "$_t/probe" 2>/dev/null; then
                 # Under the sandbox the emulator runs in, if the run puts it
-                # in one (make test-seccomp): what that refuses, the emulator
+                # in one (make test-arm64chroot-seccomp): what that refuses, the emulator
                 # cannot do either. In a subshell of its own because a probe a
                 # seccomp filter KILLS rather than refuses -- Android traps
                 # setgid with SECCOMP_RET_TRAP, and SIGSYS is fatal -- makes

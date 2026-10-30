@@ -31,7 +31,7 @@ Linux, so nothing version-sniffs.
 All of this is unconditional — the same binary behaves correctly filtered and
 unfiltered:
 
-* **SIGSYS net** (`src/signal.c`): a dedicated `SIGSYS` handler converts a
+* **SIGSYS net** (`src/arm64chroot/signal.c`): a dedicated `SIGSYS` handler converts a
   seccomp trap on a forwarded host syscall into a plain `-ENOSYS` return, so
   the handler above it takes its ordinary fallback path instead of dying. The
   first trap of each syscall number prints a one-shot notice
@@ -43,7 +43,7 @@ unfiltered:
   which every user of it probes for -- Go, systemd, Python -- and falls back
   from; `pidfd_send_signal` through a `/proc/<pid>` directory is sent by pid
   instead, and `CLONE_PIDFD` is refused (`EINVAL`) rather than half-honoured.
-  `make test-seccomp` runs the suite's host-capability probes under the same
+  `make test-arm64chroot-seccomp` runs the suite's host-capability probes under the same
   filter (`ARM64CHROOT_EMU_WRAP`), so the pidfd tests skip there by name.
 * **`statx` fallback**: when host `statx` fails with `ENOSYS` (Android 8.0/8.1,
   old kernels), the result is synthesized from `fstatat` with `STATX_BTIME`
@@ -110,7 +110,7 @@ unfiltered:
   `pivot_root(2)` re-roots like `chroot(2)`, the id maps of a faked user
   namespace are writable, and `signalfd` is the host's own with its records
   translated on the way out. See [syscalls.md](syscalls.md).
-* **System V IPC** (`src/sys_ipc.c`, `src/proctab.c`): `shmget`/`shmat`/
+* **System V IPC** (`src/arm64chroot/sys_ipc.c`, `src/arm64chroot/proctab.c`): `shmget`/`shmat`/
   `shmdt`/`shmctl` run over an in-process broker backed by an anonymous `memfd`
   (on the Oreo allow-list) passed between processes over `SCM_RIGHTS` on an
   abstract socket — no host SysV IPC syscalls (never whitelisted) and no
@@ -125,7 +125,7 @@ unfiltered:
   `arm64chroot: seccomp filter active on this process; trapped host syscalls
   return ENOSYS`. Expected on every Android run; on a normal Linux box it
   means you are inside some other sandbox (systemd, container, …).
-* **Guest-view `/proc`** (`src/sys_procfs.c`): `mounts`/`mountinfo` are
+* **Guest-view `/proc`** (`src/arm64chroot/sys_procfs.c`): `mounts`/`mountinfo` are
   synthesized as the guest's mount table — the host files expose the Android
   app-sandbox namespace (dozens of `/apex`, `/vendor`, sdcardfs mounts), which
   confuses `df`, apt's sandbox checks and mount-table parsers. `maps` and
@@ -152,7 +152,7 @@ unfiltered:
   the host denies them) — reading them is the first thing bubblewrap does, and
   it dies outright if it cannot.
 * **`memfd_create` on pre-3.17 kernels** (Android 7 class devices) is served
-  by the fallback tier documented in `docs/syscalls.md`: an unlinked file in
+  by the fallback tier documented in `docs/arm64chroot/syscalls.md`: an unlinked file in
   the app-writable backing dir plus broker-held seals, so apk-tools 3's
   sealed install triggers work even where the host kernel has no memfd at
   all.
@@ -162,7 +162,7 @@ unfiltered:
   write at all — and the arm64 rig (Android 13, 5.15) is one of them, as is
   every current LTS kernel. That is the mapping a sealed memfd exists to hand
   out, so the emulator serves it from backing of its own rather than forwarding
-  a refusal its `uname` says cannot happen; `docs/syscalls.md` has why the
+  a refusal its `uname` says cannot happen; `docs/arm64chroot/syscalls.md` has why the
   guest cannot tell, and `ARM64CHROOT_MEMFD_SEAL_FORCE_OLD` reaches the path from a
   modern host.
 
@@ -190,7 +190,7 @@ unfiltered:
   the descriptor gave, judged against this process's real identity (the
   guest's, without `--fake-id`) by the kernel's own rule. `ARM64CHROOT_OWNFD_FORCE_DENY` makes an ordinary host refuse those
   path forms — stat and access included, so it is stricter than the device —
-  and the suite runs `tests/fixtures/ownfdexec.c` over both tiers, with and
+  and the suite runs `tests/arm64chroot/fixtures/ownfdexec.c` over both tiers, with and
   without `--fake-id`, requiring identical output.
 
 * **The termios2 ioctls** are denied on a terminal: `TCGETS2`, `TCSETS2`,
@@ -201,7 +201,7 @@ unfiltered:
   terminal. They are answered from the classic commands instead (the speeds are
   the `c_cflag` rate, or a per-terminal record of an arbitrary one), and the
   first refusal is remembered so the policy is not asked again. See
-  `docs/syscalls.md`; `ARM64CHROOT_TERMIOS2_FORCE_DENY` forces the tier anywhere.
+  `docs/arm64chroot/syscalls.md`; `ARM64CHROOT_TERMIOS2_FORCE_DENY` forces the tier anywhere.
 
 * **`TIOCGSID`** (`tcgetsid(3)`) is denied on a pty slave and on a pipe, and
   allowed on the ptmx master: `EACCES` where a kernel answers the session or
@@ -233,7 +233,7 @@ unfiltered:
   pair, `TIOCNOTTY` and the modem/packet/console commands a kernel answers
   `ENOTTY` on a pty. A pty slave's answers are the tty core's alone, so they
   are served from the allowed commands (`pts_refused`, `sys_file.c`; the
-  details are in `docs/syscalls.md`) — `TCFLSH` with no queue named is exactly
+  details are in `docs/arm64chroot/syscalls.md`) — `TCFLSH` with no queue named is exactly
   the background-job check `tcdrain` makes. `TCXONC`'s `TCOOFF` and
   `TIOCNOTTY` on the caller's own controlling terminal stay refused: nothing an
   app may issue stops a terminal's output or drops a controlling terminal.
@@ -270,7 +270,7 @@ unfiltered:
   the request rather than leaving a key nothing holds. A
   native memfd is registered lazily, on its first refused chmod, so nothing is
   paid on a host that simply allows it. `ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY` forces the
-  tier anywhere, and `tests/fixtures/ownfdexec.c`'s fourth leg is what it is
+  tier anywhere, and `tests/arm64chroot/fixtures/ownfdexec.c`'s fourth leg is what it is
   for.
 
 * **The host's own /proc is older than the kernel the guest is told about.**
@@ -293,14 +293,14 @@ unfiltered:
   answered from the same view with a procfs file's attributes (regular, size
   0, root's 0444 — see [syscalls.md](syscalls.md)).
   `ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY` makes any host refuse them, and
-  `tests/fixtures/procsynth_stat.c` runs over it.
+  `tests/arm64chroot/fixtures/procsynth_stat.c` runs over it.
 
 * **`/proc/version` and `/proc/uptime`** are denied to an app outright, which
   is why both are synthesized. Where there is no anonymous backing to
   synthesize into (`ARM64CHROOT_PROCSYNTH_FORCE_FAIL`), they are the two views that
   fall through to the host rather than being denied — and on Android the guest
   then reads the host's EACCES. That is the truthful answer for a pass-through,
-  and what `tests/fixtures/procsynth_tier.c` requires there is only that the
+  and what `tests/arm64chroot/fixtures/procsynth_tier.c` requires there is only that the
   fail-closed rule did not swallow them.
 
 Raw `syscall(SYS_*)` uses in the tree are audited against the Oreo allow-list
@@ -328,8 +328,8 @@ symlinks, both of which a Linux rootfs needs.
 # unpack e.g. a Debian arm64 rootfs tarball
 mkdir -p ~/debian && tar -xf debian-rootfs-arm64.tar.xz -C ~/debian
 
-./arm64chroot ~/debian /bin/bash -l                    # plain shell
-./arm64chroot --fake-id --link2symlink ~/debian /bin/bash -l   # for apt/dpkg
+build/arm64chroot ~/debian /bin/bash -l                    # plain shell
+build/arm64chroot --fake-id --link2symlink ~/debian /bin/bash -l   # for apt/dpkg
 ```
 
 `--fake-id` (fake root) and `--link2symlink` (hard links via tracked symlinks —
@@ -337,7 +337,7 @@ Android forbids `link()`) are what package managers need; see the top-level
 README for details.
 
 A rootfs that **proot-distro** installed works with `--link2symlink` as it is
-(`./arm64chroot --link2symlink ~/…/proot-distro/containers/ubuntu/rootfs …`).
+(`build/arm64chroot --link2symlink ~/…/proot-distro/containers/ubuntu/rootfs …`).
 proot keeps each group of hard links as symlinks holding the rootfs's *host*
 path, into `<rootfs>/.l2s`; the emulator follows them, shows every name as the
 regular file a hard link is, and keeps proot's own link counts as names come
@@ -347,7 +347,7 @@ and go, so the rootfs can be used from either. Before that, the 26.04 rootfs's
 followed, refused to run (uutils checks that `/proc/self/exe` ends in the
 applet's name, and that `AT_EXECFN` is the path it was given — both of which a
 kernel reports and the emulator did not). See
-`docs/syscalls.md` ("proot's own groups") for what it does and does not do. A
+`docs/arm64chroot/syscalls.md` ("proot's own groups") for what it does and does not do. A
 rootfs *moved* since proot made it (its recorded host path no longer names it)
 is not followed, as with proot.
 
@@ -360,21 +360,21 @@ Reading the diagnostics on-device:
 | process dies with `Bad system call` (SIGSYS, exit 159) | the net failed or was bypassed — definitely report it |
 
 That last line is about the emulator and its guest. `Bad system call` named on a
-`tests/hostenv.sh` line during a test run is a different thing and not a
+`tests/arm64chroot/hostenv.sh` line during a test run is a different thing and not a
 report: the harness measures whether this host lets a process change its ids
 at all (the `set-ids` probe) by calling `setgid`, which the app filter traps on
 purpose, and the probe's death *is* the answer. The run keeps that to itself —
 if a probe's signal ever reaches the suite's own output again, the shape that
 suppresses it is in `a64_emu_syscall_ok`.
 
-## The no-device regression gate: `make test-seccomp`
+## The no-device regression gate: `make test-arm64chroot-seccomp`
 
 ```sh
-make test-seccomp
+make test-arm64chroot-seccomp
 ```
 
 runs the **entire differential suite** with the emulator under a
-`SECCOMP_RET_TRAP` filter (`tests/seccomp_wrap.c`) covering the host-arch
+`SECCOMP_RET_TRAP` filter (`tests/arm64chroot/seccomp_wrap.c`) covering the host-arch
 numbers of the full Oreo-blocked set. Any handler that forwards a blocked
 syscall either dies (net regression) or diverges from the unfiltered
 oracle — so "safe on Android 8" is verifiable on an ordinary Linux box with no
@@ -385,7 +385,7 @@ is the Android *architecture* as well. A few numbers are deliberately exempt fro
 filter because the *host glibc* issues them before the net is armed or in ways
 Bionic never would (`rseq`, `set_robust_list`, `clone3`, `membarrier`,
 `accept`); the rationale lives in the `seccomp_wrap.c` header. The related
-`make test-android-sim` target additionally forces the statx-fallback and
+`make test-arm64chroot-android-sim` target additionally forces the statx-fallback and
 Bionic-keyring code paths at compile time, and compiles in the
 `--link2symlink` hardlink emulation (which `__ANDROID__` enables on its own),
 forcing it to be taken even though the build host allows real hardlinks —
@@ -393,12 +393,12 @@ otherwise that scheme would only ever be exercised on a device.
 
 ## Running the suite on the device itself
 
-`make test` / `make test-jit` run on Termux directly (the AArch64 CPU is the
+`make test-arm64chroot` / `make test-arm64chroot-jit` run on Termux directly (the AArch64 CPU is the
 oracle; see the README). Neither depends on **termux-exec**: every test
 script is started through an explicit interpreter and the generated wrapper
 scripts carry the running `sh`'s absolute path as their shebang, so the suite
 works with the `LD_PRELOAD` shim disabled — and when the shim *is* enabled,
-`tests/hostenv.sh` unsets `LD_PRELOAD` for the whole run, so neither the
+`tests/arm64chroot/hostenv.sh` unsets `LD_PRELOAD` for the whole run, so neither the
 emulator nor the oracle ever executes under it and both configurations test
 the same thing.
 
@@ -414,7 +414,7 @@ page table exists to fill). The suite covers this host class from a 64-bit
 box instead: the answers travel, not the oracle.
 
 ```sh
-make test-pack        # on the x86-64 (or arm64) dev box, qemu installed
+make test-arm64chroot-pack        # on the x86-64 (or arm64) dev box, qemu installed
 ```
 
 runs one full suite pass with every oracle answer recorded, then bundles the
@@ -425,8 +425,8 @@ warns on a mismatch), and run:
 
 ```sh
 tar xzf arm64chroot-testpack.tar.gz
-ln -s ~/alpine-rootfs tests/.cache/rootfs/alpine   # any aarch64 rootfs with busybox
-ARM64CHROOT_ORACLE=recorded make CC=clang test
+ln -s ~/alpine-rootfs build/cache/arm64chroot/rootfs/alpine   # any aarch64 rootfs with busybox
+ARM64CHROOT_ORACLE=recorded make CC=clang test-arm64chroot
 ```
 
 Everything portable runs for real on the device — the asm and C differential
@@ -462,10 +462,10 @@ hardcoded a `/tmp` the device has none of:
   emulator's after all, though not in the row that reported it: wherever the
   host *has* `memfd_create` the guest's mmap reached that kernel, so the guest
   was told `EPERM` by a `uname` promising 6.x. The emulator now serves that
-  mapping from backing of its own (see `docs/syscalls.md`), on every host whose
+  mapping from backing of its own (see `docs/arm64chroot/syscalls.md`), on every host whose
   kernel refuses it, and the row is compared against the **oracle's** kernel
   vintage rather than this host's — a recording run stores what its own host
-  answered in `tests/.cache/recorded/MEMFD_SEAL`, so a phone replaying a pack
+  answered in `build/cache/arm64chroot/recorded/MEMFD_SEAL`, so a phone replaying a pack
   from a 6.x box runs the row (and the file-tier one) instead of skipping it.
   `ARM64CHROOT_MEMFD_SEAL_FORCE_OLD` drives the same path from a modern host.
 * **`fixtures/sockfilter_get`** — `SO_GET_FILTER` is Linux 3.8 and the armv7
@@ -601,18 +601,18 @@ skip with `host denies: link(2)`, beside the `NEEDS-HOST-READ` and
 `NEEDS-HOST-IOCTL` facts it asks for in the same place. They are the only
 three tests that make a real hardlink.
 
-The proot-group rows (`tests/l2s_proot.sh`, sourced by `run_tests.sh`) need no
+The proot-group rows (`tests/arm64chroot/l2s_proot.sh`, sourced by `run_tests.sh`) need no
 oracle: the same guest program is run over real hardlinks on a real kernel once
-(`tests/fixtures/l2s_proot.expect`) and over a layout the harness lays down by
+(`tests/arm64chroot/fixtures/l2s_proot.expect`) and over a layout the harness lays down by
 hand exactly as a device's proot wrote it, and the two must print the same
 bytes; the hostile layouts judge against what an ordinary symlink answers and
 the canary files they leave outside the rootfs. They run wherever the scheme is
-compiled in — the android-sim build (which `make test-android-sim` tells with
+compiled in — the android-sim build (which `make test-arm64chroot-android-sim` tells with
 `ARM64CHROOT_L2S_BUILD=1`) or an Android host — and are skipped under any other
 emulator, where those layouts are plain symlinks and there is nothing to ask.
 
 A binary the pack shipped counts as missing once it stops matching the
-checksum the pack recorded for it (`tests/.cache/recorded/BINSUMS`). That
+checksum the pack recorded for it (`build/cache/arm64chroot/recorded/BINSUMS`). That
 only happens on a device that also has a working toolchain — an aarch64
 phone, where a native run rebuilds the same paths with a different compiler —
 and the answers were recorded against the *packed* program, not the rebuilt
@@ -621,7 +621,7 @@ because clang laid the binary out differently from gcc and the tests fold
 their own `ADR`/`ADRP` offsets into the hash they print. Unpack the pack
 again to restore them.
 
-`ARM64CHROOT_ORACLE=recorded make test-jit` replays the same pack with the
+`ARM64CHROOT_ORACLE=recorded make test-arm64chroot-jit` replays the same pack with the
 translator on, and on a 32-bit ARM device that is the *only* check that the
 silicon agrees with what the ARM32 code generator emits — the qemu-arm tier
 on the dev box exercises the emitter, not the CPU, and the AArch64 CI
@@ -636,15 +636,15 @@ Manual sanity pass for a real device (Debian/Ubuntu arm64 rootfs under
 Termux). Everything must run without SIGSYS deaths, and the only expected
 seccomp output is the one-line startup notice.
 
-1. **stat paths** — `./arm64chroot ~/debian /bin/ls -l /usr/bin | head`
+1. **stat paths** — `build/arm64chroot ~/debian /bin/ls -l /usr/bin | head`
    (`ls` uses `statx`; on Android 8.x this exercises trap → net → fallback).
 2. **Network, TLS, threads, getrandom** —
-   `./arm64chroot --fake-id ~/debian /usr/bin/apt-get update`.
+   `build/arm64chroot --fake-id ~/debian /usr/bin/apt-get update`.
 3. **Threads and robust lists** — any threaded guest binary, e.g.
-   `./arm64chroot ~/debian /usr/bin/openssl speed -multi 2 -seconds 1 sha256`
+   `build/arm64chroot ~/debian /usr/bin/openssl speed -multi 2 -seconds 1 sha256`
    (glibc `pthread_create` hits `set_robust_list`/`rseq`/`clone` — all must be
    absorbed, never forwarded).
 4. **Package install (fake root + hard links)** —
-   `./arm64chroot --fake-id --link2symlink ~/debian /usr/bin/dpkg -i some.deb`
+   `build/arm64chroot --fake-id --link2symlink ~/debian /usr/bin/dpkg -i some.deb`
    then remove it again with `dpkg -r`.
 5. **Job control** — in `/bin/bash -l`: Ctrl-Z a `sleep`, `fg` it, Ctrl-C it.
