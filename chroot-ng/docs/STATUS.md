@@ -16,6 +16,10 @@ gaps that only a real fork+exec of a compiler exposes — see the entries below 
 handler-stack isolation, signal masking, the 0x400000 relocation, and the
 vfork/`posix_spawn` child-stack handling.
 
+At 1.6.0 the full test suite (`make test`) passes on this device (Zenfone 10)
+and on two older ones: Android 14 on kernel 4.19 (Pixel 5) and Android 8 on
+kernel 3.18 (Galaxy S7).
+
 ## Legend
 - [x] done and tested
 - [~] in progress
@@ -929,7 +933,8 @@ vfork/`posix_spawn` child-stack handling.
     `AF_INET` socket rather than a netlink one, so the fd-based hook does not
     reach them, and trapping `ioctl` wholesale would put every terminal `TCGETS`
     through the handler. The clean approach is a BPF range test on `args[1]`
-    (`0x8910`–`0x8970`), which is its own change.
+    (`0x8910`–`0x8970`), which is its own change. Done since as **M16b**,
+    with that range test.
 
 - [x] **The remaining path-bearing enumeration gaps**
   With the filter's tail being `RET_ALLOW`, any path-bearing syscall not on the
@@ -955,7 +960,9 @@ vfork/`posix_spawn` child-stack handling.
     objects. That is precisely the isolation the shm broker exists to provide, and
     the largest thing the M11/M12 divergence lists had missed. Refused, which is
     the oracle's behaviour; a broker-backed emulation mirroring shm would be the
-    richer answer and is the obvious follow-up.
+    richer answer and is the obvious follow-up. Done since as **M22**, which
+    makes `semget`/`msgget` trap like `shmget`; the refusal `bpftest` pinned
+    below is gone with it.
   - `-t bpftest` pins the distinction that matters: `semget`/`msgget` answer
     ERRNO while `shmget` still TRAPs for emulation, and `fchmodat2` TRAPs for
     translation rather than being refused. `-t dtest denied` covers the same on
@@ -4814,12 +4821,12 @@ vfork/`posix_spawn` child-stack handling.
     with the filters an attach had added since, a write the guest had just
     made was taken for a displaced trap and made twice: `attachmany` on the
     Pixel 5's SIGSYS tier, 1 run in 40.
-  - Residue: which of the tracee and tracer filters a thread carries comes
-    from its own per-task record, so a thread created by a traced one after
-    its attach, which inherits the filter but not the record, can have a
-    displaced trap misjudged. A request that lands in our trace handler
-    while it runs a guest's handler is not taken there; the resend reaches
-    it.
+  - Residue: a request that lands in our trace handler while it runs a
+    guest's handler is not taken there; the resend reaches it.
+  - Residue, fixed by M108: which of the tracee and tracer filters a thread
+    carries came from its own per-task record, so a thread created by a
+    traced one after its attach, which inherits the filter but not the
+    record, could have a displaced trap misjudged.
   - Tests: m18 `ptrace blockedmask` is `blocked` with every signal blocked
     in the tracee. `ptrace blockspin` attaches 100 times to a thread with
     every signal blocked that spins on `mkdir`/`rmdir`, which trap. Every
@@ -4831,6 +4838,49 @@ vfork/`posix_spawn` child-stack handling.
     ignored it makes calls twice in three of three. On the Pixel 5, a
     crashed Chrome browser now exits in 3 s and leaves a minidump with all
     37 of its threads, none with a pc in chroot-ng.
+
+- [x] **M108 — a task that inherited a tracee filter traced nothing**
+  A thread a traced task makes after its attach, and a fork child its tracer
+  does not follow, run as any untraced task does. The kernel copies every
+  seccomp filter into a clone or a fork, so both carry the trap-everything
+  filter the tracee stacked, but not the per-task record that says so: it is
+  keyed by tid and belongs to the thread that stacked it. Without it,
+  `cng_pt_traceall()` answered no, and the dispatcher took every trapped call
+  it does not handle itself for one an Android filter had blocked and
+  answered `ENOSYS`. A thread created after an attach got `write -1/38`, and
+  a fork child of a tracee could make almost no call at all (arm64 VM, both
+  tiers). M107's displaced-trap check read the same record, so a displaced
+  call in such a task could be misjudged (the residue noted there).
+  - The trap says which filter caught it. Each stacked filter tags its
+    `RET_TRAP` with data the kernel hands the handler as `si_errno`
+    (`CNG_TRAP_TAG_TRACEALL`/`_TRACER`, `monitor.h`). Equal actions keep the
+    newest filter's data, so every trap through an inherited filter carries
+    its tag, and the first one makes the record (`cng_pt_note_trap`) before
+    the dispatcher asks. The base filter's traps carry none.
+  - A displaced trap carries no tag (its siginfo is ours), and a task may
+    not have trapped through its inherited filter yet, so that check asks
+    the kernel (`cng_sig_filter_stacked`): it makes a call only the filter
+    in question traps, from an svc of its own outside the gate
+    (`cng_probe_svc`, `sig.S`), and the handler answers it without
+    dispatching. `getppid` asks about the tracee's filter, which traps every
+    call. `waitid` with no state bits asks about the tracer's: only the
+    tracee's filter traps it as well, and natively it fails `EINVAL` before
+    it could wait. The base filter is asked first, then each stacked one
+    only where it would change the verdict, and a hit is kept in the record.
+  - Tests: m18 `ptrace threadafter` and `forkafter`: a tracee makes a
+    thread, then a fork child, after the attach, and each must make a
+    spread of calls the dispatcher does not handle. `ptrace spinafter` is
+    `blockspin`'s hundred attaches to a thread made after the process was
+    attached to, spinning on an `lseek` that only the inherited filter
+    traps, so a misjudged displaced trap loses or doubles the offset. All
+    three match the kernel on both tiers (arm64 VM, dev host), and the M107
+    build fails all three on the SIGSYS tier. Mutations on the VM's SIGSYS
+    tier: never learning the inherited filter loses calls (`spinafter`, 3
+    runs of 3); dropping the record and asking only the kernel still passes,
+    so the probe alone would do, and the record is kept because it spares a
+    syscall on the hot path. `-t bpftest` asserts each filter's tag. At 1.6.0
+    the full suite passes on the Zenfone 10 (5.15), the Pixel 5 (4.19) and
+    the Galaxy S7 (3.18).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

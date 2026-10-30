@@ -199,10 +199,13 @@ proves it by running the same program under chroot-ng and against the real
 kernel and requiring identical output. Two things are out of reach and
 documented as such: `rt_sigreturn` and thread-creating `clone` are never
 reported (neither can be re-issued from a signal handler), so `strace -f`
-follows forks but not new threads. Single-step is emulated with breakpoints,
-since arming the hardware kind needs the kernel's own ptrace. A traced task
-stops on *every* syscall, which is slow by construction; a guest that never
-traces pays nothing at all, and `--no-ptrace` turns the whole thing off.
+follows forks but not new threads. One known gap is still open: a `poll`,
+`select`, `nanosleep` or timed futex that a task is sleeping in when a tracer
+attaches returns `EINTR`, where the kernel would let it finish. Single-step is
+emulated with breakpoints, since arming the hardware kind needs the kernel's
+own ptrace. A traced task stops on *every* syscall, which is slow by
+construction; a guest that never traces pays nothing at all, and `--no-ptrace`
+turns the whole thing off.
 
 **The environment** is built, not inherited. A host variable describes the host
 rather than the rootfs — `PATH`, `HOME`, `LD_LIBRARY_PATH`, `XDG_*`, `TMPDIR`

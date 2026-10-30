@@ -398,7 +398,11 @@ were not yet made or already over. The dispatcher's frames cannot be stepped
 out of: its stop reports the guest's registers from the dispatch's own record,
 and a tracer that changes them abandons the call in flight, which is then made
 again as the tracer left it. The kick is `SA_RESTART`, so a call it interrupts
-is restarted rather than failed with `EINTR`.
+is restarted rather than failed with `EINTR`. That covers what the kernel
+restarts after any `SA_RESTART` handler. A `poll`, `select`, `nanosleep` or
+timed futex the guest makes natively is one the kernel restarts only when no
+handler runs at all, and the kick is a handler, so after an attach such a call
+still returns `EINTR` (a known gap, recorded under M106 in STATUS.md).
 
 The kick is an ordinary signal, and a thread can block it, where the kernel's
 attach is a `SIGSTOP` no mask holds back. To a thread whose mask holds the
@@ -408,6 +412,13 @@ absorbs a trap the thread takes while it is pending, so the handler makes a
 call that was skipped that way again. It judges whether the call trapped by
 running the installed filters over it, and whether a handler of ours already
 answered it by the frame that handler returned to.
+
+Which filters a task carries is kept per task, but a thread or a fork child
+that a traced task makes later inherits the filter from the kernel without
+that record. So each filter a trace stacks tags its traps with data the
+handler receives as `si_errno`, and the first tagged trap tells the new task
+what it carries. A trap displaced as above has no tag. For that one the
+handler asks the kernel with a call only the filter in question traps.
 
 ### Known hazards (why the tiers exist)
 
