@@ -11,10 +11,16 @@
  *  - the SIMD&FP "unprivileged" encodings (V=1, op2 bits[11:10]=0b10) are
  *    unallocated and must UNDEF (EC 0x00);
  *  - AT S1E1R/S1E0R/S1E1W set PAR_EL1: F=0 + correct PA (+ATTR from MAIR) on
- *    success, F=1 + FST on permission (0x0f) and translation (0x05) failures.
+ *    success, F=1 + FST on permission (0x0f) and translation (0x05) failures;
+ *  - the unprivileged FEAT_MOPS forms take the EL0 view the same way: SETxT
+ *    fills the user block but permission-faults on the priv block (WnR, no
+ *    byte written) where a plain SETx succeeds; CPYxWT faults on a priv
+ *    destination (WnR), CPYxRT on a priv source (read), and both copy
+ *    between user pages.
  * The sync handler records EC (x21) and full ESR (x22), skips the insn.
  * x0=0 on success, else the failing-check id. */
 
+.arch armv9.3-a                         /* FEAT_MOPS (sections 11-15) */
 .text
 .global _start
 _start:
@@ -187,6 +193,102 @@ _start:
     movz    x11, #22
     ubfx    x3, x2, #1, #6
     cmp     x3, #0x05                   /* translation fault, level 1 */
+    b.ne    fail
+
+    /* x2 = 0xabababababababab: the fill byte 0xab replicated */
+    movz    x2, #0xabab
+    movk    x2, #0xabab, lsl #16
+    movk    x2, #0xabab, lsl #32
+    movk    x2, #0xabab, lsl #48
+    mov     x7, #0xab                   /* SETx data register */
+
+    /* ---- 11: SETPT/SETMT/SETET into the user block fill it ---- */
+    add     x6, x20, #0x100
+    mov     x5, #64
+    setpt   [x6]!, x5!, x7
+    setmt   [x6]!, x5!, x7
+    setet   [x6]!, x5!, x7
+    movz    x11, #23
+    cbnz    x5, fail                    /* whole size consumed */
+    movz    x11, #24
+    ldr     x3, [x20, #0x100]
+    cmp     x3, x2
+    b.ne    fail
+    ldr     x3, [x20, #0x138]           /* last doubleword */
+    cmp     x3, x2
+    b.ne    fail
+
+    /* ---- 12: SETPT into the priv block -> DABORT, perm, WnR, unwritten ---- */
+    movz    x21, #0xffff
+    add     x6, x24, #0x100
+    mov     x5, #64
+    setpt   [x6]!, x5!, x7
+    movz    x11, #25
+    cmp     x21, #0x25
+    b.ne    fail
+    movz    x11, #26
+    and     x3, x22, #0x3f
+    cmp     x3, #0x0f
+    b.ne    fail
+    movz    x11, #27
+    tbz     x22, #6, fail               /* WnR set: a store */
+    movz    x11, #28
+    ldr     x3, [x24, #0x100]           /* nothing written */
+    cbnz    x3, fail
+
+    /* ---- 13: plain SETP/SETM/SETE into the priv block works at EL1 ---- */
+    add     x6, x24, #0x100
+    mov     x5, #64
+    setp    [x6]!, x5!, x7
+    setm    [x6]!, x5!, x7
+    sete    [x6]!, x5!, x7
+    movz    x11, #29
+    cbnz    x5, fail
+    ldr     x3, [x24, #0x138]
+    cmp     x3, x2
+    b.ne    fail
+
+    /* ---- 14: CPYPWT to a priv destination faults as a store; CPYPRT from
+     *          a priv source faults as a load ---- */
+    movz    x21, #0xffff
+    add     x6, x24, #0x200             /* dest: priv */
+    add     x8, x20, #0x100             /* src: user (filled in 11) */
+    mov     x5, #64
+    cpypwt  [x6]!, [x8]!, x5!
+    movz    x11, #30
+    cmp     x21, #0x25
+    b.ne    fail
+    movz    x11, #31
+    tbz     x22, #6, fail               /* WnR set */
+    movz    x11, #32
+    ldr     x3, [x24, #0x200]           /* nothing written */
+    cbnz    x3, fail
+    movz    x21, #0xffff
+    add     x6, x20, #0x200             /* dest: user */
+    add     x8, x24, #0x100             /* src: priv (filled in 13) */
+    mov     x5, #64
+    cpyprt  [x6]!, [x8]!, x5!
+    movz    x11, #33
+    cmp     x21, #0x25
+    b.ne    fail
+    movz    x11, #34
+    tbnz    x22, #6, fail               /* WnR clear: a load */
+    movz    x11, #35
+    ldr     x3, [x20, #0x200]           /* nothing written */
+    cbnz    x3, fail
+
+    /* ---- 15: CPYPT/CPYMT/CPYET copy between user pages ---- */
+    add     x6, x20, #0x200             /* dest: user */
+    add     x8, x20, #0x100             /* src: user (filled in 11) */
+    mov     x5, #64
+    cpypt   [x6]!, [x8]!, x5!
+    cpymt   [x6]!, [x8]!, x5!
+    cpyet   [x6]!, [x8]!, x5!
+    movz    x11, #36
+    cbnz    x5, fail
+    movz    x11, #37
+    ldr     x3, [x20, #0x238]
+    cmp     x3, x2
     b.ne    fail
 
     movz    x0, #0

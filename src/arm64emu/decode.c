@@ -745,20 +745,17 @@ static bool mops_enabled_ok(CPU *c, u32 insn) {
 }
 
 /* One bounded memset step: at most to the next page boundary. Fast path is
- * the host-pointer D-TLB (RAM pages with W granted — the same fast path
- * mem_write uses, so JIT code-page coherence is preserved); on a miss, a
- * single byte through the faulting slow path, which also fills the D-TLB so
- * the next step goes fast. Returns bytes done; 0 means a fault was raised. */
+ * the program's host pointer (mem_host_ptr: in arm64emu a D-TLB hit on a RAM
+ * page with W granted — the same fast path mem_write uses, so JIT code-page
+ * coherence is preserved); on a miss, a single byte through the faulting slow
+ * path, which also fills the D-TLB so the next step goes fast. Returns bytes
+ * done; 0 means a fault was raised. */
 static u64 mops_set_step(CPU *c, u64 toaddr, u64 setsize, u8 data, bool unpriv) {
     u64 n = mops_page_limit(toaddr);
     if (n > setsize) n = setsize;
     c->ldst_unpriv = unpriv;
-    DTlbEnt *e = dtlb_ent(toaddr);
-    if (e->tag == dtlb_tag(c, toaddr) && (e->pte & DTLB_W)) {
-        memset((u8 *)(e->pte & ~0xfffULL) + (toaddr & 0xfff), data, (size_t)n);
-        c->ldst_unpriv = 0;
-        return n;
-    }
+    void *hp = mem_host_ptr(c, toaddr, (unsigned)n, ACC_WRITE);
+    if (hp) { c->ldst_unpriv = 0; memset(hp, data, (size_t)n); return n; }
     bool ok = mem_write(c, toaddr, 1, data);
     c->ldst_unpriv = 0;
     return ok ? 1 : 0;
@@ -775,23 +772,18 @@ static u64 mops_copy_step(CPU *c, u64 toaddr, u64 fromaddr, u64 copysize,
     if (m < n) n = m;
     if (n > copysize) n = copysize;
     c->ldst_unpriv = wunpriv;
-    DTlbEnt *we = dtlb_ent(toaddr);
-    bool whit = we->tag == dtlb_tag(c, toaddr) && (we->pte & DTLB_W);
+    void *w = mem_host_ptr(c, rev ? toaddr - (n - 1) : toaddr,
+                           (unsigned)n, ACC_WRITE);
     c->ldst_unpriv = runpriv;
-    DTlbEnt *re = dtlb_ent(fromaddr);
-    bool rhit = re->tag == dtlb_tag(c, fromaddr) && (re->pte & DTLB_R);
-    if (whit && rhit) {
-        u8 *w = (u8 *)(we->pte & ~0xfffULL) + (toaddr & 0xfff);
-        const u8 *r = (const u8 *)(re->pte & ~0xfffULL) + (fromaddr & 0xfff);
-        c->ldst_unpriv = 0;
-        if (rev) memmove(w - (n - 1), r - (n - 1), (size_t)n);
-        else     memmove(w, r, (size_t)n);
-        return n;
-    }
+    void *r = mem_host_ptr(c, rev ? fromaddr - (n - 1) : fromaddr,
+                           (unsigned)n, ACC_READ);
+    c->ldst_unpriv = 0;
+    if (w && r) { memmove(w, r, (size_t)n); return n; }
     u64 byte;
     c->ldst_unpriv = runpriv;
-    bool ok = mem_read(c, fromaddr, 1, &byte);
-    if (ok) { c->ldst_unpriv = wunpriv; ok = mem_write(c, toaddr, 1, byte); }
+    if (!mem_read(c, fromaddr, 1, &byte)) { c->ldst_unpriv = 0; return 0; }
+    c->ldst_unpriv = wunpriv;
+    bool ok = mem_write(c, toaddr, 1, byte);
     c->ldst_unpriv = 0;
     return ok ? 1 : 0;
 }
