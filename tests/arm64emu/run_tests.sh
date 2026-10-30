@@ -21,10 +21,21 @@ ASM="$ROOT/tests/arm64emu/asm"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
-# Toolchain: prefer clang (cross by default), else aarch64-linux-gnu-gcc.
+# Toolchain: aarch64-linux-gnu-gcc if present, else clang (cross by default).
+# Each test becomes a flat image loaded at $LOAD, so the link must be static,
+# position-dependent, and put nothing below .text that objcopy would carry
+# into the image. clang is told to link with lld: some clang drivers hand an
+# aarch64-elf link to the host's GNU ld, which cannot emulate aarch64. gcc is
+# told not to make a PIE (distribution gccs default to one, whose .interp and
+# .dynsym land below -Ttext and become the image's first bytes) nor a build-id
+# note (placed ahead of .text).
 CC_AS=""
-if command -v clang >/dev/null;             then CC_AS="clang --target=aarch64-elf"; fi
-if command -v aarch64-linux-gnu-gcc >/dev/null; then CC_AS="aarch64-linux-gnu-gcc"; fi
+if command -v clang >/dev/null && command -v ld.lld >/dev/null; then
+    CC_AS="clang --target=aarch64-elf -fuse-ld=lld"
+fi
+if command -v aarch64-linux-gnu-gcc >/dev/null; then
+    CC_AS="aarch64-linux-gnu-gcc -static -no-pie -Wl,--build-id=none"
+fi
 OBJCOPY="$(command -v llvm-objcopy || command -v aarch64-linux-gnu-objcopy || command -v objcopy)"
 
 if [ -z "$CC_AS" ] || [ -z "$OBJCOPY" ]; then
