@@ -4,7 +4,7 @@
  * Every per-process file under /proc that the emulator synthesizes is served
  * from an anonymous fd (a memfd, or an unlinked temp file where the host has no
  * memfd_create). A host with neither -- forced here with
- * A64_PROCSYNTH_FORCE_FAIL -- used to make each of those opens fall through to
+ * ARM64CHROOT_PROCSYNTH_FORCE_FAIL -- used to make each of those opens fall through to
  * the HOST file, which describes the emulator: /proc/self/environ handed the
  * guest the emulator's whole environment, cmdline its command line, mounts the
  * host mount table, maps its address space. They are denied instead.

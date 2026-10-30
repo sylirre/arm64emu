@@ -97,7 +97,7 @@ static void *sem_waiter(void *a) {    /* parked in the IPC broker, socket held *
 int main(void) {
     /* Any writable directory: the fifo below is this fixture's own and no
      * path of it is compared against another host's. The harness hands the
-     * directory in as the guest's TMPDIR (hostenv.sh A64_SCRATCH) -- Android
+     * directory in as the guest's TMPDIR (hostenv.sh ARM64CHROOT_SCRATCH) -- Android
      * has no /tmp, and this fixture used to opt out there rather than run. */
     const char *tmp = getenv("TMPDIR");
     if (!tmp || !*tmp) tmp = "/tmp";

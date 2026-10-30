@@ -126,7 +126,7 @@ is not the oracle for most, so the expected block is a native run's):
   that the classic command then proves to be about termios2 is remembered, so
   the policy is not asked (and does not log a denial) on every call; the
   classic command answers `ENOTTY` itself for a descriptor that is no terminal.
-  `A64_TERMIOS2_FORCE_DENY` forces the tier on any host, and the suite runs
+  `ARM64CHROOT_TERMIOS2_FORCE_DENY` forces the tier on any host, and the suite runs
   `termios2` over it (`(denied tier)`), a rate set through the master included.
 - `TIOCGSID` (`tcgetsid(3)`; `tty_tiocgsid`, `sys_file.c`) is served the same
   way, for the same reason: Android's SELinux policy answers `EACCES` to it on
@@ -142,7 +142,7 @@ is not the oracle for most, so the expected block is a native run's):
   group (`sig_pgrp_session`: `getsid` of the group while its leader is there,
   a member's `/proc` stat after — a group outlives its leader), `ENOTTY` when
   the slave has no group. The ids are the host's, as `getsid(2)` and
-  `TIOCGPGRP` report them. `A64_TIOCGSID_FORCE_DENY` forces the tier on any
+  `TIOCGPGRP` report them. `ARM64CHROOT_TIOCGSID_FORCE_DENY` forces the tier on any
   host and the suite runs `tests/fixtures/tiocgsid.c` over it.
 - A terminal command refused with `EACCES` on a descriptor that is no terminal
   (`ioctl_refused`, `sys_file.c`) is answered `ENOTTY`. Android's SELinux
@@ -156,7 +156,7 @@ is not the oracle for most, so the expected block is a native run's):
   `TIOCGPGRP` through the same rule. `FIOCLEX`/`FIONCLEX` refused (the policy
   does so on a memfd) are served by `F_SETFD`, which is all a kernel does for
   them; an `O_PATH` or closed descriptor is the host's `EBADF` before any policy
-  is asked. `A64_TTYIOCTL_FORCE_DENY` makes any host refuse the same way, and
+  is asked. `ARM64CHROOT_TTYIOCTL_FORCE_DENY` makes any host refuse the same way, and
   the suite runs `tests/fixtures/ttynotty.c` over it.
 - On a pty slave the policy allows only `TCGETS`, `TCSETS*`, `TCFLSH`,
   `TIOCSCTTY`, `TIOC[GS]PGRP`, `TIOC[GS]WINSZ` and `TIOCOUTQ`. A slave has no
@@ -181,7 +181,7 @@ is not the oracle for most, so the expected block is a native run's):
   that is not the caller's controlling terminal (`TIOCGPGRP` tells). Two stay
   refused, since nothing allowed can do them: `TCXONC`'s `TCOOFF` and
   `TIOCNOTTY` on the caller's own terminal. `tests/fixtures/ptsioctl.c` runs
-  over `A64_TTYIOCTL_FORCE_DENY`, background, ignoring and orphaned process
+  over `ARM64CHROOT_TTYIOCTL_FORCE_DENY`, background, ignoring and orphaned process
   groups included.
 - `TIOCOUTQ` (on a socket `SIOCOUTQ`, the bytes not yet sent) and `TCSBRKP`
   (glibc's `tcsendbreak(fd, n > 0)`) are forwarded; they used to be answered
@@ -552,7 +552,7 @@ prefix holds none to trip over. `ELOOP` is the one ambiguous answer (a symlink
 in that prefix, or the race), and it falls back to opening the trusted root by
 name and resolving only the remainder — which answers it authoritatively. A host
 without `openat2` (Android 7 runs 3.x kernels) takes the per-component loop,
-probed once; `A64_PINWALK_FORCE_LOOP` forces that tier so the suite runs the
+probed once; `ARM64CHROOT_PINWALK_FORCE_LOOP` forces that tier so the suite runs the
 race test over both.
 
 The other cost is one descriptor held across the syscall, which is why `openat`
@@ -595,8 +595,8 @@ existing file; the same shape gives a spurious `ENOENT` for the ordinary
 differential record, and a `..` at the guest root cancels nothing (it is
 clamped) so it stays on the fast route.
 
-`A64_PATHFAST_OFF` takes the route out, and the suite runs the path-race test
-over both it and the two pin tiers. `A64_PATHFAST_VERIFY` resolves every path
+`ARM64CHROOT_PATHFAST_OFF` takes the route out, and the suite runs the path-race test
+over both it and the two pin tiers. `ARM64CHROOT_PATHFAST_VERIFY` resolves every path
 both ways and aborts on disagreement — a development knob for a *quiescent*
 tree, since the two walks run at different instants and a guest racing its own
 mounts (`tests/fixtures/bindrace.c`) makes them differ for a reason that is not
@@ -1482,7 +1482,7 @@ go wrong:
   blocked, `socket()` hands out an `AF_UNIX`/`SOCK_DGRAM` stand-in and the
   netlink-shaped syscalls on it are synthesized: `NLMSG_ERROR(err=0)` for
   non-dump requests, and real host interfaces (via `getifaddrs`) or an empty
-  `NLMSG_DONE` for dumps. `A64_NETLINK_FORCE_BLOCK` forces this tier for
+  `NLMSG_DONE` for dumps. `ARM64CHROOT_NETLINK_FORCE_BLOCK` forces this tier for
   testing.
 
   A netlink socket needs no destination address, so a request arrives by
@@ -1782,7 +1782,7 @@ then make the consequences the caller depends on true:
   hotplugs cores: every core Android took offline for power used to walk the
   counters backwards, and `top`/`vmstat` subtract consecutive samples, so a
   step backwards there is not a small error but an enormous bogus one —
-  `A64_PROCSTAT_HOTPLUG_SIM` walks the count down so a machine that never
+  `ARM64CHROOT_PROCSTAT_HOTPLUG_SIM` walks the count down so a machine that never
   hotplugs anything can test it), `btime` exact from
   `time() − CLOCK_BOOTTIME` (procps computes process start times from it),
   the rest honest zeros. `/proc/uptime`'s idle field comes from the host
@@ -1867,7 +1867,7 @@ then make the consequences the caller depends on true:
   the 1 MiB cap, or no memory to hold it — is refused rather than passed
   through, and only "there is no host file at all" falls through, since the
   caller's own open then fails in exactly the same way.
-  `A64_PROCSYNTH_FORCE_FAIL` forces the no-backing tier so the suite can check
+  `ARM64CHROOT_PROCSYNTH_FORCE_FAIL` forces the no-backing tier so the suite can check
   all of that (`tests/fixtures/procsynth_tier.c`).
 
   **`stat`, `statx`, `access` and `statfs` of a synthesized name** are the
@@ -1892,7 +1892,7 @@ then make the consequences the caller depends on true:
   allow the read and refuse the stat. `access` is then the mode rule applied to
   the guest's identity, `statfs` is the `/proc` filesystem's, and a name that
   is not synthesized, or whose open a guest would be refused, keeps the host's
-  own answer — nothing is invented. `A64_PROCSYNTH_FORCE_STAT_DENY` makes any
+  own answer — nothing is invented. `ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY` makes any
   host refuse these, so the suite runs `tests/fixtures/procsynth_stat.c` over
   it, with and without the synthesized-open tiers and `--fake-id`. (A
   descriptor on a view reports the memfd behind it, as it always did; only
@@ -1931,7 +1931,7 @@ then make the consequences the caller depends on true:
   execute-permission check (`exec_perm_check`, `sys_proc.c`) makes the same
   turn: with the path refused it applies the kernel's rule to the mode the
   descriptor reported rather than re-asking the path through `access(2)`, which
-  would only reproduce the refusal. `A64_OWNFD_FORCE_DENY` simulates the tier
+  would only reproduce the refusal. `ARM64CHROOT_OWNFD_FORCE_DENY` simulates the tier
   on a host that allows the path form.
 
   Those files and `comm` cover **this** process; the cross-process view that
@@ -2072,7 +2072,7 @@ them are the guest's own IPC model, not a host one.
   path), or a file in the first writable dir (`/dev/shm`, `$XDG_RUNTIME_DIR`,
   `$TMPDIR`, `/data/local/tmp`, …) when `memfd_create` is unavailable; if neither
   is possible `shmget` fails loud with `-ENOSPC` rather than handing back
-  non-shared memory. `A64_SHM_FORCE_FILE` forces the file tier for testing.
+  non-shared memory. `ARM64CHROOT_SHM_FORCE_FILE` forces the file tier for testing.
   That file gets a `mkstemp` name and is unlinked as soon as it exists: the
   descriptor is the whole segment (attachers receive it over `SCM_RIGHTS`,
   never by name), those directories are world-writable, and a predictable name
@@ -2223,7 +2223,7 @@ held: the region stays *shared* in the emulator's own record, so `/proc/maps`
 spells it `s` and a poke into it is `EIO`, and `wr_ok = 0` keeps
 `mprotect(PROT_WRITE)` answering `EACCES` as a stripped `VM_MAYWRITE` would.
 The retry is driven by the host's own `EPERM` rather than by a version test, so
-a backported kernel is judged by what it does; `A64_MEMFD_SEAL_FORCE_OLD=1`
+a backported kernel is judged by what it does; `ARM64CHROOT_MEMFD_SEAL_FORCE_OLD=1`
 refuses the direct route on a host that would have allowed it, which is how the
 suite's `(old-seal-mmap tier)` row reaches this path from a 6.x machine.
 `F_SEAL_FUTURE_WRITE` is deliberately not covered by any of it: it grandfathers
@@ -2253,7 +2253,7 @@ spliced back into every descriptor-addressed `fstat`/`newfstatat`/`statx`, into
 the `/proc/self/fd/N` spelling of the same object, and into `exec_perm_check`
 — which then applies the kernel's rule by hand, since `access(2)` would be
 answering about the host's mode. Unlike the seals it is not monotonic, so
-nothing caches it. `A64_MEMFD_CHMOD_FORCE_DENY=1` forces that tier on any host.
+nothing caches it. `ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY=1` forces that tier on any host.
 
 The registry lives in the session's broker daemon, which retires after a
 grace period with nothing to serve — and a registered memfd counts as
@@ -2267,7 +2267,7 @@ from under `mmap`'s `as_lock`, a fork the fork barrier aborts on. An exchange
 made under an emulator lock now never spawns (`shm_connect`): the daemon it
 finds missing is one that was killed, and it fails as against any daemon that
 is gone. `tests/fixtures/memfd_idle.c` sleeps past the grace and asks again.
-`A64_MEMFD_FORCE_FILE=1` forces the file tier on
+`ARM64CHROOT_MEMFD_FORCE_FILE=1` forces the file tier on
 any host; `tests/c/memfd_seals.c` runs the whole matrix against the qemu
 oracle both ways, and run_tests.sh re-runs the memfd tests through the tier
 (`(memfd-tier)` rows). `MFD_HUGETLB` is refused (`EINVAL`) on the tier —

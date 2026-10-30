@@ -555,14 +555,14 @@ int path_fd_link_target(struct Machine *m, const char *host, char *canon_out,
 /* Test knob for the tier above. Every caller that can serve a request from the
  * descriptor tries the path first, and on an ordinary Linux host the path form
  * always works -- so those fallbacks have coverage on a device and nowhere
- * else. A64_OWNFD_FORCE_DENY makes this host refuse the path spelling of one
+ * else. ARM64CHROOT_OWNFD_FORCE_DENY makes this host refuse the path spelling of one
  * of our own fds, which is what Android's policy does to a memfd's, and is
  * deliberately harsher than the device: it refuses stat and access as well as
  * open, so a caller that is correct under it is correct under the real thing.
  * Returns 1 when the caller must behave as though the host said EACCES. */
 int proc_own_fd_denied(const char *host) {
     static int on = -1;
-    if (!PROBE_ONCE(on, getenv("A64_OWNFD_FORCE_DENY") != NULL)) return 0;
+    if (!PROBE_ONCE(on, getenv("ARM64CHROOT_OWNFD_FORCE_DENY") != NULL)) return 0;
     return proc_own_fd_path(host) >= 0;
 }
 
@@ -1514,13 +1514,13 @@ unsigned path_host_root(struct Machine *m, const char *canon) {
  * ".."), so nothing in it can climb out of `rootfd` even lexically.
  *
  * openat2 is Linux 5.6; a host without it (Android 7 runs 3.x) answers ENOSYS,
- * which is probed once and then never asked again. A64_PINWALK_FORCE_LOOP
+ * which is probed once and then never asked again. ARM64CHROOT_PINWALK_FORCE_LOOP
  * forces that tier so the suite exercises both. Returns the fd, or -1 with
  * errno set -- ENOSYS meaning "ask the loop", anything else being the answer. */
 static int pin_walk_at2(int rootfd, const char *rest) {
 #ifdef SYS_openat2
     static int off = -1;
-    if (!PROBE_ONCE(off, getenv("A64_PINWALK_FORCE_LOOP") != NULL)) {
+    if (!PROBE_ONCE(off, getenv("ARM64CHROOT_PINWALK_FORCE_LOOP") != NULL)) {
         struct { u64 flags, mode, resolve; } how = {
             (u64)(O_PATH | O_DIRECTORY | O_CLOEXEC), 0,
             /* BENEATH is meaningless (and refused) for the absolute spelling
@@ -2124,22 +2124,22 @@ int path_resolve(struct Machine *m, int dirfd, const char *gpath,
  * ".." that cancels a component (the pin only certifies the components the
  * fold LEFT, and "link/.." climbs from the link's target, not from its parent),
  * any error at all. The optimistic route can therefore only ever be a shortcut
- * to the same answer, never a different one. A64_PATHFAST_OFF takes the route
+ * to the same answer, never a different one. ARM64CHROOT_PATHFAST_OFF takes the route
  * out entirely, which is how the suite checks that both routes contain a guest
  * equally.
  *
- * A64_PATHFAST_VERIFY runs both and aborts on any disagreement. It is a
+ * ARM64CHROOT_PATHFAST_VERIFY runs both and aborts on any disagreement. It is a
  * development knob for a QUIESCENT tree: the two walks run at different
  * instants, so a guest that is concurrently mounting or renaming under its own
  * feet (tests/fixtures/bindrace.c, pathrace.c) makes them disagree for a reason
  * that is not a bug -- each answer was true when it was taken. */
 static int pathfast_off(void) {
     static int off = -1;
-    return PROBE_ONCE(off, getenv("A64_PATHFAST_OFF") != NULL);
+    return PROBE_ONCE(off, getenv("ARM64CHROOT_PATHFAST_OFF") != NULL);
 }
 static int pathfast_verify(void) {
     static int v = -1;
-    return PROBE_ONCE(v, getenv("A64_PATHFAST_VERIFY") != NULL);
+    return PROBE_ONCE(v, getenv("ARM64CHROOT_PATHFAST_VERIFY") != NULL);
 }
 
 /* Would the slow walk have looked at the final component, and so possibly

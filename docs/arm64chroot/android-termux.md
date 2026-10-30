@@ -44,7 +44,7 @@ unfiltered:
   from; `pidfd_send_signal` through a `/proc/<pid>` directory is sent by pid
   instead, and `CLONE_PIDFD` is refused (`EINVAL`) rather than half-honoured.
   `make test-seccomp` runs the suite's host-capability probes under the same
-  filter (`A64_EMU_WRAP`), so the pidfd tests skip there by name.
+  filter (`ARM64CHROOT_EMU_WRAP`), so the pidfd tests skip there by name.
 * **`statx` fallback**: when host `statx` fails with `ENOSYS` (Android 8.0/8.1,
   old kernels), the result is synthesized from `fstatat` with `STATX_BTIME`
   cleared from the mask.
@@ -56,7 +56,7 @@ unfiltered:
   seeding *skips* its own device fallback on anything ≥ 4.8 precisely because
   `getrandom` must exist there — forwarding the host's `ENOSYS` left TLS
   software with no entropy source at all (`apk update` crashed on a NULL SSL
-  object). `A64_GETRANDOM_FORCE_DEV` forces this tier for testing. The same
+  object). `ARM64CHROOT_GETRANDOM_FORCE_DEV` forces this tier for testing. The same
   two tiers seed the guest's `AT_RANDOM` (the sixteen bytes libc turns into
   a stack canary and pointer guard), which used to fall back to a fixed
   pattern instead — the same canary in every guest on such a host. A host
@@ -66,7 +66,7 @@ unfiltered:
   itself first so that nothing else the host could call `EINVAL` is left,
   remembers the refusal and serves the flag from `/dev/urandom` from then on
   — which is what it asks for, the urandom pool without the seeded wait.
-  `A64_GETRANDOM_FORCE_OLD` is such a host on any kernel.
+  `ARM64CHROOT_GETRANDOM_FORCE_OLD` is such a host on any kernel.
 * **Never-forwarded set**: the keyring family returns `-ENOSYS` everywhere now
   (`--host-keyring` opts a glibc host back into the passthrough; on Bionic the
   option cannot be honoured, since the Oreo filter kills a forwarded call);
@@ -163,7 +163,7 @@ unfiltered:
   every current LTS kernel. That is the mapping a sealed memfd exists to hand
   out, so the emulator serves it from backing of its own rather than forwarding
   a refusal its `uname` says cannot happen; `docs/syscalls.md` has why the
-  guest cannot tell, and `A64_MEMFD_SEAL_FORCE_OLD` reaches the path from a
+  guest cannot tell, and `ARM64CHROOT_MEMFD_SEAL_FORCE_OLD` reaches the path from a
   modern host.
 
 * **Re-opening a memfd through `/proc/self/fd/N`** is denied by Android's
@@ -188,7 +188,7 @@ unfiltered:
   device *does* allow `stat` and `access` through it, only the open is refused
   — then `faccessat2`'s `AT_EMPTY_PATH`, and where neither can answer, the mode
   the descriptor gave, judged against this process's real identity (the
-  guest's, without `--fake-id`) by the kernel's own rule. `A64_OWNFD_FORCE_DENY` makes an ordinary host refuse those
+  guest's, without `--fake-id`) by the kernel's own rule. `ARM64CHROOT_OWNFD_FORCE_DENY` makes an ordinary host refuse those
   path forms — stat and access included, so it is stricter than the device —
   and the suite runs `tests/fixtures/ownfdexec.c` over both tiers, with and
   without `--fake-id`, requiring identical output.
@@ -201,12 +201,12 @@ unfiltered:
   terminal. They are answered from the classic commands instead (the speeds are
   the `c_cflag` rate, or a per-terminal record of an arbitrary one), and the
   first refusal is remembered so the policy is not asked again. See
-  `docs/syscalls.md`; `A64_TERMIOS2_FORCE_DENY` forces the tier anywhere.
+  `docs/syscalls.md`; `ARM64CHROOT_TERMIOS2_FORCE_DENY` forces the tier anywhere.
 
 * **`TIOCGSID`** (`tcgetsid(3)`) is denied on a pty slave and on a pipe, and
   allowed on the ptmx master: `EACCES` where a kernel answers the session or
   `ENOTTY`. It is answered from `TCGETS`, `TIOCGPGRP` and `getsid`, as above
-  (`A64_TIOCGSID_FORCE_DENY`). What the policy did with the tty ioctls
+  (`ARM64CHROOT_TIOCGSID_FORCE_DENY`). What the policy did with the tty ioctls
   probed on a device: on a pty slave `TCGETS`, `TIOCGPGRP` and `TIOCGWINSZ`
   were answered and `TCGETS2` and `TIOCGSID` refused; on a pipe `TCGETS` got
   the kernel's `ENOTTY` while `TCGETS2`, `TIOCGPGRP` and `TIOCGSID` got
@@ -223,7 +223,7 @@ unfiltered:
   answered `ENOTTY` (`ioctl_refused`, `sys_file.c`); a character or block
   device keeps the host's answer, since its driver decides. `FIOCLEX` and
   `FIONCLEX` are refused on a memfd as well; they only set or clear
-  close-on-exec, which `F_SETFD` does unrefused. `A64_TTYIOCTL_FORCE_DENY`
+  close-on-exec, which `F_SETFD` does unrefused. `ARM64CHROOT_TTYIOCTL_FORCE_DENY`
   forces the tier anywhere (the suite's `ttynotty (denied tier)` row).
 
 * **Terminal ioctls on the pty slave.** The policy lets an app issue only
@@ -237,7 +237,7 @@ unfiltered:
   the background-job check `tcdrain` makes. `TCXONC`'s `TCOOFF` and
   `TIOCNOTTY` on the caller's own controlling terminal stay refused: nothing an
   app may issue stops a terminal's output or drops a controlling terminal.
-  `A64_TTYIOCTL_FORCE_DENY` refuses the same list on any host (the suite's
+  `ARM64CHROOT_TTYIOCTL_FORCE_DENY` refuses the same list on any host (the suite's
   `ptsioctl (denied tier)` row).
 
 * **`stat` of a device node an app may still name.** `/dev/full` (and
@@ -269,7 +269,7 @@ unfiltered:
   if the pin does — a `dup` that fails (the daemon out of descriptors) refuses
   the request rather than leaving a key nothing holds. A
   native memfd is registered lazily, on its first refused chmod, so nothing is
-  paid on a host that simply allows it. `A64_MEMFD_CHMOD_FORCE_DENY` forces the
+  paid on a host that simply allows it. `ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY` forces the
   tier anywhere, and `tests/fixtures/ownfdexec.c`'s fourth leg is what it is
   for.
 
@@ -282,7 +282,7 @@ unfiltered:
   zero), and read a `VmRSS` whose three components were missing entirely.
   Both are now appended when the host file stops short, which is what the rest
   of the Vm block, `NoNewPrivs` and `Seccomp` already did.
-  `A64_PROCFS_FORCE_OLD` hides exactly those from an ordinary host's /proc so
+  `ARM64CHROOT_PROCFS_FORCE_OLD` hides exactly those from an ordinary host's /proc so
   the append paths are reachable off the device.
 
 * **`stat` and `access` of the synthesized `/proc` files** are denied as well:
@@ -292,12 +292,12 @@ unfiltered:
   and `test -r`, which were handed to the host. The host's refusal is now
   answered from the same view with a procfs file's attributes (regular, size
   0, root's 0444 — see [syscalls.md](syscalls.md)).
-  `A64_PROCSYNTH_FORCE_STAT_DENY` makes any host refuse them, and
+  `ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY` makes any host refuse them, and
   `tests/fixtures/procsynth_stat.c` runs over it.
 
 * **`/proc/version` and `/proc/uptime`** are denied to an app outright, which
   is why both are synthesized. Where there is no anonymous backing to
-  synthesize into (`A64_PROCSYNTH_FORCE_FAIL`), they are the two views that
+  synthesize into (`ARM64CHROOT_PROCSYNTH_FORCE_FAIL`), they are the two views that
   fall through to the host rather than being denied — and on Android the guest
   then reads the host's EACCES. That is the truthful answer for a pass-through,
   and what `tests/fixtures/procsynth_tier.c` requires there is only that the
@@ -426,7 +426,7 @@ warns on a mismatch), and run:
 ```sh
 tar xzf arm64chroot-testpack.tar.gz
 ln -s ~/alpine-rootfs tests/.cache/rootfs/alpine   # any aarch64 rootfs with busybox
-A64_ORACLE=recorded make CC=clang test
+ARM64CHROOT_ORACLE=recorded make CC=clang test
 ```
 
 Everything portable runs for real on the device — the asm and C differential
@@ -467,7 +467,7 @@ hardcoded a `/tmp` the device has none of:
   vintage rather than this host's — a recording run stores what its own host
   answered in `tests/.cache/recorded/MEMFD_SEAL`, so a phone replaying a pack
   from a 6.x box runs the row (and the file-tier one) instead of skipping it.
-  `A64_MEMFD_SEAL_FORCE_OLD` drives the same path from a modern host.
+  `ARM64CHROOT_MEMFD_SEAL_FORCE_OLD` drives the same path from a modern host.
 * **`fixtures/sockfilter_get`** — `SO_GET_FILTER` is Linux 3.8 and the armv7
   rig runs 3.1. The emulator forwards the option and has no filter state of
   its own to answer from, so the fixture asks first and prints a single
@@ -555,7 +555,7 @@ Seven rows of that run skipped rather than failed, for the same reason as the
 three above: they build their files in a `/tmp` Android does not have. A host
 that keeps its scratch somewhere else says so in `$TMPDIR` — Termux sets it to
 `$PREFIX/tmp` — so `hostenv.sh` asks that first and falls back to `/tmp`
-(`A64_SCRATCH`), and `check_fixture` hands the answer to any fixture whose
+(`ARM64CHROOT_SCRATCH`), and `check_fixture` hands the answer to any fixture whose
 header carries a `WANTS-SCRATCH` marker as the guest's `TMPDIR`. It has to be
 handed in: the emulator gives the guest a clean environment, so a fixture
 cannot read the host's own variable (`-E` is how anything gets in). Only to
@@ -594,7 +594,7 @@ has a scheme for it and the oracle has none, so the oracle side dies with
 `link: Permission denied` while the emulator side prints every row. The two
 worlds differ there in what they can *do*, not in what they answer about one
 question, so no oracle on that host can referee these three. `hostenv.sh`
-tries a real hardlink in the scratch directory once (`A64_HOST_HARDLINK`), the
+tries a real hardlink in the scratch directory once (`ARM64CHROOT_HOST_HARDLINK`), the
 `--link2symlink` block names that refusal where it is what stops the rows, and
 the three sources carry a `NEEDS-HOST-LINK` marker so the C loop's own rows
 skip with `host denies: link(2)`, beside the `NEEDS-HOST-READ` and
@@ -608,7 +608,7 @@ hand exactly as a device's proot wrote it, and the two must print the same
 bytes; the hostile layouts judge against what an ordinary symlink answers and
 the canary files they leave outside the rootfs. They run wherever the scheme is
 compiled in — the android-sim build (which `make test-android-sim` tells with
-`A64_L2S_BUILD=1`) or an Android host — and are skipped under any other
+`ARM64CHROOT_L2S_BUILD=1`) or an Android host — and are skipped under any other
 emulator, where those layouts are plain symlinks and there is nothing to ask.
 
 A binary the pack shipped counts as missing once it stops matching the
@@ -621,7 +621,7 @@ because clang laid the binary out differently from gcc and the tests fold
 their own `ADR`/`ADRP` offsets into the hash they print. Unpack the pack
 again to restore them.
 
-`A64_ORACLE=recorded make test-jit` replays the same pack with the
+`ARM64CHROOT_ORACLE=recorded make test-jit` replays the same pack with the
 translator on, and on a 32-bit ARM device that is the *only* check that the
 silicon agrees with what the ARM32 code generator emits — the qemu-arm tier
 on the dev box exercises the emitter, not the CPU, and the AArch64 CI

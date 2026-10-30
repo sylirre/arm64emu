@@ -1,7 +1,7 @@
 /* /proc/stat shape + rewind freshness, differential half. The emulator
  * passes the host file through where it is readable (as on CI), so both
  * runners see the real file here; the synthesized fallback is asserted in
- * tests/arm64chroot/fixtures/procfs_fidelity.c under A64_PROCSTAT_FORCE_SYNTH. Check
+ * tests/arm64chroot/fixtures/procfs_fidelity.c under ARM64CHROOT_PROCSTAT_FORCE_SYNTH. Check
  * properties that hold for real and synthesized content alike — including
  * the procps access pattern: open once, then lseek(0)+reread and expect the
  * counters to move (real procfs regenerates on rewind; so must a synthesized

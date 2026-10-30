@@ -18,7 +18,7 @@ cflags=$(grep -m1 -o 'BUILDFLAGS:[^*]*' tests/arm64chroot/fpconsist.c | sed 's/^
     # being packed -- an inventory gap, not a broken build, and not a reason
     # to abort the run before the suite proper. Any real compiler failing is
     # still a failure.
-    if [ "${A64_ORACLE:-auto}" = recorded ]; then
+    if [ "${ARM64CHROOT_ORACLE:-auto}" = recorded ]; then
         echo "SKIP fpconsist: not in this test pack (re-record with make test-pack)"
         exit 0
     fi

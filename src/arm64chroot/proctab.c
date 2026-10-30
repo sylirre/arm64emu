@@ -1041,7 +1041,7 @@ static s32 shm_alloc_id(void) {
 }
 
 /* Create a segment's backing: an anonymous memfd (the normal, Android-safe path)
- * or, when memfd_create is unavailable -- or A64_SHM_FORCE_FILE forces it for a
+ * or, when memfd_create is unavailable -- or ARM64CHROOT_SHM_FORCE_FILE forces it for a
  * test -- a file in the first writable dir. Returns the fd, or -1 (no backing
  * -> caller fails loud).
  *
@@ -1055,7 +1055,7 @@ static s32 shm_alloc_id(void) {
  * share-map whatever it pointed at. */
 static int shm_make_backing(u64 size) {
     int fd = -1;
-    if (!getenv("A64_SHM_FORCE_FILE")) fd = proctab_memfd();
+    if (!getenv("ARM64CHROOT_SHM_FORCE_FILE")) fd = proctab_memfd();
     if (fd < 0) {
         const char *dir = shared_dir();
         if (!dir) return -1;
@@ -2671,11 +2671,11 @@ static int proctab_open_broker(const char *rootfs_key, size_t size) {
 void proctab_init(const char *rootfs_key) {
     size_t size = PROCTAB_SIZE;
     if (rootfs_key) {
-        /* A64_PROCTAB_FORCE_FILE skips the diskless broker for the named-file
+        /* ARM64CHROOT_PROCTAB_FORCE_FILE skips the diskless broker for the named-file
          * tier below -- what a host with neither memfd_create nor abstract
          * sockets is permanently on, and a tier no ordinary machine would
          * otherwise reach. */
-        if (!getenv("A64_PROCTAB_FORCE_FILE") &&
+        if (!getenv("ARM64CHROOT_PROCTAB_FORCE_FILE") &&
             proctab_open_broker(rootfs_key, size)) return;   /* diskless (normal) */
         if (proctab_open_shared(rootfs_key, size)) return;   /* named-file fallback */
     }

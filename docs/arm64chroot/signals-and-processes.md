@@ -51,7 +51,7 @@ both flags outright — qemu-user installs a handler of its own with flags of
 its own — which a child forked at startup with `SA_NOCLDWAIT` set, and
 waited for, tells apart (`sig_probe_host`): there the emulator reaps and drops
 the notices itself, as it does for a clone child (`sig_chld_reap_emulated`;
-`A64_NOCLDWAIT_FORCE_EMULATE` forces it, and the fixture runs a second time
+`ARM64CHROOT_NOCLDWAIT_FORCE_EMULATE` forces it, and the fixture runs a second time
 over it).
 
 Synchronous guest faults (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGTRAP`) never
@@ -92,7 +92,7 @@ hold what a kernel's pending queue holds, by the kernel's own two rules:
   payload, until `RLIMIT_SIGPENDING` refuses the *sender* with `EAGAIN`. The
   queue is sized for that now: 32 entries in thread-local storage, which an
   ordinary guest never outgrows, then doubling on demand up to the rlimit
-  (capped; `A64_SIGQ_MAX` caps it further, which is how the gate below is
+  (capped; `ARM64CHROOT_SIGQ_MAX` caps it further, which is how the gate below is
   tested). It used to be a fixed 32-entry ring, so an `rt_sigqueueinfo` the
   host had already accepted — the guest sender was told it succeeded — was
   dropped on arrival, and with it a `sigqueue` payload, a POSIX timer expiry,
@@ -140,7 +140,7 @@ rather than delays), `SIGSYS` (a seccomp trap that arrives blocked force-kills
 the process), and the synchronous fault numbers (the emulator's own nets need
 them deliverable at every instant). `tests/c/sigqdepth.c` covers all of it,
 including a real cross-process flood onto a parked receiver, and the suite
-runs it a second time under `A64_SIGQ_MAX=32` so every flood in it has to go
+runs it a second time under `ARM64CHROOT_SIGQ_MAX=32` so every flood in it has to go
 through the gate and back.
 
 `SIGBUS` is the one whose *host* disposition the emulator keeps for itself, like
@@ -589,7 +589,7 @@ probe only matters where a number can be installed but not delivered, which is
 what `qemu-user` does to the top three (see *A signal the host accepts is not a
 signal the host delivers* in `docs/portability-and-pitfalls.md`). Every process
 of a session reaches the same answer without sharing it, because the answer is a
-property of the host. `A64_SIGRT_MAX=N` caps the search, which is how the suite
+property of the host. `ARM64CHROOT_SIGRT_MAX=N` caps the search, which is how the suite
 exercises the low-RT tier on a host that has no hole of its own.
 
 ### The guest's blocked set is the host thread's
@@ -766,7 +766,7 @@ tagged descriptor of the signal, its kind and its sender's code in `si_value`
 receiver with no registry entry is sent what the host can carry, and loses
 what it lost before: the payload of a sigqueue'd job-control signal, the
 thread of a thread-directed one, and `si_errno`, which is qemu's own doing.
-`A64_SICODE_FORCE_KNOWN` forces the tier; the suite runs the stopping ptrace
+`ARM64CHROOT_SICODE_FORCE_KNOWN` forces the tier; the suite runs the stopping ptrace
 tests over it (`(known-layout-tier)`), with `tests/ptrace/jcqueue.c`'s queued
 job-control signals, `tests/fixtures/sqiread.c` and `carrystale.c`.
 
@@ -2127,7 +2127,7 @@ returned before `strace` had heard of its child's exit. So
 its wait, blocking `SIGCHLD` (sigpending, a `signalfd`), and ignoring it; the
 tracer reaping, leaving, and killed; a death by `SIGKILL`; and a followed fork.
 Its tracer-killed case runs a second time with every host notice the parent
-takes held up 300 ms (`A64_SIGCHLD_DELAY`, the `slow-notice tier` row), so the
+takes held up 300 ms (`ARM64CHROOT_SIGCHLD_DELAY`, the `slow-notice tier` row), so the
 watcher's look releases the child and takes that release while the parent is
 still at the tracer's notice — the case `cw_overtake` keeps in order.
 

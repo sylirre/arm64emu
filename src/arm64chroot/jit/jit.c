@@ -172,7 +172,7 @@ void jit_tls_prewarm(void) {
     (void)*(volatile char *)&g_jit_env;
 }
 
-/* ---- optional helper-call profiler (A64_JIT_STATS=1) ----
+/* ---- optional helper-call profiler (ARM64CHROOT_JIT_STATS=1) ----
  * Ranks the exact instruction words still executed through the exec_a64
  * helper, so inlining work can be aimed at what a workload actually runs
  * (feed the words to a disassembler). Per-thread open-addressed tables are
@@ -188,14 +188,14 @@ typedef struct { u32 word; u32 pad_; u64 count; } JStat;
  * by one thread and read by another is still a data race. */
 static int g_jit_stats = -1;
 static int g_jstat_fd = -1;                  /* parked dup of stderr */
-static const char *g_jstat_path;             /* A64_JIT_STATS=/file: append */
+static const char *g_jstat_path;             /* ARM64CHROOT_JIT_STATS=/file: append */
 static __thread JStat *t_jstat;
 static __thread u64 t_jstat_lost;
 static JStat g_jstat[JSTAT_SLOTS];
 static u64 g_jstat_lost, g_jstat_icount;
 static pthread_mutex_t g_jstat_mu = PTHREAD_MUTEX_INITIALIZER;
 
-/* Fork safety, as in mem.c. Only A64_JIT_STATS runs takes this, but a lock
+/* Fork safety, as in mem.c. Only ARM64CHROOT_JIT_STATS runs takes this, but a lock
  * held by a sibling at fork is inherited locked and ownerless whether or not
  * it is on a hot path, and a wedged child under the one env var that exists to
  * diagnose the JIT would be a poor place to find that out. */
@@ -265,7 +265,7 @@ static void jstat_dump(void) {
     u64 total = g_jstat_lost;
     for (u32 i = 0; i < JSTAT_SLOTS; i++) total += g_jstat[i].count;
     /* The guest may have closed stderr (fd 2 is shared with it): write to
-     * the fd parked at enable time, or append to A64_JIT_STATS=<path>. */
+     * the fd parked at enable time, or append to ARM64CHROOT_JIT_STATS=<path>. */
     int fd = g_jstat_path
                  ? open(g_jstat_path, O_WRONLY | O_CREAT | O_APPEND, 0644)
                  : g_jstat_fd;
@@ -296,7 +296,7 @@ static void jstat_dump(void) {
     EMU_UNLOCK(&g_jstat_mu, EMU_LK_JSTAT);
 }
 
-/* ---- optional per-block code dump (A64_JIT_DUMP=<prefix> or =1) ----
+/* ---- optional per-block code dump (ARM64CHROOT_JIT_DUMP=<prefix> or =1) ----
  * Every translated block's host bytes are pwritten into
  * <prefix>.<pid>.<tid>.code at the block's code-cache offset — the file is
  * a sparse image of the cache, so chain/thunk jump targets in a
@@ -389,7 +389,7 @@ static int codemap_test(u64 pc) {
 /* ---- code cache ---- */
 
 static size_t jit_cache_size(void) {
-    const char *s = getenv("A64_JIT_MB");
+    const char *s = getenv("ARM64CHROOT_JIT_MB");
     long mb = s ? atol(s) : 32;
     if (mb < 1) mb = 1;
     /* A backend's direct branch must span the whole cache (block -> epilogue,
@@ -477,10 +477,10 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->helper_ldv = (void *)jit_ldv;
     env->helper_stv = (void *)jit_stv;
     env->dtlb = jit_dtlb_base();
-    env->slowmem = getenv("A64_JIT_SLOWMEM") != NULL;
+    env->slowmem = getenv("ARM64CHROOT_JIT_SLOWMEM") != NULL;
     EMU_LOCK(&g_jstat_mu, EMU_LK_JSTAT);
     if (__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) < 0) {
-        const char *s = getenv("A64_JIT_STATS");
+        const char *s = getenv("ARM64CHROOT_JIT_STATS");
         __atomic_store_n(&g_jit_stats, s != NULL, __ATOMIC_RELAXED);
         if (s) {
             if (s[0] == '/') g_jstat_path = s;
@@ -490,7 +490,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
             }
             atexit(jstat_dump);
         }
-        const char *d = getenv("A64_JIT_DUMP");
+        const char *d = getenv("ARM64CHROOT_JIT_DUMP");
         if (d) g_jdump_prefix = (d[0] && strcmp(d, "1") != 0)
                                     ? d : "a64jit-dump";
     }

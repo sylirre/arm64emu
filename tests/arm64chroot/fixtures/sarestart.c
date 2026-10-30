@@ -179,7 +179,7 @@ static void run(const char *what, int restart, void *(*helper)(void *), long (*c
 
 int main(void) {
     /* Any writable directory: every name below is this fixture's own. The
-     * harness hands it in as the guest's TMPDIR (hostenv.sh A64_SCRATCH) --
+     * harness hands it in as the guest's TMPDIR (hostenv.sh ARM64CHROOT_SCRATCH) --
      * Android has no /tmp, and all 39 rows used to opt out there. */
     const char *tmp = getenv("TMPDIR");
     if (!tmp || !*tmp ||

@@ -282,7 +282,7 @@ itself what each provides (`tests/hostenv.sh`):
 | `make test32` | `gcc -m32` | armhf cross gcc, or SKIP |
 | `make test32-jit` | the same, with `--jit` | the same, with `--jit` |
 
-`A64_CC` overrides the compiler and `A64_ORACLE=qemu|native|recorded` the
+`ARM64CHROOT_CC` overrides the compiler and `ARM64CHROOT_ORACLE=qemu|native|recorded` the
 oracle. Running against hardware is the stricter check of the two live modes
 — it compares the emulator with silicon rather than with a second emulator —
 and it is the only way the JIT's AArch64 backend is executed at all. A test
@@ -296,7 +296,7 @@ A host that can neither build the guest programs nor run any oracle — a
 into a 32-bit host one) — replays a **recorded** oracle instead:
 `make test-pack` on a dev box runs the suite once with every oracle answer
 captured and bundles it with the built test binaries; unpacked on the target
-at the same commit, `A64_ORACLE=recorded make test` runs everything portable
+at the same commit, `ARM64CHROOT_ORACLE=recorded make test` runs everything portable
 against the recorded answers (tests that compare live host state skip, with
 the reason named). See
 [docs/android-termux.md](docs/android-termux.md).
@@ -322,7 +322,7 @@ lazy-flag window from a producer to its consumer, fused memory runs, the
 block-local vector-register cache — none of which a single-instruction stub
 can exercise.
 
-Override the location of test environment with variable `A64_TEST_ROOT`.
+Override the location of test environment with variable `ARM64CHROOT_TEST_ROOT`.
 Wipe test environment with `make clean-testenv`.
 
 Cross-compile for a specific host (static, no runtime deps):

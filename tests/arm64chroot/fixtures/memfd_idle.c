@@ -11,7 +11,7 @@
  * while any process that registered it or asked about it is alive, and an
  * exchange made under an emulator lock never spawns.
  *
- * Run over the tier (A64_MEMFD_FORCE_FILE=1); the block is what a real
+ * Run over the tier (ARM64CHROOT_MEMFD_FORCE_FILE=1); the block is what a real
  * kernel prints for this program, whose seals are the inode's. The sleep is
  * longer than the grace. A child that shares the fd asks after the parent
  * has slept, so it is a second holder the registry must know. */

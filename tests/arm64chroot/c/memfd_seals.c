@@ -1,7 +1,7 @@
 /* memfd_create sealing semantics, against qemu-aarch64.
  *
  * The seal surface is what the fallback tier (sys_misc.c: hosts whose kernel
- * predates memfd_create, or A64_MEMFD_FORCE_FILE) must reproduce by hand:
+ * predates memfd_create, or ARM64CHROOT_MEMFD_FORCE_FILE) must reproduce by hand:
  * F_GET/F_ADD_SEALS, F_SEAL_SEAL, SHRINK/GROW at ftruncate, WRITE at
  * write(2) and shared mmap (including the VM_MAYWRITE rule: a read-only
  * PROT on a write-open fd is still refused), the EBUSY precondition against
@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
      * the write back -- the kernel admitted it with VM_MAYWRITE stripped.
      * (A kernel older than 6.x refuses the mapping outright, on any fd; the
      * emulator serves it from backing of its own, and run_tests.sh drives that
-     * tier from a modern host with A64_MEMFD_SEAL_FORCE_OLD.) */
+     * tier from a modern host with ARM64CHROOT_MEMFD_SEAL_FORCE_OLD.) */
     printf("mmap_r_data=%.5s\n",
            rmap == MAP_FAILED ? "n/a" : (const char *)rmap);
     errno = 0;

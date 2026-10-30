@@ -1044,7 +1044,7 @@ fast:;
  * mappings. The cost is a reload per value later; the saving is a whole probe. */
 static int fuse_enabled(void) {
     static int v = -1;
-    return PROBE_ONCE(v, getenv("A64_JIT_NOFUSE") == NULL);
+    return PROBE_ONCE(v, getenv("ARM64CHROOT_JIT_NOFUSE") == NULL);
 }
 
 /* base -> eax:edx, read from its home. A Src naming a register is not safe

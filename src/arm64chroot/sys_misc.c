@@ -27,14 +27,14 @@
  * guest on the host. Same two tiers sys_getrandom serves the guest from:
  * getrandom(2), then the random devices where the host kernel has none
  * (< 3.17 -- Android 7 devices run 3.x) or a seccomp filter answers ENOSYS
- * through the SIGSYS net. A64_GETRANDOM_FORCE_DEV selects the device tier
+ * through the SIGSYS net. ARM64CHROOT_GETRANDOM_FORCE_DEV selects the device tier
  * here too, so the suite's dev-tier row exercises this path as well.
  * Returns 0, or -1 when the host offers no entropy at all -- which the caller
  * must treat as a refusal to start, never as a reason to invent bytes. */
 int host_random_bytes(void *buf, size_t len) {
     u8 *p = buf;
     size_t got = 0;
-    if (!getenv("A64_GETRANDOM_FORCE_DEV")) {
+    if (!getenv("ARM64CHROOT_GETRANDOM_FORCE_DEV")) {
         while (got < len) {
             long n = syscall(SYS_getrandom, p + got, len - got, 0);
             if (n > 0) { got += (size_t)n; continue; }
@@ -97,13 +97,13 @@ SYSDEF(getrandom) {
      * (the flags have already been judged above, so nothing else the host
      * could call EINVAL is left), and the flag then goes straight to the
      * urandom tier below, which is what it asks for: the urandom pool
-     * without the seeded wait. A64_GETRANDOM_FORCE_OLD is such a host on any
+     * without the seeded wait. ARM64CHROOT_GETRANDOM_FORCE_OLD is such a host on any
      * kernel, and is how the suite runs the tier where the real thing has
      * the flag. */
     static int host_no_insecure = -1;
     int old = (flags & G_GRND_INSECURE) &&
-              PROBE_ONCE(host_no_insecure, getenv("A64_GETRANDOM_FORCE_OLD") != NULL);
-    if (!old && !getenv("A64_GETRANDOM_FORCE_DEV")) {
+              PROBE_ONCE(host_no_insecure, getenv("ARM64CHROOT_GETRANDOM_FORCE_OLD") != NULL);
+    if (!old && !getenv("ARM64CHROOT_GETRANDOM_FORCE_DEV")) {
         ssize_t n = syscall(SYS_getrandom, buf, len, flags);
         if (n >= 0) {
             if (copy_to_guest(c, a0, buf, (size_t)n) < 0)
@@ -452,7 +452,7 @@ SYSDEF(getcpu) {
  * cache survives it; the CLOEXEC walk closes through mfd_track_close).
  * Seals only ever accumulate, so a cached RESTRICTIVE bit is trusted after
  * an identity fstat, while a permissive answer re-asks the broker -- another
- * process may have sealed the inode since. A64_MEMFD_FORCE_FILE forces the
+ * process may have sealed the inode since. ARM64CHROOT_MEMFD_FORCE_FILE forces the
  * tier on any host, which is how it is differentially tested against the
  * qemu oracle on machines whose kernel has the real thing. */
 #define G_MFD_CLOEXEC        0x1u
@@ -540,13 +540,13 @@ int mfd_kernel_write_sealed(int fd) {
     return s >= 0 && (s & (int)G_F_SEAL_WRITE) != 0;
 }
 
-/* A64_MEMFD_SEAL_FORCE_OLD: refuse that mapping the way a pre-6.x kernel does,
+/* ARM64CHROOT_MEMFD_SEAL_FORCE_OLD: refuse that mapping the way a pre-6.x kernel does,
  * so the workaround is what serves the guest on a host that would have allowed
  * it outright. Every current LTS kernel is on that tier -- and a 6.x developer
  * machine is the one place it cannot otherwise be reached. */
 int mfd_seal_map_force_old(void) {
     static int forced = -1;
-    return PROBE_ONCE(forced, getenv("A64_MEMFD_SEAL_FORCE_OLD") != NULL);
+    return PROBE_ONCE(forced, getenv("ARM64CHROOT_MEMFD_SEAL_FORCE_OLD") != NULL);
 }
 
 int mfd_write_denied(CPU *c, int fd) {
@@ -654,12 +654,12 @@ int mfd_link_rewrite(CPU *c, const char *hostlink, char *buf) {
  * accept. All of it is gated on a host that actually refuses, so an ordinary
  * Linux host pays one probe per process and nothing else.
  *
- * A64_MEMFD_CHMOD_FORCE_DENY forces the tier on any host: without it these
+ * ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY forces the tier on any host: without it these
  * paths are reachable on a device and nowhere else. */
 int mfd_chmod_blocked(void) {
     static int on = -1;
     return PROBE_ONCE(on, ({
-        int v = getenv("A64_MEMFD_CHMOD_FORCE_DENY") != NULL;
+        int v = getenv("ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY") != NULL;
         if (!v) {
             fdwin_enter();   /* the probe memfd: ours, briefly (machine.h) */
 #if defined(__BIONIC__) && defined(SYS_memfd_create)
@@ -740,7 +740,7 @@ SYSDEF(memfd_create) {
     if (n == -ENAMETOOLONG) return (u64)(s64)-EINVAL;
     if (n < 0) return (u64)(s64)n;
     int r = -1;
-    if (!getenv("A64_MEMFD_FORCE_FILE")) {
+    if (!getenv("ARM64CHROOT_MEMFD_FORCE_FILE")) {
 #if defined(__BIONIC__) && defined(SYS_memfd_create)
         r = (int)syscall(SYS_memfd_create, name, (unsigned)a1);
 #else

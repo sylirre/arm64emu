@@ -577,7 +577,7 @@ bool nl_host_blocks(void)
 
     /* Testability: force the fallback on hosts where netlink actually works
      * (mirrors the A64_*_FORCE_* android-sim switches). */
-    if (getenv("A64_NETLINK_FORCE_BLOCK"))
+    if (getenv("ARM64CHROOT_NETLINK_FORCE_BLOCK"))
         goto blocked;
 
     /* Mirror bubblewrap's loopback_setup(): socket() then bind() with

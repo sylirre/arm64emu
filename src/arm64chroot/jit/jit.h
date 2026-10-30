@@ -89,10 +89,10 @@ int jit_pc_in_generated(const void *pc);
 const void *jit_fault_fixup(const void *pc);
 
 /* Process termination via _exit (exit/exit_group syscalls bypass atexit):
- * flush the A64_JIT_STATS report if it is enabled. No-op otherwise. */
+ * flush the ARM64CHROOT_JIT_STATS report if it is enabled. No-op otherwise. */
 void jit_stats_flush(void);
 
-/* This file's share of the fork-safety walk (the A64_JIT_STATS lock), called by
+/* This file's share of the fork-safety walk (the ARM64CHROOT_JIT_STATS lock), called by
  * main()'s single pthread_atfork triple; see the note beside the others in
  * machine.h. Outermost of the seven, so taken first and dropped last. */
 void jit_locks_take(void);

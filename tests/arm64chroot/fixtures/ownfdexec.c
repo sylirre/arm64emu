@@ -18,7 +18,7 @@
  * refused: the emulator falls back to the descriptor for the stat, so it must
  * judge the mode it got that way instead of asking the same path again -- and
  * it must not answer "allowed" to everything for having lost the path. The
- * harness runs the whole fixture again with A64_OWNFD_FORCE_DENY, which makes
+ * harness runs the whole fixture again with ARM64CHROOT_OWNFD_FORCE_DENY, which makes
  * an ordinary host refuse those path forms the way Android's policy does, and
  * requires the two runs to be identical. */
 #define _GNU_SOURCE

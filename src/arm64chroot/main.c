@@ -284,7 +284,7 @@ static void help(void) {
         {"    --",      "Stop option parsing."},
     };
     static const struct help_def env_tune[] = {
-        {"A64_JIT_MB", "Per-thread JIT code-cache size in MiB. Default "
+        {"ARM64CHROOT_JIT_MB", "Per-thread JIT code-cache size in MiB. Default "
                         "32, clamped to 1-128."},
         {"XDG_RUNTIME_DIR, TMPDIR", "First writable of these (or /dev/shm) holds "
                         "the backing directories of emulated tmpfs mounts, plus "
@@ -292,126 +292,126 @@ static void help(void) {
                         "shm segment files when memfd_create is unavailable."},
     };
     static const struct help_def env_diag[] = {
-        {"A64_JIT_STATS", "Rank instruction words still run via the exec_a64 "
+        {"ARM64CHROOT_JIT_STATS", "Rank instruction words still run via the exec_a64 "
                         "helper, =/path dumps the ranking to a file at exit."},
-        {"A64_JIT_DUMP=PREFIX", "Write each translated block into a sparse "
+        {"ARM64CHROOT_JIT_DUMP=PREFIX", "Write each translated block into a sparse "
                         "code-cache image (PREFIX.<pid>.<tid>.code plus a .map)."},
-        {"A64_JIT_PDMAX=N", "Force predecode ops with id > N through the helper "
+        {"ARM64CHROOT_JIT_PDMAX=N", "Force predecode ops with id > N through the helper "
                         "(bisects a codegen bug to one instruction class)."},
-        {"A64_JIT_SLOWMEM", "Force every inline memory op down its slow helper "
+        {"ARM64CHROOT_JIT_SLOWMEM", "Force every inline memory op down its slow helper "
                         "branch."},
-        {"A64_JIT_NOFUSE", "Disable instruction / D-TLB-probe fusion."},
-        {"A64_JIT_NOFP16", "Disable FP16 native codegen (AArch64 backend)."},
-        {"A64_JIT_NOVRA", "Disable the V-register cache."},
-        {"A64_JIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
-        {"A64_PROCSTAT_FORCE_SYNTH", "Force the synthetic /proc/stat fallback."},
-        {"A64_PROCFS_FORCE_OLD", "Hide from the host's /proc what a kernel "
+        {"ARM64CHROOT_JIT_NOFUSE", "Disable instruction / D-TLB-probe fusion."},
+        {"ARM64CHROOT_JIT_NOFP16", "Disable FP16 native codegen (AArch64 backend)."},
+        {"ARM64CHROOT_JIT_NOVRA", "Disable the V-register cache."},
+        {"ARM64CHROOT_JIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
+        {"ARM64CHROOT_PROCSTAT_FORCE_SYNTH", "Force the synthetic /proc/stat fallback."},
+        {"ARM64CHROOT_PROCFS_FORCE_OLD", "Hide from the host's /proc what a kernel "
                         "older than the advertised one does not have -- stat "
                         "past field 44 (3.3) and status's Rss* component "
                         "lines (4.5) -- so the synthesized views must supply "
                         "them (exercises the Android 7 tier)."},
-        {"A64_PROCSTAT_HOTPLUG_SIM", "Walk the online-CPU count down on every "
+        {"ARM64CHROOT_PROCSTAT_HOTPLUG_SIM", "Walk the online-CPU count down on every "
                         "/proc/stat sample (simulates a host that hotplugs "
                         "cores, as Android does)."},
-        {"A64_OVERFLOWID_FORCE_SYNTH", "Force the synthetic "
+        {"ARM64CHROOT_OVERFLOWID_FORCE_SYNTH", "Force the synthetic "
                         "/proc/sys/kernel/overflow{u,g}id fallback."},
-        {"A64_PATHFAST_OFF", "Resolve every guest path by walking it one "
+        {"ARM64CHROOT_PATHFAST_OFF", "Resolve every guest path by walking it one "
                         "component at a time (a readlink each) instead of "
                         "folding it and letting the pin certify that it held "
                         "no symlink. Same answers, more syscalls."},
-        {"A64_PATHFAST_VERIFY", "Resolve every guest path BOTH ways and abort "
+        {"ARM64CHROOT_PATHFAST_VERIFY", "Resolve every guest path BOTH ways and abort "
                         "on any disagreement. For a quiescent tree: a guest "
                         "racing its own mounts or renames makes the two walks "
                         "differ for a reason that is not a bug."},
-        {"A64_PINWALK_FORCE_LOOP", "Pin a resolved path's parent directory one "
+        {"ARM64CHROOT_PINWALK_FORCE_LOOP", "Pin a resolved path's parent directory one "
                         "component at a time instead of in a single openat2 "
                         "(the tier a host kernel older than 5.6 is served by). "
                         "Same containment, one syscall per component."},
-        {"A64_PROCSYNTH_FORCE_FAIL", "Make the synthesized /proc views find no "
+        {"ARM64CHROOT_PROCSYNTH_FORCE_FAIL", "Make the synthesized /proc views find no "
                         "anonymous backing (the tier a host with neither "
                         "memfd_create nor a writable directory is served by): "
                         "the per-process files are denied, never served from "
                         "the host's own /proc."},
-        {"A64_PROCSYNTH_FORCE_STAT_DENY", "Make the host refuse stat, statx, "
+        {"ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY", "Make the host refuse stat, statx, "
                         "access and statfs of every synthesized /proc file "
                         "(EACCES, as Android's SELinux policy does for the "
                         "files whose open the emulator serves): the guest is "
                         "then answered from the synthesized view instead."},
-        {"A64_NETLINK_FORCE_BLOCK", "Force the netlink fallback path."},
-        {"A64_PROCTAB_FORCE_FILE", "Skip the diskless guest-PID registry "
+        {"ARM64CHROOT_NETLINK_FORCE_BLOCK", "Force the netlink fallback path."},
+        {"ARM64CHROOT_PROCTAB_FORCE_FILE", "Skip the diskless guest-PID registry "
                         "broker for the named-file tier (the tier a host with "
                         "neither memfd_create nor abstract sockets is served "
                         "by); the file is refused unless it is a regular file "
                         "of this user that nobody else can reach."},
-        {"A64_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
+        {"ARM64CHROOT_SHM_FORCE_FILE", "Force System V shm segments onto file backing "
                         "instead of an anonymous memfd (exercises the fallback "
                         "tier)."},
-        {"A64_GETRANDOM_FORCE_DEV", "Force getrandom(2), and the guest's "
+        {"ARM64CHROOT_GETRANDOM_FORCE_DEV", "Force getrandom(2), and the guest's "
                         "AT_RANDOM seed, onto the /dev/urandom / /dev/random "
                         "fallback (the tier a host kernel without getrandom "
                         "is served by)."},
-        {"A64_GETRANDOM_FORCE_OLD", "Refuse GRND_INSECURE on the host "
+        {"ARM64CHROOT_GETRANDOM_FORCE_OLD", "Refuse GRND_INSECURE on the host "
                         "getrandom(2) path the way a 3.17-5.5 kernel does "
                         "(the tier such a host is served by: the flag is "
                         "then answered from /dev/urandom)."},
-        {"A64_PAGEPROBE_FORCE_PIPE", "Probe a grown file mapping's pages "
+        {"ARM64CHROOT_PAGEPROBE_FORCE_PIPE", "Probe a grown file mapping's pages "
                         "with a pipe instead of process_vm_readv (the tier a "
                         "host kernel older than 3.2 is served by)."},
-        {"A64_MINCORE_FORCE_FAIL", "Make the resident-set sample fail (the "
+        {"ARM64CHROOT_MINCORE_FORCE_FAIL", "Make the resident-set sample fail (the "
                         "tier a host that will not answer mincore(2) is served "
                         "by): the sizes the guest reads about its own memory "
                         "stay its own, and the Rss figures fall back to the "
                         "host's, bounded by what the guest mapped -- which is "
                         "what every reader of ANOTHER process already gets."},
-        {"A64_MEMFD_FORCE_FILE", "Force guest memfd_create(2) onto the "
+        {"ARM64CHROOT_MEMFD_FORCE_FILE", "Force guest memfd_create(2) onto the "
                         "unlinked-file fallback tier with broker-held seals "
                         "(what a host kernel without memfd_create is served "
                         "by)."},
-        {"A64_MEMFD_SEAL_FORCE_OLD", "Refuse a read-only shared mapping of a "
+        {"ARM64CHROOT_MEMFD_SEAL_FORCE_OLD", "Refuse a read-only shared mapping of a "
                         "write-sealed memfd the way a kernel older than 6.x "
                         "does, so the emulator's own backing is what serves "
                         "the guest that mapping."},
-        {"A64_SIGRT_MAX=N", "Reserve the emulator's own host signals below N "
+        {"ARM64CHROOT_SIGRT_MAX=N", "Reserve the emulator's own host signals below N "
                         "instead of at the top of the RT range (exercises the "
                         "tier a host that cannot deliver its top RT signals is "
                         "served by)."},
-        {"A64_OWNFD_FORCE_DENY", "Refuse the path spelling of the emulator's "
+        {"ARM64CHROOT_OWNFD_FORCE_DENY", "Refuse the path spelling of the emulator's "
                         "own fds (/proc/self/fd/N), as Android's policy does "
                         "for a memfd, so exec and open take the descriptor "
                         "fallback."},
-        {"A64_MEMFD_CHMOD_FORCE_DENY", "Refuse every mode change on a memfd, "
+        {"ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY", "Refuse every mode change on a memfd, "
                         "as Android's policy does, so the guest-set mode is "
                         "held in the broker registry instead of by the host."},
-        {"A64_TERMIOS2_FORCE_DENY", "Refuse the termios2 ioctls (TCGETS2, "
+        {"ARM64CHROOT_TERMIOS2_FORCE_DENY", "Refuse the termios2 ioctls (TCGETS2, "
                         "TCSETS2, ...) with EACCES, as Android's policy does, "
                         "so they are served from TCGETS/TCSETS -- without "
                         "which a glibc 2.42+ guest's isatty() is false and "
                         "an interactive bash prints no prompt."},
-        {"A64_TIOCGSID_FORCE_DENY", "Refuse TIOCGSID (tcgetsid) with EACCES, "
+        {"ARM64CHROOT_TIOCGSID_FORCE_DENY", "Refuse TIOCGSID (tcgetsid) with EACCES, "
                         "as Android's policy does on a pty slave and a pipe, "
                         "so it is served from TCGETS, TIOCGPGRP and getsid."},
-        {"A64_TTYIOCTL_FORCE_DENY", "Refuse terminal ioctls with EACCES "
+        {"ARM64CHROOT_TTYIOCTL_FORCE_DENY", "Refuse terminal ioctls with EACCES "
                         "as Android's policy does -- all of them and "
                         "FIOCLEX/FIONCLEX on a pipe, socket, file or "
                         "directory, all but its short list on a pty slave -- "
                         "so the guest is answered from what the kernel does "
                         "(ENOTTY, F_SETFD, the tty core's answers)."},
-        {"A64_TLBPUB_MAX=N", "Cap the published-epoch table at N slots "
+        {"ARM64CHROOT_TLBPUB_MAX=N", "Cap the published-epoch table at N slots "
                         "(exercises the tier a guest with more live threads "
                         "than it holds is served by: the retired-backing "
                         "quarantine stops draining)."},
-        {"A64_SIGQ_MAX=N", "Cap a thread's pending-signal queue at N entries "
+        {"ARM64CHROOT_SIGQ_MAX=N", "Cap a thread's pending-signal queue at N entries "
                         "(exercises the back-pressure gate: a queue with no "
                         "room leaves the rest of a flood in the host kernel's "
                         "own queue until it drains)."},
-        {"A64_SIGCHLD_DELAY=MS", "Hold a guest thread MS milliseconds as it "
+        {"ARM64CHROOT_SIGCHLD_DELAY=MS", "Hold a guest thread MS milliseconds as it "
                         "starts on each SIGCHLD notice the host sends (what a "
                         "loaded host does to a thread it preempts there), so "
                         "the emulator's SIGCHLD watcher runs meanwhile -- the "
                         "condition under which a dead tracer's notice and the "
                         "release of the child it traced must keep the "
                         "kernel's order."},
-        {"A64_SICODE_FORCE_KNOWN", "Send the emulator's own signals between "
+        {"ARM64CHROOT_SICODE_FORCE_KNOWN", "Send the emulator's own signals between "
                         "processes with si_codes of a layout the kernel knows "
                         "only (the tier a host that cannot carry a private "
                         "si_code, qemu-user, is served by): a queued siginfo "
@@ -419,12 +419,12 @@ static void help(void) {
                         "receiver's registry inbox instead, and a job-control "
                         "signal to a traced process rides the kick as "
                         "SI_QUEUE."},
-        {"A64_NOCLDWAIT_FORCE_EMULATE", "Reap an SA_NOCLDWAIT parent's "
+        {"ARM64CHROOT_NOCLDWAIT_FORCE_EMULATE", "Reap an SA_NOCLDWAIT parent's "
                         "children and drop an SA_NOCLDSTOP parent's stop "
                         "notices in the emulator instead of leaving it to the "
                         "host (the tier a host that ignores the two flags, "
                         "qemu-user, is served by)."},
-        {"A64_STACKGROW_FORCE_PIECE", "Reserve no host room below a stack "
+        {"ARM64CHROOT_STACKGROW_FORCE_PIECE", "Reserve no host room below a stack "
                         "and never extend its backing downward, so a stack "
                         "that grows goes on in a new piece of backing of its "
                         "own (the tier a host whose address space under a "

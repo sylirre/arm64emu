@@ -24,7 +24,7 @@ static long rl(int dfd, const char *path, char *buf, long bufsiz) {
 int main(void) {
     /* Anywhere writable will do -- nothing here compares a path against
      * another host's. The harness hands the directory in as the guest's
-     * TMPDIR (hostenv.sh A64_SCRATCH), which is the only one Android has. */
+     * TMPDIR (hostenv.sh ARM64CHROOT_SCRATCH), which is the only one Android has. */
     const char *tmp = getenv("TMPDIR");
     if (!tmp || !*tmp) tmp = "/tmp";
     char dir[256];

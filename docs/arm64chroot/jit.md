@@ -30,10 +30,10 @@ Measured on an x86-64 host with small static AArch64 kernels
 
 Real workloads land near the top of that range once translation warms up:
 `gzip` and `find` over a Debian rootfs retire **99.9%+ of their instructions
-natively** (`A64_JIT_STATS`, below).
+natively** (`ARM64CHROOT_JIT_STATS`, below).
 
 Run `tests/bench/run_bench.sh ./arm64chroot` to reproduce (also times
-`qemu-aarch64` for scale). `A64_JIT_MB=N` sets the per-thread code-cache
+`qemu-aarch64` for scale). `ARM64CHROOT_JIT_MB=N` sets the per-thread code-cache
 size (default 32, max 128).
 
 ## Architecture
@@ -67,7 +67,7 @@ second block-local LRU allocator over a disjoint host vector-register pool
 (x86-64 `xmm5`–`xmm15`, AArch64 `v18`–`v29`, leaving the low scratch registers
 and the ABI-callee-saved `v8`–`v15` alone), with `c->v[]` as their home between
 blocks; the inline vector/FP recipes read operands and commit results through
-it (`A64_JIT_NOVRA=1` disables it). Guest `NZCV` maps onto host condition flags:
+it (`ARM64CHROOT_JIT_NOVRA=1` disables it). Guest `NZCV` maps onto host condition flags:
 the AArch64 backend uses them natively (`adds`/`b.cond`/`ccmp`); the x86-64
 backend keeps a producer's flags in `EFLAGS` and materializes the architectural
 `NZCV` word only when it must, inverting the carry sense on subtraction (ARM `C`
@@ -118,7 +118,7 @@ run's last byte against the tag stored for the first's, so any page crossing of
 the span mismatches and takes the slow route, where the accesses re-run through
 their helpers in program order (a fault at access *j* leaves accesses `< j`
 committed and *j*'s destination unwritten, exactly the interpreter's rule).
-`A64_JIT_NOFUSE=1` disables the sharing.
+`ARM64CHROOT_JIT_NOFUSE=1` disables the sharing.
 
 **Inline atomics.** LDXR/LDAXR record the exclusive monitor and STXR/STLXR
 resolve it with a host compare-and-swap against the recorded value (the
@@ -195,7 +195,7 @@ Inlined per a per-host fidelity table (`be_vop_ok`):
   MOVI/MVNI, DUP/INS/UMOV/SMOV lane moves. The AArch64 backend re-emits these
   by construction; on x86-64 the vector MUL/reductions/64-bit-compares/byte-
   shifts and the `pshufb`-based CNT/RBIT/REV are open-coded, some gated on
-  SSSE3/SSE4.1/SSE4.2 (`__builtin_cpu_supports`, forced off by `A64_JIT_SSE=2`)
+  SSSE3/SSE4.1/SSE4.2 (`__builtin_cpu_supports`, forced off by `ARM64CHROOT_JIT_SSE=2`)
   with a helper fallback on older CPUs.
 - **scalar AdvSIMD** (`0x5E`/`0x7E` D-form): integer ADD/SUB and the six
   compares, and the shifts SHL/SSHR/USHR plus the accumulating SSRA/USRA —
@@ -239,10 +239,10 @@ Inlined per a per-host fidelity table (`be_vop_ok`):
   scalar and vector FADD/FSUB/FMUL/FDIV, the FMULX/FRECPE/FRSQRTE estimates, the
   mask compares, and the two-register-misc page — is gated per host: the AArch64
   backend replays the native FEAT_FP16 instructions (advertised by the
-  FPHP+ASIMDHP HWCAP pair; `cpu_has_fp16`, `A64_JIT_NOFP16` forces the helper),
+  FPHP+ASIMDHP HWCAP pair; `cpu_has_fp16`, `ARM64CHROOT_JIT_NOFP16` forces the helper),
   while the x86-64 backend widens each half operand to single through **F16C**,
   computes, and narrows back (`cpu_has_f16c`, disabled together with the rest of
-  the SSE surface by `A64_JIT_SSE=2`). The AArch64 backend additionally
+  the SSE surface by `ARM64CHROOT_JIT_SSE=2`). The AArch64 backend additionally
   replays vector half FMLA/FMLS (native half `fmla` matches the
   interpreter's compute-in-double: within half's finite range an addend is
   never below half a double-ULP of the product, so the 53→11-bit double
@@ -259,7 +259,7 @@ guest's by construction — including the fused families, the steps and the
 estimates; only the NaN-result (and, for FRINTX/I, rounding-mode) gates wrap
 the replay.
 
-**Finding what still falls back.** `A64_JIT_STATS=1` (or `=/path/to/file`)
+**Finding what still falls back.** `ARM64CHROOT_JIT_STATS=1` (or `=/path/to/file`)
 counts every instruction executed through the `exec_a64` helper and dumps the
 top offenders by exact instruction word at process exit — feed the words to a
 disassembler. This is how each round's inlining list was chosen (`memops`'
@@ -324,7 +324,7 @@ edge-pool, or cache overflow flushes all translations at once (`jit_flush_all`),
 which `qemu-user` does for the same reason — partial reclaim would need cache
 compaction or region invalidation plus unpatching every incoming chain edge,
 disproportionate to a flush that, at the 32 MiB default per-thread cache
-(`A64_JIT_MB`, up to 128), is rare and cheap to re-warm.
+(`ARM64CHROOT_JIT_MB`, up to 128), is rare and cheap to re-warm.
 
 **Plain stores to code are not instrumented.** A guest that rewrites code and
 skips `IC IVAU` is architecturally undefined on this CPU (as on real hardware);
@@ -381,30 +381,30 @@ flushed with `__builtin___clear_cache` (both views when dual-mapped).
   wrong side as the JIT. It has been: the subnormal `FRECPE`/`FRSQRTE`
   normalisation was wrong in all three precisions for as long as it had existed,
   reachable from x86 only through qemu and never exercised there because the
-  tests reached for round numbers. `A64_JIT_NOFP16=1` splits the two halves
+  tests reached for round numbers. `ARM64CHROOT_JIT_NOFP16=1` splits the two halves
   apart — if it makes the mismatch go away, the disagreement is in the FP16
   path, whichever side owns it.
 
 Debug/bisection knobs (all off by default):
 
-- `A64_JIT_STATS=1` (or `=/path`) ranks the instruction words still run through
+- `ARM64CHROOT_JIT_STATS=1` (or `=/path`) ranks the instruction words still run through
   the `exec_a64` helper (above).
-- `A64_JIT_DUMP=<prefix>` writes every translated block into a sparse image of
+- `ARM64CHROOT_JIT_DUMP=<prefix>` writes every translated block into a sparse image of
   the code cache (`<prefix>.<pid>.<tid>.code`, file offset = cache offset, so a
   disassembly's jump targets line up) plus a `.map` line per block (pc, offset,
   guest words) for `objdump -b binary`.
-- `A64_JIT_PDMAX=N` forces every predecode op with id > N through the helper
+- `ARM64CHROOT_JIT_PDMAX=N` forces every predecode op with id > N through the helper
   instead of native codegen — it bisects a codegen bug to a single instruction
   class. The raw-word `fe_*` families (atomics, FP/SIMD, load/store extras,
   bitfields, LD1, RBIT, ADC/SBC) are gated by pseudo-ids just above `PD_NOPS_`
   in that same order.
-- `A64_JIT_SLOWMEM=1` forces every inline memory op (and fused run) down its
+- `ARM64CHROOT_JIT_SLOWMEM=1` forces every inline memory op (and fused run) down its
   slow helper branch — it separates fast-path codegen bugs from the surrounding
   register-sync machinery.
-- `A64_JIT_NOVRA=1` disables the V-register cache (recipes load/store `c->v[]`
-  per op); `A64_JIT_NOFUSE=1` disables D-TLB probe sharing; `A64_JIT_NOFP16=1`
+- `ARM64CHROOT_JIT_NOVRA=1` disables the V-register cache (recipes load/store `c->v[]`
+  per op); `ARM64CHROOT_JIT_NOFUSE=1` disables D-TLB probe sharing; `ARM64CHROOT_JIT_NOFP16=1`
   (AArch64) forces the half-precision surface through the interpreter helper;
-  `A64_JIT_SSE=2` (x86-64) forces the SSE2-baseline capability answers (which
+  `ARM64CHROOT_JIT_SSE=2` (x86-64) forces the SSE2-baseline capability answers (which
   also disables the F16C half-precision path). Each isolates its feature's
   codegen from the rest, and the full suite must pass under every one.
 
@@ -529,7 +529,7 @@ up to eight destination halves. Agreement is reached the other way round instead
 — the fast path writes the same *homes* the helpers would, and both arms then
 drop the mappings. That costs a reload per value later and saves a whole probe;
 measured, it makes a call-heavy kernel ~6% faster and the emitted code for a real
-program ~10% smaller. `A64_JIT_NOFUSE=1` disables it.
+program ~10% smaller. `ARM64CHROOT_JIT_NOFUSE=1` disables it.
 
 **Not inlined on i686.** All FP/SIMD: `be_vop_ok` declines every class, so the
 frontend keeps its `exec_fpsimd` helper calls. The atomics re-run the whole

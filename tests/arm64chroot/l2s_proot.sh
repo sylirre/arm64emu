@@ -1,5 +1,5 @@
 # proot's link2symlink groups -- sourced by run_tests.sh (counters pass/fail/skip,
-# $EMU, $AGCC and $A64_SCRATCH are its).
+# $EMU, $AGCC and $ARM64CHROOT_SCRATCH are its).
 #
 # What is under test (sys_file.c, "proot's link2symlink"; path.c, l2s_unhost): a
 # rootfs installed through proot holds its hardlinks as proot writes them -- a
@@ -26,7 +26,7 @@
 #
 # The scheme is compiled in only where the host needs it (Android) or with
 # -DA64_LINK2SYMLINK (the android-sim build, which Makefile tells with
-# A64_L2S_BUILD=1); under any other emulator these layouts are plain symlinks
+# ARM64CHROOT_L2S_BUILD=1); under any other emulator these layouts are plain symlinks
 # and there is nothing to ask.
 
 l2sp_row() {   # l2sp_row <name> <expected> <got> [extra-failure-note]
@@ -47,7 +47,7 @@ l2sp_verdict() {   # l2sp_verdict <name> <ok: 1|0> <what, on failure>
 # The rootfs W/r, a scratch directory of its own, the probe at /bin/p, and the
 # host paths proot would have recorded: P (the rootfs), WP (its parent).
 l2sp_newroot() {
-    W=$(mktemp -d "$A64_SCRATCH/l2sp.XXXXXX") || return 1
+    W=$(mktemp -d "$ARM64CHROOT_SCRATCH/l2sp.XXXXXX") || return 1
     R=$W/r
     mkdir -p "$R/bin" "$R/.l2s" "$W/out" || return 1
     cp build/tests/arm64chroot/fixtures/l2s_probe.bin "$R/bin/p" || return 1
@@ -91,14 +91,14 @@ l2sp_layout() {   # l2sp_layout <rootfs> <guest binary>
 
 l2s_proot_suite() {
     local l2s_built=0
-    [ "${A64_L2S_BUILD:-}" = 1 ] && l2s_built=1
+    [ "${ARM64CHROOT_L2S_BUILD:-}" = 1 ] && l2s_built=1
     [ "$(uname -o 2>/dev/null)" = Android ] && l2s_built=1
     if [ "$l2s_built" != 1 ]; then
         skip=$((skip+1))
         echo "SKIP l2s_proot (this emulator carries no emulated-hardlink scheme: the android-sim build does)"
         return
     fi
-    if [ ! -w "$A64_SCRATCH" ]; then
+    if [ ! -w "$ARM64CHROOT_SCRATCH" ]; then
         skip=$((skip+1)); echo "SKIP l2s_proot (no writable scratch directory)"; return
     fi
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/l2s_proot.bin tests/arm64chroot/fixtures/l2s_proot.c 2>/dev/null &&
@@ -107,7 +107,7 @@ l2s_proot_suite() {
     local W R P WP got exp ok before out n m
 
     # ---- 1. the differential row, and the host's side of it ----
-    W=$(mktemp -d "$A64_SCRATCH/l2sp.XXXXXX"); R=$W/r; mkdir -p "$R"
+    W=$(mktemp -d "$ARM64CHROOT_SCRATCH/l2sp.XXXXXX"); R=$W/r; mkdir -p "$R"
     l2sp_layout "$R" build/tests/arm64chroot/fixtures/l2s_proot.bin
     P=$(cd "$R" && pwd -P)
     got=$(l2sp_run "$R" /bin/t proot)
@@ -127,7 +127,7 @@ l2s_proot_suite() {
     rm -rf "$W"
     # The same, with the rootfs named through a symlink: its recorded host path
     # is the real one, and the emulator must find it from either spelling.
-    W=$(mktemp -d "$A64_SCRATCH/l2sp.XXXXXX"); mkdir -p "$W/real"
+    W=$(mktemp -d "$ARM64CHROOT_SCRATCH/l2sp.XXXXXX"); mkdir -p "$W/real"
     l2sp_layout "$W/real" build/tests/arm64chroot/fixtures/l2s_proot.bin; ln -s real "$W/via"
     got=$(l2sp_run "$W/via" /bin/t proot)
     l2sp_row "the rootfs named through a symlink" "$(cat tests/arm64chroot/fixtures/l2s_proot.expect)" "$got"

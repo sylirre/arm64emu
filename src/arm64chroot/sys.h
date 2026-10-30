@@ -435,7 +435,7 @@ void mfd_track_native(int fd, u64 dev, u64 ino);   /* a real kernel memfd */
  * the broker's, and whose backing the host will map either way) answers no,
  * and so does every ordinary file. */
 int  mfd_kernel_write_sealed(int fd);
-int  mfd_seal_map_force_old(void);   /* A64_MEMFD_SEAL_FORCE_OLD */
+int  mfd_seal_map_force_old(void);   /* ARM64CHROOT_MEMFD_SEAL_FORCE_OLD */
 
 /* ---- the mode of a memfd a host will not let the guest change -------------
  * Android's SELinux policy refuses an app every mode change on a memfd, so a

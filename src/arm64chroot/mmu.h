@@ -372,7 +372,7 @@ typedef struct AddrSpace {
 /* The guest's memory footprint as its own /proc reports it. Bytes throughout;
  * a kernel prints kB in status and pages in statm/stat, and the callers there
  * divide. `rss_ok` is 0 on a host whose mincore(2) would not answer (and under
- * A64_MINCORE_FORCE_FAIL, which is how that tier is tested elsewhere): the
+ * ARM64CHROOT_MINCORE_FORCE_FAIL, which is how that tier is tested elsewhere): the
  * resident set is unknowable there, the rss_* fields are left zero, and the
  * caller falls back to the host's own figures -- bounded, since the host
  * process is the emulator and its resident set is not the guest's. */

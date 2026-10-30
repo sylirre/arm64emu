@@ -544,7 +544,7 @@ arm64chroot_m32_runnable = t=$$(mktemp -d) || exit 1; \
 test-arm64chroot32:
 	@if $(arm64chroot_m32_runnable); then \
 	    $(MAKE) --no-print-directory $(BUILD)/arm64chroot32 && \
-	    A64_EMU_CC="$(ARM64CHROOT_M32CC)" A64_EMU_CFLAGS="$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS)" \
+	    ARM64CHROOT_EMU_CC="$(ARM64CHROOT_M32CC)" ARM64CHROOT_EMU_CFLAGS="$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS)" \
 	      bash tests/arm64chroot/run_tests.sh $(BUILD)/arm64chroot32; \
 	else \
 	    echo "SKIP $@: no runnable 32-bit host toolchain ($(ARM64CHROOT_M32CC) $(ARM64CHROOT_M32FLAGS))"; \
@@ -564,7 +564,7 @@ test-arm64chroot32-jit:
 	    printf '#!%s\nexec %s --jit "$$@"\n' "$$(command -v sh)" "$(CURDIR)/$(BUILD)/arm64chroot32" \
 	      > $(ARM64CHROOT_TESTS)/jit32_emu.sh; \
 	    chmod +x $(ARM64CHROOT_TESTS)/jit32_emu.sh; \
-	    A64_EMU_CC="$(ARM64CHROOT_M32CC)" A64_EMU_CFLAGS="$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS)" \
+	    ARM64CHROOT_EMU_CC="$(ARM64CHROOT_M32CC)" ARM64CHROOT_EMU_CFLAGS="$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS)" \
 	      bash tests/arm64chroot/run_tests.sh $(ARM64CHROOT_TESTS)/jit32_emu.sh; \
 	else \
 	    echo "SKIP $@: no runnable 32-bit host toolchain ($(ARM64CHROOT_M32CC) $(ARM64CHROOT_M32FLAGS))"; \
@@ -572,10 +572,10 @@ test-arm64chroot32-jit:
 
 # Android-behavior simulation on the dev host: the statx ENOSYS fallback, the
 # Bionic keyring gate and the emulated-hardlink scheme, under the full
-# differential suite (A64_L2S_BUILD=1 tells it the scheme is compiled in).
+# differential suite (ARM64CHROOT_L2S_BUILD=1 tells it the scheme is compiled in).
 test-arm64chroot-android-sim:
 	@$(MAKE) --no-print-directory $(BUILD)/arm64chroot_asim
-	A64_L2S_BUILD=1 bash tests/arm64chroot/run_tests.sh $(BUILD)/arm64chroot_asim
+	ARM64CHROOT_L2S_BUILD=1 bash tests/arm64chroot/run_tests.sh $(BUILD)/arm64chroot_asim
 
 # Android-seccomp regression gate: the ENTIRE differential suite with the
 # emulator under a SECCOMP_RET_TRAP filter for the full Oreo-blocked set
@@ -589,18 +589,18 @@ test-arm64chroot-seccomp:
 	printf '#!%s\nexec %s %s "$$@"\n' "$$(command -v sh)" "$(CURDIR)/$(ARM64CHROOT_TESTS)/seccomp_wrap.bin" \
 	    "$(CURDIR)/$(BUILD)/arm64chroot" > $(ARM64CHROOT_TESTS)/seccomp_emu.sh
 	chmod +x $(ARM64CHROOT_TESTS)/seccomp_emu.sh
-	A64_EMU_WRAP=$(ARM64CHROOT_TESTS)/seccomp_wrap.bin bash tests/arm64chroot/run_tests.sh \
+	ARM64CHROOT_EMU_WRAP=$(ARM64CHROOT_TESTS)/seccomp_wrap.bin bash tests/arm64chroot/run_tests.sh \
 	    $(ARM64CHROOT_TESTS)/seccomp_emu.sh
 
 # Record a portable test pack: one full suite run under the qemu oracle with
-# every oracle answer captured (A64_RECORD=1), then the built guest binaries,
+# every oracle answer captured (ARM64CHROOT_RECORD=1), then the built guest binaries,
 # the recordings and the small glibc test rootfs bundled into
 # build/arm64chroot-testpack.tar.gz. A host that can neither build the guests
 # nor run any oracle — a 32-bit ARM device: its CPU cannot execute AArch64, and
 # qemu-user cannot map a 64-bit guest into a 32-bit address space at all —
 # unpacks it in the repository root (at the SAME commit; the pack carries the
 # id and the replay warns on mismatch) and replays with
-# `A64_ORACLE=recorded make test-arm64chroot`. The Alpine-backed self-checking
+# `ARM64CHROOT_ORACLE=recorded make test-arm64chroot`. The Alpine-backed self-checking
 # sections additionally want an aarch64 rootfs with busybox at
 # build/cache/arm64chroot/rootfs/alpine — a symlink to any existing rootfs is
 # fine. fpconsist is built here rather than left to test-arm64chroot-jit,
@@ -615,7 +615,7 @@ ARM64CHROOT_PACKBINS = $$(find $(addprefix $(ARM64CHROOT_TESTS)/,asm c fixtures 
 test-arm64chroot-pack:
 	@$(MAKE) --no-print-directory $(BUILD)/arm64chroot
 	rm -rf $(BUILD)/cache/arm64chroot/recorded
-	A64_ORACLE=qemu A64_RECORD=1 bash tests/arm64chroot/run_tests.sh $(BUILD)/arm64chroot
+	ARM64CHROOT_ORACLE=qemu ARM64CHROOT_RECORD=1 bash tests/arm64chroot/run_tests.sh $(BUILD)/arm64chroot
 	sh tests/arm64chroot/run_consist.sh $(BUILD)/arm64chroot
 	git rev-parse HEAD > $(BUILD)/cache/arm64chroot/recorded/COMMIT
 	md5sum $(ARM64CHROOT_PACKBINS) < /dev/null > $(BUILD)/cache/arm64chroot/recorded/BINSUMS

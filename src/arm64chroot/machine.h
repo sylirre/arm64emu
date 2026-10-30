@@ -1299,7 +1299,7 @@ int proc_fd_link_path(const char *host);   /* any process's /proc/.../fd/N */
  * -errno: the object is gone. See path.c. */
 int path_fd_link_target(struct Machine *m, const char *host, char *canon_out,
                         char *host_out);
-/* Test knob (A64_OWNFD_FORCE_DENY): behave as a host that refuses the path
+/* Test knob (ARM64CHROOT_OWNFD_FORCE_DENY): behave as a host that refuses the path
  * spelling of one of our own fds, the way Android's policy does for a memfd. */
 int proc_own_fd_denied(const char *host);
 

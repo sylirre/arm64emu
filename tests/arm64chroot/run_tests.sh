@@ -15,12 +15,12 @@ mkdir -p build/tests/arm64chroot/asm build/tests/arm64chroot/c build/tests/arm64
 
 . tests/arm64chroot/hostenv.sh
 [ -n "$AGCC" ] || {
-    echo "SKIP: no aarch64 C compiler (install aarch64-linux-gnu-gcc, or set A64_CC)"; exit 0; }
+    echo "SKIP: no aarch64 C compiler (install aarch64-linux-gnu-gcc, or set ARM64CHROOT_CC)"; exit 0; }
 [ "$ORACLE_KIND" != none ] || {
     echo "SKIP: no oracle (install qemu-aarch64, or run on a host that executes AArch64 binaries)"
     exit 0; }
-echo "host $A64_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
-[ "$A64_STATIC_OK" = 1 ] ||
+echo "host $ARM64CHROOT_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
+[ "$ARM64CHROOT_STATIC_OK" = 1 ] ||
     echo "WARN: $AGCC cannot link -static; most tests will skip (install the static libc)"
 
 # The HOST compiler, as distinct from $AGCC which builds guests. A handful of
@@ -30,9 +30,9 @@ echo "host $A64_HOST_ARCH | compiler $AGCC | oracle $ORACLE_DESC"
 HCC=$(command -v "${CC:-cc}" 2>/dev/null || command -v gcc 2>/dev/null || true)
 
 # Provision the Alpine + glibc test rootfs from scratch into a repo-local cache
-# (overridable via A64_TEST_ROOT). Idempotent and best-effort: glibc is built
+# (overridable via ARM64CHROOT_TEST_ROOT). Idempotent and best-effort: glibc is built
 # offline, Alpine needs a one-time network fetch and otherwise degrades to SKIP.
-export A64_TEST_ROOT="${A64_TEST_ROOT:-$PWD/build/cache/arm64chroot/rootfs}"
+export ARM64CHROOT_TEST_ROOT="${ARM64CHROOT_TEST_ROOT:-$PWD/build/cache/arm64chroot/rootfs}"
 bash tests/arm64chroot/setup_env.sh || true
 
 pass=0 fail=0 skip=0
@@ -47,8 +47,8 @@ skip_build() {   # skip_build <what>
 
 # Test binaries are deleted after use in a normal run; a pack-recording run
 # must keep every one (they ARE the pack), and a replay run must not eat the
-# pack it is running from. hostenv.sh sets A64_KEEP_TESTBINS for both.
-fx_rm() { [ "${A64_KEEP_TESTBINS:-0}" = 1 ] || rm -f "$@"; }
+# pack it is running from. hostenv.sh sets ARM64CHROOT_KEEP_TESTBINS for both.
+fx_rm() { [ "${ARM64CHROOT_KEEP_TESTBINS:-0}" = 1 ] || rm -f "$@"; }
 
 # What a test declares it needs of the ORACLE (its NEEDS-ORACLE marker, set by
 # the loop that is running it). Only consulted to explain a disagreement that
@@ -156,15 +156,15 @@ fi
 # host could only assume, and assuming wrongly costs the rows either way: a
 # phone whose kernel refuses would skip rows its emulator now answers, and a
 # pack recorded on a refusing host would fail rows nothing could reconcile.
-if [ -n "${A64_RECORD:-}" ]; then
-    mkdir -p "$A64_RECORD_DIR"
-    printf '%s\n' "$MEMFD_SEAL_HOST" > "$A64_RECORD_DIR/MEMFD_SEAL"
+if [ -n "${ARM64CHROOT_RECORD:-}" ]; then
+    mkdir -p "$ARM64CHROOT_RECORD_DIR"
+    printf '%s\n' "$MEMFD_SEAL_HOST" > "$ARM64CHROOT_RECORD_DIR/MEMFD_SEAL"
 fi
 MEMFD_SEAL_ORACLE="$MEMFD_SEAL_HOST"
 if [ "$ORACLE_KIND" = recorded ]; then
     MEMFD_SEAL_ORACLE=unknown       # a pack from before this was recorded
-    [ -f "$A64_RECORD_DIR/MEMFD_SEAL" ] &&
-        MEMFD_SEAL_ORACLE=$(cat "$A64_RECORD_DIR/MEMFD_SEAL")
+    [ -f "$ARM64CHROOT_RECORD_DIR/MEMFD_SEAL" ] &&
+        MEMFD_SEAL_ORACLE=$(cat "$ARM64CHROOT_RECORD_DIR/MEMFD_SEAL")
 fi
 
 # ---- C tests: static and dynamic ----
@@ -222,7 +222,7 @@ for cfile in tests/arm64chroot/c/*.c; do
     # And a real hardlink, which Android refuses an app (hostenv.sh): the
     # emulator has a scheme for link(2) and the oracle has none, so there the
     # oracle dies where the emulator answers.
-    if [ "$A64_HOST_HARDLINK" = 0 ] && grep -qm1 'NEEDS-HOST-LINK' "$cfile"; then
+    if [ "$ARM64CHROOT_HOST_HARDLINK" = 0 ] && grep -qm1 'NEEDS-HOST-LINK' "$cfile"; then
         denied="$denied link(2)"
     fi
     if [ -n "$denied" ]; then
@@ -240,10 +240,10 @@ for cfile in tests/arm64chroot/c/*.c; do
     # compilers disagree on how a source file may enable an AArch64 feature, so
     # it goes on the command line, where both understand it.
     cflags=$(grep -m1 -o 'BUILDFLAGS:[^*]*' "$cfile" | sed 's/^BUILDFLAGS: *//')
-    "$AGCC" -static -O2 $cflags -o "$bs" "$cfile" $A64_TESTLIBS 2>/dev/null || {
+    "$AGCC" -static -O2 $cflags -o "$bs" "$cfile" $ARM64CHROOT_TESTLIBS 2>/dev/null || {
         skip_build "$cfile"; continue; }
     run_diff "c/${base}(static)" "$bs"
-    GLIBC_ROOT="$A64_TEST_ROOT/glibc"
+    GLIBC_ROOT="$ARM64CHROOT_TEST_ROOT/glibc"
     # A test that writes its own /tmp paths needs one on the host too: the
     # emulator side has the rootfs's, the live oracle side runs on the host and
     # Android has no /tmp to give it. Nothing about the emulator is under test
@@ -257,11 +257,11 @@ for cfile in tests/arm64chroot/c/*.c; do
     static_only=$(grep -m1 -o 'STATIC-ONLY:[^*]*' "$cfile" | sed 's/^STATIC-ONLY: *//')
     if [ -n "$static_only" ]; then
         skip=$((skip+1)); echo "SKIP c/${base}(dyn) (static-only: $static_only)"
-    elif [ "$A64_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ] &&
+    elif [ "$ARM64CHROOT_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ] &&
        grep -q '"/tmp' "$cfile"; then
         skip=$((skip+1)); echo "SKIP c/${base}(dyn) (host has no /tmp for the oracle side)"
-    elif [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $A64_TESTLIBS 2>/dev/null &&
-       { rec_have0 "$A64_DYN_ARGV0" "$bd" ||
+    elif [ -d "$GLIBC_ROOT/lib" ] && "$AGCC" -O2 $cflags -o "$bd" "$cfile" $ARM64CHROOT_TESTLIBS 2>/dev/null &&
+       { rec_have0 "$ARM64CHROOT_DYN_ARGV0" "$bd" ||
          { skip=$((skip+1)); echo "SKIP c/${base}(dyn) (not in the test pack)"; false; }; }; then
         # argv[0] must be the same path in BOTH worlds: tests that re-exec
         # argv[0] (proctitle) need it to resolve — staged in the rootfs for
@@ -271,17 +271,17 @@ for cfile in tests/arm64chroot/c/*.c; do
         # by it; hostenv.sh picks a writable stand-in where it does not.
         # (A replaying host may have no /tmp — Android — and no live oracle to
         # need the copy; the rootfs staging is the one that matters there.)
-        mkdir -p "$GLIBC_ROOT$(dirname "$A64_DYN_ARGV0")"
-        cp "$bd" "$GLIBC_ROOT$A64_DYN_ARGV0"
-        cp "$bd" "$A64_DYN_ARGV0" 2>/dev/null || true
-        out_q=$(oracle_run0 "$A64_DYN_ARGV0" "$bd" 2>/dev/null); rc_q=$?
-        out_e=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 60 "$EMU" -0 "$A64_DYN_ARGV0" "$GLIBC_ROOT" "$A64_DYN_ARGV0" 2>/dev/null); rc_e=$?
+        mkdir -p "$GLIBC_ROOT$(dirname "$ARM64CHROOT_DYN_ARGV0")"
+        cp "$bd" "$GLIBC_ROOT$ARM64CHROOT_DYN_ARGV0"
+        cp "$bd" "$ARM64CHROOT_DYN_ARGV0" 2>/dev/null || true
+        out_q=$(oracle_run0 "$ARM64CHROOT_DYN_ARGV0" "$bd" 2>/dev/null); rc_q=$?
+        out_e=$(QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 60 "$EMU" -0 "$ARM64CHROOT_DYN_ARGV0" "$GLIBC_ROOT" "$ARM64CHROOT_DYN_ARGV0" 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS c/${base}(dyn)"
         else
             # The CPU's re-run needs the same argv[0] both other worlds saw.
             diff_verdict "c/${base}(dyn)" "$out_q" "$rc_q" "$out_e" "$rc_e" \
-                         "$A64_DYN_ARGV0" "$bd"
+                         "$ARM64CHROOT_DYN_ARGV0" "$bd"
         fi
     fi
 done
@@ -307,7 +307,7 @@ rm -f /tmp/t.bin
 # sides here see the same directory, which is why the mode can run at all.
 #
 # Why the three --link2symlink rows below may not run here, if they may not.
-# Both worlds are handed the same scratch directory ($A64_SCRATCH: $TMPDIR
+# Both worlds are handed the same scratch directory ($ARM64CHROOT_SCRATCH: $TMPDIR
 # first, then /tmp) -- the oracle inherits it, the emulator is given it with
 # -E, since it hands the guest a clean environment -- so the only thing that
 # stops them is a host whose answers cannot be compared with the recording's
@@ -320,9 +320,9 @@ rm -f /tmp/t.bin
 l2s_skip=
 if [ "$ORACLE_KIND" = recorded ]; then
     l2s_skip="same-host-only; the recorded oracle ran elsewhere"
-elif [ ! -w "$A64_SCRATCH" ]; then
+elif [ ! -w "$ARM64CHROOT_SCRATCH" ]; then
     l2s_skip="no writable scratch directory on this host"
-elif [ "$A64_HOST_HARDLINK" = 0 ]; then
+elif [ "$ARM64CHROOT_HOST_HARDLINK" = 0 ]; then
     # The oracle makes real hardlinks; Android refuses an app link(2)
     # altogether, which is what --link2symlink is for. The emulated scheme has
     # nothing to be compared against there: the oracle dies with "link:
@@ -337,8 +337,8 @@ elif [ -x build/tests/arm64chroot/c/l2s_rename_static.bin ]; then
         label="c/l2s_rename${mode:+ $mode}(--link2symlink)"
         rec_have build/tests/arm64chroot/c/l2s_rename_static.bin $mode || {
             skip=$((skip+1)); echo "SKIP $label (not in the test pack)"; continue; }
-        out_q=$(TMPDIR="$A64_SCRATCH" oracle_run build/tests/arm64chroot/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
-        out_e=$(timeout -k 5 60 "$EMU" -E TMPDIR="$A64_SCRATCH" --link2symlink / build/tests/arm64chroot/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
+        out_q=$(TMPDIR="$ARM64CHROOT_SCRATCH" oracle_run build/tests/arm64chroot/c/l2s_rename_static.bin $mode 2>/dev/null); rc_q=$?
+        out_e=$(timeout -k 5 60 "$EMU" -E TMPDIR="$ARM64CHROOT_SCRATCH" --link2symlink / build/tests/arm64chroot/c/l2s_rename_static.bin $mode 2>/dev/null); rc_e=$?
         if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
             pass=$((pass+1)); echo "PASS $label"
         else
@@ -378,8 +378,8 @@ for l2snf in l2s_access l2s_nofollow; do
         skip=$((skip+1))
         echo "SKIP c/${l2snf}(--link2symlink) (not in the test pack)"; continue; }
     case $l2snf in l2s_access) NEEDS_ORACLE=faccessat2 ;; *) NEEDS_ORACLE= ;; esac
-    out_q=$(TMPDIR="$A64_SCRATCH" oracle_run "$L2SBIN" 2>/dev/null); rc_q=$?
-    out_e=$(timeout -k 5 60 "$EMU" -E TMPDIR="$A64_SCRATCH" --link2symlink / "$L2SBIN" 2>/dev/null); rc_e=$?
+    out_q=$(TMPDIR="$ARM64CHROOT_SCRATCH" oracle_run "$L2SBIN" 2>/dev/null); rc_q=$?
+    out_e=$(timeout -k 5 60 "$EMU" -E TMPDIR="$ARM64CHROOT_SCRATCH" --link2symlink / "$L2SBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${l2snf}(--link2symlink)"
     else
@@ -399,7 +399,7 @@ l2s_proot_suite
 
 # ---- System V shm: file-backed fallback tier ----
 # The shm tests already ran memfd-backed vs the qemu oracle in the C loop above.
-# Re-run them with A64_SHM_FORCE_FILE=1 so the broker backs each segment with a
+# Re-run them with ARM64CHROOT_SHM_FORCE_FILE=1 so the broker backs each segment with a
 # file instead of an anonymous memfd, and confirm the guest sees identical
 # semantics (the backing choice is transparent to the guest).
 for base in shm_sysv shm_stat; do
@@ -408,7 +408,7 @@ for base in shm_sysv shm_stat; do
     rec_have "$SHMBIN" || {
         skip=$((skip+1)); echo "SKIP c/${base}(file-tier) (not in the test pack)"; continue; }
     out_q=$(oracle_run "$SHMBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_SHM_FORCE_FILE=1 timeout -k 5 60 "$EMU" / "$SHMBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_SHM_FORCE_FILE=1 timeout -k 5 60 "$EMU" / "$SHMBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${base}(file-tier)"
     else
@@ -419,7 +419,7 @@ done
 
 # ---- getrandom: /dev-backed fallback tier ----
 # The C loop above ran tests/arm64chroot/c/getrandom.c against the host's real
-# getrandom(2). Re-run it with A64_GETRANDOM_FORCE_DEV=1 so the answer comes
+# getrandom(2). Re-run it with ARM64CHROOT_GETRANDOM_FORCE_DEV=1 so the answer comes
 # from /dev/urandom / /dev/random -- the tier a host kernel without getrandom
 # (Android 7's 3.x) is served by -- and require identical semantics.
 GRBIN="build/tests/arm64chroot/c/getrandom_static.bin"
@@ -427,7 +427,7 @@ if [ -x "$GRBIN" ] && ! rec_have "$GRBIN"; then
     skip=$((skip+1)); echo "SKIP c/getrandom(dev-tier) (not in the test pack)"
 elif [ -x "$GRBIN" ]; then
     out_q=$(oracle_run "$GRBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_GETRANDOM_FORCE_DEV=1 timeout -k 5 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_GETRANDOM_FORCE_DEV=1 timeout -k 5 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/getrandom(dev-tier)"
     else
@@ -438,7 +438,7 @@ elif [ -x "$GRBIN" ]; then
     # (3.17-5.5: every Android 10/11 kernel), which answers EINVAL for the
     # flag; the emulator must serve it from /dev/urandom there, and the rest
     # of the calls still from the host.
-    out_e=$(A64_GETRANDOM_FORCE_OLD=1 timeout -k 5 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_GETRANDOM_FORCE_OLD=1 timeout -k 5 60 "$EMU" / "$GRBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/getrandom(old-getrandom tier)"
     else
@@ -448,7 +448,7 @@ elif [ -x "$GRBIN" ]; then
 fi
 
 # ---- Alpine rootfs shell tests (if present) ----
-ALPINE="$A64_TEST_ROOT/alpine"
+ALPINE="$ARM64CHROOT_TEST_ROOT/alpine"
 if [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok &&
    ! oracle_proot -r "$ALPINE" /bin/sh -c 'exit 0' >/dev/null 2>&1; then
     # proot is the oracle for these, and where proot itself cannot run the
@@ -586,7 +586,7 @@ done" --fake-id 7 "$ALPINE" /tmp/ci_fakecred
     # change it as one step and a reader read it as one (the task lock,
     # sys_proc.c): readers must never see a triple no setter wrote, and a
     # whole-struct writeback on one thread must not undo a sibling's setfsgid.
-    "$AGCC" -O2 -static -o build/tests/arm64chroot/fixtures/credrace.bin tests/arm64chroot/fixtures/credrace.c $A64_TESTLIBS 2>/dev/null && {
+    "$AGCC" -O2 -static -o build/tests/arm64chroot/fixtures/credrace.bin tests/arm64chroot/fixtures/credrace.c $ARM64CHROOT_TESTLIBS 2>/dev/null && {
         for eng in "" "--jit"; do
             check_fakeid "credentials under concurrent setters${eng:+ (jit)}" "start uid=0 euid=0
 gids=5 6 fs=6
@@ -635,7 +635,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     }
     # A non-terminal host var must NOT reach the guest.
     check_env "host var not leaked" "none" \
-        "$(A64_ENV_LEAK=leaked "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "${A64_ENV_LEAK:-none}"' 2>/dev/null)"
+        "$(ARM64CHROOT_ENV_LEAK=leaked "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "${ARM64CHROOT_ENV_LEAK:-none}"' 2>/dev/null)"
     # TERM / COLORTERM are the only inherited host vars.
     check_env "TERM inherited" "xterm-a64test" \
         "$(TERM=xterm-a64test "$EMU" "$ALPINE" /bin/busybox sh -c 'echo "$TERM"' 2>/dev/null)"
@@ -729,7 +729,7 @@ fi
 # checking: qemu has no bind-mount concept. ----
 if [ ! -x build/tests/arm64chroot/fixtures/bindlong.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/bindlong.bin \
-        tests/arm64chroot/fixtures/bindlong.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/bindlong.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/bindlong.bin ]; then
     BLSRC=$(mktemp -d)
@@ -920,7 +920,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     rm -f "$ALPINE/tmp/apid"
 fi
 
-# ---- shared-proc: the named-file registry tier (A64_PROCTAB_FORCE_FILE) ----
+# ---- shared-proc: the named-file registry tier (ARM64CHROOT_PROCTAB_FORCE_FILE) ----
 # The diskless broker above is what every ordinary host uses, so the named-file
 # fallback -- what a host with neither memfd_create nor abstract sockets is
 # permanently on -- is reached nowhere else in this suite. Two things about it.
@@ -944,7 +944,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         [ -n "$d" ] && rm -f "$d"/arm64chroot-proctab.v*."$(id -u)".* 2>/dev/null
     done
     rm -f "$ALPINE/tmp/apid"
-    A64_PROCTAB_FORCE_FILE=1 timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" \
+    ARM64CHROOT_PROCTAB_FORCE_FILE=1 timeout -k 5 60 "$EMU" --shared-proc "$ALPINE" \
         /bin/busybox sh -c 'sleep 30 & echo $! > /tmp/apid; wait' &
     sp_bg=$!
     apid=""; n=0
@@ -953,7 +953,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         sleep 0.1; n=$((n+1))
     done
     sleep 0.3
-    got=$(A64_PROCTAB_FORCE_FILE=1 "$EMU" --shared-proc -E APID="${apid:-0}" "$ALPINE" \
+    got=$(ARM64CHROOT_PROCTAB_FORCE_FILE=1 "$EMU" --shared-proc -E APID="${apid:-0}" "$ALPINE" \
         /bin/busybox sh -c 'tr "\0" " " < /proc/$APID/cmdline | sed "s/ $//"' 2>/dev/null)
     reg=$(pt_registry) || reg=
     kill "$sp_bg" 2>/dev/null; wait "$sp_bg" 2>/dev/null
@@ -972,7 +972,7 @@ if [ -x "$ALPINE/bin/busybox" ]; then
         victim="$(dirname "$reg")/ci_ptvictim.$$"   # absolute: a symlink target
         printf 'do-not-truncate\n' > "$victim"
         rm -f "$reg"; ln -s "$victim" "$reg"
-        out=$(A64_PROCTAB_FORCE_FILE=1 "$EMU" --shared-proc "$ALPINE" \
+        out=$(ARM64CHROOT_PROCTAB_FORCE_FILE=1 "$EMU" --shared-proc "$ALPINE" \
               /bin/busybox echo ok 2>/dev/null)
         if [ "$out" = "ok" ] && [ "$(cat "$victim")" = "do-not-truncate" ]; then
             pass=$((pass+1)); echo "PASS shared-proc: planted symlink refused, target untouched"
@@ -1035,15 +1035,15 @@ fi
 # per-slot seqlock it trips several times in every run. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/bindrace.bin \
-            tests/arm64chroot/fixtures/bindrace.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/bindrace.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         expect="resolved=1 wrong=0 garbage=0"
         got=$(timeout -k 5 120 "$EMU" --fake-id / build/tests/arm64chroot/fixtures/bindrace.bin \
-              "$A64_SCRATCH" 2>/dev/null)
+              "$ARM64CHROOT_SCRATCH" 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: bindrace"
         else
             fail=$((fail+1)); echo "FAIL fixture: bindrace (want '$expect' got '$got')"
         fi
-        rm -rf "$A64_SCRATCH/a64bindrace"
+        rm -rf "$ARM64CHROOT_SCRATCH/a64bindrace"
         fx_rm build/tests/arm64chroot/fixtures/bindrace.bin
     else
         skip_build "fixtures/bindrace"
@@ -1169,7 +1169,7 @@ fi
 # finishes. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/sigsvc.bin \
-            tests/arm64chroot/fixtures/sigsvc.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/sigsvc.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         for eng in "" "--jit"; do
             lbl="fixture: sigsvc${eng:+ (jit)}"
             got=$(timeout -k 5 60 "$EMU" $eng / build/tests/arm64chroot/fixtures/sigsvc.bin 2>/dev/null); rc=$?
@@ -1216,7 +1216,7 @@ fi
 # (7 of 8 runs short by one or two filters), so it runs in both engines. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/seccomp_threads.bin \
-            tests/arm64chroot/fixtures/seccomp_threads.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/seccomp_threads.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         expect=$'nnp=0\nchild_installed=3641 enomem=1\nchild_status_filters=3641\nchild_exit=1\nthreads=8 per=300 failures=0\nfilters=2401 expected=2401\nmode=2\nchdir=-1 1\ndone'
         for eng in "" "--jit"; do
             lbl="fixture: seccomp_threads${eng:+ (jit)}"
@@ -1328,7 +1328,7 @@ vachurn_pair() {   # vachurn_pair [extra fixture args...] -> "<lo> <hi>"
 }
 if [ -n "$AGCC" ] && [ -n "$HCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/vachurn.bin \
-            tests/arm64chroot/fixtures/vachurn.c $A64_TESTLIBS 2>/dev/null &&
+            tests/arm64chroot/fixtures/vachurn.c $ARM64CHROOT_TESTLIBS 2>/dev/null &&
        "$HCC" -O2 -o build/tests/arm64chroot/maxrss.bin tests/arm64chroot/maxrss.c 2>/dev/null; then
         read -r lo hi <<EOF
 $(vachurn_pair)
@@ -1370,7 +1370,7 @@ EOF
         else
             skip=$((skip+1)); echo "SKIP fixture: vachurn threaded (no rusage from the host)"
         fi
-        # And the fallback itself, forced with A64_TLBPUB_MAX. A thread the
+        # And the fallback itself, forced with ARM64CHROOT_TLBPUB_MAX. A thread the
         # epoch table has no room for is exactly the thread the drain would not
         # be waiting for, so the rule is that one such thread stops the drain
         # dead -- the quarantine grows instead of freeing backing out from under
@@ -1380,9 +1380,9 @@ EOF
         # Eight threads, not three hundred: the cap is what forces the
         # fallback, and three hundred host thread stacks plus a code cache
         # apiece is more address space than a 32-bit host has to spare.
-        lo=$(A64_TLBPUB_MAX=2 ./build/tests/arm64chroot/maxrss.bin "$EMU" / \
+        lo=$(ARM64CHROOT_TLBPUB_MAX=2 ./build/tests/arm64chroot/maxrss.bin "$EMU" / \
                 build/tests/arm64chroot/fixtures/vachurn.bin 100 8 2>/dev/null); rcl=$?
-        hi=$(A64_TLBPUB_MAX=2 ./build/tests/arm64chroot/maxrss.bin "$EMU" / \
+        hi=$(ARM64CHROOT_TLBPUB_MAX=2 ./build/tests/arm64chroot/maxrss.bin "$EMU" / \
                 build/tests/arm64chroot/fixtures/vachurn.bin 1000 8 2>/dev/null); rch=$?
         if [ -n "$lo" ] && [ -n "$hi" ] && [ "$rcl" = 0 ] && [ "$rch" = 0 ]; then
             grew=$((hi - lo))
@@ -1415,10 +1415,10 @@ fi
 # in turn: order inverted 15 s at 0.2 s CPU, mem triple removed 3/3 hangs. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/forklock.bin \
-            tests/arm64chroot/fixtures/forklock.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/forklock.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         for eng in "" "--jit"; do
             lbl="fixture: forklock${eng:+ (jit)}"
-            got=$(A64_NETLINK_FORCE_BLOCK=1 timeout -k 5 90 "$EMU" $eng / \
+            got=$(ARM64CHROOT_NETLINK_FORCE_BLOCK=1 timeout -k 5 90 "$EMU" $eng / \
                       build/tests/arm64chroot/fixtures/forklock.bin 2>/dev/null); rc=$?
             if [ "$got" = "OK" ] && [ "$rc" = 0 ]; then
                 pass=$((pass+1)); echo "PASS $lbl"
@@ -1444,7 +1444,7 @@ fi
 # generator never disagree with each other about an odd encoding. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O1 -o build/tests/arm64chroot/fixtures/cu_writeback.bin \
-            tests/arm64chroot/fixtures/cu_writeback.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/cu_writeback.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         cu_i=$(timeout -k 5 60 "$EMU" / build/tests/arm64chroot/fixtures/cu_writeback.bin 2>/dev/null)
         cu_p=$(timeout -k 5 60 "$EMU" --no-predecode / build/tests/arm64chroot/fixtures/cu_writeback.bin 2>/dev/null)
         cu_j=$(timeout -k 5 60 "$EMU" --jit / build/tests/arm64chroot/fixtures/cu_writeback.bin 2>/dev/null)
@@ -1580,7 +1580,7 @@ fi
 # the temporary mask it holds has no delivery frame to put it back. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/mtexec.bin \
-            tests/arm64chroot/fixtures/mtexec.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/mtexec.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         expect=$'reached_child tid_is_pid=1\nafter_join exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_parked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_masked exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nafter_live exited=1 status=0\nreached_child tid_is_pid=1\nsibling_gone=1\nmask_clean=1\nafter_secondary exited=1 status=0\nstress=1\ndone'
         got=$(timeout -k 5 120 "$EMU" / build/tests/arm64chroot/fixtures/mtexec.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mtexec"
@@ -1604,7 +1604,7 @@ fi
 # count to one. ----
 if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/mainexit.bin \
-            tests/arm64chroot/fixtures/mainexit.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/mainexit.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         expect=$'tasks=1 threads=1 leader_signalable=1\nview_exit=1\nexec_after_leader=1\ngroup_after_leader=1\nstress_exit=1 stress_exec=1\ndone'
         got=$(timeout -k 5 300 "$EMU" / build/tests/arm64chroot/fixtures/mainexit.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: mainexit"
@@ -1620,7 +1620,7 @@ fi
 
 # ---- memfd_create: unlinked-file fallback tier ----
 # The C loop above ran the memfd tests against the host's real memfd_create.
-# Re-run them with A64_MEMFD_FORCE_FILE=1 so creation, sealing, enforcement
+# Re-run them with ARM64CHROOT_MEMFD_FORCE_FILE=1 so creation, sealing, enforcement
 # and the /proc spellings come from the fallback tier -- what a host kernel
 # without memfd_create (Android 7's 3.x) is served by -- and require
 # identical semantics.
@@ -1644,7 +1644,7 @@ for base in memfd_seals memfd_ro_share mfdsync mmap_eof; do
     NEEDS_ORACLE=$(grep -m1 -o 'NEEDS-ORACLE:[^*]*' "tests/arm64chroot/c/${base}.c" 2>/dev/null |
                    sed 's/^NEEDS-ORACLE: *//')
     out_q=$(oracle_run "$MBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_MEMFD_FORCE_FILE=1 timeout -k 5 60 "$EMU" / "$MBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_MEMFD_FORCE_FILE=1 timeout -k 5 60 "$EMU" / "$MBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${base}(memfd-tier)"
     else
@@ -1662,7 +1662,7 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/memfd_idle.bin \
             tests/arm64chroot/fixtures/memfd_idle.c 2>/dev/null; then
         expect=$'seal=0\nget=8\nget-after=8\nmmap-shared-w=1\nmmap-shared-r=1\nchild-get=8\nchild=1'
-        got=$(A64_MEMFD_FORCE_FILE=1 timeout -k 5 60 "$EMU" / build/tests/arm64chroot/fixtures/memfd_idle.bin 2>/dev/null)
+        got=$(ARM64CHROOT_MEMFD_FORCE_FILE=1 timeout -k 5 60 "$EMU" / build/tests/arm64chroot/fixtures/memfd_idle.bin 2>/dev/null)
         if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: memfd_idle (memfd-tier)"
         else
             fail=$((fail+1)); echo "FAIL fixture: memfd_idle (memfd-tier)"
@@ -1699,7 +1699,7 @@ for base in memfd_seals memfd_ro_share; do
     NEEDS_ORACLE=$(grep -m1 -o 'NEEDS-ORACLE:[^*]*' "tests/arm64chroot/c/${base}.c" 2>/dev/null |
                    sed 's/^NEEDS-ORACLE: *//')
     out_q=$(oracle_run "$MSBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_MEMFD_SEAL_FORCE_OLD=1 timeout -k 5 60 "$EMU" / "$MSBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_MEMFD_SEAL_FORCE_OLD=1 timeout -k 5 60 "$EMU" / "$MSBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/${base}(old-seal-mmap tier)"
     else
@@ -1713,14 +1713,14 @@ NEEDS_ORACLE=
 # A page a file has since grown into is filled lazily, and whether the kernel
 # will hand it over is asked without faulting -- process_vm_readv normally,
 # a pipe write on a host too old to have it (< 3.2, e.g. Android 7's 3.1).
-# Re-run the mapping test with A64_PAGEPROBE_FORCE_PIPE=1 so the fallback is
+# Re-run the mapping test with ARM64CHROOT_PAGEPROBE_FORCE_PIPE=1 so the fallback is
 # exercised on every host, not only on such a device.
 MEBIN="build/tests/arm64chroot/c/mmap_eof_static.bin"
 if [ -x "$MEBIN" ] && ! rec_have "$MEBIN"; then
     skip=$((skip+1)); echo "SKIP c/mmap_eof(pipe-probe) (not in the test pack)"
 elif [ -x "$MEBIN" ]; then
     out_q=$(oracle_run "$MEBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_PAGEPROBE_FORCE_PIPE=1 timeout -k 5 60 "$EMU" / "$MEBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_PAGEPROBE_FORCE_PIPE=1 timeout -k 5 60 "$EMU" / "$MEBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/mmap_eof(pipe-probe)"
     else
@@ -1740,22 +1740,22 @@ fi
 # where there is no compiler to rebuild it.
 if [ ! -x build/tests/arm64chroot/fixtures/ownfdexec.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/ownfdexec.bin \
-        tests/arm64chroot/fixtures/ownfdexec.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/ownfdexec.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 #
 # Run over every tier, and every run must print the same thing. Two knobs stand
 # in for what Android's policy does to a memfd, and they are the only way to
 # reach those fallbacks off a device:
-#   A64_OWNFD_FORCE_DENY       refuses the path spelling of one of our own fds
+#   ARM64CHROOT_OWNFD_FORCE_DENY       refuses the path spelling of one of our own fds
 #                              -- harsher than the device, since it refuses
 #                              stat and access as well as open, so a host that
 #                              denies only the open is covered a fortiori;
-#   A64_MEMFD_CHMOD_FORCE_DENY refuses every mode change on a memfd, so the
+#   ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY refuses every mode change on a memfd, so the
 #                              guest-set mode of leg 4 is the one the broker
 #                              registry holds and not the host's. Without it
 #                              that leg's fchmod simply works here and the
 #                              whole holding path goes untested;
-#   A64_MEMFD_FORCE_FILE       makes the guest's memfds the fallback tier's
+#   ARM64CHROOT_MEMFD_FORCE_FILE       makes the guest's memfds the fallback tier's
 #                              unlinked files, which is what a kernel without
 #                              memfd_create serves -- and that changes what the
 #                              two above are working on: the /proc link names a
@@ -1774,13 +1774,13 @@ if [ -x build/tests/arm64chroot/fixtures/ownfdexec.bin ]; then
                     ofx_env=""
                     [ "$ofx_deny" = 1 ] && {
                         ofx_tag="$ofx_tag (path-denied tier)"
-                        ofx_env="$ofx_env A64_OWNFD_FORCE_DENY=1"; }
+                        ofx_env="$ofx_env ARM64CHROOT_OWNFD_FORCE_DENY=1"; }
                     [ "$ofx_chmod" = 1 ] && {
                         ofx_tag="$ofx_tag (chmod-denied tier)"
-                        ofx_env="$ofx_env A64_MEMFD_CHMOD_FORCE_DENY=1"; }
+                        ofx_env="$ofx_env ARM64CHROOT_MEMFD_CHMOD_FORCE_DENY=1"; }
                     [ "$ofx_tier" = 1 ] && {
                         ofx_tag="$ofx_tag (memfd-tier)"
-                        ofx_env="$ofx_env A64_MEMFD_FORCE_FILE=1"; }
+                        ofx_env="$ofx_env ARM64CHROOT_MEMFD_FORCE_FILE=1"; }
                     got=$(env $ofx_env timeout -k 5 60 "$EMU" $ofx_id / \
                               build/tests/arm64chroot/fixtures/ownfdexec.bin 2>/dev/null)
                     if [ "$got" = "$expect" ]; then
@@ -1804,7 +1804,7 @@ fi
 # prints for this program, natively. ----
 if [ ! -x build/tests/arm64chroot/fixtures/netfault.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/netfault.bin \
-        tests/arm64chroot/fixtures/netfault.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/netfault.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/netfault.bin ]; then
     expect=$'socketpair err=14 leaked=0 still=1\nrecvmsg n=-1 err=14\nrecvmsg-hdr n=-1 err=14\ngetname addr=14 len=14 zero=0 neg=22 peer=14\nrecvfrom none=2 half=-1 err=14 left=11\naccept none=1 half=-1 err=14 next=11\ngetsockopt val=14 len=14 zero=0 neg=22\ngso-timeo val=14 len=14 zero=0 neg=22\naddrlen ok=0 big=22 neg=22\nsendto-addrlen ok=0 big=22 neg=22\nmsgname send_neg=22 send_null=2 recv_neg=22 recv_big=2'
@@ -1829,7 +1829,7 @@ fi
 # torn1/torn2 5 runs of 5. ----
 if [ ! -x build/tests/arm64chroot/fixtures/sigdisp.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/sigdisp.bin \
-        tests/arm64chroot/fixtures/sigdisp.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/sigdisp.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/sigdisp.bin ]; then
     expect=$'held=pending\ntuple=ok'
@@ -1858,7 +1858,7 @@ fi
 # mask kill=1 stop=1. ----
 if [ ! -x build/tests/arm64chroot/fixtures/sigactorder.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/sigactorder.bin \
-        tests/arm64chroot/fixtures/sigactorder.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/sigactorder.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/sigactorder.bin ]; then
     expect=$'badact r=-1 e=14 oldact=untouched\nbadold r=-1 e=14 disposition=installed\nkill-badact r=-1 e=14 oldact=untouched\nkill-set r=-1 e=22\nkill-get r=0 e=0 handler=0\nrange-badact r=-1 e=14\nrange-set r=-1 e=22\nmask kill=0 stop=0 usr2=1'
@@ -1884,7 +1884,7 @@ fi
 # the empty-argv one handed the new image argc=0. ----
 if [ ! -x build/tests/arm64chroot/fixtures/execnullv.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/execnullv.bin \
-        tests/arm64chroot/fixtures/execnullv.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/execnullv.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/execnullv.bin ]; then
     expect=$'keptargv argc=2 arg0=kept envc=0\nnullboth argc=1 arg0=empty envc=0\nnullargv argc=1 arg0=empty envc=1\nemptyargv argc=1 arg0=empty envc=1'
@@ -1909,7 +1909,7 @@ fi
 # kernel prints for this program, natively. ----
 if [ ! -x build/tests/arm64chroot/fixtures/bigcount.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/bigcount.bin \
-        tests/arm64chroot/fixtures/bigcount.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/bigcount.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/bigcount.bin ]; then
     expect=$'huge-pread 204800 1\nshort-pread 4096 1\nefault-pread -1 14\nshort-write 4096\nefault-write -1 14'
@@ -1933,7 +1933,7 @@ fi
 # 4.5, keyrings on Android). ----
 if [ ! -x build/tests/arm64chroot/fixtures/hugecount.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/hugecount.bin \
-        tests/arm64chroot/fixtures/hugecount.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/hugecount.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/hugecount.bin ]; then
     expect=$'huge-sendfile 204800 1\nhuge-splice 1\nhuge-cfr 1\nshort-getrandom 4096 1\nhuge-addkey 1\nhuge-setxattr 1\nwide-getdents 1 1'
@@ -1960,7 +1960,7 @@ fi
 # deliberately not reproduced and not tested -- the oracle would hang. ----
 if [ ! -x build/tests/arm64chroot/fixtures/recvmmsg_tmo.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/recvmmsg_tmo.bin \
-        tests/arm64chroot/fixtures/recvmmsg_tmo.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/recvmmsg_tmo.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/recvmmsg_tmo.bin ]; then
     expect=$'bad-nsec -1 22\nneg-sec -1 22\nbad-ptr -1 14\nwaitforone 2 0 len0=1 len1=1\nremainder-shrank 1\nzero-tmo -1 11 quick=1\nno-tmo 1 0\nhuge 2 0 rem-big=1\nmax 1 0 rem-big=1'
@@ -2000,7 +2000,7 @@ if ! a64_emu_syscall_ok iov-fault; then
 else
 if [ ! -x build/tests/arm64chroot/fixtures/iovroom.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/iovroom.bin \
-        tests/arm64chroot/fixtures/iovroom.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/iovroom.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/iovroom.bin ]; then
     # The one row the host kernel's own vintage decides: a write whose first
@@ -2052,7 +2052,7 @@ fi
 # -- it validates the full 64-bit count for readv too. ----
 if [ ! -x build/tests/arm64chroot/fixtures/iovcnt.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/iovcnt.bin \
-        tests/arm64chroot/fixtures/iovcnt.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/iovcnt.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/iovcnt.bin ]; then
     expect=$'readv 0x1 -> 11 errno=0
@@ -2088,7 +2088,7 @@ fi
 # image, so qemu, not the kernel, is what fails to open a missing interpreter. ----
 if [ ! -x build/tests/arm64chroot/fixtures/execimg.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/execimg.bin \
-        tests/arm64chroot/fixtures/execimg.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/execimg.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/execimg.bin ]; then
     expect=$'foreign=8\njunk=8\nnointerp=2\nbadsegs=-11\nwrapvaddr=-11\ndone'
@@ -2255,7 +2255,7 @@ if [ -n "$AGCC" ]; then
 fi
 
 # ---- the synthesized /proc must fail closed. Self-checking: qemu-user has no
-# synthesized /proc, so it cannot be the oracle. A64_PROCSYNTH_FORCE_FAIL is the
+# synthesized /proc, so it cannot be the oracle. ARM64CHROOT_PROCSYNTH_FORCE_FAIL is the
 # tier a host with neither memfd_create nor a writable directory is served by,
 # where every synthesized open used to fall through to the HOST file -- the
 # emulator's own environment, command line, mount table and address space. Both
@@ -2305,7 +2305,7 @@ done"
             fi
         }
         pst_run "normal" served served
-        pst_run "no-anonfd tier" ENOENT passthru A64_PROCSYNTH_FORCE_FAIL=1
+        pst_run "no-anonfd tier" ENOENT passthru ARM64CHROOT_PROCSYNTH_FORCE_FAIL=1
         fx_rm build/tests/arm64chroot/fixtures/procsynth_tier.bin
     else
         skip_build "fixtures/procsynth_tier"
@@ -2315,7 +2315,7 @@ fi
 # ---- the optimistic resolver must answer exactly what the walk answers. It
 # skips the walk's per-component readlink on the assumption that no component is
 # a symlink and has the pin certify that, so a mistake in the fold it builds
-# meanwhile would be a wrong path, not a refused one. A64_PATHFAST_VERIFY runs
+# meanwhile would be a wrong path, not a refused one. ARM64CHROOT_PATHFAST_VERIFY runs
 # both routes for every resolution and aborts the process on any disagreement;
 # the workload below is deliberately quiescent (the two walks run at different
 # instants, so a guest racing itself makes them differ for a reason that is not
@@ -2350,7 +2350,7 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
             test -e /dev/null; chk $? dev
             rm -f /tmp/ci_v_lnk /tmp/ci_v_lnk2
             echo "routes-agree$vfail"'
-    vout=$(A64_PATHFAST_VERIFY=1 timeout -k 5 180 "$EMU" --bind /etc:/ro:ro "$ALPINE" \
+    vout=$(ARM64CHROOT_PATHFAST_VERIFY=1 timeout -k 5 180 "$EMU" --bind /etc:/ro:ro "$ALPINE" \
                /bin/busybox sh -c "$vprobe" 2>&1)
     rc=$?
     got=$(printf '%s\n' "$vout" | tail -1)
@@ -2412,7 +2412,7 @@ elif [ -x "$FDLBIN" ]; then
     rm -f /tmp/ci_fdlim_new
     out_q=$(oracle_run "$FDLBIN" 2>/dev/null); rc_q=$?
     rm -f /tmp/ci_fdlim_new
-    out_e=$(A64_PINWALK_FORCE_LOOP=1 timeout -k 5 60 "$EMU" / "$FDLBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_PINWALK_FORCE_LOOP=1 timeout -k 5 60 "$EMU" / "$FDLBIN" 2>/dev/null); rc_e=$?
     rm -f /tmp/ci_fdlim_new
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/fdlimit(loop-tier)"
@@ -2440,7 +2440,7 @@ fi
 # on the host. ----
 if [ -n "$AGCC" ] && [ -d "$ALPINE" ] && [ -w /tmp ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/pathrace.bin \
-            tests/arm64chroot/fixtures/pathrace.c $A64_TESTLIBS 2>/dev/null; then
+            tests/arm64chroot/fixtures/pathrace.c $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         rm -rf /tmp/a64_race_mkdir /tmp/a64_race_creat /tmp/a64_race_sym \
                /tmp/a64_race_fifo /tmp/a64_race_moved /tmp/a64_race_sock \
                /tmp/a64_race_rmdir /tmp/a64_toctou_victim /tmp/a64_toctou_unlinkme
@@ -2451,10 +2451,10 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ] && [ -w /tmp ]; then
         # Every route into the pin: the optimistic resolver over one openat2,
         # the same over the per-component loop a host kernel older than 5.6 is
         # served by, and the plain walk with the optimistic route off.
-        for tier in "" "A64_PINWALK_FORCE_LOOP=1" "A64_PATHFAST_OFF=1"; do
+        for tier in "" "ARM64CHROOT_PINWALK_FORCE_LOOP=1" "ARM64CHROOT_PATHFAST_OFF=1"; do
             case $tier in
                 "")                      lbl="fixture: pathrace";;
-                A64_PINWALK_FORCE_LOOP*) lbl="fixture: pathrace (loop-tier)";;
+                ARM64CHROOT_PINWALK_FORCE_LOOP*) lbl="fixture: pathrace (loop-tier)";;
                 *)                       lbl="fixture: pathrace (walk-tier)";;
             esac
             rm -rf "$ALPINE/a64race"
@@ -2518,7 +2518,7 @@ if [ -n "$AGCC" ] && [ -d "$ALPINE" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/robind.bin \
             tests/arm64chroot/fixtures/robind.c 2>/dev/null &&
        cp build/tests/arm64chroot/fixtures/robind.bin "$ALPINE/tmp/robind.bin"; then
-        ROSRC="$A64_TEST_ROOT/robind_src"
+        ROSRC="$ARM64CHROOT_TEST_ROOT/robind_src"
         rm -rf "$ROSRC"; mkdir -p "$ROSRC"; echo content > "$ROSRC/f"
         chmod 644 "$ROSRC/f"
         got=$("$EMU" --bind "$ROSRC:/ro:ro" "$ALPINE" /tmp/robind.bin 2>/dev/null)
@@ -2605,7 +2605,7 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
     local got
     # A fixture that makes files of its own says so with a WANTS-SCRATCH
     # marker and is handed a directory as the guest's TMPDIR (hostenv.sh
-    # A64_SCRATCH: $TMPDIR first, then /tmp). It has to be handed in -- the
+    # ARM64CHROOT_SCRATCH: $TMPDIR first, then /tmp). It has to be handed in -- the
     # emulator gives the guest a clean environment, so a fixture cannot read
     # the host's own -- and only to the fixtures that ask for it: every
     # expectation here was recorded in that clean environment, and one
@@ -2613,7 +2613,7 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
     # of its own envp, and nothing says the next fixture will not).
     local -a sc=()
     grep -qm1 'WANTS-SCRATCH' "tests/arm64chroot/fixtures/$name.c" &&
-        sc=(-E "TMPDIR=$A64_SCRATCH")
+        sc=(-E "TMPDIR=$ARM64CHROOT_SCRATCH")
     got=$("$EMU" "${sc[@]}" / "build/tests/arm64chroot/fixtures/$name.bin" 2>/dev/null)
     fixture_verdict "$name" "$expect" "$got"
     # The fallback tiers the same expectations have to survive: what the guest
@@ -2631,7 +2631,7 @@ check_fixture() {   # check_fixture <name> <expected> ["VAR=VAL ..." <tier-label
 # qemu-user has no synthesized /proc. Android's SELinux policy denies an app
 # getattr and access on the files whose open the emulator serves itself
 # (version, stat, loadavg, ...), and a guest could `cat /proc/version` but
-# neither `stat` nor `test -r` it. A64_PROCSYNTH_FORCE_STAT_DENY makes any host
+# neither `stat` nor `test -r` it. ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY makes any host
 # refuse those (EACCES) -- the third row is that tier with the open of the
 # try-host-first names synthesized too, as the device has it; the fake-root rows
 # run the same relations through the guest's own credentials (a host root has
@@ -2640,8 +2640,8 @@ if [ -n "$AGCC" ]; then
     if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/procsynth_stat.bin \
             tests/arm64chroot/fixtures/procsynth_stat.c 2>/dev/null; then
         pss_want=$'fails=0\ndone'
-        pss_deny="A64_PROCSYNTH_FORCE_STAT_DENY=1"
-        pss_both="$pss_deny A64_PROCSTAT_FORCE_SYNTH=1 A64_OVERFLOWID_FORCE_SYNTH=1"
+        pss_deny="ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY=1"
+        pss_both="$pss_deny ARM64CHROOT_PROCSTAT_FORCE_SYNTH=1 ARM64CHROOT_OVERFLOWID_FORCE_SYNTH=1"
         got=$("$EMU" / build/tests/arm64chroot/fixtures/procsynth_stat.bin 2>/dev/null)
         fixture_verdict "procsynth_stat" "$pss_want" "$got"
         got=$(env $pss_deny "$EMU" / build/tests/arm64chroot/fixtures/procsynth_stat.bin 2>/dev/null)
@@ -2793,7 +2793,7 @@ check_fixture fiemapio $'one_run=0 mapped=1 last=1 untouched=1\none_run_badr=53 
 # the same answers over that, a BOTHER rate and a rate set through the pty's
 # master included.
 check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 readback=1\nsetsw2=0 errno=0 readback=1\nsetsf2=0 errno=0 readback=1\nmaster_set2=0 errno=0 readback=1\nmaster_get2=0 speed=1\nget2_fault=-1 errno=14\nset2_fault=-1 errno=14\npipe=-1 errno=25\ndone' \
-    "A64_TERMIOS2_FORCE_DENY=1" "denied tier"
+    "ARM64CHROOT_TERMIOS2_FORCE_DENY=1" "denied tier"
 # TIOCGSID (tcgetsid): the session of a terminal over a real pty -- ENOTTY with
 # no session, a child that setsid()s and takes the pty reads its own pid from
 # the slave and from the master, the parent reads it from the master and is
@@ -2804,7 +2804,7 @@ check_fixture termios2 $'get2=0 errno=0 whole=1 tail=1 prefix=1\nset2=0 errno=0 
 # output taken from a real kernel); steps aside where the pty cannot be handed
 # to a new session.
 check_fixture tiocgsid $'slave_nosess=-1 errno=25\nmaster_nosess=-1 errno=25\nslave_foreign=-1 errno=25\nslave_ctl=0 own=1\nslave_fault=-1 errno=14\nmaster_ctl=0 own=1\nmaster_parent=0 kid=1\nmaster_gone=-1 errno=25\npipe=-1 errno=25\nnull=-1 errno=25\nclosed=-1 errno=9\ndone' \
-    "A64_TIOCGSID_FORCE_DENY=1" "denied tier"
+    "ARM64CHROOT_TIOCGSID_FORCE_DENY=1" "denied tier"
 # The terminal ioctls on descriptors that are no terminal: ENOTTY for every
 # command on a pipe, a socket, a file, a directory, a memfd, a /proc file, an
 # eventfd and /dev/null, EBADF on an O_PATH or closed descriptor, FIOCLEX and
@@ -2814,7 +2814,7 @@ check_fixture tiocgsid $'slave_nosess=-1 errno=25\nmaster_nosess=-1 errno=25\nsl
 # read the kernel's answers. Self-checking; the expected output is a real
 # kernel's.
 check_fixture ttynotty $'pipe_r: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\npipe_w: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nstream: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\ndgram: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\ndir: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nfile: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nmemfd: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nproc: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\neventfd: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nnull: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\nopath: all EBADF | fioclex=EBADF fd=0 fionclex=EBADF fd=0\nclosed: all EBADF | fioclex=EBADF fd=-1 fionclex=EBADF fd=-1\nfionread=ok n=3\ndone' \
-    "A64_TTYIOCTL_FORCE_DENY=1" "denied tier"
+    "ARM64CHROOT_TTYIOCTL_FORCE_DENY=1" "denied tier"
 # The terminal commands a pty slave answers from the tty core alone, over a
 # real pty: TIOC[GS]SOFTCAR, TCSBRK/TCSBRKP, TCXONC (the master reads the
 # STOP/START characters), TIOCNOTTY, the modem/packet/pty-number/console
@@ -2826,15 +2826,15 @@ check_fixture ttynotty $'pipe_r: all ENOTTY | fioclex=ok fd=1 fionclex=ok fd=0\n
 # netlink-blocked tier puts the emulator's AF_UNIX stand-in under the netlink
 # rows. Self-checking; the expected output is a real kernel's.
 check_fixture ptsioctl $'softcar_get0=0\nsoftcar_set1=0 errno=0\nsoftcar_now=1 clocal=1 master=1\nsoftcar_set0=0 errno=0\nsoftcar_now=0 clocal=0 master=0\nsoftcar_get_fault=-1 errno=14\nsoftcar_set_fault=-1 errno=14\ntcsbrk_drain=0 errno=0\ntcsbrk_break=0 errno=0\ntcsbrkp_0=0 errno=0\ntcsbrkp_2=0 errno=0\ntcxonc_on=0 errno=0\ntcxonc_bad=-1 errno=22\ntcxonc_wide=-1 errno=22\ntcflsh_wide=-1 errno=22\nbefore_xchar=none\ntcxonc_ioff=0 errno=0\nmaster_read=13\ntcxonc_ion=0 errno=0\nmaster_read=11\ntcxonc_ioff_disabled=0 errno=0\nmaster_read=none\nnotty_not_ctty=-1 errno=25\nslave_tty_core: TIOCMGET=25 TIOCMBIS=25 TIOCMBIC=25 TIOCMSET=25 TIOCPKT=25 TIOCGPTN=25 TIOCSPTLCK=25 VT_GETSTATE=25 KDGKBTYPE=25\noutq_slave=0 errno=0 n=0\noutq_master=0 errno=0 n=0\noutq_pipe=-1 errno=25\noutq_sock=0 errno=0 queued=1\noutq_sock_read=0 errno=0 n=0\noutq_sock_fault=-1 errno=14\nnetlink_fionread=-1 errno=25\nnetlink_outq=-1 errno=25\nbg_ignored: tcsbrk=0/0 tcxonc=0/0 softcar=0/0\nbg_default: softcar=0/0\nbg_default: tcsbrk stopped SIGTTOU\norphaned: tcsbrk=-1/5 tcxonc=-1/5\ndone' \
-    "A64_TTYIOCTL_FORCE_DENY=1" "denied tier" \
-    "A64_NETLINK_FORCE_BLOCK=1" "netlink-blocked tier"
+    "ARM64CHROOT_TTYIOCTL_FORCE_DENY=1" "denied tier" \
+    "ARM64CHROOT_NETLINK_FORCE_BLOCK=1" "netlink-blocked tier"
 # An ioctl whose argument cannot be read: EBADF, or ENOTTY from a file that
 # does not take the command, ahead of the EFAULT the emulator used to answer
 # first; EFAULT where the kernel does read or write it. Gated on the host
 # reading the argument late (qemu-user does not). Self-checking; the expected
 # output is a real kernel's.
 check_fixture ioctlorder $'pipe_tcsets=-1 errno=25\npipe_tiocswinsz=-1 errno=25\npipe_tiocspgrp=-1 errno=25\nsock_tcsets=-1 errno=25\nclosed_tcsets=-1 errno=9\nclosed_fionbio=-1 errno=9\nopath_tcsets=-1 errno=9\nslave_tiocmset=-1 errno=25\nslave_tiocmbis=-1 errno=25\nslave_tiocpkt=-1 errno=25\nslave_tiocsptlck=-1 errno=25\nslave_tcsets=-1 errno=14\nslave_tiocswinsz=-1 errno=14\nslave_tiocssoftcar=-1 errno=14\nmaster_tiocpkt=-1 errno=14\npipe_fionbio=-1 errno=14\npipe_tcgets=-1 errno=25\nslave_tcgets=-1 errno=14\nslave_tiocgsoftcar=-1 errno=14\nsock_tiocoutq=-1 errno=14\ndone' \
-    "A64_TTYIOCTL_FORCE_DENY=1" "denied tier"
+    "ARM64CHROOT_TTYIOCTL_FORCE_DENY=1" "denied tier"
 # AT_EXECFN and comm: the path execve was GIVEN, not the one it resolved to.
 # Through a symlink, a relative path or a script a kernel keeps the name as
 # written; the emulator reported the resolved file's, and uutils' coreutils
@@ -2875,23 +2875,23 @@ check_fixture procmode $'unshare=0\nuid_ro_open=1\nuid_ro_write=EBADF\nuid_ro_pw
 # relation a kernel keeps true for any process; compiled and run natively on
 # x86-64 the same program prints the same block.
 #
-# Run again with the resident-set sample forced to fail (A64_MINCORE_FORCE_FAIL
+# Run again with the resident-set sample forced to fail (ARM64CHROOT_MINCORE_FORCE_FAIL
 # -- the tier a host that will not answer mincore(2) is served by, which is
 # also the tier every reader of ANOTHER process is on). The expectations do not
 # change: the sizes are the guest's either way, and the resident figures the
 # emulator falls back to are bounded so that the same relations still hold.
 #
 # And again on a host whose own /proc is older than the kernel this emulator
-# says it is (A64_PROCFS_FORCE_OLD): stat stops at field 44 and status has no
+# says it is (ARM64CHROOT_PROCFS_FORCE_OLD): stat stops at field 44 and status has no
 # Rss* components, so rewriting the host's files cannot produce them and they
 # have to be appended. An Android 7 device (3.1) is such a host, and there the
 # guest could not find its own argv, its own brk, or the parts of its own
 # resident set. Crossed with the no-mincore tier because that is the
 # combination that has to invent the split with no host figures to bound.
 check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=1\nrss_bounded=1\ncode_span=1\nargenv=1\nstack_span=1\ngrow=1\nshrink=1\npeak_holds=1\nbrk_is_data=1\nother_stat=1\nother_statm=1\nother_status=1\nother_bounded=1\nrsslim=1\ndone' \
-              A64_MINCORE_FORCE_FAIL=1 "no-mincore tier" \
-              A64_PROCFS_FORCE_OLD=1 "old-procfs tier" \
-              "A64_PROCFS_FORCE_OLD=1 A64_MINCORE_FORCE_FAIL=1" "old-procfs, no-mincore tier"
+              ARM64CHROOT_MINCORE_FORCE_FAIL=1 "no-mincore tier" \
+              ARM64CHROOT_PROCFS_FORCE_OLD=1 "old-procfs tier" \
+              "ARM64CHROOT_PROCFS_FORCE_OLD=1 ARM64CHROOT_MINCORE_FORCE_FAIL=1" "old-procfs, no-mincore tier"
 # /proc/self/stat read by four threads at once: every read one whole line with
 # the field count of a read made alone. The synthesized line was cut up with
 # strtok(3), whose position glibc keeps once per process, so threads building
@@ -2899,7 +2899,7 @@ check_fixture vmreport $'size_agrees=1\ndata_agrees=1\nrss_adds_up=1\nhwm_holds=
 # malformed). Self-checking; the old-procfs tier appends the fields past 44
 # instead of rewriting them, which is the other half of the same loop.
 check_fixture procstatmt $'single=ok\nconcurrent bad=0\ndone' \
-              A64_PROCFS_FORCE_OLD=1 "old-procfs tier"
+              ARM64CHROOT_PROCFS_FORCE_OLD=1 "old-procfs tier"
 # madvise over a range with a hole in it: ENOMEM, whatever the advice. Self-
 # checking because qemu emulates MADV_DONTNEED and ignores every other advice,
 # answering 0 to all of these; the values are a real kernel's.
@@ -2972,9 +2972,9 @@ check_fixture stackrlimit $'tiny=1\nsmall=1\ndefault=1\nlarge=1\nscales=1\ndone'
 # which a stack moved to grow could not give, and mprotect(PROT_GROWSDOWN)
 # reaching through every piece.
 check_fixture growsdown $'initial stack: [stack], 128..256 KiB: 1\nVmStk 128..256 kB: 1\nraised to 64 MiB after exec, 24 MiB deep: ok\nlowered to 512 KiB after exec: Segmentation fault, depth 64..128: 1\nplaced by the system, 1 and 64 pages below: 1 1, start moved: 1\nnext mapping clear of its guard gap: 1\nhint inside the guard gap taken: 0\n4 MiB growsdown: VmStk +4096 kB, VmData +0 kB\ngrown 16 pages: VmStk +4160 kB\nover RLIMIT_DATA: mmap ok, mremap ok\npage below: 1, start moved: 1\n10 pages below: 1, start moved: 1\npast RLIMIT_STACK: 0\nto RLIMIT_STACK: 1\nguard: 1.5 MiB above the mapping below: 1\nguard: 0.5 MiB above it: 0\nguard: 0.5 MiB above it, PROT_NONE: 1\ngrowsdown below, 1 page between: 1\nread into the hole: 3, start moved: 1\nread at end-of-file into the hole: 0, start moved: 0\nwrite from the hole to a pipe with no reader: EPIPE, start moved: 0\nwrite from the hole to /dev/null: 12288, start moved: 0\nreadv, 4 pages to the end of the file before the hole: 16384, start moved: 0\nreadv, 64 pages to the end of the file before the hole: 262144, start moved: 0\nwrite from the hole to a pipe: 12288, start moved: 1\nwritev, 64 pages and the hole, to a file: 270336, start moved: 1, zeroes 1\nprocess_vm_readv into the hole: EFAULT\npeek into the hole: read\nprocess_vm_readv, the hole grown into: EFAULT\npoke into the hole: ok, reads back 42\nmunmap\'d bottom page regrown: 1, reads 0\nwrite below a read-only one: 0 SEGV_ACCERR, start moved: 1\ncall below a non-executable one: 0 SEGV_ACCERR, start moved: 1\nmincore of the hole: Cannot allocate memory, start moved: 0\nRLIMIT_AS: 8 pages 1, 256 pages 0\nlimit raised past the one it was made under, 8 MiB below: 1, kept: 1, start moved: 1\nsignal delivered on it, frame below: 1, start moved: 1\nvfork child writes in the stack\'s hole: in the hole 1, parent reads 42, grown 1\nvfork child reads the hole: grown 1\nvfork child writes a zero in the hole: grown 1\nvfork child grows it past the parent\'s RLIMIT_STACK: grown 1, parent reads 5\nfork child grows its own: 1, parent\'s unmoved: 1\ndone' \
-    "A64_STACKGROW_FORCE_PIECE=1" "piece-tier"
+    "ARM64CHROOT_STACKGROW_FORCE_PIECE=1" "piece-tier"
 check_fixture growsnomove $'thread grows it: 1, start moved: 1\nthe other thread sees the page: 1\natomic first touch: 1, value 5, start moved: 1\none transfer into it and below: 68 pages, start moved: 1, bytes 1 1\ngrown 300 pages: 1, PROT_GROWSDOWN from the top: 0, bottom page rwxp\ndone' \
-    "A64_STACKGROW_FORCE_PIECE=1" "piece-tier"
+    "ARM64CHROOT_STACKGROW_FORCE_PIECE=1" "piece-tier"
 # O_DIRECT where the host really does direct I/O (ext4, xfs, f2fs, exfat; not
 # btrfs or tmpfs, which fall back to the page cache): the guest's buffers are
 # the host's to judge, and a transfer staged rather than lent keeps the guest
@@ -3144,7 +3144,7 @@ check_fixture forkfds $'openers: bad=0/200\nfifo_open: bad=0/50\nsemop: bad=0/50
 # its host kernel and applies none of it to the guest. The per-thread and
 # cross-process semantics are c/personality's, against the oracle.
 PERS_EXPECT=$'refuse 0x8: r=-1 errno=22 now=00040000\nrefuse 0x20008: r=-1 errno=22 now=00040000\nrefuse 0x8000008: r=-1 errno=22 now=00040000\nrefuse 0x108: r=-1 errno=22 now=00040000\ntype 0x18 kept: 00000018\nuname26 2.6.61-arm64chroot\nuname 6.1.0-arm64chroot\nrw-page before SIGSEGV\nmmap r r-xp w -w-p none ---p\nmprotect rw rwxp w -w-p\nbrk rwxp\nshmat ro r-xs\nrw-page under it 42\nexec 00120000 mmap(r) r--p rw-page SIGSEGV\npage0 follows the limit\ndone'
-A64_KEEP_TESTBINS=1 check_fixture personality "$PERS_EXPECT"
+ARM64CHROOT_KEEP_TESTBINS=1 check_fixture personality "$PERS_EXPECT"
 # ...and on a host whose vm.mmap_min_addr is 0, where MMAP_PAGE_ZERO does map
 # page zero: no stock kernel ships that, so the sysctl is replaced for the
 # emulator and the guest alike by a bind mount in a bubblewrap sandbox --
@@ -3165,7 +3165,7 @@ if [ ! -x build/tests/arm64chroot/fixtures/personality.bin ] || ! command -v bwr
 else
     pers_t=$(mktemp -d)
     if printf 'int main(void) { return 0; }\n' |
-           $A64_EMU_CC $A64_EMU_CFLAGS -x c - -o "$pers_t/start" 2>/dev/null &&
+           $ARM64CHROOT_EMU_CC $ARM64CHROOT_EMU_CFLAGS -x c - -o "$pers_t/start" 2>/dev/null &&
        ! pers_sandbox "$pers_t/start" >/dev/null 2>&1; then
         pers_why="the emulator's host cannot start where vm.mmap_min_addr reads 0"
     fi
@@ -3210,7 +3210,7 @@ check_fixture waitany $'wait4(-1): ordinary child status=4\nwait4(-1) with only 
 # nothing (sig_taken_quietly). Self-checking: qemu-user forks for a clone child, which then signals with
 # SIGCHLD; the block is the kernel's.
 check_fixture sigchldflags $'nocldwait handler: notices=1 code=1 wait=ECHILD\nnocldwait default: wait=ECHILD\nnocldstop: notices=1 code=2 wait=ok\nignored, ordinary: wait=ECHILD\nignored, clone child: wait=ok status=7 usr1=1\nignored, exit-0 child looked at: wait=ok status=9\nignored, exit-0 child: wait=ok status=9\nignored, ordinary looked at: wait=ECHILD pid=0\nignored, second clone child: wait=ok status=1\nignored, clone child about, read: ok\nignored, clone child about, epoll: timeout\ndefault, clone child about, read: ok\ndefault, clone child about, epoll: timeout\nnocldwait with a clone child: notices=1 code=1 wait=ECHILD\nnocldwait, clone child: wait=ok status=6 usr1=1\ndone' \
-    "A64_NOCLDWAIT_FORCE_EMULATE=1" "nocld-tier"
+    "ARM64CHROOT_NOCLDWAIT_FORCE_EMULATE=1" "nocld-tier"
 # What a clone child's death is reported with (sys_proc.c, "clone
 # children"): its own signal, or none, even while the parent blocks SIGCHLD,
 # which the host's notice of it then waited behind (signal.c, "the SIGCHLD
@@ -3306,7 +3306,7 @@ if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/sigident.bin tests/ar
     done
     # ...and on the tier where a guest's queued siginfo cannot bear the mark
     # that says a guest wrote it, and goes through the receiver's inbox.
-    got=$(A64_SICODE_FORCE_KNOWN=1 timeout -k 5 60 "$EMU" -u / "$PWD/build/tests/arm64chroot/fixtures/sigident.bin" 2>/dev/null)
+    got=$(ARM64CHROOT_SICODE_FORCE_KNOWN=1 timeout -k 5 60 "$EMU" -u / "$PWD/build/tests/arm64chroot/fixtures/sigident.bin" 2>/dev/null)
     fixture_verdict "sigident (known-layout tier)" "$SIGID_EXPECT" "$got"
     fx_rm build/tests/arm64chroot/fixtures/sigident.bin
 else
@@ -3319,7 +3319,7 @@ fi
 # both tiers of what the host carries. Self-checking: the block is the
 # kernel's.
 check_fixture tracerchld $'tracer:\n  attach stop: [4 19 tracee]\n  syscall stop: [4 5 tracee]\n  signal stop: [4 10 tracee]\n  group stop: [5 19 tracee]\n  death: [1 7 tracee] times ok\ntracer with SA_NOCLDSTOP:\n  attach stop: none\n  syscall stop: none\n  signal stop: none\n  group stop: none\n  death: [1 7 tracee] times ok\ndone' \
-    "A64_SICODE_FORCE_KNOWN=1" "known-layout-tier"
+    "ARM64CHROOT_SICODE_FORCE_KNOWN=1" "known-layout-tier"
 # ...and what the real parent of a traced process is told of its job control:
 # a group stop that completes while it is traced (a CLD_STOPPED notice, a
 # WUNTRACED report), the SIGCONT that ends it (WCONTINUED at once, the
@@ -3328,7 +3328,7 @@ check_fixture tracerchld $'tracer:\n  attach stop: [4 19 tracee]\n  syscall stop
 # parent with SA_NOCLDSTOP asking waitid (signal.c, "the real parent's view").
 # Self-checking: the block is the kernel's.
 check_fixture rpjobctl $'== group stop (attach)\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld wait 0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer sigchld\n== group stop (seize)\n  tracer attach 0\n  parent: sigchld wait 0\n  parent after SIGSTOP: sigchld wait 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer sigchld [4 19]\n  parent: sigchld wait 0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=128\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer sigchld\n== attach stopped (attach)\n  parent after SIGSTOP: sigchld [5 19 T] wait stopped 19\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld wait 0\n  tracer sigchld [5 0]\n  state t\n== attach stopped (seize)\n  parent after SIGSTOP: sigchld [5 19 T] wait stopped 19\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=128\n  parent: sigchld wait 0\n  tracer sigchld [5 0]\n  state t\n== foreign stop (seize)\n  tracer attach 0\n  tracer cont -1\n  parent: sigchld wait 0\n  parent after SIGSTOP: sigchld wait 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer sigchld [4 19]\n  parent: sigchld wait 0\n  state t\n== continue notice (attach)\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer cont 0\n  tracer sigchld [6 18]\n  parent: sigchld [6 18 T] wait 0\n  state t\n== continue notice (seize)\n  tracer attach 0\n  parent: sigchld wait 0\n  parent after SIGSTOP: sigchld wait 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer sigchld [4 19]\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=128\n  parent: sigchld [5 19 T] wait stopped 19\n  parent after SIGCONT: sigchld wait continued 0\n  parent: sigchld wait 0\n  tracer cont 0\n  tracer sigchld [6 18]\n  tracer wait tracee stopped=1 sig=5 ev=128\n  tracer sigchld\n  parent: sigchld [6 18 T] wait 0\n  state t\n== parent SA_NOCLDSTOP (attach)\n  tracer attach 0\n  tracer wait tracee stopped=1 sig=19 ev=0\n  tracer cont(SIGSTOP) 0\n  tracer sigchld [5 19]\n  tracer wait tracee stopped=1 sig=19 ev=0\n  parent waitid WNOWAIT: 0 code=5 status=19 pid=T\n  parent waitid: 0 code=5 status=19 pid=T\n  parent: sigchld wait 0\n  parent after SIGCONT: sigchld wait continued 0\n  parent waitid WNOWAIT: 0 code=0 status=0 pid=0\n  parent waitid: 0 code=0 status=0 pid=0\n  parent: sigchld wait 0\ndone' \
-    "A64_SICODE_FORCE_KNOWN=1" "known-layout-tier"
+    "ARM64CHROOT_SICODE_FORCE_KNOWN=1" "known-layout-tier"
 # ...and what the host does to a tracee that its tracer is still to hear of: a
 # death by SIGKILL (a CLD_KILLED notice, for a tracer that waits only once its
 # handler says so), and -- sent from out here -- a SIGSTOP, the one stop a
@@ -3367,7 +3367,7 @@ fi
 # the kernel's.
 check_fixture heldzombie $'tracer reaps it:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: reaped it, exited 5\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ntracer leaves:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: left it\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ntracer killed:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: killed\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\nkilled by SIGKILL:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: reaped it, killed\n  after: notice code=2 status=9 from the child=1\n  wait(child)=the child, killed by 9\nblocked in its wait:\n  wait(child)=the child, exited 5, after the tracer\'s reap\n  tracer: reaped it, exited 5\nSIGCHLD blocked:\n  before: pending=0, signalfd empty\n  tracer: reaped it, exited 5\n  after: signalfd read the child=1 code=1 status=5\n  wait(child)=the child, exited 5\nSIGCHLD ignored:\n  wait(child)=ECHILD, after the tracer\'s reap\n  tracer: reaped it, exited 5\na followed fork\'s child:\n  parent before the tracer: nothing yet\n  parent: the child, exited 6, after the tracer\'s reap\ndone'
 # ...and the tracer killed with every notice the host sends the parent held up
-# 300 ms (A64_SIGCHLD_DELAY): the emulator's look for a gone tracer, every 100
+# 300 ms (ARM64CHROOT_SIGCHLD_DELAY): the emulator's look for a gone tracer, every 100
 # ms, releases the child meanwhile, and the SIGCHLD watcher takes that release
 # while the parent's thread is still at the tracer's own notice -- which the
 # guest was told of first (signal.c, cw_overtake). The kernel's order is the
@@ -3376,7 +3376,7 @@ check_fixture heldzombie $'tracer reaps it:\n  before: wait(child)=nothing yet, 
 # keep either.
 if [ -n "$AGCC" ] && "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/heldzombie.bin \
         tests/arm64chroot/fixtures/heldzombie.c 2>/dev/null; then
-    got=$(A64_SIGCHLD_DELAY=300 timeout -k 5 60 "$EMU" / build/tests/arm64chroot/fixtures/heldzombie.bin killed 2>/dev/null)
+    got=$(ARM64CHROOT_SIGCHLD_DELAY=300 timeout -k 5 60 "$EMU" / build/tests/arm64chroot/fixtures/heldzombie.bin killed 2>/dev/null)
     fixture_verdict "heldzombie (slow-notice tier)" $'tracer killed:\n  before: wait(child)=nothing yet, wait(any)=nothing yet, waitid look=nothing, notices=0\n  tracer: killed\n  after: notice code=1 status=5 from the child=1\n  wait(child)=the child, exited 5\ndone' "$got"
     fx_rm build/tests/arm64chroot/fixtures/heldzombie.bin
 else
@@ -3397,13 +3397,13 @@ check_fixture tagged $'initial: 0\nwrite tagged, off: EFAULT\nread tagged, off, 
 # row forces that tier on any host, so the inbox is checked where it is not
 # otherwise needed.
 check_fixture sqiread $'sigqueueinfo errno 7: 0\nsigqueueinfo errno 7: took 10 errno=7 val=1\ntgsigqueueinfo errno 11: 0\ntgsigqueueinfo errno 11: took 10 errno=11 val=2\n48 readable, SI_QUEUE: 0\n48 readable, SI_QUEUE: took 10 errno=0 val=3\n48 readable, unknown layout: EFAULT\n47 readable, SI_QUEUE: EFAULT\nunknown layout, zero tail: 0\nunknown layout, zero tail: took 10 errno=0\nunknown layout, byte 100 set: E2BIG\nunknown layout, byte 100 set, other pid: E2BIG\nSI_QUEUE, byte 100 set: 0\nSI_QUEUE, byte 100 set: took 10 errno=0 val=6\ndone' \
-    A64_SICODE_FORCE_KNOWN=1 known-layout-tier
+    ARM64CHROOT_SICODE_FORCE_KNOWN=1 known-layout-tier
 # ...and the inbox's slots are taken back only from a signal that is gone,
 # never from one that still waits (a receiver blocking it past the stale age,
 # a sender queueing past the inbox): every instance arrives with its own
 # value. Self-checking; ~5 s.
 check_fixture carrystale $'real-time: received 80, wrong value 0, errno lost in the inbox 0\nstandard: received 1, wrong value 0, errno lost in the inbox 0\ndone' \
-    A64_SICODE_FORCE_KNOWN=1 known-layout-tier
+    ARM64CHROOT_SICODE_FORCE_KNOWN=1 known-layout-tier
 # vm.mmap_min_addr: a fixed mapping below it is EPERM (ahead of NOREPLACE's
 # EEXIST and of the MAP_TYPE check), a hint below it is raised to it (it lands
 # on the limit itself, at_min), MREMAP_FIXED below it is EPERM after
@@ -3454,7 +3454,7 @@ proctid_expect=$'own_exists=1\nown_listed=0\nown_status_pid=1 tgid=1\nown_comm=w
 check_fixture proctid "$proctid_expect"
 if [ -d "$ALPINE/tmp" ] && [ -n "$AGCC" ] &&
    "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/proctid.bin tests/arm64chroot/fixtures/proctid.c \
-        $A64_TESTLIBS 2>/dev/null; then
+        $ARM64CHROOT_TESTLIBS 2>/dev/null; then
     cp build/tests/arm64chroot/fixtures/proctid.bin "$ALPINE/tmp/ci_proctid"
     fixture_verdict "proctid (rootfs)" "$proctid_expect" \
         "$("$EMU" "$ALPINE" /tmp/ci_proctid 2>/dev/null)"
@@ -3525,7 +3525,7 @@ check_fixture timers_many $'created 300\nreplaced 150\ntimer 0: code=-2 si_timer
 # reason as userns_race: no oracle can take the writes. Both registry tiers,
 # since the record is what used to truncate.
 check_fixture idmapparse $'simple: 9 back=0:1000:1\nno_newline: 8 back=0:1000:1\ntwo_lines: 18 back=0:1000:1,1:1001:1\ntabs: 9 back=0:1000:1\ncr: 10 back=0:1000:1\nleading_space: 11 back=0:1000:1\ntrailing_space: 10 back=0:1000:1\nblank_between: -22\nblank_trailing: -22\nblank_leading: -22\nspace_only_line: -22\njunk: -22\ntwo_fields: -22\none_field: -22\nempty: -22\nnewline_only: -22\nplus: -22\nminus: -22\nhex: -22\nglued: -22\nnul_ends: 23 back=0:1000:1\nnul_after_newline: 11 back=0:1000:1\nwrap_first: 18 back=0:1000:1\nwrap_lower: 15 back=0:1000:1\nwrap_huge: 28 back=5:1000:1\nfirst_minus1: -22\nlower_minus1: -22\ncount_zero: -22\nfirst_wraps: -22\nlower_wraps: -22\nfirst_to_end: 18 back=4294967294:1000:1\nlower_to_end: 15 back=0:4294967294:1\noverlap_upper: -22\noverlap_lower: -22\noverlap_touch: -22\nadjacent: 21 back=0:1000:10,10:1010:10\nduplicate: -22\nextents_340: 3630 back=0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nextents_341: -22\nextents_340_blank: -22\nbytes_4095: 4095 back=0:100000:1,11:100011:1,23:100023:1,35:100035:1,...(298 extents)\nbytes_4096: -22\nbytes_4096_junk: -22\ncut: -14\ncut_page: -22\nsg_deny: 4\nsg_allow: 5\nsg_deny_nl: 5\nsg_allow_nl: 6\nsg_denyx: -22\nsg_allowx: -22\nsg_deny_ws: 7\nsg_allow_ws: 7\nsg_deny_junk: -22\nsg_den: -22\nsg_empty: -22\nsg_8bytes: -22\nsg_Deny: -22\nsg_cut: -14\nsg_cut_8: -22\ngid_map: 9\nallow_after_gid_map: 5\ndeny_after_gid_map: -1\ngid_map_again: -1\ngid_map_again_junk: -1\ngid_map_again_page: -22\ndeny: 4\ndeny_again: 4\nallow_after_deny: -1\nallowx_after_deny: -22\nsetgroups_back: deny\ngid_map_after_deny: 9\nparent_writes_340: 3630\nparent_writes_again: -1\nparent_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\ngrandchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_status: 0\ndone' \
-    "A64_PROCTAB_FORCE_FILE=1" "file-registry tier"
+    "ARM64CHROOT_PROCTAB_FORCE_FILE=1" "file-registry tier"
 
 # mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped
 # afresh -- zeroes behind private anonymous memory, the file again behind a
@@ -3544,7 +3544,7 @@ check_fixture dontunmap $'shrink: Invalid argument\ngrow: Invalid argument\nno_m
 # native kernel's, and qemu-user hands the host an ordinary file for maps.
 # The tier row is the one with a backing file of its own to protect.
 check_fixture reflinkobj $'reopen=1\nmaps<-zero=EXDEV/EXDEV\nmaps<-exe=EXDEV/EXDEV\ncomm<-zero=EXDEV/EXDEV\nmaps<-m1=EXDEV/EXDEV\nm1<-maps=EXDEV/EXDEV\nm1<-zero=EXDEV/EXDEV\nm1<-exe=EXDEV/EXDEV\nreg<-m1=EXDEV/EXDEV\nm1<-reg=EXDEV/EXDEV\nmaps<-maps=EBADF/EBADF\nmaps<-comm=EBADF/EBADF\ncomm<-comm=EBADF/EBADF\nm2ro<-m1=EBADF/EBADF\nm2ap<-m1=EBADF/EBADF\nm1<-m2ap=EBADF/EBADF\ncomm<-maps=EOPNOTSUPP/EOPNOTSUPP\nm1<-m2=EOPNOTSUPP/EOPNOTSUPP\nm1<-m1=EOPNOTSUPP/EOPNOTSUPP\nm1<-(-1)=EBADF/EBADF\nm1<-999=EBADF/EBADF\nmaps<-999=EBADF/EBADF\n999<-m1=EBADF/EBADF\nm1<-hi32(m2)=EOPNOTSUPP\nm1<-badptr=EFAULT\n999<-badptr=EBADF\nseal=0\nsealed<-m2=EOPNOTSUPP/EOPNOTSUPP\nsealed<-exe=EXDEV/EXDEV\ncontent=aaaa\nreopen_rw=1\nreopen_write=EPERM\nreopen_pwrite=EPERM\nreopen_seals=8\ncontent=aaaa\ndone' \
-    "A64_MEMFD_FORCE_FILE=1" "memfd-tier"
+    "ARM64CHROOT_MEMFD_FORCE_FILE=1" "memfd-tier"
 
 # RUSAGE_CHILDREN is the guest's own children's (sys_proc.c children_rusage,
 # proctab.c helper_charge): the broker spawn's middle child, which the
@@ -3568,7 +3568,7 @@ if [ -n "$AGCC" ]; then
         fixture_verdict "helperusage" "$expect" "$got"
         got=$(timeout -k 5 60 "$EMU" --shared-proc / build/tests/arm64chroot/fixtures/helperusage.bin 2>/dev/null)
         fixture_verdict "helperusage (--shared-proc)" "$expect" "$got"
-        got=$(A64_NOCLDWAIT_FORCE_EMULATE=1 timeout -k 5 60 "$EMU" / build/tests/arm64chroot/fixtures/helperusage.bin 2>/dev/null)
+        got=$(ARM64CHROOT_NOCLDWAIT_FORCE_EMULATE=1 timeout -k 5 60 "$EMU" / build/tests/arm64chroot/fixtures/helperusage.bin 2>/dev/null)
         fixture_verdict "helperusage (nocld-tier)" "$expect" "$got"
         fx_rm build/tests/arm64chroot/fixtures/helperusage.bin
     else
@@ -3692,13 +3692,13 @@ if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/netns_ack.bin \
             # The substituted socket has no kernel behind it, so it acks every
             # non-dump request whether or not a namespace was faked.
             want_no_netns="acked"
-            got=$(A64_NETLINK_FORCE_BLOCK=1 timeout -k 5 60 "$EMU" / \
+            got=$(ARM64CHROOT_NETLINK_FORCE_BLOCK=1 timeout -k 5 60 "$EMU" / \
                   build/tests/arm64chroot/fixtures/netns_ack.bin 2>/dev/null)
         else
             # The switch must be *absent*, not empty -- these A64_* switches are
             # presence-tested (getenv), so FOO= would select the fallback.
             want_no_netns="passed-through|acked"
-            got=$(env -u A64_NETLINK_FORCE_BLOCK timeout -k 5 60 "$EMU" / \
+            got=$(env -u ARM64CHROOT_NETLINK_FORCE_BLOCK timeout -k 5 60 "$EMU" / \
                   build/tests/arm64chroot/fixtures/netns_ack.bin 2>/dev/null)
         fi
         # Fold the one host-dependent line out, then require an exact match on
@@ -3720,7 +3720,7 @@ fi
 # escape to the host fs) and synthesized maps/cmdline/comm/mounts/mountinfo/
 # loadavg/uptime/version/auxv (incl. another guest PID's auxv — the gdb-attach
 # shape), against a throwaway mini-rootfs (qemu has no rootfs concept).
-# A64_PROCSTAT_FORCE_SYNTH and A64_OVERFLOWID_FORCE_SYNTH exercise the
+# ARM64CHROOT_PROCSTAT_FORCE_SYNTH and ARM64CHROOT_OVERFLOWID_FORCE_SYNTH exercise the
 # /proc/stat and /proc/sys/kernel/overflow{u,g}id fallbacks (on a normal Linux
 # host the readable real files would pass through instead). ----
 if "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/procfs_fidelity.bin \
@@ -3752,7 +3752,7 @@ stat_rewind=1
 uptime_rewind=1
 auxv_foreign entries>10=1 hwcap=1 pagesz=1
 overflowuid=65534 overflowgid=65534'
-    got=$(A64_PROCSTAT_FORCE_SYNTH=1 A64_OVERFLOWID_FORCE_SYNTH=1 \
+    got=$(ARM64CHROOT_PROCSTAT_FORCE_SYNTH=1 ARM64CHROOT_OVERFLOWID_FORCE_SYNTH=1 \
           "$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
     if [ "$got" = "$expect_pf" ]; then pass=$((pass+1)); echo "PASS fixture: procfs_fidelity"
     else
@@ -3764,10 +3764,10 @@ overflowuid=65534 overflowgid=65534'
     # armv7 device was measured going 3 -> 2 -> 3 -> 2 -> 1 in fifteen
     # seconds), and deriving the /proc/stat totals from the current count made
     # every such event walk the counters backwards, which the stat_rewind and
-    # uptime_rewind checks catch. A64_PROCSTAT_HOTPLUG_SIM alternates the
+    # uptime_rewind checks catch. ARM64CHROOT_PROCSTAT_HOTPLUG_SIM alternates the
     # count so a machine that never hotplugs anything can test it too.
-    got=$(A64_PROCSTAT_FORCE_SYNTH=1 A64_OVERFLOWID_FORCE_SYNTH=1 \
-          A64_PROCSTAT_HOTPLUG_SIM=1 \
+    got=$(ARM64CHROOT_PROCSTAT_FORCE_SYNTH=1 ARM64CHROOT_OVERFLOWID_FORCE_SYNTH=1 \
+          ARM64CHROOT_PROCSTAT_HOTPLUG_SIM=1 \
           "$EMU" "$PFROOT" /procfs_fidelity.bin 2>/dev/null)
     if [ "$got" = "$expect_pf" ]; then
         pass=$((pass+1)); echo "PASS fixture: procfs_fidelity (hotplug)"
@@ -3876,7 +3876,7 @@ for pt in tests/arm64chroot/ptrace/*.c; do
         echo "SKIP ptrace: $(basename "$pt" .c) (the emulator's host cannot:$pt_lacks)"
         continue
     fi
-    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" $A64_TESTLIBS 2>/dev/null; then
+    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         skip_build "$pt"; continue
     fi
     for eng in "" "--jit"; do
@@ -3905,7 +3905,7 @@ rm -f "$ptout"
 # descriptor in si_value instead (signal.c, sig_probe_host), and a queued
 # siginfo the host would not carry whole goes through the receiver's inbox
 # (sig_carry_send).
-# A64_SICODE_FORCE_KNOWN forces that tier on a host that could do better: the
+# ARM64CHROOT_SICODE_FORCE_KNOWN forces that tier on a host that could do better: the
 # ptrace tests whose tracees stop and continue, over it, and jcqueue's queued
 # job-control signals, payload, si_errno and all.
 kltout=$(mktemp)
@@ -3913,11 +3913,11 @@ for t in stopsig stopsig_detach jobctl mtjobctl listen killed_stop jcqueue; do
     pt=tests/arm64chroot/ptrace/$t.c
     ptbin=build/tests/arm64chroot/ptrace/$t.bin
     [ -e "$pt" ] || continue
-    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" $A64_TESTLIBS 2>/dev/null; then
+    if ! "$AGCC" -static -O2 -o "$ptbin" "$pt" $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         skip_build "$pt(known-layout-tier)"; continue
     fi
     lbl="ptrace: $t(known-layout-tier)"
-    A64_SICODE_FORCE_KNOWN=1 timeout -k 5 30 "$EMU" / "$PWD/$ptbin" > "$kltout" 2>/dev/null
+    ARM64CHROOT_SICODE_FORCE_KNOWN=1 timeout -k 5 30 "$EMU" / "$PWD/$ptbin" > "$kltout" 2>/dev/null
     rc=$?
     out=$(cat "$kltout")
     if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
@@ -3938,10 +3938,10 @@ rm -f "$kltout"
 # deliver them (qemu-user reserves host RT signals and shifts the guest's range,
 # so the top three have nowhere to land) turns every one of those wake-ups into a
 # deadlock, so the emulator probes and drops to lower numbers instead.
-# A64_SIGRT_MAX forces that tier on a host with no hole of its own: one ptrace
+# ARM64CHROOT_SIGRT_MAX forces that tier on a host with no hole of its own: one ptrace
 # test for the kick, the timer test for the carriers.
 if [ -x build/tests/arm64chroot/ptrace/basic.bin ]; then
-    out=$(A64_SIGRT_MAX=48 timeout -k 5 30 "$EMU" / build/tests/arm64chroot/ptrace/basic.bin 2>/dev/null); rc=$?
+    out=$(ARM64CHROOT_SIGRT_MAX=48 timeout -k 5 30 "$EMU" / build/tests/arm64chroot/ptrace/basic.bin 2>/dev/null); rc=$?
     if [ "$out" = "OK" ] && [ "$rc" = 0 ]; then
         pass=$((pass+1)); echo "PASS ptrace: basic(low-rt-tier)"
     else
@@ -3956,7 +3956,7 @@ if [ -x "$TMBIN" ] && ! rec_have "$TMBIN"; then
     skip=$((skip+1)); echo "SKIP c/timers(low-rt-tier) (not in the test pack)"
 elif [ -x "$TMBIN" ]; then
     out_q=$(oracle_run "$TMBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_SIGRT_MAX=48 timeout -k 5 60 "$EMU" / "$TMBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_SIGRT_MAX=48 timeout -k 5 60 "$EMU" / "$TMBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/timers(low-rt-tier)"
     else
@@ -3972,14 +3972,14 @@ fi
 # emulator's own code running in between to make room. The queue answers by
 # blocking those signals in the mask its capture handler returns to, so the
 # rest of the flood stays in the kernel's own queue -- in order, payloads
-# intact -- until a consumer opens it again. A64_SIGQ_MAX pins the queue at its
+# intact -- until a consumer opens it again. ARM64CHROOT_SIGQ_MAX pins the queue at its
 # floor, so every flood in this test has to go through that gate and back.
 SQBIN="build/tests/arm64chroot/c/sigqdepth_static.bin"
 if [ -x "$SQBIN" ] && ! rec_have "$SQBIN"; then
     skip=$((skip+1)); echo "SKIP c/sigqdepth(gate-tier) (not in the test pack)"
 elif [ -x "$SQBIN" ]; then
     out_q=$(oracle_run "$SQBIN" 2>/dev/null); rc_q=$?
-    out_e=$(A64_SIGQ_MAX=32 timeout -k 5 60 "$EMU" / "$SQBIN" 2>/dev/null); rc_e=$?
+    out_e=$(ARM64CHROOT_SIGQ_MAX=32 timeout -k 5 60 "$EMU" / "$SQBIN" 2>/dev/null); rc_e=$?
     if [ "$out_q" = "$out_e" ] && [ "$rc_q" = "$rc_e" ]; then
         pass=$((pass+1)); echo "PASS c/sigqdepth(gate-tier)"
     else
@@ -4037,11 +4037,11 @@ fi
 # entropy tiers are checked, the second forced onto the random devices.
 if [ ! -x build/tests/arm64chroot/fixtures/atrandom.bin ] && [ -n "$AGCC" ]; then
     "$AGCC" -static -O2 -o build/tests/arm64chroot/fixtures/atrandom.bin \
-        tests/arm64chroot/fixtures/atrandom.c $A64_TESTLIBS 2>/dev/null || true
+        tests/arm64chroot/fixtures/atrandom.c $ARM64CHROOT_TESTLIBS 2>/dev/null || true
 fi
 if [ -x build/tests/arm64chroot/fixtures/atrandom.bin ]; then
     LEGACY=07305982abd4fd264f78a1caf31c456e   # the old fixed pattern
-    for tier in "" "A64_GETRANDOM_FORCE_DEV=1"; do
+    for tier in "" "ARM64CHROOT_GETRANDOM_FORCE_DEV=1"; do
         label="fixture: atrandom${tier:+(dev-tier)}"
         seen= bad= n=0
         for i in 1 2 3; do

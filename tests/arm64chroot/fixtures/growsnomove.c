@@ -6,7 +6,7 @@
  * under it to new backing, and refused these growths there; it now grows
  * one past its room in a new piece of backing below, moving nothing
  * (src/arm64chroot/mem.c, region_grow_piece), and run_tests.sh runs these rows on that
- * tier too (A64_STACKGROW_FORCE_PIECE). Self-checking; every line was taken
+ * tier too (ARM64CHROOT_STACKGROW_FORCE_PIECE). Self-checking; every line was taken
  * from a native kernel running this program built for the host. Another
  * thread touching the hole under a MAP_GROWSDOWN mapping grows it for the
  * whole process, and an atomic as the first touch of the hole grows it like

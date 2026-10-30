@@ -18,13 +18,13 @@
 
 enum { FE_CONT, FE_END };
 
-/* Debug bisection knob: A64_JIT_PDMAX=N translates only PD ops <= N
+/* Debug bisection knob: ARM64CHROOT_JIT_PDMAX=N translates only PD ops <= N
  * natively (branches always native); everything else goes through the
  * exec_a64 helper. Used to localize a codegen bug to one handler class. */
 static int fe_pdmax(void) {
     static int v = -2;
     if (v == -2) {
-        const char *s = getenv("A64_JIT_PDMAX");
+        const char *s = getenv("ARM64CHROOT_JIT_PDMAX");
         v = s ? atoi(s) : -1;
     }
     return v;
@@ -1495,7 +1495,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
          * interpreter helper ---- */
         default: {
             /* The fe_* families decode raw words (no PD id), so each gets a
-             * pseudo-id above PD_NOPS_ for A64_JIT_PDMAX bisection:
+             * pseudo-id above PD_NOPS_ for ARM64CHROOT_JIT_PDMAX bisection:
              *   +0 fe_atomic  +1 fe_fpsimd  +2 fe_ldst_extra  +3 fe_bitfield
              *   +4 fe_ld1     +5 RBIT idiom +6 ADC/SBC family */
             if (e->op == PD_GENERIC && !fe_gated(PD_NOPS_ + 0) &&

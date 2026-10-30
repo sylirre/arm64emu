@@ -8,21 +8,21 @@
 # host is, and that is the only thing this file decides.
 #
 #   compiler   A host that is not AArch64 needs a cross gcc. An AArch64 host
-#              already has one: its own cc. A64_CC overrides either.
+#              already has one: its own cc. ARM64CHROOT_CC overrides either.
 #
 #   oracle     qemu-aarch64 where the host cannot execute AArch64 code, which
 #              is the only option on x86-64. Where it can — an AArch64 host,
 #              or any host with binfmt_misc wired up — the binary can simply
 #              be run, and on real ARM that is the stronger of the two
 #              references: hardware rather than a second emulator.
-#              A64_ORACLE=auto|qemu|native chooses; auto prefers qemu when it
+#              ARM64CHROOT_ORACLE=auto|qemu|native chooses; auto prefers qemu when it
 #              is installed, so a run on ARM stays comparable to a run on x86.
 #              Whether the host can run AArch64 code is PROBED, not inferred
 #              from uname, because binfmt_misc makes the answer yes on hosts
 #              where the architecture says no.
 #
 # Sets:     AGCC, ORACLE_KIND (qemu|native|none), ORACLE_QEMU, ORACLE_DESC,
-#           ORACLE_GATE, A64_HOST_ARCH, A64_SYSROOT
+#           ORACLE_GATE, ARM64CHROOT_HOST_ARCH, ARM64CHROOT_SYSROOT
 # Provides: oracle_run, oracle_run0, oracle_proot, oracle_proot_ok,
 #           host_missing_features, a64_oracle_ioctl_ok,
 #           a64_emu_syscall_ok
@@ -35,14 +35,14 @@
 # oracle run with the environment the kernel gives them, not a patched one.
 unset LD_PRELOAD
 
-A64_HOST_ARCH=$(uname -m)
+ARM64CHROOT_HOST_ARCH=$(uname -m)
 
 a64_host_arm64() {
-    case "$A64_HOST_ARCH" in aarch64|arm64) return 0 ;; *) return 1 ;; esac
+    case "$ARM64CHROOT_HOST_ARCH" in aarch64|arm64) return 0 ;; *) return 1 ;; esac
 }
 
 # ---- the guest compiler ------------------------------------------------------
-if [ "${A64_ORACLE:-auto}" = recorded ]; then
+if [ "${ARM64CHROOT_ORACLE:-auto}" = recorded ]; then
     # Replaying a test pack: no toolchain is needed (or available). The
     # stand-in succeeds exactly when the -o target is already in the pack, so
     # every compile-or-skip site keeps its meaning without building anything.
@@ -53,8 +53,8 @@ if [ "${A64_ORACLE:-auto}" = recorded ]; then
     mkdir -p build/cache/arm64chroot
     { printf '#!%s\n' "$(command -v sh)"; sed 1d tests/arm64chroot/replay_cc.sh; } > "$AGCC"
     chmod +x "$AGCC"
-elif [ -n "${A64_CC:-}" ]; then
-    AGCC="$A64_CC"
+elif [ -n "${ARM64CHROOT_CC:-}" ]; then
+    AGCC="$ARM64CHROOT_CC"
 else
     AGCC=$(command -v aarch64-linux-gnu-gcc 2>/dev/null) ||
     AGCC=$(command -v aarch64-linux-gnu-gcc-13 2>/dev/null) || AGCC=
@@ -68,11 +68,11 @@ fi
 # Where the aarch64 runtime lives, for qemu's dynamic loader and for
 # setup_env.sh's glibc rootfs. On an AArch64 host that is the host's own root.
 if a64_host_arm64; then
-    A64_SYSROOT="${A64_SYSROOT:-/}"
+    ARM64CHROOT_SYSROOT="${ARM64CHROOT_SYSROOT:-/}"
 else
-    A64_SYSROOT="${A64_SYSROOT:-/usr/aarch64-linux-gnu}"
+    ARM64CHROOT_SYSROOT="${ARM64CHROOT_SYSROOT:-/usr/aarch64-linux-gnu}"
 fi
-export A64_SYSROOT
+export ARM64CHROOT_SYSROOT
 
 # ---- the oracle --------------------------------------------------------------
 
@@ -80,8 +80,8 @@ export A64_SYSROOT
 # exit(0) — no libc, so the answer does not depend on a static libc being
 # installed — and cached, since it costs a compile.
 a64_native_exec_works() {
-    if [ -z "${A64_NATIVE_EXEC:-}" ]; then
-        A64_NATIVE_EXEC=0
+    if [ -z "${ARM64CHROOT_NATIVE_EXEC:-}" ]; then
+        ARM64CHROOT_NATIVE_EXEC=0
         if [ -n "$AGCC" ]; then
             _probe=$(mktemp 2>/dev/null) || _probe="${TMPDIR:-/tmp}/a64exec.$$"
             if [ -n "$_probe" ]; then
@@ -90,61 +90,61 @@ void _start(void) { __asm__ volatile("mov x8, #93\nmov x0, #0\nsvc #0"); }
 EOF
                 then
                     chmod +x "$_probe" 2>/dev/null
-                    "$_probe" 2>/dev/null && A64_NATIVE_EXEC=1
+                    "$_probe" 2>/dev/null && ARM64CHROOT_NATIVE_EXEC=1
                 fi
                 rm -f "$_probe"
             fi
         fi
     fi
-    [ "$A64_NATIVE_EXEC" = 1 ]
+    [ "$ARM64CHROOT_NATIVE_EXEC" = 1 ]
 }
 
-# Recorded-oracle support: make test-pack runs the suite with A64_RECORD=1,
+# Recorded-oracle support: make test-pack runs the suite with ARM64CHROOT_RECORD=1,
 # saving every oracle answer keyed by its invocation (binary + args) next to
 # the built test binaries. A host that can neither build the guests nor run
 # any oracle — a 32-bit ARM device: the CPU cannot execute AArch64, and
 # qemu-user cannot map a 64-bit guest into a 32-bit address space at all —
-# unpacks that in the repo root and replays it with A64_ORACLE=recorded.
+# unpacks that in the repo root and replays it with ARM64CHROOT_ORACLE=recorded.
 # Recordings are only valid where the oracle's output does not depend on the
 # recording host; tests that compare host state (the NEEDS-HOST-* markers)
 # are skipped by run_tests.sh in this mode.
-A64_RECORD_DIR="${A64_RECORD_DIR:-build/cache/arm64chroot/recorded}"
+ARM64CHROOT_RECORD_DIR="${ARM64CHROOT_RECORD_DIR:-build/cache/arm64chroot/recorded}"
 
 rec_key() { printf '%s' "$*" | tr '/ ' '__'; }
 rec_have() {   # rec_have <oracle_run args...> — false only in replay mode with no recording
-    [ "$ORACLE_KIND" != recorded ] || [ -f "$A64_RECORD_DIR/$(rec_key "$@").out" ]
+    [ "$ORACLE_KIND" != recorded ] || [ -f "$ARM64CHROOT_RECORD_DIR/$(rec_key "$@").out" ]
 }
 rec_have0() { _r0="$1"; shift; rec_have "argv0=$_r0" "$@"; }
 rec_save() {   # rec_save <key> <rc> <output>
-    mkdir -p "$A64_RECORD_DIR"
-    printf '%s' "$3" > "$A64_RECORD_DIR/$1.out"
-    printf '%s\n' "$2" > "$A64_RECORD_DIR/$1.rc"
+    mkdir -p "$ARM64CHROOT_RECORD_DIR"
+    printf '%s' "$3" > "$ARM64CHROOT_RECORD_DIR/$1.out"
+    printf '%s\n' "$2" > "$ARM64CHROOT_RECORD_DIR/$1.rc"
 }
 rec_replay() {   # rec_replay <key>; a missing recording answers rc 213
-    [ -f "$A64_RECORD_DIR/$1.out" ] && [ -f "$A64_RECORD_DIR/$1.rc" ] || return 213
-    cat "$A64_RECORD_DIR/$1.out"
-    return "$(cat "$A64_RECORD_DIR/$1.rc")"
+    [ -f "$ARM64CHROOT_RECORD_DIR/$1.out" ] && [ -f "$ARM64CHROOT_RECORD_DIR/$1.rc" ] || return 213
+    cat "$ARM64CHROOT_RECORD_DIR/$1.out"
+    return "$(cat "$ARM64CHROOT_RECORD_DIR/$1.rc")"
 }
 
 ORACLE_QEMU=$(command -v qemu-aarch64 2>/dev/null) || ORACLE_QEMU=
-case "${A64_ORACLE:-auto}" in
+case "${ARM64CHROOT_ORACLE:-auto}" in
     qemu)
         if [ -n "$ORACLE_QEMU" ]; then ORACLE_KIND=qemu
-        else ORACLE_KIND=none; echo "A64_ORACLE=qemu but qemu-aarch64 is not installed" >&2; fi ;;
+        else ORACLE_KIND=none; echo "ARM64CHROOT_ORACLE=qemu but qemu-aarch64 is not installed" >&2; fi ;;
     native)
         if a64_native_exec_works; then ORACLE_KIND=native
-        else ORACLE_KIND=none; echo "A64_ORACLE=native but this host cannot execute AArch64 binaries" >&2; fi ;;
+        else ORACLE_KIND=none; echo "ARM64CHROOT_ORACLE=native but this host cannot execute AArch64 binaries" >&2; fi ;;
     recorded)
-        if [ -d "$A64_RECORD_DIR" ]; then
+        if [ -d "$ARM64CHROOT_RECORD_DIR" ]; then
             ORACLE_KIND=recorded
-            if [ -f "$A64_RECORD_DIR/COMMIT" ] &&
+            if [ -f "$ARM64CHROOT_RECORD_DIR/COMMIT" ] &&
                _hc=$(git rev-parse HEAD 2>/dev/null) && [ -n "$_hc" ] &&
-               [ "$_hc" != "$(cat "$A64_RECORD_DIR/COMMIT")" ]; then
-                echo "WARN: test pack recorded at commit $(cut -c1-12 "$A64_RECORD_DIR/COMMIT"), tree is at $(printf '%.12s' "$_hc") — regenerate with make test-pack if tests changed" >&2
+               [ "$_hc" != "$(cat "$ARM64CHROOT_RECORD_DIR/COMMIT")" ]; then
+                echo "WARN: test pack recorded at commit $(cut -c1-12 "$ARM64CHROOT_RECORD_DIR/COMMIT"), tree is at $(printf '%.12s' "$_hc") — regenerate with make test-pack if tests changed" >&2
             fi
         else
             ORACLE_KIND=none
-            echo "A64_ORACLE=recorded but $A64_RECORD_DIR is missing (unpack a test pack in the repo root first)" >&2
+            echo "ARM64CHROOT_ORACLE=recorded but $ARM64CHROOT_RECORD_DIR is missing (unpack a test pack in the repo root first)" >&2
         fi ;;
     auto)
         if   [ -n "$ORACLE_QEMU" ];   then ORACLE_KIND=qemu
@@ -152,22 +152,22 @@ case "${A64_ORACLE:-auto}" in
         else ORACLE_KIND=none; fi ;;
     *)
         ORACLE_KIND=none
-        echo "A64_ORACLE must be auto, qemu, native or recorded (got '$A64_ORACLE')" >&2 ;;
+        echo "ARM64CHROOT_ORACLE must be auto, qemu, native or recorded (got '$ARM64CHROOT_ORACLE')" >&2 ;;
 esac
 
 case "$ORACLE_KIND" in
     qemu)     ORACLE_DESC="$ORACLE_QEMU" ;;
-    native)   ORACLE_DESC="native execution on $A64_HOST_ARCH" ;;
-    recorded) ORACLE_DESC="recorded oracle answers ($A64_RECORD_DIR)" ;;
+    native)   ORACLE_DESC="native execution on $ARM64CHROOT_HOST_ARCH" ;;
+    recorded) ORACLE_DESC="recorded oracle answers ($ARM64CHROOT_RECORD_DIR)" ;;
     *)        ORACLE_DESC="none" ;;
 esac
 
 # A pack-recording run must keep every test binary it builds (they ARE the
 # pack), and a replay run must not delete the pack it is running from.
-if [ -n "${A64_RECORD:-}" ] || [ "$ORACLE_KIND" = recorded ]; then
-    A64_KEEP_TESTBINS=1
+if [ -n "${ARM64CHROOT_RECORD:-}" ] || [ "$ORACLE_KIND" = recorded ]; then
+    ARM64CHROOT_KEEP_TESTBINS=1
 else
-    A64_KEEP_TESTBINS="${A64_KEEP_TESTBINS:-0}"
+    ARM64CHROOT_KEEP_TESTBINS="${ARM64CHROOT_KEEP_TESTBINS:-0}"
 fi
 
 # Feature gating (see host_missing_features) applies only where the thing
@@ -185,11 +185,11 @@ oracle_run() {   # oracle_run <binary> [args...]
         rec_replay "$(rec_key "$@")"
         return
     fi
-    if [ -n "${A64_RECORD:-}" ]; then
+    if [ -n "${ARM64CHROOT_RECORD:-}" ]; then
         if [ "$ORACLE_KIND" = qemu ]; then
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@")
+            _ro=$(QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@")
         else
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$@")
+            _ro=$(QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$@")
         fi
         _rr=$?
         rec_save "$(rec_key "$@")" "$_rr" "$_ro"
@@ -197,9 +197,9 @@ oracle_run() {   # oracle_run <binary> [args...]
         return $_rr
     fi
     if [ "$ORACLE_KIND" = qemu ]; then
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@"
+        QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$ORACLE_QEMU" "$@"
     else
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$@"
+        QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" "$@"
     fi
 }
 
@@ -212,12 +212,12 @@ oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
         rec_replay "$(rec_key "argv0=$_a0" "$@")"
         return
     fi
-    if [ -n "${A64_RECORD:-}" ]; then
+    if [ -n "${ARM64CHROOT_RECORD:-}" ]; then
         if [ "$ORACLE_KIND" = qemu ]; then
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
+            _ro=$(QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
                 "$ORACLE_QEMU" -0 "$_a0" "$@")
         else
-            _ro=$(QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
+            _ro=$(QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
                 bash -c 'a0=$1; shift; exec -a "$a0" "$@"' _ "$_a0" "$@")
         fi
         _rr=$?
@@ -226,10 +226,10 @@ oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
         return $_rr
     fi
     if [ "$ORACLE_KIND" = qemu ]; then
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
+        QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
             "$ORACLE_QEMU" -0 "$_a0" "$@"
     else
-        QEMU_LD_PREFIX="$A64_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
+        QEMU_LD_PREFIX="$ARM64CHROOT_SYSROOT" timeout -k 5 "${ORACLE_TIMEOUT:-60}" \
             bash -c 'a0=$1; shift; exec -a "$a0" "$@"' _ "$_a0" "$@"
     fi
 }
@@ -239,7 +239,7 @@ oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
 # AArch64 binary work on a host that is not AArch64, never gets a say here.
 # Unless the CPU really is AArch64, proot has to be handed the interpreter.
 #
-# On an AArch64 host it runs the rootfs natively whatever A64_ORACLE says. It
+# On an AArch64 host it runs the rootfs natively whatever ARM64CHROOT_ORACLE says. It
 # is not the oracle for instruction semantics — it is how the reference rootfs
 # gets executed at all — and demanding qemu-aarch64-static there (Termux has
 # proot but not qemu-static) silently drops every Alpine-backed block: the
@@ -331,8 +331,8 @@ a64_oracle_can() {   # a64_oracle_can <name> -> 0 if the oracle can
     [ -n "$AGCC" ] || return 0
     case "$1" in
     syncfs)
-        if [ -z "${A64_ORACLE_SYNCFS:-}" ]; then
-            A64_ORACLE_SYNCFS=1
+        if [ -z "${ARM64CHROOT_ORACLE_SYNCFS:-}" ]; then
+            ARM64CHROOT_ORACLE_SYNCFS=1
             _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64syn.$$"
             # The raw syscall, not the libc wrapper: Bionic declares syncfs
             # only from API 28 and Termux's clang targets older, so a probe
@@ -354,14 +354,14 @@ int main(void) {
 EOF
             then
                 chmod +x "$_p" 2>/dev/null
-                oracle_run "$_p" >/dev/null 2>&1 || A64_ORACLE_SYNCFS=0
+                oracle_run "$_p" >/dev/null 2>&1 || ARM64CHROOT_ORACLE_SYNCFS=0
             fi
             rm -f "$_p"
         fi
-        [ "$A64_ORACLE_SYNCFS" = 1 ] ;;
+        [ "$ARM64CHROOT_ORACLE_SYNCFS" = 1 ] ;;
     so_rcvtimeo)
-        if [ -z "${A64_ORACLE_RCVTIMEO:-}" ]; then
-            A64_ORACLE_RCVTIMEO=1
+        if [ -z "${ARM64CHROOT_ORACLE_RCVTIMEO:-}" ]; then
+            ARM64CHROOT_ORACLE_RCVTIMEO=1
             _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64sot.$$"
             if cat <<'EOF' | "$AGCC" -x c - -static -o "$_p" 2>/dev/null
 #include <string.h>
@@ -382,14 +382,14 @@ int main(void) {
 EOF
             then
                 chmod +x "$_p" 2>/dev/null
-                oracle_run "$_p" >/dev/null 2>&1 || A64_ORACLE_RCVTIMEO=0
+                oracle_run "$_p" >/dev/null 2>&1 || ARM64CHROOT_ORACLE_RCVTIMEO=0
             fi
             rm -f "$_p"
         fi
-        [ "$A64_ORACLE_RCVTIMEO" = 1 ] ;;
+        [ "$ARM64CHROOT_ORACLE_RCVTIMEO" = 1 ] ;;
     faccessat2)
-        if [ -z "${A64_ORACLE_FACCESSAT2:-}" ]; then
-            A64_ORACLE_FACCESSAT2=1
+        if [ -z "${ARM64CHROOT_ORACLE_FACCESSAT2:-}" ]; then
+            ARM64CHROOT_ORACLE_FACCESSAT2=1
             _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64fa2.$$"
             # The raw syscall, for the same reason the test that needs it uses
             # one: the libc wrapper emulates the flags in user space wherever
@@ -412,11 +412,11 @@ int main(void) {
 EOF
             then
                 chmod +x "$_p" 2>/dev/null
-                oracle_run "$_p" >/dev/null 2>&1 || A64_ORACLE_FACCESSAT2=0
+                oracle_run "$_p" >/dev/null 2>&1 || ARM64CHROOT_ORACLE_FACCESSAT2=0
             fi
             rm -f "$_p"
         fi
-        [ "$A64_ORACLE_FACCESSAT2" = 1 ] ;;
+        [ "$ARM64CHROOT_ORACLE_FACCESSAT2" = 1 ] ;;
     *)  return 0 ;;                  # unknown name: nothing to gate on
     esac
 }
@@ -442,12 +442,12 @@ a64_oracle_missing() {   # a64_oracle_missing <name>...
 # live oracle on such a host, stage both copies in the first writable scratch
 # directory instead and let argv[0] be that. (A test that hardcodes /tmp paths of
 # its OWN still needs the oracle to have one; run_tests.sh names those skips.)
-A64_HOST_TMP=0
-{ [ -d /tmp ] && [ -w /tmp ]; } && A64_HOST_TMP=1
-A64_DYN_ARGV0=/tmp/t.bin
-if [ "$A64_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ]; then
+ARM64CHROOT_HOST_TMP=0
+{ [ -d /tmp ] && [ -w /tmp ]; } && ARM64CHROOT_HOST_TMP=1
+ARM64CHROOT_DYN_ARGV0=/tmp/t.bin
+if [ "$ARM64CHROOT_HOST_TMP" = 0 ] && [ "$ORACLE_KIND" != recorded ]; then
     for _d in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" "${HOME:-}"; do
-        [ -n "$_d" ] && [ -w "$_d" ] && { A64_DYN_ARGV0="$_d/t.bin"; break; }
+        [ -n "$_d" ] && [ -w "$_d" ] && { ARM64CHROOT_DYN_ARGV0="$_d/t.bin"; break; }
     done
 fi
 
@@ -464,16 +464,16 @@ fi
 # $TMPDIR comes FIRST here: it is the host's own answer to "where does scratch
 # go", a host that sets it means it, and on Android it is the only answer there
 # is. /tmp follows for every host that has one, so nothing moves on the
-# development box, where TMPDIR is usually unset. (A64_DYN_ARGV0 above keeps
+# development box, where TMPDIR is usually unset. (ARM64CHROOT_DYN_ARGV0 above keeps
 # the opposite order on purpose: the recorded answers are KEYED by that path,
 # so it may not follow a variable that differs per host.)
-A64_SCRATCH=
+ARM64CHROOT_SCRATCH=
 for _d in "${TMPDIR:-}" /tmp "${XDG_RUNTIME_DIR:-}" "${HOME:-}"; do
-    [ -n "$_d" ] && [ -d "$_d" ] && [ -w "$_d" ] && { A64_SCRATCH="$_d"; break; }
+    [ -n "$_d" ] && [ -d "$_d" ] && [ -w "$_d" ] && { ARM64CHROOT_SCRATCH="$_d"; break; }
 done
 # Nothing writable at all: name /tmp and let each fixture report the failure
 # itself, rather than decide here that a run is impossible.
-[ -n "$A64_SCRATCH" ] || A64_SCRATCH=/tmp
+[ -n "$ARM64CHROOT_SCRATCH" ] || ARM64CHROOT_SCRATCH=/tmp
 
 # ---- does this host give the ORACLE a real hardlink? -------------------------
 # Android denies link(2) to an app outright, which is the whole reason
@@ -485,10 +485,10 @@ done
 # name where this is 0. Probed in the scratch directory, which is where those
 # tests work; a probe that cannot even make its first file does not gate
 # anything, the same rule the syscall probes follow.
-A64_HOST_HARDLINK=1
-_hl="$A64_SCRATCH/.a64hl.$$"
+ARM64CHROOT_HOST_HARDLINK=1
+_hl="$ARM64CHROOT_SCRATCH/.a64hl.$$"
 if : > "$_hl" 2>/dev/null; then
-    ln "$_hl" "$_hl.l" 2>/dev/null || A64_HOST_HARDLINK=0
+    ln "$_hl" "$_hl.l" 2>/dev/null || ARM64CHROOT_HOST_HARDLINK=0
 fi
 rm -f "$_hl" "$_hl.l"
 
@@ -499,18 +499,18 @@ rm -f "$_hl" "$_hl.l"
 # reported "SKIP build" and vanished from the totals -- on Termux that was the
 # whole C, ptrace and threaded-fixture set, ~120 tests, with the suite still
 # exiting 0. So probe each once and keep only what links.
-A64_TESTLIBS=
-A64_STATIC_OK=0
+ARM64CHROOT_TESTLIBS=
+ARM64CHROOT_STATIC_OK=0
 if [ -n "$AGCC" ]; then
     # Probed in the same mode the tests link in, since a library can exist as a
     # .so and not as a .a; most of the suite is -static.
     printf 'int main(void){return 0;}\n' |
-        "$AGCC" -static -O0 -x c - -o /dev/null 2>/dev/null && A64_STATIC_OK=1
-    [ "$A64_STATIC_OK" = 1 ] && _st=-static || _st=
+        "$AGCC" -static -O0 -x c - -o /dev/null 2>/dev/null && ARM64CHROOT_STATIC_OK=1
+    [ "$ARM64CHROOT_STATIC_OK" = 1 ] && _st=-static || _st=
     for _l in -lm -lpthread; do
         if printf 'int main(void){return 0;}\n' |
                "$AGCC" $_st -O0 -x c - $_l -o /dev/null 2>/dev/null; then
-            A64_TESTLIBS="$A64_TESTLIBS $_l"
+            ARM64CHROOT_TESTLIBS="$ARM64CHROOT_TESTLIBS $_l"
         fi
     done
 fi
@@ -527,14 +527,14 @@ fi
 #
 # naming the strings the kernel prints on the cpuinfo "Features" line, so the
 # declaration can be checked against this host with no translation table.
-A64_HOST_FEATURES=" $(awk -F: '/^Features/ { print $2; exit }' /proc/cpuinfo 2>/dev/null) "
+ARM64CHROOT_HOST_FEATURES=" $(awk -F: '/^Features/ { print $2; exit }' /proc/cpuinfo 2>/dev/null) "
 
 host_missing_features() {   # host_missing_features <source-file> -> missing names
     [ "$ORACLE_GATE" = 1 ] || return 0
     _need=$(grep -m1 -o 'REQUIRES:[a-z0-9 ]*' "$1" 2>/dev/null | sed 's/^REQUIRES://')
     _miss=
     for _f in $_need; do
-        case "$A64_HOST_FEATURES" in
+        case "$ARM64CHROOT_HOST_FEATURES" in
             *" $_f "*) ;;
             *)         _miss="$_miss $_f" ;;
         esac
@@ -646,7 +646,7 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 #   pidfd           pidfd_open works: a kernel since 5.3, and no sandbox that
 #                   refuses it -- the Android app sandbox's seccomp filter
 #                   does, and so does `make test-seccomp`'s, under which the
-#                   probes run too (A64_EMU_WRAP). Where it is refused the
+#                   probes run too (ARM64CHROOT_EMU_WRAP). Where it is refused the
 #                   emulator answers the guest's pidfd_open ENOSYS, and a test
 #                   of what a pidfd does has nothing to compare.
 #
@@ -681,11 +681,11 @@ host_missing_features() {   # host_missing_features <source-file> -> missing nam
 # BUILT AND RUN THE WAY THE EMULATOR IS -- same compiler, same ABI flags, so
 # the same interpreter picks it up -- because the question is what the
 # emulator's own process can do -- run under the same sandbox, when the run
-# puts the emulator in one (A64_EMU_WRAP). On an ordinary host, and on real
+# puts the emulator in one (ARM64CHROOT_EMU_WRAP). On an ordinary host, and on real
 # ARM32 silicon, every probe passes and every test runs; nothing is gated away
 # on a machine that can actually answer.
-A64_EMU_CC="${A64_EMU_CC:-${CC:-cc}}"
-A64_EMU_CFLAGS="${A64_EMU_CFLAGS:-}"
+ARM64CHROOT_EMU_CC="${ARM64CHROOT_EMU_CC:-${CC:-cc}}"
+ARM64CHROOT_EMU_CFLAGS="${ARM64CHROOT_EMU_CFLAGS:-}"
 
 a64_emu_syscall_src() {   # a64_emu_syscall_src <name> -> C on stdout
     case "$1" in
@@ -1133,13 +1133,13 @@ EOF
 
 a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
     _v=$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')
-    eval "_c=\${A64_SYSPROBE_$_v-}"
+    eval "_c=\${ARM64CHROOT_SYSPROBE_$_v-}"
     if [ -z "$_c" ]; then
         _c=yes
         _s=$(a64_emu_syscall_src "$1")
         if [ -n "$_s" ]; then
             _t=$(mktemp -d) || return 0
-            if printf '%s\n' "$_s" | $A64_EMU_CC $A64_EMU_CFLAGS -O1 -x c - \
+            if printf '%s\n' "$_s" | $ARM64CHROOT_EMU_CC $ARM64CHROOT_EMU_CFLAGS -O1 -x c - \
                    -o "$_t/probe" 2>/dev/null; then
                 # Under the sandbox the emulator runs in, if the run puts it
                 # in one (make test-seccomp): what that refuses, the emulator
@@ -1156,12 +1156,12 @@ a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
                 # stderr is the suite's own. With something left to do
                 # afterwards the subshell has to fork, and then it is the one
                 # that reports, into the /dev/null it was given.
-                ( ${A64_EMU_WRAP:+"$A64_EMU_WRAP"} "$_t/probe" >/dev/null 2>&1
+                ( ${ARM64CHROOT_EMU_WRAP:+"$ARM64CHROOT_EMU_WRAP"} "$_t/probe" >/dev/null 2>&1
                   exit $? ) 2>/dev/null || _c=no
             fi   # cannot build the probe: do not gate on an unasked question
             rm -rf "$_t"
         fi
-        eval "A64_SYSPROBE_$_v=\$_c"
+        eval "ARM64CHROOT_SYSPROBE_$_v=\$_c"
     fi
     [ "$_c" = yes ]
 }
@@ -1181,8 +1181,8 @@ a64_emu_syscall_ok() {   # a64_emu_syscall_ok <name> -> 0 if it works here
 # answer the test is compared against.
 a64_oracle_ioctl_ok() {   # a64_oracle_ioctl_ok <name> -> 0 if the oracle can
     [ "$1" = SIOCGIFHWADDR ] || return 0   # unknown name: nothing to gate on
-    if [ -z "${A64_IOCTL_HWADDR:-}" ]; then
-        A64_IOCTL_HWADDR=0
+    if [ -z "${ARM64CHROOT_IOCTL_HWADDR:-}" ]; then
+        ARM64CHROOT_IOCTL_HWADDR=0
         if [ -n "$AGCC" ] && [ "$ORACLE_KIND" != none ]; then
             _p=$(mktemp 2>/dev/null) || _p="${TMPDIR:-/tmp}/a64ioc.$$"
             if cat <<'EOF' | "$AGCC" -x c - -static -o "$_p" 2>/dev/null
@@ -1201,10 +1201,10 @@ int main(void) {
 EOF
             then
                 chmod +x "$_p" 2>/dev/null
-                oracle_run "$_p" >/dev/null 2>&1 && A64_IOCTL_HWADDR=1
+                oracle_run "$_p" >/dev/null 2>&1 && ARM64CHROOT_IOCTL_HWADDR=1
             fi
             rm -f "$_p"
         fi
     fi
-    [ "$A64_IOCTL_HWADDR" = 1 ]
+    [ "$ARM64CHROOT_IOCTL_HWADDR" = 1 ]
 }

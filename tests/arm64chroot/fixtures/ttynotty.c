@@ -11,7 +11,7 @@
  * FIOCLEX/FIONCLEX on a memfd -- so a guest's tcgetpgrp(3) of a pipe read
  * "Permission denied" and an ioctl(FIOCLEX) of a memfd failed. The emulator
  * answers those refusals the way the kernel would have (src/arm64chroot/sys_file.c,
- * ioctl_refused); A64_TTYIOCTL_FORCE_DENY makes any host refuse the same way,
+ * ioctl_refused); ARM64CHROOT_TTYIOCTL_FORCE_DENY makes any host refuse the same way,
  * and the answers must be the kernel's over it too. The termios2 commands and
  * TIOCGSID are asked as well: their own fallbacks lean on TCGETS and TIOCGPGRP,
  * which the policy refuses on the same descriptors.

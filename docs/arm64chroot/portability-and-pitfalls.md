@@ -264,7 +264,7 @@ these time out". They were not slow — they used 0.1 s of CPU in 5 minutes.
 So `sig_probe_reserved` (`src/signal.c`) **asks**: queue each candidate to
 ourselves and check a handler runs. It takes the three highest RT numbers that
 answer, which on a host with nothing in the way are the three it used to
-hardcode. `A64_SIGRT_MAX=N` caps the search so the low-RT tier is exercised
+hardcode. `ARM64CHROOT_SIGRT_MAX=N` caps the search so the low-RT tier is exercised
 where there is no hole to find.
 
 *The general rule:* a number the host hands you (a signal, an fd class, a
@@ -473,7 +473,7 @@ unreachable and a guest that extended a file it had mapped took a spurious
 copies from the address in kernel space and reports the same `EFAULT` — with
 the two descriptors created and closed inside the call, because guest fd ==
 host fd here and an fd held across guest execution would be guest-visible.
-`A64_PAGEPROBE_FORCE_PIPE=1` selects the fallback anywhere, which is how the
+`ARM64CHROOT_PAGEPROBE_FORCE_PIPE=1` selects the fallback anywhere, which is how the
 suite covers it off-device (`c/mmap_eof(pipe-probe)`).
 
 The resident half of what a guest reads about its own memory needs
@@ -485,7 +485,7 @@ the *emulator's*, which hold the guest's pages plus its own overhead — bounded
 by what the guest mapped, since a resident set larger than the address space
 holding it is something no kernel can report. That is the same tier every
 reader of *another* process is permanently on, so it is not an exotic path;
-`A64_MINCORE_FORCE_FAIL=1` selects it for the reader's own process too, and the
+`ARM64CHROOT_MINCORE_FORCE_FAIL=1` selects it for the reader's own process too, and the
 suite runs `tests/fixtures/vmreport.c` over both tiers against one set of
 expectations.
 

@@ -15,7 +15,7 @@
  * What is checked is the relation, not a host's answer: for every name the
  * guest CAN open, the stat family must succeed and describe a procfs file --
  * so the same expectations hold on a host that answers the stat itself, on one
- * that refuses it (A64_PROCSYNTH_FORCE_STAT_DENY makes any host that), and on
+ * that refuses it (ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY makes any host that), and on
  * one that denies the open too (the name is then not served, and not checked).
  * A name that is not there, or not synthesized, must not be invented or
  * disturbed by the fallback. */

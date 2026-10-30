@@ -9,7 +9,7 @@
  * is must not be visible, so this test asks the mapping every question that
  * could tell a private one from a shared one, and run_tests.sh runs the whole
  * file down BOTH routes -- the host's, and the fallback's, forced on with
- * A64_MEMFD_SEAL_FORCE_OLD -- against the same oracle answers.
+ * ARM64CHROOT_MEMFD_SEAL_FORCE_OLD -- against the same oracle answers.
  *
  * The rows are what the substitution rests on: under F_SEAL_WRITE the file can
  * no longer change, so the same bytes are there through a second view, across

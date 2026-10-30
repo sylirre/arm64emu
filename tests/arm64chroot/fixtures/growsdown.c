@@ -24,7 +24,7 @@
  * placed in 64 MiB holes of their own, a GiB below the first free mapping, so
  * nothing a libc maps meanwhile lands in them. run_tests.sh runs it a second
  * time on the tier that gives a stack a new piece of backing at every growth
- * (A64_STACKGROW_FORCE_PIECE). growsnomove.c has the thread. */
+ * (ARM64CHROOT_STACKGROW_FORCE_PIECE). growsnomove.c has the thread. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

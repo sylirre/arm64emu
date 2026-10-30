@@ -465,7 +465,7 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
          *
          * The retry is driven by the host's own refusal rather than by a
          * version test, so a backported kernel is judged by what it does.
-         * A64_MEMFD_SEAL_FORCE_OLD refuses the direct route to reach the same
+         * ARM64CHROOT_MEMFD_SEAL_FORCE_OLD refuses the direct route to reach the same
          * path from a host that would have allowed it. */
         int seal_ro = shared && !is_mfd && !(pte & PTE_W);
         int forced = seal_ro && mfd_seal_map_force_old() &&

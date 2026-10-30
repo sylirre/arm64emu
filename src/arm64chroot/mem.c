@@ -114,7 +114,7 @@ static __thread int g_pub_slot = -1;
 static __thread int g_pub_over_self;    /* this thread is one of them */
 static __thread s32 g_pub_tid;          /* cached: the claim path is not hot */
 
-/* How many slots this run may hand out. A64_TLBPUB_MAX shrinks it, which is
+/* How many slots this run may hand out. ARM64CHROOT_TLBPUB_MAX shrinks it, which is
  * the only way to reach the unregistered-thread fallback on a machine that
  * cannot run four thousand guest threads -- i.e. every machine. Resolved once;
  * a race between two threads recomputes the same answer from the same env. */
@@ -122,7 +122,7 @@ static int g_pub_cap;
 static int pub_cap(void) {
     int c = __atomic_load_n(&g_pub_cap, __ATOMIC_RELAXED);
     if (UNLIKELY(!c)) {
-        const char *e = getenv("A64_TLBPUB_MAX");
+        const char *e = getenv("ARM64CHROOT_TLBPUB_MAX");
         c = e ? atoi(e) : AS_PUB_MAX;
         if (c < 1) c = 1;
         if (c > AS_PUB_MAX) c = AS_PUB_MAX;
@@ -1389,13 +1389,13 @@ int guest_map_anon_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
  * growth past that is still tried (region_grow_down). */
 #define GROW_ROOM_MAX (sizeof(void *) >= 8 ? (1ULL << 30) : (64ULL << 20))
 
-/* A64_STACKGROW_FORCE_PIECE: no room below a stack and no extending its
+/* ARM64CHROOT_STACKGROW_FORCE_PIECE: no room below a stack and no extending its
  * allocation, so every growth takes the last tier and gives the stack a new
  * piece of backing (region_grow_piece) -- the tier a host whose address
  * space under a stack is taken is served by. */
 static int stack_force_piece(void) {
     static int v = -1;
-    return PROBE_ONCE(v, getenv("A64_STACKGROW_FORCE_PIECE") != NULL);
+    return PROBE_ONCE(v, getenv("ARM64CHROOT_STACKGROW_FORCE_PIECE") != NULL);
 }
 
 /* Room for a stack to grow into: an LP64 host the most, an ILP32 one what
@@ -2310,10 +2310,10 @@ static u64 region_resident(const Region *r, int *ok) {
     /* A host that will not answer. mincore(2) is old enough (2.4) that no
      * kernel we run on lacks it, but a sandbox or a seccomp policy between
      * the emulator and the kernel can deny it, and then the resident set is
-     * simply not knowable from in here. A64_MINCORE_FORCE_FAIL selects that
+     * simply not knowable from in here. ARM64CHROOT_MINCORE_FORCE_FAIL selects that
      * tier anywhere, which is how it is exercised off such a host. */
     static int no_mincore = -1;
-    if (PROBE_ONCE(no_mincore, getenv("A64_MINCORE_FORCE_FAIL") != NULL)) {
+    if (PROBE_ONCE(no_mincore, getenv("ARM64CHROOT_MINCORE_FORCE_FAIL") != NULL)) {
         *ok = 0;
         return 0;
     }
@@ -2536,11 +2536,12 @@ static int __attribute__((cold)) va_is_file_hole(CPU *c, u64 va) {
  * an fd held across guest execution would be visible to the guest. Both paths
  * are cold -- only a page the walk already found missing gets here. */
 static int __attribute__((cold)) host_page_readable(const u8 *hp) {
-    /* -1 undecided, 0 process_vm_readv works, 1 pipe only. A64_PAGEPROBE_
-     * FORCE_PIPE selects the fallback on a host that has the syscall, which
-     * is how the pipe path is tested anywhere but on a pre-3.2 kernel. */
+    /* -1 undecided, 0 process_vm_readv works, 1 pipe only.
+     * ARM64CHROOT_PAGEPROBE_FORCE_PIPE selects the fallback on a host that has
+     * the syscall, which is how the pipe path is tested anywhere but on a
+     * pre-3.2 kernel. */
     static int no_pvr = -1;
-    if (!PROBE_ONCE(no_pvr, getenv("A64_PAGEPROBE_FORCE_PIPE") != NULL)) {
+    if (!PROBE_ONCE(no_pvr, getenv("ARM64CHROOT_PAGEPROBE_FORCE_PIPE") != NULL)) {
         u8 probe;
         struct iovec loc = { &probe, 1 };
         struct iovec rem = { (void *)(uintptr_t)hp, 1 };

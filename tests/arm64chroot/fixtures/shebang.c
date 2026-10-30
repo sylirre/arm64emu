@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
     if (!realpath("/proc/self/exe", self)) { printf("SKIP: no /proc/self/exe\n"); return 0; }
     /* Any writable directory: the scripts below are this fixture's own, and
      * what it prints folds their paths to <dir> tokens. The harness hands the
-     * directory in as the guest's TMPDIR (hostenv.sh A64_SCRATCH) -- Android
+     * directory in as the guest's TMPDIR (hostenv.sh ARM64CHROOT_SCRATCH) -- Android
      * has no /tmp. The long-name rows further down stay exact either way:
      * they size their subdirectory from strlen(dir) so the interpreter path
      * is 253 bytes whatever the base is. */

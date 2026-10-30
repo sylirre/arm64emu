@@ -12,12 +12,12 @@
 #            Missing tools/network -> graceful skip.
 #
 # Idempotent: both trees are keyed on a marker file, so a second run is a no-op.
-# Override the destination with A64_TEST_ROOT, the glibc source with A64_SYSROOT.
+# Override the destination with ARM64CHROOT_TEST_ROOT, the glibc source with ARM64CHROOT_SYSROOT.
 set -u
 
-ROOT="${A64_TEST_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/build/cache/arm64chroot/rootfs}"
+ROOT="${ARM64CHROOT_TEST_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)/build/cache/arm64chroot/rootfs}"
 . "$(dirname "$0")/hostenv.sh"
-SYSROOT="$A64_SYSROOT"
+SYSROOT="$ARM64CHROOT_SYSROOT"
 
 # ---- glibc rootfs (offline) --------------------------------------------------
 # Two ways in, because the runtime lives somewhere different depending on how
@@ -101,10 +101,10 @@ int main(void) {
     return (int)cos(a64_probe_x) + (int)log(a64_probe_x);
 }
 EOF
-    # $A64_TESTLIBS, not a hardcoded -lm -lpthread: on Bionic both live in libc
+    # $ARM64CHROOT_TESTLIBS, not a hardcoded -lm -lpthread: on Bionic both live in libc
     # and the standalone archives may not exist, which would fail this link and
     # leave the host with no native provisioning at all.
-    if ! "$AGCC" -O0 -o "$tmpd/probe" "$tmpd/probe.c" $A64_TESTLIBS 2>/dev/null; then
+    if ! "$AGCC" -O0 -o "$tmpd/probe" "$tmpd/probe.c" $ARM64CHROOT_TESTLIBS 2>/dev/null; then
         rm -rf "$tmpd"; return 1
     fi
     # "lib => /abs/path (0x..)" for the DT_NEEDED set, a bare "/abs/path (0x..)"

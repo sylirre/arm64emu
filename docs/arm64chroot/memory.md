@@ -410,7 +410,7 @@ pre-epoch rule, which grows the address space but can never pull backing out
 from under a translation. Slots are held for the life of a guest thread and
 returned when it leaves, so the table bounds *live* threads (4096) rather than
 threads ever created; both the reuse scan and the drain stop at the high-water
-mark, so a four-thread process walks four entries. `A64_TLBPUB_MAX=N` shrinks
+mark, so a four-thread process walks four entries. `ARM64CHROOT_TLBPUB_MAX=N` shrinks
 the table, which is the only way to reach the fallback on a machine that cannot
 run four thousand guest threads — the suite's `vachurn unaccounted` row runs
 over it and asserts that the backing really is held, since releasing it anyway
@@ -576,7 +576,7 @@ host can give it no backing at all stops growing: `SIGSEGV`, which is what a
 kernel out of memory answers too. Pages a `munmap` took off a stack's bottom
 keep their bytes in the allocation (backing is released whole), so growing back
 over them zeroes them first: a grown page is the zero page.
-`A64_STACKGROW_FORCE_PIECE` reserves no room and never extends, putting every
+`ARM64CHROOT_STACKGROW_FORCE_PIECE` reserves no room and never extends, putting every
 growth on that last tier; the suite runs `tests/fixtures/growsdown.c` and
 `growsnomove.c` over it too.
 
@@ -686,7 +686,7 @@ An optional second argument parks that many guest threads first and touches 32
 pages of each mapping instead of one, which points the same measurement at the
 quarantine: the harness runs it once at 300 threads (the drain must still
 happen, so the growth must stay flat) and once more at eight threads with
-`A64_TLBPUB_MAX=2`, so that most of them have no epoch slot (the drain must then
+`ARM64CHROOT_TLBPUB_MAX=2`, so that most of them have no epoch slot (the drain must then
 stop, so the growth must appear). Eight for the second one because the cap, not
 the thread count, is what forces the fallback — three hundred host thread stacks
 and a code cache apiece is more address space than a 32-bit host has to spare.
@@ -794,7 +794,7 @@ high-water mark over the samples actually taken: a guest watching its own
 footprint reads repeatedly and misses nothing between its own reads. A host
 that cannot answer `mincore` — a sandbox or a seccomp policy between the
 emulator and the kernel — falls back to the host file's own figures, bounded
-as below; `A64_MINCORE_FORCE_FAIL=1` selects that tier anywhere, and the suite
+as below; `ARM64CHROOT_MINCORE_FORCE_FAIL=1` selects that tier anywhere, and the suite
 runs `tests/fixtures/vmreport.c` over both. One approximation is named rather
 than hidden:
 a System V shm attachment is backed by a memfd mapped like any other file, so
@@ -855,9 +855,9 @@ resident set with, the components have no host figures to be bounded by either:
 what is left of the bounded `VmRSS` is resident and unattributed, and anonymous
 is what it is — which is what the sampled tier reports too (a guest's images
 are read into anonymous guest pages, so `RssFile` and `RssShmem` are zero
-there), and it keeps the three summing to `VmRSS`. `A64_PROCFS_FORCE_OLD`
+there), and it keeps the three summing to `VmRSS`. `ARM64CHROOT_PROCFS_FORCE_OLD`
 hides those fields and lines from an ordinary host's /proc so the suite reaches
-both append paths, crossed with `A64_MINCORE_FORCE_FAIL` for the split.
+both append paths, crossed with `ARM64CHROOT_MINCORE_FORCE_FAIL` for the split.
 
 `/proc/<pid>/limits` is synthesized from the same table (`put_limits`,
 `sys_procfs.c`); passing the host file through would have shown a guest a "Max

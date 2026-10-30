@@ -822,7 +822,7 @@ fast:;
 
 static int fuse_enabled(void) {
     static int v = -1;
-    return PROBE_ONCE(v, getenv("A64_JIT_NOFUSE") == NULL);
+    return PROBE_ONCE(v, getenv("ARM64CHROOT_JIT_NOFUSE") == NULL);
 }
 
 #define FUSE_VA_SLOT ((s32)(offsetof(JitEnv, tmp_spill) + 24))
@@ -867,7 +867,7 @@ static void ld_rdx_disp(Emit *e, const IROp *p, int reg, s32 d) {
 
 /* k same-base constant-offset accesses behind ONE span-checked probe
  * (LDP/STP shapes, DC ZVA's eight stores, prologue spill runs). The bail
- * path (miss / span page-cross / TBI / perm — or A64_JIT_SLOWMEM) re-runs
+ * path (miss / span page-cross / TBI / perm — or ARM64CHROOT_JIT_SLOWMEM) re-runs
  * every access through its helper in program order, each with its own
  * baked pc and fault exit, so a fault at access j leaves accesses < j
  * committed and j's destination unwritten, exactly like the interpreter.
@@ -1129,12 +1129,12 @@ static void st_lane_rax(Emit *e, unsigned size, s32 disp) {
 
 /* Baseline is SSE2 (x86-64); some vector ops need SSSE3/SSE4.1/SSE4.2 (any
  * Intel/AMD core since ~2008) — probed once, helper fallback without them.
- * Debug: A64_JIT_SSE=2 forces the baseline answers, proving every gated
+ * Debug: ARM64CHROOT_JIT_SSE=2 forces the baseline answers, proving every gated
  * recipe's decline/fallback path on a modern host. */
 static int sse_forced_baseline(void) {
     static int v = -1;
     const char *s;
-    return PROBE_ONCE(v, (s = getenv("A64_JIT_SSE")) != NULL && atoi(s) == 2);
+    return PROBE_ONCE(v, (s = getenv("ARM64CHROOT_JIT_SSE")) != NULL && atoi(s) == 2);
 }
 static int cpu_has_sse41(void) {
     static int v = -1;
@@ -1153,7 +1153,7 @@ static int cpu_has_sse42(void) {
 }
 /* F16C: half<->single vector convert (vcvtph2ps / vcvtps2ph). The gate for the
  * whole FP16 surface — without it every half encoding stays an interpreter
- * helper. A64_JIT_SSE=2 forces it off, exercising that fallback. */
+ * helper. ARM64CHROOT_JIT_SSE=2 forces it off, exercising that fallback. */
 static int cpu_has_f16c(void) {
     static int v = -1;
     return PROBE_ONCE(v, !!__builtin_cpu_supports("f16c")) &&
@@ -1219,7 +1219,7 @@ static void emit_const128(BE *be, u64 lo, u64 hi, int xreg) {
  * Block-local LRU cache of guest V registers in xmm5-15; xmm0-4 remain the
  * recipes' fixed scratch. Recipes fetch operands with vop_src (a movdqa
  * from the cached register, or the old movdqu from c->v[] under
- * A64_JIT_NOVRA) and commit full-vector results with vop_dst; lane/GPR-
+ * ARM64CHROOT_JIT_NOVRA) and commit full-vector results with vop_dst; lane/GPR-
  * crossing recipes instead spill the named registers and run their
  * memory-based code unchanged. All xmm registers are caller-saved, so
  * helper-calling slow paths store the dirty set before the call (dirty
@@ -1229,7 +1229,7 @@ static void emit_const128(BE *be, u64 lo, u64 hi, int xreg) {
 
 static int vra_enabled(void) {
     static int v = -1;
-    return PROBE_ONCE(v, getenv("A64_JIT_NOVRA") == NULL);
+    return PROBE_ONCE(v, getenv("ARM64CHROOT_JIT_NOVRA") == NULL);
 }
 static void vld_q(BE *be, int hx, unsigned vn) { /* movdqu hx, c->v[vn] */
     sse_mem(be->e, 0xF3, 0x6F, hx, OFF_V(vn));

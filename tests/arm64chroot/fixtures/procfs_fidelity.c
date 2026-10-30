@@ -143,7 +143,7 @@ int main(void) {
     printf("version_guest=%d\n",
            strncmp(b, "Linux version 6.1.0-arm64chroot ", 32) == 0);
 
-    /* /proc/stat — run_tests.sh sets A64_PROCSTAT_FORCE_SYNTH, so this is
+    /* /proc/stat — run_tests.sh sets ARM64CHROOT_PROCSTAT_FORCE_SYNTH, so this is
      * the synthesized fallback exactly: one cpuN line per online CPU, the
      * loadavg-consistent procs_running 1, an exact btime, an idle figure
      * agreeing with /proc/uptime's, and counters that advance when reread
@@ -253,7 +253,7 @@ int main(void) {
     }
 
     /* /proc/sys/kernel/overflow{u,g}id — run_tests.sh sets
-     * A64_OVERFLOWID_FORCE_SYNTH, so these are the synthesized fallback for a
+     * ARM64CHROOT_OVERFLOWID_FORCE_SYNTH, so these are the synthesized fallback for a
      * host that denies them (Android SELinux); with a readable host file they
      * pass through unchanged instead, which run_tests.sh checks separately. */
     char ou[32] = "", og[32] = "";

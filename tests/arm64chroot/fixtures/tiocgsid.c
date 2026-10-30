@@ -7,7 +7,7 @@
  * the caller does not control, a master whose slave has no session, and a
  * descriptor that is no terminal. The emulator serves it from the commands the
  * policy allows (src/arm64chroot/sys_file.c, tty_tiocgsid); the answers must be the
- * kernel's whichever way it was reached, so this runs over A64_TIOCGSID_FORCE_DENY
+ * kernel's whichever way it was reached, so this runs over ARM64CHROOT_TIOCGSID_FORCE_DENY
  * too.
  *
  * What is asked, over a real pty: before anything controls it, the slave and

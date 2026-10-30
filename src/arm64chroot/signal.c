@@ -194,10 +194,10 @@ static int sigq_limit(void) {
     if (getrlimit(RLIMIT_SIGPENDING, &rl) == 0 &&
         rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < (rlim_t)SIGQ_MAX)
         v = (int)rl.rlim_cur;
-    /* A64_SIGQ_MAX caps it further, which is how the gate below gets tested:
+    /* ARM64CHROOT_SIGQ_MAX caps it further, which is how the gate below gets tested:
      * pin the queue at its floor and every flood has to go through the
      * kernel's queue and back. */
-    const char *cap = getenv("A64_SIGQ_MAX");
+    const char *cap = getenv("ARM64CHROOT_SIGQ_MAX");
     if (cap && *cap) {
         int n = atoi(cap);
         if (n > 0 && n < v) v = n;
@@ -753,7 +753,7 @@ int sig_guest_nr(int sig) { return sig_remap_to_guest(sig); }
  * before -- so this changes nothing where nothing is wrong. The kick is
  * assigned first, being the one whose loss deadlocks the emulator itself.
  *
- * A64_SIGRT_MAX=N caps the search, which is how the fallback gets exercised on
+ * ARM64CHROOT_SIGRT_MAX=N caps the search, which is how the fallback gets exercised on
  * a host that has no hole of its own. */
 static volatile sig_atomic_t sig_probe_hit;   /* not __thread: see sig_tls_prewarm */
 
@@ -801,7 +801,7 @@ void sig_probe_reserved(void) {
     g_sig_remap_host[0] = SIGRTMAX - 1;       /* answers nothing below */
     g_sig_remap_host[1] = SIGRTMAX - 2;
 
-    const char *cap = getenv("A64_SIGRT_MAX");
+    const char *cap = getenv("ARM64CHROOT_SIGRT_MAX");
     int top = SIGRTMAX;
     if (cap && *cap) {
         int n = atoi(cap);
@@ -877,7 +877,7 @@ static int rq_stale(const siginfo_t *si);
  * the first handler and the first thread, read from handlers after. */
 static int g_sig_sicode_ok = 1;   /* a private si_code, si_errno and si_value
                                    * go out and come back as they were */
-static int g_sig_chld_delay;      /* A64_SIGCHLD_DELAY, ms (sig_chld_notice) */
+static int g_sig_chld_delay;      /* ARM64CHROOT_SIGCHLD_DELAY, ms (sig_chld_notice) */
 static int g_sig_nocld_ok = 1;    /* SA_NOCLDWAIT reaps and SA_NOCLDSTOP
                                    * spares the notices */
 
@@ -1335,7 +1335,7 @@ u8 sig_chldact_bits(void) {
  * with a descriptor in si_value (sig_jc_desc). A host that refuses the probe's calls
  * outright (a seccomp filter's ENOSYS) cannot be told apart and keeps the
  * full encoding, which such a host could not carry any other way either.
- * A64_SICODE_FORCE_KNOWN selects the tier anywhere.
+ * ARM64CHROOT_SICODE_FORCE_KNOWN selects the tier anywhere.
  *
  * And the same host does not pass the guest's SIGCHLD flags on: it installs a
  * handler of its own with flags of its own, so SA_NOCLDWAIT reaps nothing and
@@ -1343,11 +1343,11 @@ u8 sig_chldact_bits(void) {
  * waited for says which: a kernel answers ECHILD once it has reaped it. Where
  * the host does not, the emulator does both itself, as it does whenever a
  * clone child bars the host from it (sig_chld_reap_emulated, host_catcher).
- * A64_NOCLDWAIT_FORCE_EMULATE selects that anywhere. Both are asked before
+ * ARM64CHROOT_NOCLDWAIT_FORCE_EMULATE selects that anywhere. Both are asked before
  * the first handler, thread and fork, and every process of the session
  * inherits the answers. */
 static int sig_probe_sicode(void) {
-    if (getenv("A64_SICODE_FORCE_KNOWN")) return 0;
+    if (getenv("ARM64CHROOT_SICODE_FORCE_KNOWN")) return 0;
     int sig = g_sig_kicksig;
     struct sigaction ign, old;
     memset(&ign, 0, sizeof ign);
@@ -1385,7 +1385,7 @@ static int sig_probe_sicode(void) {
 }
 
 static int sig_probe_nocld(void) {
-    if (getenv("A64_NOCLDWAIT_FORCE_EMULATE")) return 0;
+    if (getenv("ARM64CHROOT_NOCLDWAIT_FORCE_EMULATE")) return 0;
     struct sigaction sa, old;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = SIG_DFL;
@@ -1470,7 +1470,7 @@ static void sig_probe_host(void) {
     g_sig_sicode_ok = sig_probe_sicode();
     g_sig_nocld_ok = sig_probe_nocld();
     if (!g_sig_sicode_ok) g_sig_pnd_trust = sig_probe_procpnd();
-    const char *d = getenv("A64_SIGCHLD_DELAY");
+    const char *d = getenv("ARM64CHROOT_SIGCHLD_DELAY");
     if (d && *d) {
         int ms = atoi(d);
         g_sig_chld_delay = ms < 0 ? 0 : ms > 10000 ? 10000 : ms;
@@ -1888,7 +1888,7 @@ static int chld_released(PendSig *p, s32 kid) {
 
 static int sig_chld_notice(PendSig *p, const siginfo_t *si) {
     if (p->signo != SIGCHLD) return 1;
-    /* A64_SIGCHLD_DELAY: a thread of the guest's held as it starts on a
+    /* ARM64CHROOT_SIGCHLD_DELAY: a thread of the guest's held as it starts on a
      * notice the host kernel made, as a loaded host holds one it preempts
      * there -- long enough for the watcher, which is never held, to do what
      * it does every 100 ms meanwhile: a dead tracer's held children released

@@ -24,7 +24,7 @@
  * copy is a guaranteed miss and takes as_lock underneath nl_lock.
  *
  * Both violations are hangs, so an alarm converts them into a named failure
- * instead of a suite timeout. Run under A64_NETLINK_FORCE_BLOCK so the netlink
+ * instead of a suite timeout. Run under ARM64CHROOT_NETLINK_FORCE_BLOCK so the netlink
  * thread exercises the emulated path on any host. */
 #include <stdio.h>
 #include <stdlib.h>

@@ -897,7 +897,7 @@ static void ld_rdx_disp(Emit *e, const IROp *p, int reg, s32 d) {
 
 /* k same-base constant-offset accesses behind ONE span-checked probe
  * (LDP/STP shapes, DC ZVA's eight stores, prologue spill runs). The bail
- * path (miss / span page-cross / TBI / perm — or A64_JIT_SLOWMEM) re-runs
+ * path (miss / span page-cross / TBI / perm — or ARM64CHROOT_JIT_SLOWMEM) re-runs
  * every access through its helper in program order, each with its own
  * baked pc and fault exit, so a fault at access j leaves accesses < j
  * committed and j's destination unwritten, exactly like the interpreter.

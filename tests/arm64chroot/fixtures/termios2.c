@@ -27,7 +27,7 @@
  * NEEDS-HOST-SYSCALL: tcgets2
  * A host that has a kernel but refuses the ioctl on a pty -- an SELinux policy
  * that whitelists a slave's ioctls, Android's -- is served from TCGETS/TCSETS
- * by the emulator itself (A64_TERMIOS2_FORCE_DENY runs that tier anywhere), and
+ * by the emulator itself (ARM64CHROOT_TERMIOS2_FORCE_DENY runs that tier anywhere), and
  * the answers above are the same; a host this program reaches by itself and
  * which still refuses steps aside with a lone SKIP line. The expected output is
  * what this program prints built for the host and run on a real kernel. */

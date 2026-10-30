@@ -24,7 +24,7 @@
  * Self-checking: the block is what a real kernel prints for this program
  * (compile it natively to see), and qemu-user is no oracle here -- it hands
  * the host an ordinary file for /proc/self/maps. Run plain and over the tier
- * (A64_MEMFD_FORCE_FILE=1); the rows must not depend on which backing the
+ * (ARM64CHROOT_MEMFD_FORCE_FILE=1); the rows must not depend on which backing the
  * host let the emulator use, nor on the filesystem under it. */
 #define _GNU_SOURCE
 #include <errno.h>

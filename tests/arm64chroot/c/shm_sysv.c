@@ -3,7 +3,7 @@
  * Prints only *semantic* outcomes — never shmids, attach addresses, or
  * timestamps — so the emulator's portable IPC broker (src/arm64chroot/sys_ipc.c, no host
  * SysV IPC) and the host kernel's real SysV shm under qemu produce byte-identical
- * output. run_tests.sh also re-runs this with A64_SHM_FORCE_FILE=1 to cover the
+ * output. run_tests.sh also re-runs this with ARM64CHROOT_SHM_FORCE_FILE=1 to cover the
  * file-backed fallback tier.
  *
  * Buffering note: stdout is block-buffered when captured (not a tty), so the

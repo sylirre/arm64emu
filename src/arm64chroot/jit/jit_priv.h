@@ -115,7 +115,7 @@ typedef struct JitEnv {
                                  * code stores a translate-time constant here
                                  * and movdqu-loads it (x86 pshufb LUTs and
                                  * byte-shift masks; no RIP-relative pools) */
-    u32 slowmem;                /* A64_JIT_SLOWMEM: every mem op takes the
+    u32 slowmem;                /* ARM64CHROOT_JIT_SLOWMEM: every mem op takes the
                                  * helper path (fast-path codegen bisection) */
     /* Sticky union of the FP modes (FPMODE_*) this thread's guest has asked
      * for; what it costs the inline FP surface is ir.h's vop_fpcr_blocked.

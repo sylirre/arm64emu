@@ -21,7 +21,7 @@
  *
  * `heldzombie killed` runs the tracer-killed case alone, which the suite
  * also runs with every notice the host sends this process held up
- * (A64_SIGCHLD_DELAY): the tracer's death then reaches it while the
+ * (ARM64CHROOT_SIGCHLD_DELAY): the tracer's death then reaches it while the
  * emulator's own look for a gone tracer -- every 100 ms -- releases the
  * child, and the kernel's order (the child's notice, then the tracer's,
  * which finds SIGCHLD pending) has to hold all the same. The other cases

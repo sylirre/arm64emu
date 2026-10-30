@@ -660,7 +660,7 @@ fast:;
 
 static int fuse_enabled(void) {
     static int v = -1;
-    return PROBE_ONCE(v, getenv("A64_JIT_NOFUSE") == NULL);
+    return PROBE_ONCE(v, getenv("ARM64CHROOT_JIT_NOFUSE") == NULL);
 }
 
 #define FUSE_VA_SLOT ((unsigned)(offsetof(JitEnv, tmp_spill) + 24))
@@ -798,13 +798,13 @@ fast:;
 /* FEAT_FP16 (native half-precision arith/convert) probe. Gates the FP16
  * classes: without it, half encodings stay interpreter helpers. Both HWCAP
  * bits (scalar FPHP + SIMD ASIMDHP) come together on real FEAT_FP16 cores.
- * A64_JIT_NOFP16 forces it off, exercising the helper fallback. */
+ * ARM64CHROOT_JIT_NOFP16 forces it off, exercising the helper fallback. */
 static int cpu_has_fp16(void) {
     static int v = -1;
     return PROBE_ONCE(v,
         ((getauxval(AT_HWCAP) & (HWCAP_FPHP | HWCAP_ASIMDHP)) ==
              (HWCAP_FPHP | HWCAP_ASIMDHP)) &&
-        getenv("A64_JIT_NOFP16") == NULL);
+        getenv("ARM64CHROOT_JIT_NOFP16") == NULL);
 }
 
 int be_vop_ok(unsigned vclass, u32 insn) {
@@ -864,7 +864,7 @@ static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
 /* ---- guest V-register cache ----
  * Block-local LRU cache of guest V registers in host v18-v29. The replay
  * path fetches operands with vop_src (a 16B register move from the cached
- * copy, or the old LDR Q under A64_JIT_NOVRA) and commits the replayed
+ * copy, or the old LDR Q under ARM64CHROOT_JIT_NOVRA) and commits the replayed
  * result from v2 with vop_dst; the GPR-composed recipes (MOVI/FMOVI/
  * FMOVG) spill the named registers and run unchanged. All pool registers
  * are caller-saved, so helper-calling slow paths store the dirty set and
@@ -875,7 +875,7 @@ static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
 
 static int vra_enabled(void) {
     static int v = -1;
-    return PROBE_ONCE(v, getenv("A64_JIT_NOVRA") == NULL);
+    return PROBE_ONCE(v, getenv("ARM64CHROOT_JIT_NOVRA") == NULL);
 }
 static u32 enc_vmov16(unsigned vd, unsigned vn) {   /* mov vd.16b, vn.16b */
     return 0x4EA01C00u | (vn << 16) | (vn << 5) | vd;

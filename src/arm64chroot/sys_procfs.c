@@ -323,10 +323,10 @@ static void put_loadavg(int fd) {
 }
 
 /* Try-host-first gate for /proc/stat: 1 when the host denies the file
- * (Android SELinux) or A64_PROCSTAT_FORCE_SYNTH forces the fallback in
+ * (Android SELinux) or ARM64CHROOT_PROCSTAT_FORCE_SYNTH forces the fallback in
  * tests; probed once per process, netlink-style. */
 static int stat_probe_blocked(void) {
-    if (getenv("A64_PROCSTAT_FORCE_SYNTH")) return 1;
+    if (getenv("ARM64CHROOT_PROCSTAT_FORCE_SYNTH")) return 1;
     fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     int fd = open("/proc/stat", O_RDONLY | O_CLOEXEC);
     if (fd >= 0) close(fd);
@@ -342,21 +342,21 @@ static int stat_blocked(void) {
  * whole fields and lines the guest ABI promises are simply not there to
  * rewrite: /proc/<pid>/stat stops at field 44 (start_data..exit_code are 3.3)
  * and status has no RssAnon/RssFile/RssShmem (4.5). Real on an Android 7
- * device (3.1) and nowhere else, so A64_PROCFS_FORCE_OLD stands in for one --
+ * device (3.1) and nowhere else, so ARM64CHROOT_PROCFS_FORCE_OLD stands in for one --
  * it hides exactly those from the host's own files, which is what makes the
  * emulator's two append paths reachable on an ordinary machine. */
 static int procfs_old_host(void) {
     static int on = -1;
-    return PROBE_ONCE(on, getenv("A64_PROCFS_FORCE_OLD") != NULL);
+    return PROBE_ONCE(on, getenv("ARM64CHROOT_PROCFS_FORCE_OLD") != NULL);
 }
 
 /* Same try-host-first gate for /proc/sys/kernel/overflow{u,g}id, which Android
  * SELinux denies an app along with the rest of /proc/sys. A guest that cannot
  * read them is not a hypothetical: it is the first thing bubblewrap does, and
  * it dies outright ("Can't read /proc/sys/kernel/overflowuid"). Probed once per
- * file per process; A64_OVERFLOWID_FORCE_SYNTH forces the fallback in tests. */
+ * file per process; ARM64CHROOT_OVERFLOWID_FORCE_SYNTH forces the fallback in tests. */
 static int overflowid_probe_blocked(int is_gid) {
-    if (getenv("A64_OVERFLOWID_FORCE_SYNTH")) return 1;
+    if (getenv("ARM64CHROOT_OVERFLOWID_FORCE_SYNTH")) return 1;
     fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
     int fd = open(is_gid ? "/proc/sys/kernel/overflowgid"
                          : "/proc/sys/kernel/overflowuid",
@@ -527,7 +527,7 @@ static void put_limits(int fd, struct Machine *m) {
 /* Online CPUs, as the synthesized /proc/stat reports them: one cpuN line each,
  * kernel-style (Linux prints the online mask, not the possible one).
  *
- * A64_PROCSTAT_HOTPLUG_SIM walks the count down on every sample (N, N-1, ...,
+ * ARM64CHROOT_PROCSTAT_HOTPLUG_SIM walks the count down on every sample (N, N-1, ...,
  * 1, N, ...). A host that takes cores offline is what breaks the counters'
  * monotonicity, and no ordinary development or CI machine ever does -- only
  * phones do -- so without this the regression is reachable on an Android
@@ -538,7 +538,7 @@ static u64 stat_ncpu(void) {
     static int sim = -1;
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     u64 v = n > 0 ? (u64)n : 1;
-    if (PROBE_ONCE(sim, getenv("A64_PROCSTAT_HOTPLUG_SIM") != NULL)) {
+    if (PROBE_ONCE(sim, getenv("ARM64CHROOT_PROCSTAT_HOTPLUG_SIM") != NULL)) {
         static unsigned tick;
         u64 top = v > 4 ? v : 4;
         unsigned t = __atomic_fetch_add(&tick, 1u, __ATOMIC_RELAXED);
@@ -1351,13 +1351,13 @@ out:
  * to the HOST file, and a guest read the emulator's own Uid lines, mount
  * table and environment. */
 static int synth_memfd(void) {
-    /* A64_PROCSYNTH_FORCE_FAIL: pretend there is no anonymous backing at all
+    /* ARM64CHROOT_PROCSYNTH_FORCE_FAIL: pretend there is no anonymous backing at all
      * -- the tier a host with neither memfd_create nor a writable directory is
      * served by. What matters about that tier is that it must not degrade into
      * handing the guest the emulator's own /proc files, so the suite runs the
      * leak check over it. Probed once per process (a fork inherits it). */
     static int forced = -1;
-    if (PROBE_ONCE(forced, getenv("A64_PROCSYNTH_FORCE_FAIL") != NULL)) {
+    if (PROBE_ONCE(forced, getenv("ARM64CHROOT_PROCSYNTH_FORCE_FAIL") != NULL)) {
         errno = ENOSYS;
         return -1;
     }
@@ -2416,7 +2416,7 @@ int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
  * -- plus the names it leaves to a readable host file (stat, overflow{u,g}id),
  * which a host that will not stat them has made no less readable.
  *
- * A64_PROCSYNTH_FORCE_STAT_DENY makes the host refuse them all (EACCES), the
+ * ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY makes the host refuse them all (EACCES), the
  * tier an Android host is on, so the fallback is reachable anywhere. */
 
 /* What a kernel's procfs reports as the mode of each kind of file. */
@@ -2501,7 +2501,7 @@ static int synth_stat_fill(CPU *c, const char *canon, int nofollow, struct stat 
 
 static int stat_forced_deny(void) {
     static int on = -1;
-    return PROBE_ONCE(on, getenv("A64_PROCSYNTH_FORCE_STAT_DENY") != NULL);
+    return PROBE_ONCE(on, getenv("ARM64CHROOT_PROCSYNTH_FORCE_STAT_DENY") != NULL);
 }
 
 int procfs_stat_fallback(CPU *c, const char *canon, int nofollow, int host_rc,

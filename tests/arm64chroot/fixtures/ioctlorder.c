@@ -11,7 +11,7 @@
  * not read, ahead of all of those; it now hands the host an address no process
  * has and lets the kernel decide (src/arm64chroot/sys_file.c, SYSDEF(ioctl)). The answers
  * must be the kernel's also where a policy refuses the command ahead of the
- * file (A64_TTYIOCTL_FORCE_DENY), and for the commands then served in the
+ * file (ARM64CHROOT_TTYIOCTL_FORCE_DENY), and for the commands then served in the
  * host's place (TIOCSSOFTCAR). An output argument is written after the
  * handler ran, so a bad one is EFAULT on any descriptor that answers.
  *

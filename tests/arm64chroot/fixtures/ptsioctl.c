@@ -7,7 +7,7 @@
  * tcsendbreak(3) and tcflow(3) among them. A pty slave has no ioctl, break,
  * modem lines, output queue or xchar of its own, so the kernel's answers are
  * the tty core's, and the emulator serves them from the commands the policy
- * allows (src/arm64chroot/sys_file.c, pts_refused); A64_TTYIOCTL_FORCE_DENY makes any host
+ * allows (src/arm64chroot/sys_file.c, pts_refused); ARM64CHROOT_TTYIOCTL_FORCE_DENY makes any host
  * refuse them the same way, and the answers here must be the kernel's over it.
  *
  * What is asked:

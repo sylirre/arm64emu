@@ -3321,7 +3321,7 @@ static const IoctlEnt ioctl_tab[] = {
  * and a terminal is one -- except a pty slave, whose answers are the tty
  * core's alone (pts_refused below). FIOCLEX and FIONCLEX set or clear
  * close-on-exec on the descriptor, which is all a kernel does for them, and
- * F_SETFD does the same thing unrefused. A64_TTYIOCTL_FORCE_DENY makes any host
+ * F_SETFD does the same thing unrefused. ARM64CHROOT_TTYIOCTL_FORCE_DENY makes any host
  * refuse the way the policy does: on a memfd, everything on each of those four
  * kinds of descriptor; on a pty slave, all but the commands it lists. */
 #define TC_FIOCLEX  0x5451u
@@ -3370,12 +3370,12 @@ static int pts_policy_allows(u32 cmd) {
     return 0;
 }
 
-/* The host's ioctl, for a command of `kind` -- or, with A64_TTYIOCTL_FORCE_DENY,
+/* The host's ioctl, for a command of `kind` -- or, with ARM64CHROOT_TTYIOCTL_FORCE_DENY,
  * the policy's EACCES. Only for a descriptor the command could reach at all:
  * one that is not open, or open O_PATH, is the host's EBADF either way. */
 static int ioctl_host(int fd, u32 cmd, unsigned long arg, int kind) {
     if (kind != IOK_FILE &&
-        PROBE_ONCE(ttyio_force_deny, getenv("A64_TTYIOCTL_FORCE_DENY") != NULL) > 0) {
+        PROBE_ONCE(ttyio_force_deny, getenv("ARM64CHROOT_TTYIOCTL_FORCE_DENY") != NULL) > 0) {
         int fl = fcntl(fd, F_GETFL);
         int fdk = fl >= 0 && !(fl & O_PATH) ? fd_kind(fd) : FDK_OTHER;
         if ((fdk == FDK_FILE || fdk == FDK_SOCK) ? (kind == IOK_FD || !fd_answers(fdk, kind))
@@ -3434,7 +3434,7 @@ static u64 ioctl_refused(int fd, u32 cmd, int kind, unsigned long arg) {
  * itself; the first refusal that the classic command then proves to be about
  * termios2 (it worked on the same descriptor) is remembered, and the
  * remaining calls go straight to the fallback instead of being denied -- and
- * logged by the policy -- every time. A64_TERMIOS2_FORCE_DENY forces the tier
+ * logged by the policy -- every time. ARM64CHROOT_TERMIOS2_FORCE_DENY forces the tier
  * on any host. */
 #define TC_GETS    0x5401u
 #define TC_SETS    0x5402u
@@ -3511,7 +3511,7 @@ static int tc2_host_lacks = -1;
 
 /* The host's own answer, or a refusal when the tier is forced. */
 static int tc2_host(int fd, u32 cmd, void *buf) {
-    if (PROBE_ONCE(tc2_host_lacks, getenv("A64_TERMIOS2_FORCE_DENY") != NULL) > 0) {
+    if (PROBE_ONCE(tc2_host_lacks, getenv("ARM64CHROOT_TERMIOS2_FORCE_DENY") != NULL) > 0) {
         errno = EACCES;
         return -1;
     }
@@ -3577,7 +3577,7 @@ static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
  *     slave nobody controls has no group, and no session: ENOTTY).
  * The ids are the host's, as getsid(2) and TIOCGPGRP report them. As with
  * termios2 above, the first refusal that the allowed commands prove to be
- * about TIOCGSID is remembered, and A64_TIOCGSID_FORCE_DENY forces the tier
+ * about TIOCGSID is remembered, and ARM64CHROOT_TIOCGSID_FORCE_DENY forces the tier
  * on any host. */
 #define TC_GPGRP 0x540fu
 #define TC_GSID  0x5429u
@@ -3587,7 +3587,7 @@ static int tsid_host_lacks = -1;      /* as tc2_host_lacks: -1 = knob unread, 1 
 static u64 tty_tiocgsid(CPU *c, int fd, u64 gp) {
     s32 sid = 0;
     int ok = 0;
-    if (!PROBE_ONCE(tsid_host_lacks, getenv("A64_TIOCGSID_FORCE_DENY") != NULL)) {
+    if (!PROBE_ONCE(tsid_host_lacks, getenv("ARM64CHROOT_TIOCGSID_FORCE_DENY") != NULL)) {
         if (ioctl_host(fd, TC_GSID, (unsigned long)&sid, IOK_TTY) == 0) ok = 1;
         else if (errno != EACCES) return host_err();
     }
