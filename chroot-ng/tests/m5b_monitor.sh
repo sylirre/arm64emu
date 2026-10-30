@@ -1,0 +1,971 @@
+# M5b monitor tests (sourced by tests/run.sh). Exercises the dispatcher and the
+# signal round-trip directly; the seccomp trap itself is inert under qemu-user
+# and must be confirmed on a real AArch64 kernel.
+echo "== M5b: syscall monitor (dispatch + signal) =="
+
+ROOT=$(mktemp -d)
+mkdir -p "$ROOT/etc"
+printf 'HELLO-FROM-ROOTFS' > "$ROOT/etc/greeting"
+
+check_contains "dispatch openat translated into rootfs" \
+    "read: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" open /etc/greeting 2>&1)"
+
+# --- the rootfs argument itself ---------------------------------------------
+# It is a prefix, and every guest path is joined to it, so the two ways of
+# getting one that is not what the user typed both end somewhere they did not
+# ask for. An empty one is the identity — `chroot-ng "$ROOTFS" rm -rf /` with the
+# variable unset ran against the host root, silently. And one that did not fit
+# the 512-byte field was truncated, which lands mid-component: the guest was
+# rooted at a shorter path, or at one that is not a directory at all. (The
+# truncation also read one byte past the buffer while trimming trailing slashes,
+# since cng_strlcpy reports the length of the source.)
+run "" /bin/true >/dev/null 2>&1
+check "an empty rootfs argument is refused" 2 $?
+check_contains "the empty rootfs is diagnosed, with the deliberate spelling" \
+    "chroot-ng: <rootfs> is empty (use '/' for the host root)" \
+    "$(run "" /bin/true 2>&1)"
+M5B_DEEP="$ROOT"
+while [ ${#M5B_DEEP} -lt 512 ]; do M5B_DEEP="$M5B_DEEP/dddddddddddddddddddd"; done
+mkdir -p "$M5B_DEEP"
+run "$M5B_DEEP" /bin/true >/dev/null 2>&1
+check "a rootfs path too long to hold is refused, not truncated" 2 $?
+check_contains "the over-long rootfs is diagnosed with the limit" \
+    "path too long (max 511)" "$(run "$M5B_DEEP" /bin/true 2>&1)"
+check_contains "a bind destination too long to hold is refused too" \
+    "--bind '$ROOT:/$(printf 'b%.0s' $(seq 1 300))': path too long" \
+    "$(run -b "$ROOT:/$(printf 'b%.0s' $(seq 1 300))" "$ROOT" /bin/true 2>&1)"
+
+# The runtime's own formatter, which everything here reports through and the
+# SIGSYS handler runs with every signal but SIGSYS masked — so an out-of-bounds
+# read in it is an unblockable kill, not a wrong string. A format ending in a
+# bare '%' had one: stepping past the '%' is unconditional and the flag, width
+# and length scans all stop at the terminator, so the conversion dispatch landed
+# on '\0', emitted it, and let the loop walk off the end of the literal and keep
+# formatting the bytes after it — consuming a va_arg for every '%' it found.
+# Latent (every format in the tree is a literal, none ending in '%'), so the
+# probe builds its formats at runtime and puts known bytes past the terminator:
+# the walk shows as a reported length of 9 rather than 2.
+check_contains "a format ending in a bare % stops at the terminator" \
+    "fmt: bare=1,2 wide=1,2 normal=1,6 [x007%y]" \
+    "$(run -t dtest fmt / 2>&1)"
+
+run -t dtest -r "$ROOT" access /etc/greeting >/dev/null 2>&1
+check "dispatch faccessat: present file" 0 $?
+run -t dtest -r "$ROOT" access /etc/nope >/dev/null 2>&1
+check "dispatch faccessat: missing file" 1 $?
+
+# faccessat2's AT_SYMLINK_NOFOLLOW asks about the link itself, so a dangling one
+# exists while following it does not. Resolving the final component during
+# translation answered for the target and lost the distinction.
+ln -s /nowhere "$ROOT/dangling"
+# chroot(2) is privileged. Ungated, an unprivileged guest could move its own
+# root where a real kernel refuses -- a check the guest's own code may rely on
+# (a daemon that drops privileges and expects chroot to fail afterwards).
+mkdir -p "$ROOT/sub"
+check_contains "chroot needs CAP_SYS_CHROOT (fake-root), else EPERM" \
+    "chroot: unpriv=-1 root=0 cwd=/" \
+    "$(run -t dtest -r "$ROOT" chroot /sub 2>&1)"
+
+# Android's own seccomp filter refuses faccessat2 (measured on Android 13), and
+# dispatch then answers the ENOSYS an older kernel would have. There is no flag
+# behaviour left to compare there, so the driver says so and this pair sits out.
+nf_out=$(run -t dtest -r "$ROOT" accessnf /dangling 2>&1)
+case "$nf_out" in
+*"accessnf: unavailable"*)
+    skip "faccessat2 legs: the ambient seccomp filter refuses the syscall here"
+    ;;
+*)
+    check_contains "faccessat2 AT_SYMLINK_NOFOLLOW answers for the link itself" \
+        "accessnf: nofollow=0 follow=-2" "$nf_out"
+    check_contains "...and for an ordinary file both forms agree" \
+        "accessnf: nofollow=0 follow=0" \
+        "$(run -t dtest -r "$ROOT" accessnf /etc/greeting 2>&1)"
+    ;;
+esac
+
+# faccessat(2) is a three-argument syscall -- dirfd, path, mode -- and has no
+# flags word; only faccessat2 has one. Read as flags, a stray AT_SYMLINK_NOFOLLOW
+# in the caller's x3 made fake-root's X_OK recovery stat the /proc fd link
+# (mode 0700: executable whatever it points at) instead of the file behind it,
+# so a non-executable file answered "yes" depending on register leftovers.
+printf x > "$ROOT/etc/noexec"
+chmod 0644 "$ROOT/etc/noexec"
+exec 7< "$ROOT/etc/noexec"
+check_contains "faccessat has no flags word, so x3 cannot change its answer" \
+    "accessgb: clean=-13 dirty=-13" \
+    "$(run -t dtest -r "$ROOT" accessgb /proc/self/fd/7 2>&1)"
+exec 7<&-
+
+# Root's DAC bypass covers a *permission* denial and nothing else. It used to
+# fire on any negative answer at all and recover it from a stat, so two refusals
+# the kernel gives root as readily as anyone else came back as "granted":
+# EINVAL, for a mode word carrying bits outside R_OK|W_OK|X_OK, and EROFS, which
+# sb_permission() raises for MAY_WRITE on a read-only superblock before it ever
+# reaches the DAC check ("Nobody gets write access to a read-only fs" — no
+# capability escape, so real root sees it too).
+#
+# The EROFS half is the failure ro_denied() exists to prevent, reached by a
+# route it cannot see: it knows our own :ro binds, not a rootfs that is
+# genuinely mounted read-only — on Android /system, /vendor and /apex all are.
+# `test -w` answered yes and the write that followed got EROFS.
+ARW=$(mktemp -d)
+: >"$ARW/f"
+chmod 0444 "$ARW/f"
+a_out=$(run -t dtest -r "$ARW" accessfr /f 2>&1)
+check_contains "fake-root still grants a write the file's own mode denies" \
+    "w=0" "$a_out"
+check_contains "...but an invalid access mode stays EINVAL" "badmode=-22" \
+    "$a_out"
+check_contains "...and a missing file stays ENOENT" "missing=-2" "$a_out"
+rm -rf "$ARW"
+
+# ...and the same question asked of a filesystem that really is mounted
+# read-only. Field 4 of /proc/mounts is the option list; `test -w` on the result
+# is the host kernel confirming the premise, since inode_permission() runs
+# sb_permission() before the DAC check and so answers EROFS whatever the mode.
+M5RO=$(awk '$4 ~ /(^|,)ro(,|$)/ { print $2; exit }' /proc/mounts 2>/dev/null)
+if [ -z "$M5RO" ] || [ ! -r "$M5RO" ] || [ -w "$M5RO" ]; then
+    skip "read-only-mount leg: no read-only mount on this host to check against"
+else
+    ro_out=$(run -t dtest -r "$M5RO" accessfr / 2>&1)
+    check_contains "a genuinely read-only mount is EROFS to fake-root too" \
+        "w=-30" "$ro_out"
+    check_contains "...while a read of the same name still succeeds" "r=0" \
+        "$ro_out"
+fi
+
+# Plant a file OUTSIDE the rootfs; guest /../ must not reach it.
+printf SECRET > "$ROOT/../esc_$$"
+check_contains "dispatch blocks .. escape" \
+    "open: errno 2" \
+    "$(run -t dtest -r "$ROOT" open "/../esc_$$" 2>&1)"
+rm -f "$ROOT/../esc_$$"
+
+# /proc magic links live in the host namespace: an fd link names this process's
+# own open file whatever the rootfs is, and /proc/self/cwd is the *guest* cwd,
+# not the host one. Re-rooting either readlink target lands on nothing.
+exec 7< "$ROOT/etc/greeting"
+check_contains "dispatch openat through /proc/self/fd" \
+    "read: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" open /proc/self/fd/7 2>&1)"
+exec 7<&-
+check_contains "dispatch openat through /proc/self/cwd" \
+    "read: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" open /proc/self/cwd/etc/greeting 2>&1)"
+
+# CNG_DEBUG error logging must not read a scalar syscall arg as a path pointer:
+# truncate's length is large enough to look like one, and dereferencing it is a
+# wild read inside the handler (SIGSEGV masked there => the guest is killed).
+out=$(run -t dtest -r "$ROOT" dbgpath /etc 2>&1); rc=$?
+check "debug logging survives a scalar syscall arg" 0 "$rc"
+
+check_contains "debug logging still reports the real error" \
+    "dbgpath: survived rc=-21 -> OK" "$out"
+
+# ...and an EMPTY CNG_DEBUG is off, as it is for every other CNG_* switch (the
+# two beside it in the same loop, and cng_broker_env, all require a non-empty
+# value). `CNG_DEBUG= chroot-ng ...` is how a shell clears a variable for one
+# command; it used to turn verbose logging on instead, onto the guest's own
+# stderr -- a stream package managers capture.
+# The knob is read by cng_run, so a real (here: failing) guest launch is what
+# drives it; the banner it stamps is the cheapest thing to look for.
+check_contains "CNG_DEBUG=1 does log" "[cng] chroot-ng" \
+    "$(CNG_DEBUG=1 run "$ROOT" /nosuchprogram 2>&1)"
+check_absent "an empty CNG_DEBUG does not" "[cng] chroot-ng" \
+    "$(CNG_DEBUG= run "$ROOT" /nosuchprogram 2>&1)"
+check_absent "and CNG_DEBUG=0 does not" "[cng] chroot-ng" \
+    "$(CNG_DEBUG=0 run "$ROOT" /nosuchprogram 2>&1)"
+
+# A name resolved relative to a real dirfd must be contained exactly like an
+# absolute one. It used to be passed to the kernel untouched, and the kernel has
+# no rootfs: a ".." run climbed out (find/rm -rf/tar -C all issue these) and an
+# absolute symlink target was taken from the host root.
+mkdir -p "$ROOT/sub"
+printf SECRET > "$ROOT/../atesc_$$"
+check_contains "dirfd-relative .. cannot escape the rootfs" \
+    "atrel: errno 2" \
+    "$(run -t dtest -r "$ROOT" atrel /sub "../../atesc_$$" 2>&1)"
+rm -f "$ROOT/../atesc_$$"
+# ..-clamped, the same walk still reaches the real file inside the rootfs.
+check_contains "dirfd-relative .. still resolves inside the rootfs" \
+    "atrel: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" atrel /sub "../etc/greeting" 2>&1)"
+# An absolute symlink target is a guest path, so it re-roots rather than
+# reaching the host file of the same name.
+ln -sf /etc/greeting "$ROOT/sub/lnk"
+check_contains "dirfd-relative absolute symlink re-roots into the rootfs" \
+    "atrel: HELLO-FROM-ROOTFS" \
+    "$(run -t dtest -r "$ROOT" atrel /sub lnk 2>&1)"
+
+# AT_EMPTY_PATH names the descriptor, not a name to resolve. The empty name was
+# walked like any other relative one -- the probe deciding that ends in a
+# readlinkat, which for an empty name reports on the dirfd, so a symlink fd said
+# "this is a link, walk it" -- and the walk then resolved the fd's own guest path
+# dereferencing its final component. fstatat described the TARGET where the
+# kernel describes the link, and a dangling link answered ENOENT where the kernel
+# answers fine. That is the race-free lstat-by-fd idiom systemd and util-linux
+# use everywhere. Byte-for-byte against the host build, which is the kernel.
+EPD=$(mktemp -d)
+printf hi > "$EPD/f"; ln -s f "$EPD/l"; ln -s nowhere "$EPD/dang"
+if ! guest_xlate_ready "AT_EMPTY_PATH legs"; then
+    :
+elif guest_cc_report "$EPD/emptypath" tests/guests/emptypath.c; then
+    ep_k=""
+    if have cc && cc -O1 -o "$EPD/ep_host" tests/guests/emptypath.c 2>/dev/null; then
+        ep_k=$(kref "$EPD/ep_host" "$EPD" 2>/dev/null)
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    ep_g=$(run_t 60 -R $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    # A kernel before 3.19 has no execveat and answers every exec_ line ENOSYS:
+    # no reference for that half, which the emulation answers as the 6.1 it
+    # advertises. The rest is still the kernel's to judge.
+    case "$ep_k" in
+    *"exec_cwd=38"*)
+        skip "AT_EMPTY_PATH execveat differential: the host kernel predates execveat (3.19), so it is no reference"
+        ep_k=$(printf '%s\n' "$ep_k" | grep -v '^exec_')
+        ep_g=$(printf '%s\n' "$ep_g" | grep -v '^exec_') ;;
+    esac
+    if [ -z "$ep_k" ]; then
+        skip "AT_EMPTY_PATH differential: no host compiler for the oracle"
+    elif [ "$ep_k" = "$ep_g" ]; then
+        pass=$((pass + 1))
+        echo "  ok   AT_EMPTY_PATH matches the kernel byte-for-byte"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL AT_EMPTY_PATH diverges from the kernel"
+        printf '    kernel: %s\n' "$(echo "$ep_k" | tr '\n' '|')"
+        printf '    cng   : %s\n' "$(echo "$ep_g" | tr '\n' '|')"
+    fi
+    # linkat's half of the flag is a capability question, and the kernel's
+    # answer is what the differential above pins: before 6.10 an unprivileged
+    # caller is refused with ENOENT ahead of everything else, and it used to
+    # get the link anyway, made through the descriptor's /proc link. Under
+    # fake root the capability is faked the way chroot's CAP_SYS_CHROOT is, so
+    # the descriptor links on every kernel — and the number still has to be
+    # one: AT_FDCWD is the working directory (EPERM: no link to a directory),
+    # a negative or closed number is EBADF, as root would have had them.
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    ep_r=$(run_t 60 -R -u 0:0 $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    # ...and the link it makes is the host's to make: made where the filesystem
+    # allows a hardlink (link_plain=0), and answered with the host's own errno
+    # where it does not (Android's SELinux policy: EACCES). Either way it is a
+    # link by name's verdict, which is not what the capability gate answers.
+    ep_lp=$(printf '%s\n' "$ep_r" | sed -n 's/^link_plain=//p')
+    case "$ep_lp" in '' | *[!0-9]*) ep_lp=missing ;; esac
+    check_contains "fake root links by descriptor on every kernel" \
+        "link_byfd=$ep_lp" "$ep_r"
+    check_contains "...and AT_FDCWD is still the working directory there" \
+        "link_cwd=1" "$ep_r"
+    check_contains "...a number that is no descriptor is still EBADF" \
+        "link_negfd=9" "$ep_r"
+    check_contains "...a closed one too" "link_closedfd=9" "$ep_r"
+    check_contains "...and an unknown flag bit is still EINVAL" \
+        "link_badflag=22" "$ep_r"
+    check_contains "...and the flag beside a real name links it" \
+        "link_named_flag=$ep_lp" "$ep_r"
+fi
+rm -rf "$EPD"
+
+# name_to_handle_at's flag runs the other way from every other *at() call: it
+# does NOT follow a final symlink unless AT_SYMLINK_FOLLOW is given. Translation
+# treated it as a follower, so it encoded the target instead of the link, and a
+# dangling link — which the kernel encodes happily, never looking at the target —
+# came back ENOENT. Byte-for-byte against the host build.
+NHD=$(mktemp -d)
+printf hi > "$NHD/f"; ln -s f "$NHD/l"; ln -s nowhere "$NHD/dang"
+if ! guest_xlate_ready "name_to_handle_at legs"; then
+    :
+elif guest_cc_report "$NHD/handleat" tests/guests/handleat.c; then
+    nh_k=""
+    nh_built=0
+    if have cc && cc -O1 -o "$NHD/nh_host" tests/guests/handleat.c 2>/dev/null; then
+        nh_built=1
+        # Android's ambient filter kills a process that issues name_to_handle_at
+        # (SIGSYS), and the shell reports that on ITS stderr: the group takes it.
+        nh_k=$({ kref "$NHD/nh_host" "$NHD" || true; } 2>/dev/null)
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    nh_g=$(run_t 60 -R $GUEST_BINDS "$NHD" /handleat 2>/dev/null)
+    if [ "$nh_built" = 0 ]; then
+        skip "name_to_handle_at differential: no host compiler for the oracle"
+    elif [ -z "$nh_k" ]; then
+        skip "name_to_handle_at differential: the host build cannot issue it (the ambient filter refuses it)"
+    elif [ "$nh_k" = "$nh_g" ]; then
+        pass=$((pass + 1))
+        echo "  ok   name_to_handle_at matches the kernel byte-for-byte"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL name_to_handle_at diverges from the kernel"
+        printf '    kernel: %s\n' "$(echo "$nh_k" | tr '\n' '|')"
+        printf '    cng   : %s\n' "$(echo "$nh_g" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$NHD"
+
+# The xattr family was never trapped, so a guest's absolute path reached the HOST
+# filesystem: getxattr answered existence questions about it and setxattr wrote
+# it. Translation shows up in the errno: a name that resolves inside the rootfs
+# reaches a real file and answers "no such attribute", while an untranslated path
+# lands on a host name that is not there -> ENOENT (2).
+#
+# Which errno "reached a real file" is depends on the filesystem holding it --
+# ENODATA (61) where user.* xattrs are supported, EOPNOTSUPP (95) where they are
+# not (tmpfs before 6.6), or an SELinux refusal on a device -- so take it from an
+# identity-rootfs control run over the very same file instead of pinning a
+# number. All that matters is that it is distinguishable from ENOENT.
+xa_ctl=$(run -t dtest -r / getxa "$ROOT/etc/greeting" 2>&1)
+xa_real=$(printf '%s\n' "$xa_ctl" |
+    sed -n 's/.*getxa: errno \([0-9]*\).*/\1/p' | head -1)
+# The host-only path is one we create outside the rootfs: absolute, present on
+# the host, and absent from the rootfs, which is the shape of the pre-fix escape.
+XAH=$(mktemp); printf x >"$XAH"
+if [ -z "$xa_real" ] || [ "$xa_real" = 2 ]; then
+    skip "xattr legs: no errno on this filesystem distinguishes reached from contained"
+else
+    check_contains "xattr on a host-only path is contained" \
+        "getxa: errno 2" \
+        "$(run -t dtest -r "$ROOT" getxa "$XAH" 2>&1)"
+    check_contains "xattr reaches the rootfs file, so it is translated not blocked" \
+        "getxa: errno $xa_real" \
+        "$(run -t dtest -r "$ROOT" getxa /etc/greeting 2>&1)"
+fi
+# getxattrat (6.13) is the same question by (dirfd, path), and was in no table
+# at all: the numbers came from the build host's headers, which ended before
+# it. Only a kernel that has the call can show the difference between reached
+# and contained (ENOSYS says nothing about the path); the dispatcher's own
+# handling of it is covered by the `newat` op below on every host.
+xaat_real=$(printf '%s\n' "$xa_ctl" |
+    sed -n 's/.*getxaat: errno \([0-9]*\).*/\1/p' | head -1)
+if [ -z "$xaat_real" ] || [ "$xaat_real" = 38 ]; then
+    skip "getxattrat legs: this kernel has no getxattrat (errno ${xaat_real:-?})"
+elif [ "$xaat_real" = 2 ]; then
+    skip "getxattrat legs: no errno on this filesystem distinguishes reached from contained"
+else
+    check_contains "getxattrat on a host-only path is contained" \
+        "getxaat: errno 2" \
+        "$(run -t dtest -r "$ROOT" getxa "$XAH" 2>&1)"
+    check_contains "getxattrat reaches the rootfs file, so it is translated" \
+        "getxaat: errno $xaat_real" \
+        "$(run -t dtest -r "$ROOT" getxa /etc/greeting 2>&1)"
+fi
+rm -f "$XAH"
+# What the dispatcher decides about the six new calls before any kernel is
+# asked: the path is read from the right register, ".." through a file is
+# ENOTDIR, an empty name is ENOENT unless the family's own AT_EMPTY_PATH slot
+# says otherwise.
+out=$(run -t dtest -r "$ROOT" newat /etc/greeting 2>&1); rc=$?
+check "the 6.13/6.17 dirfd calls are dispatched as path syscalls" 0 "$rc"
+for _leg in getxattrat setxattrat listxattrat removexattrat file_getattr \
+    file_setattr; do
+    check_contains "$_leg reads its path from (a0, a1)" \
+        "newat $_leg-dotdot: rc=-20 -> OK" "$out"
+done
+check_contains "an empty name without AT_EMPTY_PATH is ENOENT for both families" \
+    "newat file_getattr-empty: rc=-2 -> OK" "$out"
+check_contains "...and AT_EMPTY_PATH is read from each family's own slot" \
+    "newat empty-path-flag: getxattrat=" "$out"
+check_absent "no newat leg failed" "-> FAIL" "$out"
+
+# inotify_add_watch is the last path-bearing syscall with no dirfd form, and the
+# only one whose a0 is not one — which is how it was missed. Untranslated it was
+# the containment exactly inverted: a watch on a name present only on the HOST
+# armed, while the rootfs's own file answered ENOENT. Both directions are
+# asserted, so a blanket refusal cannot pass either.
+INOH=$(mktemp); printf x >"$INOH"
+check_contains "inotify on a host-only path is contained" \
+    "inotify: errno 2" \
+    "$(run -t dtest -r "$ROOT" inotify "$INOH" 2>&1)"
+check_contains "inotify reaches the rootfs file, so it is translated not blocked" \
+    "inotify: errno 0" \
+    "$(run -t dtest -r "$ROOT" inotify /etc/greeting 2>&1)"
+rm -f "$INOH"
+
+# A ":ro" bind must answer EROFS for every mutating path syscall while still
+# serving reads. The rw run is the negative control: the same calls must NOT
+# report EROFS there, so a blanket refusal cannot pass both legs.
+RB=$(mktemp -d); printf 'RO-DATA' > "$RB/f"
+out=$(run -t dtest -r "$ROOT" -b "$RB":/ro:ro robind /ro/f 2>&1); rc=$?
+check ":ro bind refuses every mutating syscall" 0 "$rc"
+check_contains ":ro bind still serves reads" "robind ro read: rc=" "$out"
+check_contains ":ro bind refuses a write open" \
+    "robind ro open-w: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses unlinkat" \
+    "robind ro unlinkat: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses rename" \
+    "robind ro renameat: rc=-30 -> OK" "$out"
+# The 6.13/6.17 dirfd-relative setters, which were in no table at all.
+check_contains ":ro bind refuses setxattrat" \
+    "robind ro setxattrat: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses file_setattr" \
+    "robind ro file_setattr: rc=-30 -> OK" "$out"
+# access(W_OK) reports a read-only filesystem — SuS requires it and the kernel
+# does it — so `test -w` inside a :ro bind agrees with what the write would do
+# rather than with the host file's own mode. R_OK on the same name still passes.
+check_contains ":ro bind reports itself to access(W_OK)" \
+    "robind ro access-w: rc=-30 -> OK" "$out"
+check_contains ":ro bind still answers access(R_OK)" \
+    "robind ro access-r: rc=0 -> OK" "$out"
+# The refusal keys on the resolved HOST path, and a plain name against a
+# directory fd inside the bind never used to acquire one — so it went straight
+# to the kernel and the mount was read-only only to whoever spelled the name out
+# in full. rm -rf, find -delete, tar and git all work through a dirfd.
+check_contains ":ro bind refuses a write open through a dirfd" \
+    "robind ro at-open-w: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses a create through a dirfd" \
+    "robind ro at-creat: rc=-30 -> OK" "$out"
+check_contains ":ro bind refuses an unlink through a dirfd" \
+    "robind ro at-unlink: rc=-30 -> OK" "$out"
+check_contains ":ro bind still reads through a dirfd" \
+    "robind ro at-read: rc=" "$out"
+# ...and through the fd magic link of a descriptor opened read-only (or
+# O_PATH) under the bind. The link resolves to a host path that names no
+# bind, so a write-open of it went straight through: open the file read-only,
+# reopen /proc/self/fd/N with O_WRONLY or O_TRUNC, and the host file was
+# written. A real read-only mount refuses the reopen — the description was
+# opened through it — and so does this now, keyed on the file the link stands
+# for. The read-only reopen is the control that the link itself still works.
+check_contains ":ro bind still reopens read-only through an fd link" \
+    "robind ro fdlink-read: rc=" "$out"
+for _leg in fdlink-open-w fdlink-open-trunc devfd-open-w pathfd-open-w \
+    fdlink-truncate fdlink-chmod; do
+    check_contains ":ro bind refuses $_leg through an fd link" \
+        "robind ro $_leg: rc=-30 -> OK" "$out"
+done
+# ...and by descriptor alone: the calls that carry no path for the refusal to
+# key on. The bind hands out read-only descriptors, and fchmod, fchown,
+# futimens, the fd xattr setters, the AT_EMPTY_PATH spellings of the path
+# forms and the mount-writing ioctls on one all used to go to the kernel with
+# nothing in the way — where a real read-only mount refuses every one of them
+# (mnt_want_write_file). FIDEDUPERANGE names its target in its argument and
+# is judged per destination; a kernel with no dedupe at all (tmpfs, qemu-user)
+# fails the call whole, which the driver reports and does not judge.
+for _leg in fchmod fchown fchmod-dir futimens fsetxattr fremovexattr \
+    fchownat-empty fchmodat2-empty setxattrat-empty file_setattr-empty \
+    ioctl-setflags ioctl-fssetxattr cwd-empty; do
+    check_contains ":ro bind refuses $_leg by descriptor" \
+        "robind ro $_leg: rc=-30 -> OK" "$out"
+done
+check_contains ":ro bind's dedupe destination is judged, or dedupe is absent here" \
+    "robind ro dedupe: rc=" "$out"
+check_absent ":ro bind's dedupe destination did not fail the judgement" \
+    "robind ro dedupe: rc=0 status=0" "$out"
+# A read-only mount refuses where the kernel reaches it, and for the calls that
+# must operate on an existing name that is *after* the path has resolved -- so a
+# name that is not there is ENOENT, the same answer a writable mount gives. The
+# refusal used to be returned before the syscall was issued and so did not
+# depend on the file existing, which told `[ -e f ] || : >f` that an absent file
+# was present and sent it down the wrong branch. Measured on a squashfs mount:
+# open(missing, O_WRONLY), O_TRUNC, truncate, chmod, chown and utimensat all
+# answer ENOENT there, and EROFS only on a name that is there.
+for _leg in open-w open-trunc truncate chmod chown utimensat; do
+    check_contains ":ro bind answers ENOENT for a $_leg on a name that is not there" \
+        "robind ro miss-$_leg: rc=-2 -> OK" "$out"
+done
+# ...and the other half, which the kernel orders the other way round: the
+# create-and-remove family takes write access on the parent before it looks at
+# the final component, so those are EROFS even for a name that is not there.
+for _leg in open-creat mkdir unlink; do
+    check_contains ":ro bind answers EROFS for a $_leg on a name that is not there" \
+        "robind ro miss-$_leg: rc=-30 -> OK" "$out"
+done
+out=$(run -t dtest -r "$ROOT" -b "$RB":/rw robind /rw/f 2>&1); rc=$?
+check "a plain (rw) bind reports no EROFS" 0 "$rc"
+rm -rf "$RB"
+
+# ...and the same bind with a link2symlink group in it. The emulation's names
+# are symlinks onto a data file in the store under the rootfs, which no bind
+# covers — so every mutator that followed one arrived at a writable file and
+# the :ro mount over the guest's own name was lost on the way. To the guest
+# that name is a regular file, and a real hardlink cannot leave its mount at
+# all, so the mount over the NAME is what governs it. The group is built by
+# the driver through the l2s API (the bind refuses the linkat that would make
+# one), which is also how such a tree arises: linked while writable, bound
+# read-only afterwards.
+LB=$(mktemp -d); printf 'L2S-DATA' > "$LB/f"
+out=$(run -t dtest -r "$ROOT" -b "$LB":/ro:ro l2sro /ro/f 2>&1); rc=$?
+check ":ro bind refuses every mutating syscall on an l2s name" 0 "$rc"
+check_contains "the group's data really is outside the bind" \
+    "l2sro group: link=0 group=1 data-outside-bind=1" "$out"
+check_contains ":ro bind still serves reads of an l2s name" \
+    "l2sro ro read: rc=" "$out"
+check_contains ":ro bind still answers access(R_OK) on an l2s name" \
+    "l2sro ro access-r: rc=0 -> OK" "$out"
+for _leg in open-w open-trunc access-w truncate fchmodat fchownat utimensat \
+    setxattr setxattrat file_setattr unlinkat fdlink-open-w; do
+    check_contains ":ro bind refuses $_leg on an l2s name" \
+        "l2sro ro $_leg: rc=-30 -> OK" "$out"
+done
+rm -rf "$LB"
+LB=$(mktemp -d); printf 'L2S-DATA' > "$LB/f"
+out=$(run -t dtest -r "$ROOT" -b "$LB":/rw l2sro /rw/f 2>&1); rc=$?
+check "a plain (rw) bind reports no EROFS on an l2s name" 0 "$rc"
+rm -rf "$LB"
+
+# A link out of a :ro bind. A real one is EXDEV — a link cannot span mounts,
+# and the bind is one — after the new name's own verdict (EEXIST, ENOENT).
+# Made anyway, on a host whose filesystem allowed it, the new name was a
+# writable way into the :ro file, and under -l the fallback moved the file
+# into the store and left a symlink in the bind. By name, through a followed
+# symlink, by descriptor (whose source verdict stays the kernel's), and
+# through the fallback; then a group such a link already made — data under
+# the bind, a writable name outside — which is read-only through that name,
+# is not decref'd on the :ro mount, and cannot be linked out again. The rw
+# bind is the control: there every link is the host's to make.
+LR=$(mktemp -d); LB=$(mktemp -d); printf 'RO-DATA' > "$LB/f"
+out=$(run -t dtest -r "$LR" -b "$LB":/ro:ro rolink /ro/f 2>&1); rc=$?
+check "a link out of a :ro bind is refused as a real one is" 0 "$rc"
+for _leg in name followed l2s-fallback; do
+    check_contains "a link out of a :ro bind ($_leg) is EXDEV" \
+        "rolink ro $_leg: rc=-18" "$out"
+done
+# By descriptor the source is the kernel's to judge first, and before 6.10 it
+# refuses AT_EMPTY_PATH without CAP_DAC_READ_SEARCH (ENOENT, measured on 6.8).
+# The op asks the kernel and expects EXDEV where it takes the descriptor, its
+# own errno where it does not; its verdict is the needle, not a fixed errno.
+check_contains "a link out of a :ro bind (by-fd) is EXDEV where the kernel takes the descriptor" \
+    "-> OK" "$(printf '%s\n' "$out" | grep '^rolink ro by-fd: ')"
+check_contains "...after the new name's EEXIST" "rolink ro dst-taken: rc=-17 -> OK" "$out"
+check_contains "...and its missing directory's ENOENT" \
+    "rolink ro dst-nodir: rc=-2 -> OK" "$out"
+check_contains "...and the bind's file is left as it was" \
+    "rolink ro file-kept: 1 -> OK" "$out"
+for _leg in pair-utimensat pair-fchownat pair-open-w; do
+    check_contains "a group with its data under a :ro bind refuses $_leg" \
+        "rolink ro $_leg: rc=-30 -> OK" "$out"
+done
+check_contains "...and its name cannot be linked out again" \
+    "rolink ro pair-link: rc=-18 -> OK" "$out"
+check_contains "...and its name's unlink leaves the count on the :ro mount" \
+    "rolink ro pair-count-kept: 1 -> OK" "$out"
+rm -rf "$LR" "$LB"
+LR=$(mktemp -d); LB=$(mktemp -d); printf 'RW-DATA' > "$LB/f"
+out=$(run -t dtest -r "$LR" -b "$LB":/rw rolink /rw/f 2>&1); rc=$?
+check "a link out of a plain (rw) bind is the host's to make" 0 "$rc"
+rm -rf "$LR" "$LB"
+
+run -t sigtest >/dev/null 2>&1
+check "signal round-trip + ucontext readable" 0 $?
+check_contains "sigtest handler ran" "handler ran" "$(run -t sigtest 2>&1)"
+
+rm -rf "$ROOT"
+
+# symlink resolution: absolute guest-target symlinks re-rooted (Alpine busybox
+# style), relative symlinks, and no escape via a symlink target.
+SR=$(mktemp -d)
+mkdir -p "$SR/bin"
+printf REAL-BB > "$SR/bin/busybox"
+ln -s /bin/busybox "$SR/bin/ls"
+ln -s busybox "$SR/bin/cat"
+ln -s /../../../etc/passwd "$SR/bin/esc"
+check_contains "abs symlink re-rooted into rootfs" "read: REAL-BB" \
+    "$(run -t dtest -r "$SR" open /bin/ls 2>&1)"
+check_contains "relative symlink resolved" "read: REAL-BB" \
+    "$(run -t dtest -r "$SR" open /bin/cat 2>&1)"
+check_contains "symlink target cannot escape rootfs" "open: errno 2" \
+    "$(run -t dtest -r "$SR" open /bin/esc 2>&1)"
+rm -rf "$SR"
+
+# The SIGSYS handler runs the (stack-hungry) dispatcher on a large per-thread
+# scratch stack so it never smashes a small guest stack (e.g. Go's ~8 KiB
+# goroutine stacks). Validate the stack-switch trampoline itself.
+out=$(run -t stackswtest 2>&1); rc=$?
+check "stackswtest exit 0" 0 "$rc"
+check_contains "handler stack switch runs on scratch and preserves caller" \
+    "stacksw: ran_on_scratch=1 ret=0xc0de caller_ok=1 -> OK" "$out"
+# ...and there has to be a stack to switch to. The table those come from is keyed
+# by TID and had no way to give a slot back: nothing hooks thread exit, so a
+# runtime that gets through hundreds of short-lived threads (Go, a JVM's GC
+# workers) filled it, and from then on the dispatcher ran on the guest's own
+# stack — where its frame is bigger than a guard page, so it steps over the guard
+# into guest memory instead of faulting. A slot whose thread has exited is now
+# taken over, stack and all; a live thread's is never touched.
+check_contains "a full scratch table recovers the slots of threads that exited" \
+    "stacksw reclaim: filled=300/300 then=" "$out"
+check_contains "...with a stack, and never at the expense of a live thread" \
+    "mapped=1 mine_kept=1 -> OK" "$out"
+# The stack has to be a VMA of its own. The kernel merges adjacent anonymous
+# mappings of equal permissions, and SELinux judges an mprotect(PROT_EXEC) with
+# the whole VMA the range lies in: one holding the caller's stack pointer is a
+# stack being made executable, which an Android app domain is refused. A bare
+# stack sat among the guest's own mappings, so every executable mprotect made
+# from the handler failed for a page beside it (the JVM's startup probe, which
+# is how this was found). A PROT_NONE page on each side cannot merge with a
+# read-write neighbour.
+check_contains "the scratch stack is bounded by inaccessible pages" \
+    "stacksw guards: below=---p first=rw-p last=rw-p above=---p -> OK" "$out"
+
+# End to end, the shape the JVM hit: a page that shares a VMA with a thread's
+# stack, made executable by that thread. Where SELinux is enforcing the kernel
+# refuses it for the stack pointer's sake (EACCES), so what is asserted is that
+# the guest gets the same answer for that page as for one of its own. Elsewhere
+# the call never fails and the legs pass without proving much; the structural
+# legs above are what hold there. The gate is the harness's own probe of
+# anonymous executable memory, not a case of the guest's: a baseline taken
+# through the monitor would be refused by the very defect being tested (under
+# -R the dispatcher's stack was in the page's VMA), and the leg would skip
+# instead of fail.
+EXD=$(mktemp -d)
+if guest_xlate_ready "executable mprotect beside a thread's stack" &&
+    guest_cc_report "$EXD/execstack" tests/guests/execstack.c -lpthread; then
+    for _tier in -R plain; do
+        if [ "$_tier" = plain ]; then
+            if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+                skip "executable mprotect beside a thread's stack, seccomp tier: the filter is inert here"
+                continue
+            fi
+            _opt=""
+        else
+            _opt="-R"
+        fi
+        if [ "$CNG_EXECMEM" != 1 ]; then
+            skip "executable mprotect beside a thread's stack ($_tier): the host denies anonymous executable memory"
+            continue
+        fi
+        # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
+        out=$(run_t 60 $_opt $GUEST_BINDS "$EXD" /execstack 2>/dev/null)
+        check_contains "a page of its own can be made RWX ($_tier)" \
+            "rwx_main=0" "$out"
+        check_contains "a page beside a thread's stack can be made RWX ($_tier)" \
+            "rwx_beside_stack=0" "$out"
+        check_contains "...or R+X ($_tier)" "rx_beside_stack=0" "$out"
+        check_contains "...and the guest is none the worse for it ($_tier)" \
+            "rwx_after=0" "$out"
+    done
+fi
+rm -rf "$EXD"
+
+# And a SIGSYS that arrives while the handler is already on that scratch stack
+# must not land on the frame of the one that put it there. The kernel picks a
+# frame's address with sigsp(): SA_ONSTACK plus an SP that is not on the
+# alt-stack means the alt-stack TOP — which the handler satisfies a second time
+# once it has switched stacks, so the nested frame was written at exactly the
+# outer frame's address (measured with a plain C repro, natively and under qemu:
+# delta 0). The alt-stack is now disarmed for the duration; rt_sigreturn puts the
+# guest's back from the frame. A real nested SIGSYS needs an ambient filter to
+# block a syscall we re-issue, so the handler raises one itself on request.
+out=$(run -t nesttest 2>&1); rc=$?
+check "nesttest exit 0" 0 "$rc"
+check_contains "a nested SIGSYS frame does not land on the outer one" \
+    "nested=elsewhere same=0 -> OK" "$out"
+check_contains "...and the outer handler still returns through its own frame" \
+    "nest: child status 0 -> OK" "$out"
+
+# The guest's view of SIGSYS, whose real disposition is the monitor's for the
+# life of the process. rt_sigaction(SIGSYS) used to be answered with a bare 0 —
+# no sigsetsize check, no EFAULT for a bad pointer, and a query that never saw
+# the handler the guest had installed — and a SIGSYS that was not a seccomp
+# trap was consumed by our handler: kill -SYS did nothing, where the kernel's
+# default action is a core dump. Now the call is answered from ptsig.c's mirror
+# with the kernel's own checks and order (size, then act, then oact), the real
+# handler is never touched by it, and a tgkill'd SIGSYS goes to the mirrored
+# disposition: default kills (WIFSIGNALED, SIGSYS), SIG_IGN drops, a handler
+# runs with its siginfo under sa_mask — SIGSYS itself being the one bit that
+# cannot be added, since a masked seccomp SIGSYS force-kills — with the guest's
+# own mask back afterwards, and SA_RESETHAND puts the default back so the second
+# one kills. The emulated execve resets the mirror as the kernel resets
+# dispositions: handlers to default, SIG_IGN kept but stripped of flags and mask.
+# The two deaths are compared with the host's own for a plain SIG_DFL SIGSYS
+# rather than pinned to a status: the 0x80 core-dumped bit in it is the host's
+# core policy (a pipe core_pattern dumps under RLIMIT_CORE 0, a file one does
+# not), which the leg used to assume was "no core" from the dev host's settings.
+out=$(run -t sigsystest 2>&1); rc=$?
+check "sigsystest exit 0" 0 "$rc"
+check_contains "rt_sigaction(SIGSYS) is answered from the mirror with the kernel's checks" \
+    "sigsys sigaction: size=-22 act=-14 oact=-14 dfl=1 ign=1 handler=1 real_kept=1 -> OK" "$out"
+check_contains "the emulated execve resets the SIGSYS disposition as the kernel would" \
+    "sigsys exec reset: ign_bare=1 handler_dfl=1 -> OK" "$out"
+check_contains "a guest-directed SIGSYS takes the default action: death" \
+    "sigsys default action: killed_by_sigsys=1 as_kernel=1" "$out"
+check_contains "...is dropped under SIG_IGN" \
+    "sigsys ignored: status=0x2a00 survived=1 -> OK" "$out"
+check_contains "...runs the guest's handler under its sa_mask" \
+    "sigsys handled: status=0x2b00 runs=1 sig=31 code=-6 sa_mask=1 sigsys_unblocked=1 mask_back=1 -> OK" "$out"
+check_contains "...and SA_RESETHAND puts the default back for the next one" \
+    "sigsys resethand: runs=1 reset=1 second_kills=1 as_kernel=1" "$out"
+
+# ...and what runs there must not itself scale with the guest's argv. The
+# emulated execve accepts a quarter of RLIMIT_STACK of arguments (megabytes),
+# and the guest-stack builder used to collect one address per entry in a VLA of
+# the caller's stack -- so an exec the kernel takes happily, `rm *` in a
+# directory of fifty thousand files, overflowed the 256 KiB scratch stack. With
+# every signal but SIGSYS masked there, that kills the guest outright: before
+# the fix this leg does not fail, it segfaults.
+out=$(run -t argvtest 2>&1); rc=$?
+check "argvtest exit 0" 0 "$rc"
+check_contains "a 50k-entry argv builds on a handler-sized stack" \
+    "argv: n=50000 shape=1 strings=1 env=1 caller_ok=1 -> OK" "$out"
+
+# A vfork-style clone (CLONE_VFORK|CLONE_VM, as Go's os/exec and posix_spawn use)
+# must be converted to a real COW fork, or the in-process emulated execve would
+# load the new program over the shared parent's memory.
+out=$(run -t clonetest 2>&1); rc=$?
+check "clonetest exit 0" 0 "$rc"
+check_contains "vfork clone converted to private-VM fork" \
+    "clone: pid>0=1 child_exit7=1 private_vm=1 sp_kept=1 -> OK" "$out"
+
+# A vfork-style clone carrying a caller-provided child stack (musl __clone /
+# posix_spawn, as gcc uses to launch cc1) must resume the converted child on
+# that stack — driven through the real SIGSYS body, which fixes uc->sp.
+out=$(run -t clonestktest 2>&1); rc=$?
+check "clonestktest exit 0" 0 "$rc"
+check_contains "converted clone resumes child on its own stack" \
+    "clonestk: pid>0=1 child_sp=childstk=1 parent_sp=orig=1 -> OK" "$out"
+
+# The BPF filter itself: qemu-user does not honor a guest's seccomp filter, so
+# its logic is verified by building it and running it through an interpreter —
+# the only pre-device check available for it.
+out=$(run -t bpftest 2>&1); rc=$?
+check "bpftest exit 0" 0 "$rc"
+check_contains "filter is structurally valid (jumps in range, ends in RET)" \
+    "jumps_in_range=1 -> OK" "$out"
+check_contains "path syscalls trap, others run native" \
+    "bpftest openat traps: TRAP -> OK" "$out"
+check_contains "in-gate reissue is allowed (no re-trap)" \
+    "bpftest in-gate reissue allowed: ALLOW -> OK" "$out"
+check_contains "fork traps (registry publish), threads do not" \
+    "bpftest thread runs native: ALLOW -> OK" "$out"
+check_contains "reads trap only for the reserved synthesized fd range" \
+    "bpftest read of a synth fd traps: TRAP -> OK" "$out"
+check_contains "an fd arg with a dirty upper half is judged on its low word" \
+    "bpftest read with a dirty upper half is judged on the low word: ALLOW -> OK" \
+    "$out"
+check_contains "a foreign architecture is killed" \
+    "bpftest foreign arch killed -> OK" "$out"
+check_contains "the System V shm syscalls trap (M12 emulation)" \
+    "bpftest shmat traps: TRAP -> OK" "$out"
+# mprotect(PROT_EXEC) is judged by SELinux against the whole VMA the range lies
+# in, stack pointer and all, so it has to be made from the dispatcher's own
+# stack rather than the guest's. Only that shape traps: RELRO, guard pages and
+# the allocator's growth carry no PROT_EXEC and must not pay for a handler.
+check_contains "an executable mprotect traps (made from the scratch stack)" \
+    "bpftest mprotect RWX traps: TRAP -> OK" "$out"
+check_contains "...whichever other bits ride with PROT_EXEC" \
+    "bpftest mprotect RX traps: TRAP -> OK" "$out"
+check_contains "...down to PROT_EXEC alone" \
+    "bpftest mprotect X alone traps: TRAP -> OK" "$out"
+check_contains "an mprotect without PROT_EXEC runs native" \
+    "bpftest mprotect RW runs native: ALLOW -> OK" "$out"
+check_contains "...PROT_NONE included" \
+    "bpftest mprotect PROT_NONE runs native: ALLOW -> OK" "$out"
+check_contains "the dispatcher's own mprotect is not trapped again" \
+    "bpftest mprotect the dispatcher's own re-issue is allowed: ALLOW -> OK" "$out"
+# io_uring submits path operations through a ring, never an svc, so a created
+# ring reaches the host filesystem with no trap and no translation. The filter
+# must refuse it outright -- including from inside the gate, which exempts our
+# own re-issues but must not become a hole for a call we never make.
+check_contains "io_uring is refused ENOSYS by the filter" \
+    "bpftest io_uring_setup is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "io_uring is refused even from inside the gate" \
+    "bpftest in-gate io_uring is refused too: ERRNO -> OK" "$out"
+# clone3's flags sit behind a pointer, so BPF cannot tell a thread from a vfork.
+# Refusing it puts glibc's posix_spawn/pthread_create back on __NR_clone, where
+# the CLONE_VFORK->fork conversion lives; otherwise a shared-VM child would
+# reach the emulated execve and load the new program over its parent.
+check_contains "clone3 is refused so spawns use the converted clone path" \
+    "bpftest clone3 is refused ENOSYS: ERRNO -> OK" "$out"
+# acct(2) names a file, and was the last path-bearing syscall in the table that
+# was neither trapped nor refused: unprivileged it is EPERM, but chroot-ng run
+# as root would have pointed the machine's process accounting at whatever the
+# guest named. It cannot be translated either -- there is one such file per
+# machine, so re-rooting the name only files the host's records in the guest.
+check_contains "acct is refused ENOSYS by the filter" \
+    "bpftest acct is refused ENOSYS: ERRNO -> OK" "$out"
+# A guest-installed filter also governs the syscalls the SIGSYS handler
+# re-issues through the gate, which that filter knows nothing about -- so
+# seccomp(2) is refused outright. prctl carries the same capability under an op
+# number it shares with process state we must not slow down (bionic's allocator
+# calls PR_SET_VMA on every mapping), so the filter tests the op itself.
+check_contains "seccomp(2) is refused ENOSYS by the filter" \
+    "bpftest seccomp(2) is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "the prctl ops that describe our confinement trap" \
+    "bpftest prctl PR_SET_SECCOMP traps: TRAP -> OK" "$out"
+check_contains "PR_GET_SECCOMP traps, so it cannot report our mode 2" \
+    "bpftest prctl PR_GET_SECCOMP traps: TRAP -> OK" "$out"
+check_contains "the rest of prctl stays untrapped" \
+    "bpftest prctl PR_SET_VMA runs native: ALLOW -> OK" "$out"
+# fstat/fchmod are trapped only where they have something to do: under a fake
+# identity, where fstat must remap ownership the way stat does and fchmod needs
+# the same fail-soft; and with the /proc synthesis on, where the memfd behind a
+# synthesized fd must not answer fstat/fstatfs for the real file. With both
+# off, an ordinary fstat must not pay for a trap.
+check_contains "fstat is trapped for fake-id and /proc synthesis, and only then" \
+    "bpftest fake-id: fstat_off=1 fstat_proc=1 fstat_on=1 fchmod_on=1 -> OK" \
+    "$out"
+# The hidden-process view by pid: process_vm_readv/writev and pidfd_open are
+# the routes to a process that carry no path, so they trap while there is a
+# view to apply and run native under --no-proc, where nothing is hidden.
+# pidfd_getfd's import is judged whatever the view, and traps either way.
+check_contains "the pid-keyed routes trap with the /proc view and not without" \
+    "bpftest hidden-pid: pvm_proc=1 pidfd_proc=1 pvm_off=1 pidfd_off=1 getfd_always=1 -> OK" \
+    "$out"
+# SysV sem/msg are emulated from the same broker as shm, so they trap rather
+# than being refused -- and they trap unconditionally, so the guest gets its own
+# namespace whatever the host's own IPC would have allowed.
+check_contains "SysV semaphores trap for emulation" \
+    "bpftest semget traps: TRAP -> OK" "$out"
+check_contains "...including the blocking operation" \
+    "bpftest semtimedop traps: TRAP -> OK" "$out"
+check_contains "SysV message queues trap for emulation" \
+    "bpftest msgget traps: TRAP -> OK" "$out"
+check_contains "...including both ends of the queue" \
+    "bpftest msgrcv traps: TRAP -> OK" "$out"
+# POSIX mqueue: the same leak one namespace over. An mq name is not a filesystem
+# path -- it names an entry in the per-IPC-namespace mqueue mount -- so no path
+# trap can translate it and the rootfs prefix cannot scope it. Left native, a
+# guest mq_open() created its queue in the HOST's namespace.
+check_contains "POSIX message queues no longer reach the host namespace" \
+    "bpftest mq_open is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "and the descriptor-taking mqueue calls are refused with them" \
+    "bpftest mq_timedsend is refused ENOSYS: ERRNO -> OK" "$out"
+check_contains "shm is still emulated rather than refused" \
+    "bpftest shmget still traps for emulation: TRAP -> OK" "$out"
+check_contains "fchmodat2 is translated, not refused" \
+    "bpftest fchmodat2 traps for translation: TRAP -> OK" "$out"
+# The syscall numbers are our own table now (include/cng/unistd.h), not the
+# build host's headers: a number the headers did not know used to fall out of
+# the filter altogether, and the filter's default is ALLOW -- so a guest on a
+# newer kernel reached the host by the raw number, untranslated and unrefused.
+# These are the path-bearing calls born after the previous table's last entry
+# (6.13's *xattrat family, 6.17's file_[gs]etattr, 6.15's open_tree_attr).
+for _leg in setxattrat getxattrat listxattrat removexattrat file_getattr \
+    file_setattr openat2 execveat; do
+    check_contains "$_leg is in the filter whatever headers built this binary" \
+        "bpftest $_leg traps for " "$out"
+done
+for _leg in open_tree_attr open_tree statmount; do
+    check_contains "$_leg is refused whatever headers built this binary" \
+        "bpftest $_leg is refused ENOSYS: ERRNO -> OK" "$out"
+done
+# ...and the filter with every optional set on still fits its buffer, with room
+# for the next entry: the builder has no bounds check of its own. (The count is
+# printed and not pinned; a FAIL there fails the "exit 0" check above.)
+check_contains "the largest filter is measured against CNG_SECCOMP_MAX_INSNS" \
+    "bpftest largest filter: " "$out"
+# The descriptor side of a :ro bind. With one in the view, the fd-form
+# metadata setters and the mount-writing ioctl requests trap so the dispatcher
+# can refuse them for a descriptor under the bind; the SIOCxIF band still
+# traps beside them, and a terminal TCGETS, the flag getter and FICLONE (which
+# needs a write descriptor the bind never hands out) stay native. Without a
+# :ro bind none of it is in the filter and the calls run native as before.
+for _leg in fchmod fchown fsetxattr fremovexattr FS_IOC_SETFLAGS \
+    FS_IOC_FSSETXATTR FIDEDUPERANGE F2FS_IOC_SET_PIN_FILE; do
+    check_contains "with a :ro bind, $_leg traps" \
+        "bpftest ro-fd $_leg traps: TRAP -> OK" "$out"
+done
+check_contains "with a :ro bind, SIOCGIFCONF still traps" \
+    "bpftest ro-fd SIOCGIFCONF still traps: TRAP -> OK" "$out"
+check_contains "with a :ro bind, TCGETS still runs native" \
+    "bpftest ro-fd TCGETS still runs native: ALLOW -> OK" "$out"
+check_contains "with a :ro bind, FS_IOC_GETFLAGS runs native" \
+    "bpftest ro-fd FS_IOC_GETFLAGS runs native: ALLOW -> OK" "$out"
+for _leg in fchmod fsetxattr FS_IOC_SETFLAGS FIDEDUPERANGE; do
+    check_contains "without a :ro bind, $_leg runs native" \
+        "bpftest rw-fd $_leg runs native: ALLOW -> OK" "$out"
+done
+check_contains "plain clone still traps for the vfork conversion" \
+    "bpftest plain clone still traps for the conversion: TRAP -> OK" "$out"
+
+# The -R trampoline tier runs with no filter, so the designed-ENOSYS refusals
+# cannot come from the kernel there -- the dispatcher must answer them itself.
+# bpftest covers the filter; this covers the other tier, and is the only one of
+# the two that qemu-user can actually run.
+DR=$(mktemp -d)
+out=$(run -t dtest -r "$DR" denied /x 2>&1); rc=$?
+check "the trampoline tier refuses the designed-ENOSYS set itself" 0 "$rc"
+check_contains "io_uring is refused on the -R tier" \
+    "denied io_uring_setup: rc=-38 -> OK" "$out"
+check_contains "clone3 is refused on the -R tier" \
+    "denied clone3: rc=-38 -> OK" "$out"
+check_contains "an ordinary syscall still runs on the -R tier" \
+    "denied control getpid: rc=" "$out"
+check_contains "POSIX message queues are refused on the -R tier" \
+    "denied mq_open: rc=-38 -> OK" "$out"
+# The mount family took paths and was neither trapped nor refused, so the
+# guest's own untranslated spelling went to the host kernel to be judged. A
+# mount cannot be carried out here in any case — the path layer would not know
+# about it and the synthesized /proc/self/mounts is built from the rootfs and
+# its binds — so ENOSYS is the honest answer, where EPERM implied it might have
+# worked with privilege.
+check_contains "mount is refused rather than judged by the host" \
+    "denied mount: rc=-38 -> OK" "$out"
+check_contains "umount2 likewise" "denied umount2: rc=-38 -> OK" "$out"
+check_contains "pivot_root likewise" "denied pivot_root: rc=-38 -> OK" "$out"
+check_contains "quotactl likewise" "denied quotactl: rc=-38 -> OK" "$out"
+check_contains "swapon likewise" "denied swapon: rc=-38 -> OK" "$out"
+check_contains "acct likewise" "denied acct: rc=-38 -> OK" "$out"
+rm -rf "$DR"
+
+# Two ways a guest path says "this had better be a directory", both of which
+# canonicalization throws away -- because what canonicalization makes is a name,
+# and neither of these is about the name.
+#
+# A trailing slash: "f/" says f is a directory, and Linux answers ENOTDIR when
+# it is not, loudly enough to override the caller -- a final symlink is followed
+# under O_NOFOLLOW and AT_SYMLINK_NOFOLLOW alike, and an O_CREAT becomes EISDIR.
+#
+# And "..", which is walked THROUGH the directory it leaves: "f/.." is ENOTDIR
+# and "missing/.." is ENOENT, where collapsing the pair -- the thing that keeps
+# a guest inside its rootfs, since "/../../etc" has to come out as "/etc" --
+# never looks at what is being left.
+#
+# Neither statement reached the kernel, so every one of these answered about a
+# file the kernel would have refused to reach. Mostly that was a wrong answer;
+# for the calls that WRITE it was worse, since `unlink("f/")` and
+# `unlink("f/../f")` both removed a file the kernel will not touch. The last
+# legs ask it of a #! interpreter path, which the kernel opens by name like any
+# other and which the emulation resolves down its own chain.
+# Byte-for-byte against the host build.
+TSD=$(mktemp -d)
+mkdir -p "$TSD/d" "$TSD/d2"; printf hi > "$TSD/f"; : > "$TSD/d/mark"
+printf x > "$TSD/a..b"   # dots in a name are not a ".." component
+ln -s f "$TSD/l2f"; ln -s d "$TSD/l2d"; ln -s nowhere "$TSD/dang"
+ln -s /d "$TSD/labs"   # absolute target: only the walk can re-root it
+if ! guest_xlate_ready "trailing-slash legs"; then
+    :
+elif guest_cc_report "$TSD/trailslash" tests/guests/trailslash.c; then
+    ts_k=""
+    if have cc && cc -O1 -o "$TSD/ts_host" tests/guests/trailslash.c \
+        2>/dev/null; then
+        ts_k=$(kref "$TSD/ts_host" "$TSD" 2>/dev/null)
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    ts_g=$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash 2>/dev/null)
+    if [ -z "$ts_k" ]; then
+        skip "trailing-slash differential: no host compiler for the oracle"
+    elif [ "$ts_k" = "$ts_g" ]; then
+        pass=$((pass + 1))
+        echo "  ok   a trailing slash and \"..\" match the kernel byte-for-byte"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL a trailing slash or \"..\" diverges from the kernel"
+        printf '    kernel: %s\n' "$(echo "$ts_k" | tr '\n' '|')"
+        printf '    cng   : %s\n' "$(echo "$ts_g" | tr '\n' '|')"
+    fi
+    # ...and the tree is still standing, which is the half of it that a diff
+    # against a mangled oracle could not have caught on its own.
+    check_contains "the path-spelling probes left the tree as they found it" \
+        "intact=1" "$ts_g"
+    # The one question the oracle cannot be asked: the same tree on the host has
+    # no rootfs to be inside of. A trailing slash makes the kernel follow the
+    # final symlink whatever O_NOFOLLOW said, so leaving that link for the
+    # kernel would have it follow an ABSOLUTE target from the host root -- out
+    # of the rootfs. The walk follows it first, where the target is re-rooted.
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    check_contains "a trailing slash on an absolute symlink stays in the rootfs" \
+        "contain=rootfs" \
+        "$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash "" contain 2>/dev/null)"
+fi
+rm -rf "$TSD"
+
+# The freestanding mem/str primitives run word-at-a-time (src/rt/rt.c) and are
+# what every path copy, dirent record and /proc line goes through. The
+# self-test holds each against a byte-wise reference at every alignment and
+# length, memmove over every overlap, and the scans on strings ending at a
+# PROT_NONE page -- where an over-read is a fault, not a wrong answer.
+out=$(run_t 60 -t rttest 2>&1); rc=$?
+check "rt primitives self-test rc" 0 $rc
+check_contains "memcpy/memset/memcmp agree with the byte loops" \
+    "memcpy/memset/memcmp: " "$out"
+check_absent "no primitive case went wrong" "FAIL" "$out"
+check_contains "the scans stop at a page edge" "at a page edge: " "$out"

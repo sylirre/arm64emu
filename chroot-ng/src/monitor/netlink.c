@@ -1,0 +1,1736 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* NETLINK_ROUTE emulation.
+ *
+ * Android denies app domains rtnetlink: `socket(AF_NETLINK, …)` may be refused
+ * outright, and where it is allowed the `bind()` is refused under a separate
+ * SELinux check. Everything that reaches for interface information goes through
+ * it — glibc/musl `getifaddrs(3)`, iproute2 (`ip link/addr/route`), bubblewrap's
+ * `loopback_setup()`, and glibc's netlink-based source-address selection — so
+ * without a shim they all fail inside the guest. This is the largest pure
+ * functionality gap against arm64chroot, and it is on chroot-ng's own target
+ * platform.
+ *
+ * The trick that makes it small: **an unbound socket can still dump.** Android
+ * denies the bind, not the query, so dumps can be relayed through a host
+ * netlink socket we open, send on, and read from without ever binding it. But
+ * the policy also splits by message type: RTM_GETADDR and RTM_GETROUTE are
+ * plain `nlmsg_read` and relay fine, while RTM_GETLINK needs `nlmsg_readpriv`
+ * (link dumps expose MAC addresses) and app domains are refused it in *every*
+ * request form — the sendto itself fails with EACCES. A dump the host refuses
+ * to answer is therefore synthesized instead, the way arm64chroot builds its
+ * link replies (sys_netlink.c build_host_links): interfaces enumerated from
+ * the one dump Android leaves open (RTM_GETADDR — the same enumeration
+ * Bionic's getifaddrs falls back to under this policy), fleshed out with
+ * SIOCGIF* ioctls. chroot-ng is -nostdlib, so this is that Bionic fallback
+ * rebuilt from raw syscalls.
+ *
+ * The guest's fd is one end of a real AF_UNIX SOCK_SEQPACKET socketpair, and
+ * the namespace's broker daemon (broker.c) holds the other. Replies are pushed
+ * into the pair one message to a record, so the guest's recv — trapped or not —
+ * reads real records from a real socket, and the kernel provides
+ * MSG_PEEK/MSG_TRUNC/blocking/poll semantics unaided.
+ *
+ * The daemon is where requests are served, and it serves each the moment it
+ * arrives, by whatever route it came: the kernel's netlink answers inside the
+ * sendmsg that carries a request, and a client may write(2) it and read(2) the
+ * reply — syscalls the seccomp tier leaves untrapped for speed — with no call in
+ * between that the monitor would ever see. The mtu crate, which Firefox's HTTP/3
+ * stack asks for the path MTU of every connection, does exactly that, and so
+ * did nothing else for as long as this end was the monitor's: a request was
+ * served at the next trapped call on its socket, there was none, and the read
+ * slept for good. A send the monitor does trap (send, sendto, sendmsg,
+ * sendmmsg) goes into the pair as the guest made it and then waits for the
+ * daemon to have served it (cng_nl_sync), so its replies are queued when the
+ * call returns, as they would be from the kernel.
+ *
+ * Why a sequenced-packet pair and not a datagram one: records keep their
+ * boundaries either way, but only a connection hangs up. The guest's last
+ * close of its end is POLLHUP on the daemon's, which is how the daemon knows to
+ * let go — a datagram pair tells its survivor nothing, and close(2) is not
+ * trapped. It also ignores a destination address rather than refusing one,
+ * which is what a sendmmsg naming the kernel needs. What it costs, should the
+ * daemon be killed under a live socket: the guest's untrapped write(2) to the
+ * stand-in is then EPIPE and SIGPIPE, as on any sequenced-packet socket whose
+ * peer has gone (a trapped send carries MSG_NOSIGNAL), and a read is end of
+ * file — where a datagram pair would have refused the write and left the read
+ * to sleep.
+ *
+ * The same socket(2) trap carries the other netlink protocol Android takes
+ * away, NETLINK_AUDIT — not emulated but *rephrased*, since the whole of what
+ * libaudit's callers need is a refusal they recognise. See cng_nl_audit_refusal.
+ */
+#include "cng/monitor.h"
+#include "cng/netlink.h"
+#include "cng/path.h"
+#include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/tab.h"
+#include "cng/uapi.h"
+
+#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+
+int cng_nl_force_block = 0;
+int cng_nl_no_relay = 0;
+int cng_nl_deny_getlink = 0;
+int cng_nl_deny_audit = 0;
+
+#define AF_NETLINK_    16
+#define AF_INET_       2
+#define AF_INET6_      10
+#define NETLINK_ROUTE_ 0
+#define NETLINK_AUDIT_ 9
+#define SOCK_DGRAM_    2
+#define SOCK_RAW_      3
+#define SOCK_TYPE_MASK 0xf /* SOCK_CLOEXEC/NONBLOCK ride the upper bits */
+#define SOCK_MAX_      11  /* SOCK_PACKET is 10, and __sock_create stops there */
+
+#define NLMSG_ERROR_   2
+#define NLMSG_DONE_    3
+#define NLM_F_REQUEST_ 1
+#define NLM_F_MULTI_   2
+#define NLM_F_ACK_     4
+#define NLM_F_CAPPED_  0x100 /* an ACK carrying the request's header alone */
+#define NLM_F_DUMP_    0x300
+#define MSG_PEEK_      2
+#define MSG_TRUNC_     0x20
+#define MSG_DONTWAIT_  0x40
+
+#define RTM_NEWLINK_  16
+#define RTM_GETLINK_  18
+#define RTM_NEWADDR_  20
+#define RTM_GETADDR_  22
+#define RTM_GETROUTE_ 26
+
+/* For the synthesized RTM_NEWLINK/RTM_NEWADDR messages (values are ABI). */
+#define IFLA_ADDRESS_    1
+#define IFLA_BROADCAST_  2
+#define IFLA_IFNAME_     3
+#define IFLA_MTU_        4
+#define IFLA_TXQLEN_     13
+#define IFLA_OPERSTATE_  16
+#define IF_OPER_DOWN_    2
+#define IF_OPER_UP_      6
+#define IFA_ADDRESS_     1
+#define IFA_LOCAL_       2
+#define IFA_LABEL_       3
+#define IFA_F_PERMANENT_ 0x80
+#define RT_SCOPE_HOST_   254
+#define IFF_UP_          0x1
+#define IFF_LOOPBACK_    0x8
+#define IFF_RUNNING_     0x40
+#define IFF_LOWER_UP_    0x10000
+#define ARPHRD_ETHER_    1
+#define ARPHRD_LOOPBACK_ 772
+#define IFNAMSIZ_        16
+
+#define SIOCGIFNAME_    0x8910
+#define SIOCGIFCONF_    0x8912
+#define SIOCGIFFLAGS_   0x8913
+#define SIOCGIFADDR_    0x8915
+#define SIOCGIFDSTADDR_ 0x8917
+#define SIOCGIFBRDADDR_ 0x8919
+#define SIOCGIFNETMASK_ 0x891b
+#define SIOCGIFMETRIC_  0x891d
+#define SIOCGIFMTU_     0x8921
+#define SIOCGIFHWADDR_  0x8927
+#define SIOCGIFINDEX_   0x8933
+#define SIOCGIFTXQLEN_  0x8942
+#define SIOCGIFMAP_     0x8970
+
+/* Reply assembly capacity, matching the oracle's NL_REPLY_MAX. A synthesized
+ * link dump is ~100 bytes per interface, so this holds dozens with room for
+ * the terminator. Assembly space is the caller's, on the scratch stack. */
+#define NL_REPLY_MAX 8192
+
+struct nlmsghdr_ {
+    unsigned len;
+    unsigned short type, flags;
+    unsigned seq, pid;
+};
+
+struct sockaddr_nl_ {
+    unsigned short family, pad;
+    unsigned pid, groups;
+};
+
+/* One emulated netlink socket, as the guest's process knows it.
+ *
+ * `fd` is the guest's end of the stand-in socketpair; the other end is the
+ * daemon's, which names it `sock` (what cng_nl_sync asks it to serve), and
+ * which answers as port id `port`, the pid of the process that opened the
+ * socket — getsockname reports the same, and a client matches every reply
+ * against it. Both are fixed for the socket's life, as the kernel's port id
+ * is, so a fork child sharing the socket is told what its parent was.
+ *
+ * The daemon's end used to be the monitor's, a second number in the guest's
+ * own table beside a relay socket per request — and close(2) is not trapped:
+ * a close-all loop before an exec closed them and opened files onto their
+ * numbers, which the monitor then had to tell from its own. That is gone with
+ * them; what is left in the guest's table is `fd`, and the number is still
+ * one the guest can close and be handed back for a file of its own. So the
+ * slot carries the identity of the socket it was opened as (cng_fdid: device
+ * and inode, the discipline procfs.c and uaccess.c apply to their own
+ * descriptors), and the number is the socket's only while that identity
+ * still says so: without the check a guest that closed this fd and opened
+ * something else on the number would have its I/O quietly diverted here.
+ *
+ * `state` is the slot's claim, in its low two bits: NL_FREE is a slot nobody
+ * holds (a fresh table element is all zero, so this is also the state an fd
+ * of 0 must never be mistaken for), NL_CLAIMED one a thread is filling or
+ * emptying, and NL_LIVE one whose fields are published. The table grows a page
+ * at a time (cng_tab) and there is no limit on the sockets it holds: there
+ * was one, at four, and the fifth concurrent emulated socket was handed the
+ * host's own refusal — a resolver with one per thread reaches that on a
+ * device where rtnetlink is denied. Two threads opening sockets at once used
+ * to pick the same free slot; the claim is a compare-and-swap now.
+ *
+ * The bits above the claim count the claims made on the slot. A live slot
+ * whose fd no longer names its socket is retired by whoever finds it — close
+ * is not trapped — and finding, judging and claiming were three steps with
+ * nothing tying them to one occupant: another thread could retire the slot
+ * and put a new socket in it between a judgement and a claim, and the claim,
+ * from the "live" it had read, went through and released that new, live
+ * socket — and gave the slot to a third. So a live slot is judged on a
+ * snapshot of its fields taken between two reads of an unchanged state
+ * (slot_snap), and claimed by a compare-and-swap from that very state
+ * (slot_claim), which every claim has since changed. */
+enum { NL_FREE = 0, NL_CLAIMED = 1, NL_LIVE = 2 };
+#define NL_KIND(st) ((st) & 3u)
+
+struct nl_slot {
+    unsigned state; /* claim | claims made << 2 */
+    int fd;
+    struct cng_fdid id;
+    unsigned sock, port;
+};
+
+/* What a snapshot of a live slot says: the socket's fields, as one occupant
+ * published them. */
+struct nl_snap {
+    int fd;
+    struct cng_fdid id;
+    unsigned sock, port;
+};
+
+static struct cng_tab g_slots = CNG_TAB_INIT(struct nl_slot);
+
+/* Claim the slot if its state is still `st`: 1 with *mine the claimed state.
+ * The fence orders the claim before the field stores that follow it, so a
+ * snapshot that reads one of them also reads the state move (slot_snap). */
+static int slot_claim(struct nl_slot *s, unsigned st, unsigned *mine) {
+    unsigned want = ((st & ~3u) + 4u) | NL_CLAIMED;
+    if (!__atomic_compare_exchange_n(&s->state, &st, want, 0, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_RELAXED))
+        return 0;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *mine = want;
+    return 1;
+}
+
+/* Settle a claimed slot as `kind` (NL_LIVE or NL_FREE), its fields written. */
+static void slot_settle(struct nl_slot *s, unsigned mine, unsigned kind) {
+    __atomic_store_n(&s->state, (mine & ~3u) | kind, __ATOMIC_RELEASE);
+}
+
+/* A live slot's fields as one occupant published them, and the state they
+ * were read at; 0 for a slot that is not live, or changed while it was being
+ * read. */
+static int slot_snap(struct nl_slot *s, unsigned *st, struct nl_snap *sn) {
+    unsigned a = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
+    if (NL_KIND(a) != NL_LIVE)
+        return 0;
+    sn->fd = __atomic_load_n(&s->fd, __ATOMIC_RELAXED);
+    sn->id.dev = __atomic_load_n(&s->id.dev, __ATOMIC_RELAXED);
+    sn->id.ino = __atomic_load_n(&s->id.ino, __ATOMIC_RELAXED);
+    sn->sock = __atomic_load_n(&s->sock, __ATOMIC_RELAXED);
+    sn->port = __atomic_load_n(&s->port, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&s->state, __ATOMIC_RELAXED) != a)
+        return 0;
+    *st = a;
+    return 1;
+}
+
+static long open_hostfd(int no_relay);
+
+/* A relay socket for one request, and the identity it is closed by. -1 when
+ * the host will not give one, or the relay is switched off. */
+static int relay_open(struct cng_fdid *id, int no_relay) {
+    long fd = open_hostfd(no_relay);
+    if (fd < 0)
+        return -1;
+    if (cng_fdid_of((int)fd, id) != 0) {
+        sys_close((int)fd);
+        return -1;
+    }
+    return (int)fd;
+}
+
+/* ...closed where the number still names it: in a guest's process (the
+ * SIOCGIF* family enumerates through one too) a guest thread may have closed
+ * it under us and been handed the number back for a file of its own. */
+static void relay_close(int fd, const struct cng_fdid *id) {
+    if (fd >= 0 && cng_fd_is(fd, id))
+        sys_close(fd);
+}
+
+/* Retire a live slot judged stale on a snapshot taken at `st`: 1 with the
+ * slot emptied and claimed (*mine), for the caller to fill or give back; 0
+ * when it is not ours to retire — claimed or refilled since, or its fd put
+ * back meanwhile (asked again under the claim, and published as it was).
+ * Nothing is closed: the number is the guest's now, and the daemon gives up
+ * its end of the pair when the last of the guest's goes. */
+static int slot_retire(struct nl_slot *s, unsigned st, unsigned *mine) {
+    if (!slot_claim(s, st, mine))
+        return 0;
+    if (cng_fd_is(s->fd, &s->id)) {
+        slot_settle(s, *mine, NL_LIVE);
+        return 0;
+    }
+    __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
+    return 1;
+}
+
+/* The live slot of the socket `fd` names, with its fields in *sn; 0 when the
+ * number is not an emulated socket's. */
+static struct nl_slot *slot_find(int fd, struct nl_snap *sn) {
+    if (fd < 0)
+        return 0;
+    struct cng_tab_iter it;
+    for (struct nl_slot *s = cng_tab_first(&g_slots, &it); s;
+         s = cng_tab_next(&g_slots, &it)) {
+        unsigned st, mine;
+        if (!slot_snap(s, &st, sn) || sn->fd != fd)
+            continue;
+        if (cng_fd_is(fd, &sn->id))
+            return s;
+        /* Recycled behind our back: this slot is not the number's socket.
+         * Retired by whoever claims it first — and the search goes on, for
+         * the slot a new socket given the number sits in. */
+        if (slot_retire(s, st, &mine))
+            slot_settle(s, mine, NL_FREE);
+    }
+    return 0;
+}
+
+static struct nl_slot *slot_of(int fd) {
+    struct nl_snap sn;
+    return slot_find(fd, &sn);
+}
+
+int cng_nl_is_fake(int fd) { return slot_of(fd) != 0; }
+
+/* Does the host refuse us rtnetlink? Probed once. socket() *and* bind() are both
+ * tried, because a host may permit the socket and reject the bind under a
+ * separate check — probing socket() alone would call such a host "working" and
+ * leave the guest with a socket it can never use. */
+static int host_blocks(void) {
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    if (cng_nl_force_block) {
+        cached = 1;
+        return 1;
+    }
+    long fd = CNG_SYS(__NR_socket, AF_NETLINK_, SOCK_RAW_ | CNG_O_CLOEXEC,
+                      NETLINK_ROUTE_, 0, 0, 0);
+    if (fd < 0) {
+        cached = 1;
+        return 1;
+    }
+    struct sockaddr_nl_ sa;
+    memset(&sa, 0, sizeof sa);
+    sa.family = AF_NETLINK_;
+    long r = CNG_SYS(__NR_bind, fd, (long)&sa, sizeof sa, 0, 0, 0);
+    sys_close((int)fd);
+    cached = (r < 0);
+    return cached;
+}
+
+/* Build a well-formed NLMSG_DONE at `buf`. The kernel's own DONE carries a
+ * 4-byte error int and NLM_F_MULTI, and iproute2 *enforces* it: rtnl_dump_done()
+ * prints "DONE truncated" and abandons the dump when nlmsg_len is below
+ * NLMSG_LENGTH(sizeof(int)) == 20. glibc's getifaddrs never looks, which is why
+ * a 16-byte DONE passed every local test and still broke `ip addr` on a device.
+ * Returns the bytes written. */
+static long put_done(unsigned char *buf, unsigned seq, unsigned pid) {
+    struct nlmsghdr_ *d = (struct nlmsghdr_ *)buf;
+    d->len = (unsigned)(sizeof *d + 4);
+    d->type = NLMSG_DONE_;
+    d->flags = NLM_F_MULTI_;
+    d->seq = seq;
+    d->pid = pid;
+    *(int *)(buf + sizeof *d) = 0; /* dump error: success */
+    return (long)d->len;
+}
+
+/* Rewrite the port id of every complete message in a received buffer.
+ *
+ * Our host socket is unbound, so the kernel addresses its replies to port 0,
+ * while the guest's client matches them against the port id getsockname reported
+ * (cng_nl_getname: our pid). iproute2 and glibc both silently skip a mismatch,
+ * which loses the whole dump including its terminator. The sequence number needs
+ * no fixing: the guest's own request carried it and we forward that verbatim.
+ * Returns 1 when the buffer contained the NLMSG_DONE terminator. */
+static int fix_pid(unsigned char *buf, long len, unsigned pid) {
+    int done = 0;
+    for (long p = 0; p + (long)sizeof(struct nlmsghdr_) <= len;) {
+        struct nlmsghdr_ *h = (struct nlmsghdr_ *)(buf + p);
+        if (h->len < sizeof *h || p + (long)h->len > len)
+            break;
+        h->pid = pid;
+        if (h->type == NLMSG_DONE_)
+            done = 1;
+        p += (long)((h->len + 3) & ~3u);
+    }
+    return done;
+}
+
+/* An unbound netlink socket for relaying. Unbound is the whole point: the
+ * SELinux denial on Android is on bind(2), not on the query. `no_relay` is the
+ * CNG_NETLINK_NO_RELAY test aid of whoever the relay is for — the daemon's
+ * caller, not the daemon (see CNG_NL_F_NO_RELAY). */
+static long open_hostfd(int no_relay) {
+    if (no_relay)
+        return -1; /* test aid: exercise the degradation path on a working host */
+    long fd = CNG_SYS(__NR_socket, AF_NETLINK_, SOCK_RAW_ | CNG_O_CLOEXEC,
+                      NETLINK_ROUTE_, 0, 0, 0);
+    if (fd < 0)
+        return -1;
+    /* Never block the guest forever on a kernel that says nothing. */
+    struct cng_timeval tv = {2, 0};
+    CNG_SYS(__NR_setsockopt, fd, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO, (long)&tv,
+            sizeof tv, 0);
+    return fd;
+}
+
+/* Relay a dump as the MINIMAL request form: an nlmsghdr plus a one-byte
+ * rtgenmsg family, which is what Bionic's getifaddrs(3) sends.
+ *
+ * Forwarding the guest's request verbatim looked obviously right and is not:
+ * iproute2 asks for RTM_GETLINK with a struct ifinfomsg *and* an IFLA_EXT_MASK
+ * attribute, and Android refuses that form — while the bare rtgenmsg form it
+ * refuses nothing. That is exactly the split observed on-device, where
+ * RTM_GETLINK came back refused and RTM_GETADDR (which iproute2 sends without
+ * the extra attribute) went through, leaving `ip addr` with an empty link list
+ * and so nothing at all to print. It is also why arm64chroot works there: it
+ * builds its link replies from getifaddrs, i.e. from this same minimal form.
+ *
+ * Dropping the request's filter attributes means the kernel may return more than
+ * the guest asked for, which is safe: netlink filtering is advisory and every
+ * client filters the replies itself (iproute2 always has).
+ *
+ * The family byte sits at offset 16 in all three dump payloads we relay —
+ * ifinfomsg.ifi_family, ifaddrmsg.ifa_family, rtmsg.rtm_family — so it is
+ * carried across without knowing which one this is. */
+/* The most a non-dump get needs bounced: `ip route get ADDR` is 36 bytes,
+ * `ip link show dev NAME` about 42. */
+#define NL_RELAY_MAX 256
+
+static long relay_request(int hostfd, const unsigned char *req, long rlen,
+                          int is_dump) {
+    unsigned char out[NL_RELAY_MAX];
+    long n;
+    const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)out;
+    if (is_dump) {
+        /* A dump goes in the minimal form — header plus a one-byte family,
+         * with the request's filter attributes dropped. That is what gets past
+         * Android's refusal of the attribute-bearing form, and it is safe
+         * because netlink filtering is advisory: the kernel may return more
+         * than the guest asked for, and every client filters the replies
+         * itself. */
+        n = 20;
+        memset(out, 0, (size_t)n);
+        h->len = (unsigned)n;
+        h->type = rh->type;
+        h->flags = rh->flags;
+        h->seq = rh->seq;
+        out[16] = (rlen > 16) ? req[16] : 0;
+    } else {
+        /* A non-dump get cannot be expressed that way: its payload *is* the
+         * request, and the kernel validates that payload's length before the
+         * handler ever sees it. rtnl_getlink() parses with hdrlen
+         * sizeof(struct ifinfomsg) == 16 and rtnl_getroute() with
+         * sizeof(struct rtmsg) == 12, while the minimal form's nlmsg_len() is
+         * 4 — so nlmsg_parse refuses it and `ip route get 8.8.8.8` was told
+         * "Invalid argument" for a request the host would have answered.
+         * Forward it as it stands instead. */
+        if (rlen < (long)sizeof *rh || rlen > (long)sizeof out)
+            return -EINVAL; /* too big to bounce: fall back to synthesis */
+        memcpy(out, req, (size_t)rlen);
+        n = rlen;
+        h->len = (unsigned)n; /* consistent with what we actually send */
+    }
+    h->pid = 0; /* the kernel fills in the source port id */
+    struct sockaddr_nl_ sa;
+    memset(&sa, 0, sizeof sa);
+    sa.family = AF_NETLINK_;
+    return CNG_SYS(__NR_sendto, hostfd, (long)out, n, 0, (long)&sa, sizeof sa);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Synthesized replies, for the queries the host refuses to answer at all.
+ * Android forbids app domains RTM_GETLINK in every form (nlmsg_readpriv), so
+ * the link dump is rebuilt the way the oracle rebuilds it: enumerate from the
+ * address dump, flesh out with SIOCGIF* ioctls, hardcode what an app cannot
+ * know (txqlen), and fall back to a bare loopback when even that is denied.   */
+
+/* Append one rtattr; drop it (return `off` unchanged) if it would not fit. */
+static long put_attr(unsigned char *buf, long off, long max, unsigned short type,
+                     const void *data, unsigned short dlen) {
+    long space = (long)((4u + dlen + 3u) & ~3u);
+    if (off + space > max)
+        return off;
+    unsigned short *rta = (unsigned short *)(buf + off);
+    rta[0] = (unsigned short)(4 + dlen);
+    rta[1] = type;
+    if (dlen)
+        memcpy(buf + off + 4, data, dlen);
+    if (space > 4 + dlen)
+        memset(buf + off + 4 + dlen, 0, (size_t)(space - 4 - dlen));
+    return off + space;
+}
+
+/* Facts for one synthesized RTM_NEWLINK. */
+struct ifinfo {
+    int index;
+    unsigned flags, mtu;
+    unsigned short hwtype;
+    unsigned char hwaddr[8], hwlen;
+    char name[IFNAMSIZ_];
+};
+
+/* Append an RTM_NEWLINK describing one interface. Attribute set and the values
+ * an app cannot query (txqlen 1000, operstate from IFF_UP, IFF_LOWER_UP from
+ * IFF_RUNNING) mirror the oracle's nl_build_link, which is what the on-device
+ * `ip addr` output has always shown under arm64chroot. */
+static long put_link(unsigned char *buf, long off, long max, unsigned seq,
+                     unsigned pid, unsigned short nlflags,
+                     const struct ifinfo *fi) {
+    long start = off;
+    if (start + 32 > max)
+        return start;
+    unsigned char *ifi = buf + start + 16; /* struct ifinfomsg */
+    memset(ifi, 0, 16);
+    *(unsigned short *)(ifi + 2) = fi->hwtype;
+    *(int *)(ifi + 4) = fi->index;
+    *(unsigned *)(ifi + 8) =
+        fi->flags | ((fi->flags & IFF_RUNNING_) ? IFF_LOWER_UP_ : 0);
+    off = start + 32;
+    off = put_attr(buf, off, max, IFLA_IFNAME_, fi->name,
+                   (unsigned short)(strlen(fi->name) + 1));
+    unsigned mtu = fi->mtu, txqlen = 1000;
+    unsigned char oper = (fi->flags & IFF_UP_) ? IF_OPER_UP_ : IF_OPER_DOWN_;
+    off = put_attr(buf, off, max, IFLA_MTU_, &mtu, 4);
+    off = put_attr(buf, off, max, IFLA_TXQLEN_, &txqlen, 4);
+    off = put_attr(buf, off, max, IFLA_OPERSTATE_, &oper, 1);
+    if (fi->hwlen) {
+        unsigned char brd[8];
+        memset(brd, fi->hwtype == ARPHRD_LOOPBACK_ ? 0x00 : 0xff, sizeof brd);
+        off = put_attr(buf, off, max, IFLA_ADDRESS_, fi->hwaddr, fi->hwlen);
+        off = put_attr(buf, off, max, IFLA_BROADCAST_, brd, fi->hwlen);
+    }
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)(buf + start);
+    h->len = (unsigned)(off - start);
+    h->type = RTM_NEWLINK_;
+    h->flags = nlflags;
+    h->seq = seq;
+    h->pid = pid;
+    return off; /* header + 4-aligned attrs: already NLMSG_ALIGNed */
+}
+
+/* Append an RTM_NEWADDR for loopback (127.0.0.1/8 or ::1/128, scope host). */
+static long put_lo_addr(unsigned char *buf, long off, long max, unsigned seq,
+                        unsigned pid, int v6, unsigned short nlflags) {
+    long start = off;
+    if (start + 24 > max)
+        return start;
+    unsigned char *ifa = buf + start + 16; /* struct ifaddrmsg */
+    memset(ifa, 0, 8);
+    ifa[0] = (unsigned char)(v6 ? AF_INET6_ : AF_INET_);
+    ifa[1] = (unsigned char)(v6 ? 128 : 8); /* prefixlen */
+    ifa[2] = IFA_F_PERMANENT_;
+    ifa[3] = RT_SCOPE_HOST_;
+    *(unsigned *)(ifa + 4) = 1; /* loopback is index 1 on every kernel */
+    off = start + 24;
+    unsigned char a[16];
+    memset(a, 0, sizeof a);
+    unsigned short alen;
+    if (v6) {
+        a[15] = 1;
+        alen = 16;
+    } else {
+        a[0] = 127;
+        a[3] = 1;
+        alen = 4;
+    }
+    off = put_attr(buf, off, max, IFA_ADDRESS_, a, alen);
+    off = put_attr(buf, off, max, IFA_LOCAL_, a, alen);
+    if (!v6)
+        off = put_attr(buf, off, max, IFA_LABEL_, "lo", 3);
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)(buf + start);
+    h->len = (unsigned)(off - start);
+    h->type = RTM_NEWADDR_;
+    h->flags = nlflags;
+    h->seq = seq;
+    h->pid = pid;
+    return off;
+}
+
+/* Append an NLMSG_ERROR carrying `error`. The embedded original header is
+ * zeroed, as the oracle's nl_build_error leaves it: clients match on the outer
+ * header's seq, not the copy. */
+static long put_error(unsigned char *buf, long off, long max, unsigned seq,
+                      unsigned pid, int error) {
+    long need = 16 + 4 + 16;
+    if (off + need > max)
+        return off;
+    memset(buf + off, 0, (size_t)need);
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)(buf + off);
+    h->len = (unsigned)need;
+    h->type = NLMSG_ERROR_;
+    h->seq = seq;
+    h->pid = pid;
+    *(int *)(buf + off + 16) = error;
+    return off + need;
+}
+
+/* Append the ACK the kernel sends after a request that asked for one and was
+ * not refused (netlink_ack with an error of 0): an NLMSG_ERROR of error 0,
+ * flagged NLM_F_CAPPED (4.12's extended ACK reporting on), carrying the
+ * request's own header as it was sent — and nothing of its payload, which only
+ * an error report echoes. */
+static long put_ack(unsigned char *buf, long off, long max, unsigned seq,
+                    unsigned pid, const unsigned char *req) {
+    long need = 16 + 4 + 16;
+    if (off + need > max)
+        return off;
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)(buf + off);
+    h->len = (unsigned)need;
+    h->type = NLMSG_ERROR_;
+    h->flags = NLM_F_CAPPED_;
+    h->seq = seq;
+    h->pid = pid;
+    *(int *)(buf + off + 16) = 0;
+    memcpy(buf + off + 20, req, 16);
+    return off + need;
+}
+
+/* Flag a relayed ACK the way put_ack's are. A kernel before 4.12 sends the same
+ * message with no flags at all (Android 8's 3.18, measured), and the
+ * emulation answers as the 6.1 uname advertises: unflagged, a relayed route's
+ * ACK would sit beside a synthesized link's flagged one on the same socket. */
+static void cap_ack(unsigned char *buf, long len) {
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)buf;
+    if (len >= (long)sizeof *h + 4 && h->type == NLMSG_ERROR_ &&
+        *(const int *)(buf + sizeof *h) == 0)
+        h->flags |= NLM_F_CAPPED_;
+}
+
+/* Is the first message of a buffer of `len` an NLMSG_ERROR — a refusal, where
+ * it answers a get? */
+static int is_error(const unsigned char *buf, long len) {
+    return len >= (long)sizeof(struct nlmsghdr_) &&
+           ((const struct nlmsghdr_ *)buf)->type == NLMSG_ERROR_;
+}
+
+/* Enumerate interface indices from our own RTM_GETADDR dump on a throwaway
+ * unbound socket — the one enumeration Android's policy leaves open, and the
+ * same one Bionic's getifaddrs falls back to when RTM_GETLINK is refused. So
+ * the guest sees the interface set arm64chroot shows there: everything that
+ * carries at least one address; an interface with none stays invisible,
+ * because an app has no way to learn of it. `scratch` is borrowed for the
+ * receive buffer (the caller's reply buffer, not yet written). */
+static int addr_dump_indices(int *idx, unsigned *v4, unsigned char *plen,
+                             int cap, unsigned char *scratch,
+                             long scratch_len, int no_relay) {
+    struct cng_fdid rid;
+    int fd = relay_open(&rid, no_relay);
+    int n = 0;
+    if (fd < 0)
+        return 0;
+    unsigned char req[20];
+    memset(req, 0, sizeof req);
+    struct nlmsghdr_ *h = (struct nlmsghdr_ *)req;
+    h->len = (unsigned)sizeof req;
+    h->type = RTM_GETADDR_;
+    h->flags = NLM_F_REQUEST_ | NLM_F_DUMP_;
+    h->seq = 1;
+    struct sockaddr_nl_ sa;
+    memset(&sa, 0, sizeof sa);
+    sa.family = AF_NETLINK_;
+    if (CNG_SYS(__NR_sendto, fd, (long)req, sizeof req, 0, (long)&sa,
+                sizeof sa) < 0)
+        goto out;
+    for (int rounds = 0, done = 0; !done && rounds < 64; rounds++) {
+        long r = CNG_SYS(__NR_recvfrom, fd, (long)scratch, scratch_len, 0, 0, 0);
+        if (r <= 0)
+            break;
+        for (long p = 0; p + (long)sizeof(struct nlmsghdr_) <= r;) {
+            struct nlmsghdr_ *m = (struct nlmsghdr_ *)(scratch + p);
+            /* Read the length once and bound everything below by the copy. The
+             * walk stores through idx/v4/plen, which the compiler must assume
+             * may alias this buffer, so re-reading m->len would let a value
+             * written after the check decide how far the attribute loop goes —
+             * and this buffer is the caller's, not ours. */
+            long mlen = (long)m->len;
+            if (mlen < (long)sizeof *m || p + mlen > r)
+                break;
+            if (m->type == NLMSG_DONE_ || m->type == NLMSG_ERROR_) {
+                done = 1;
+                break;
+            }
+            /* ifaddrmsg: family, prefixlen, flags, scope, then u32 index. */
+            if (m->type == RTM_NEWADDR_ && mlen >= (long)sizeof *m + 8) {
+                unsigned char *ifa = (unsigned char *)m + sizeof *m;
+                int ifi = *(int *)(ifa + 4);
+                int slot = -1;
+                for (int i = 0; i < n; i++)
+                    if (idx[i] == ifi)
+                        slot = i;
+                if (slot < 0 && n < cap) {
+                    slot = n++;
+                    idx[slot] = ifi;
+                    if (v4)
+                        v4[slot] = 0;
+                    if (plen)
+                        plen[slot] = 0;
+                }
+                /* The first IPv4 address of each interface, for the SIOCGIF*
+                 * family — which has no way to express anything else, and which
+                 * must describe the same interfaces this dump defines. */
+                if (slot >= 0 && v4 && !v4[slot] && ifa[0] == AF_INET_) {
+                    for (long q = (long)sizeof *m + 8; q + 4 <= mlen;) {
+                        unsigned short al = *(unsigned short *)((char *)m + q);
+                        unsigned short at = *(unsigned short *)((char *)m + q + 2);
+                        if (al < 4 || q + al > mlen)
+                            break;
+                        if ((at == IFA_LOCAL_ || at == IFA_ADDRESS_) &&
+                            al >= 8 && !v4[slot]) {
+                            memcpy(&v4[slot], (char *)m + q + 4, 4);
+                            if (plen)
+                                plen[slot] = ifa[1];
+                        }
+                        q += (al + 3) & ~3u;
+                    }
+                }
+            }
+            p += (mlen + 3) & ~3L;
+        }
+    }
+out:
+    relay_close(fd, &rid);
+    return n;
+}
+
+/* The kernel's struct ifreq: 16 bytes of name, 24 of union. */
+struct ifreq_ {
+    char name[IFNAMSIZ_];
+    unsigned char u[24];
+};
+
+/* Fill `fi` for the interface with `index` via SIOCGIF* on an AF_INET dgram
+ * socket (the ioctls Bionic's fallback leans on; app domains keep them). */
+static int gather_ifinfo(long ioctlfd, int index, struct ifinfo *fi) {
+    struct ifreq_ ifr;
+    if (ioctlfd < 0)
+        return 0;
+    memset(&ifr, 0, sizeof ifr);
+    *(int *)ifr.u = index; /* SIOCGIFNAME: ifr_ifindex in, ifr_name out */
+    if (CNG_SYS(__NR_ioctl, ioctlfd, SIOCGIFNAME_, (long)&ifr, 0, 0, 0) < 0)
+        return 0;
+    memset(fi, 0, sizeof *fi);
+    fi->index = index;
+    memcpy(fi->name, ifr.name, IFNAMSIZ_);
+    fi->name[IFNAMSIZ_ - 1] = 0;
+
+    memset(ifr.u, 0, sizeof ifr.u);
+    if (CNG_SYS(__NR_ioctl, ioctlfd, SIOCGIFFLAGS_, (long)&ifr, 0, 0, 0) == 0)
+        fi->flags = *(unsigned short *)ifr.u;
+    /* Defaults the remaining ioctls refine — the oracle's assumptions. */
+    fi->hwtype = (fi->flags & IFF_LOOPBACK_) ? ARPHRD_LOOPBACK_ : ARPHRD_ETHER_;
+    fi->mtu = (fi->flags & IFF_LOOPBACK_) ? 65536 : 1500;
+    memset(ifr.u, 0, sizeof ifr.u);
+    if (CNG_SYS(__NR_ioctl, ioctlfd, SIOCGIFMTU_, (long)&ifr, 0, 0, 0) == 0)
+        fi->mtu = (unsigned)*(int *)ifr.u;
+    memset(ifr.u, 0, sizeof ifr.u);
+    if (CNG_SYS(__NR_ioctl, ioctlfd, SIOCGIFHWADDR_, (long)&ifr, 0, 0, 0) == 0) {
+        /* A sockaddr whose sa_family is the ARPHRD_* type. Android refuses
+         * this to apps; then the attribute is simply absent, which is the
+         * blank `link/ether ` arm64chroot prints on-device. */
+        fi->hwtype = *(unsigned short *)ifr.u;
+        memcpy(fi->hwaddr, ifr.u + 2, 6);
+        fi->hwlen = 6;
+    }
+    return 1;
+}
+
+/* The target of a single (non-dump) RTM_GETLINK: ifi_index, and the
+ * IFLA_IFNAME string when one was given (empty otherwise). */
+static int link_target(const unsigned char *req, long rlen,
+                       char name[IFNAMSIZ_]) {
+    name[0] = 0;
+    if (rlen < 32)
+        return 0;
+    int index = *(const int *)(req + 20); /* ifinfomsg.ifi_index */
+    for (long p = 32; p + 4 <= rlen;) {
+        unsigned short alen = *(const unsigned short *)(req + p);
+        unsigned short atype = *(const unsigned short *)(req + p + 2);
+        if (alen < 4 || p + (long)alen > rlen)
+            break;
+        if (atype == IFLA_IFNAME_) {
+            long d = alen - 4;
+            if (d > IFNAMSIZ_ - 1)
+                d = IFNAMSIZ_ - 1;
+            memcpy(name, req + p + 4, (size_t)d);
+            name[d] = 0;
+        }
+        p += (long)((alen + 3) & ~3u);
+    }
+    return index;
+}
+
+/* Build the RTM_GETLINK reply the host refused to give us. Mirrors the
+ * oracle's RTM_GETLINK case: enumerate, filter for a non-dump get, and when
+ * enumeration comes up empty present loopback alone — or ENODEV for a
+ * non-dump get of anything else. */
+static long synth_links(unsigned char *out, long max, const unsigned char *req,
+                        long rlen, unsigned seq, unsigned pid, int dump,
+                        int no_relay) {
+    char want[IFNAMSIZ_];
+    int want_index = 0;
+    want[0] = 0;
+    if (!dump)
+        want_index = link_target(req, rlen, want);
+
+    int idx[32];
+    int nidx = addr_dump_indices(idx, 0, 0, 32, out, max, no_relay);
+    long ioctlfd = CNG_SYS(__NR_socket, AF_INET_, SOCK_DGRAM_ | CNG_O_CLOEXEC,
+                           0, 0, 0, 0);
+    long off = 0;
+    int built = 0;
+    for (int i = 0; i < nidx; i++) {
+        struct ifinfo fi;
+        if (!gather_ifinfo(ioctlfd, idx[i], &fi))
+            continue;
+        if (!dump) {
+            if (want[0]) {
+                if (strcmp(want, fi.name) != 0)
+                    continue;
+            } else if (want_index > 0 && fi.index != want_index)
+                continue;
+        }
+        off = put_link(out, off, max, seq, pid, dump ? NLM_F_MULTI_ : 0, &fi);
+        built++;
+        if (!dump)
+            break;
+    }
+    if (ioctlfd >= 0)
+        sys_close((int)ioctlfd);
+
+    if (!built) {
+        /* Enumeration unavailable (or no match): loopback is still real. */
+        struct ifinfo lo;
+        memset(&lo, 0, sizeof lo);
+        lo.index = 1;
+        lo.flags = IFF_UP_ | IFF_LOOPBACK_ | IFF_RUNNING_;
+        lo.mtu = 65536;
+        lo.hwtype = ARPHRD_LOOPBACK_;
+        lo.hwlen = 6; /* all-zero hwaddr, as the kernel reports for lo */
+        lo.name[0] = 'l';
+        lo.name[1] = 'o';
+        lo.name[2] = 0;
+        off = 0;
+        if (dump)
+            off = put_link(out, 0, max, seq, pid, NLM_F_MULTI_, &lo);
+        else if (want[0] ? strcmp(want, "lo") == 0
+                         : (want_index == 0 || want_index == 1))
+            off = put_link(out, 0, max, seq, pid, 0, &lo);
+        else
+            off = put_error(out, 0, max, seq, pid, -ENODEV);
+    }
+    return off;
+}
+
+/* Build the RTM_GETADDR reply when even the address dump is refused: loopback
+ * and nothing else, filtered by the request's rtgenmsg family byte. */
+static long synth_addrs(unsigned char *out, long max, const unsigned char *req,
+                        long rlen, unsigned seq, unsigned pid, int dump) {
+    unsigned char family = (rlen > 16) ? req[16] : 0;
+    unsigned short fl = dump ? NLM_F_MULTI_ : 0;
+    long off = 0;
+    if (family == 0 || family == AF_INET_)
+        off = put_lo_addr(out, off, max, seq, pid, 0, fl);
+    if (family == 0 || family == AF_INET6_)
+        off = put_lo_addr(out, off, max, seq, pid, 1, fl);
+    return off;
+}
+
+/* ------------------------------------------------------------------------- */
+/* The daemon's side: its end of every emulated socket, and the serving.       */
+
+/* One emulated socket as the broker daemon holds it. Only the daemon touches
+ * these, single-threaded from its loop, so nothing here is atomic; and its
+ * descriptors are its own — no guest shares its table — so none needs the
+ * identity check the guest's side lives by. */
+struct nl_peer {
+    int used;
+    unsigned id;   /* what the guest's side asks for it by (cng_nl_sync) */
+    int fd;        /* the daemon's end of the pair */
+    unsigned port; /* what replies carry as nlmsg_pid: the opener's pid */
+    int flags;     /* CNG_NL_F_*: its opener's test aids */
+    /* What it has been served since the last sync asked: a trace for the
+     * guest's CNG_DEBUG, the daemon's own stderr being /dev/null. */
+    unsigned served, relayed, synthesized;
+};
+
+static struct nl_peer g_peer[CNG_NL_SOCK_MAX];
+static int g_npeer;
+static unsigned g_next_id;
+/* The peer behind each netlink entry of the poll array, by its index there:
+ * filled by cng_nl_poll_add and read back by cng_nl_poll_ready in the same
+ * round, which is all the time the array lives. */
+static short g_pollpeer[CNG_NL_SOCK_MAX];
+
+/* Send one reply message into the guest's receive queue. DONTWAIT: if the
+ * guest let its queue fill (~200 KB of unread replies) the tail is dropped
+ * rather than deadlocking the daemon against a guest that is not reading.
+ * NOSIGNAL: an end whose guest has gone is EPIPE on a sequenced-packet pair,
+ * and the SIGPIPE that comes with it would take the daemon down. */
+static void push(struct nl_peer *p, const void *b, long len) {
+    if (len <= 0)
+        return;
+    long r = CNG_SYS(__NR_sendto, p->fd, (long)b, len,
+                     MSG_DONTWAIT_ | CNG_MSG_NOSIGNAL, 0, 0);
+    if (r < 0 && cng_g_debug)
+        cng_dprintf(2, "[cng] nl push %ld bytes -> %ld (reply dropped)\n", len,
+                    r);
+}
+
+/* Push a buffer of built messages as one record apiece. Per-message records
+ * keep every recv smaller than any client's buffer, so nothing is ever
+ * truncated; a client loops until NLMSG_DONE regardless (a real kernel also
+ * splits a dump across recvs whenever it overflows one skb). */
+static void push_msgs(struct nl_peer *p, const unsigned char *b, long len) {
+    for (long o = 0; o + (long)sizeof(struct nlmsghdr_) <= len;) {
+        const struct nlmsghdr_ *h = (const struct nlmsghdr_ *)(b + o);
+        long step = (long)((h->len + 3) & ~3u);
+        if (step < (long)sizeof *h || o + step > len)
+            break;
+        push(p, b + o, (long)h->len);
+        o += step;
+    }
+}
+
+/* Relay the host kernel's answer to `req` into the pair, datagram for
+ * datagram. A dump runs until its NLMSG_DONE, and is never acked, whatever it
+ * asked. A single get is answered by one message — the object, or the error
+ * that refuses it — and then, when the request asked for one (NLM_F_ACK) and
+ * was not refused, by the kernel's ACK, a datagram of its own (flagged as a
+ * current kernel flags it, cap_ack). That ACK used to be left unread on the
+ * relay socket and closed with it, so a client waiting for it (libnl's
+ * nl_wait_for_ack) waited for good. If the host goes quiet
+ * (SO_RCVTIMEO) the guest still gets a terminator — a dump that simply stops
+ * mid-stream would hang every netlink client ever written. */
+static void pump(struct nl_peer *p, int hostfd, const unsigned char *req,
+                 int is_dump, unsigned char *scratch) {
+    const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
+    unsigned seq = rh->seq;
+    int done = 0;
+    for (int rounds = 0; !done && rounds < 256; rounds++) {
+        long r = CNG_SYS(__NR_recvfrom, hostfd, (long)scratch, NL_REPLY_MAX,
+                         0, 0, 0);
+        if (r <= 0)
+            break;
+        done = fix_pid(scratch, r, p->port);
+        push(p, scratch, r);
+        if (!is_dump) {
+            if ((rh->flags & NLM_F_ACK_) && !is_error(scratch, r)) {
+                long a = CNG_SYS(__NR_recvfrom, hostfd, (long)scratch,
+                                 NL_REPLY_MAX, 0, 0, 0);
+                if (a > 0) {
+                    fix_pid(scratch, a, p->port);
+                    cap_ack(scratch, a);
+                } else {
+                    a = put_ack(scratch, 0, NL_REPLY_MAX, seq, p->port, req);
+                }
+                push(p, scratch, a);
+            }
+            return;
+        }
+    }
+    if (!done) {
+        long n = is_dump
+                     ? put_done(scratch, seq, p->port)
+                     : put_error(scratch, 0, NL_REPLY_MAX, seq, p->port, 0);
+        push(p, scratch, n);
+    }
+}
+
+/* Serve one guest request: relay it when the host will answer, synthesize when
+ * it will not, ack everything else. Replies land in the pair as records,
+ * assembled in `scratch` (NL_REPLY_MAX bytes of the caller's). */
+static void process_request(struct nl_peer *p, const unsigned char *req,
+                            long rlen, unsigned char *scratch) {
+    if (!req || rlen < (long)sizeof(struct nlmsghdr_))
+        return;
+    const struct nlmsghdr_ *rh = (const struct nlmsghdr_ *)req;
+    unsigned short type = rh->type;
+    unsigned seq = rh->seq;
+    unsigned pid = p->port;
+    int is_dump = (rh->flags & NLM_F_DUMP_) == NLM_F_DUMP_;
+    long rl = (long)rh->len < rlen ? (long)rh->len : rlen;
+    p->served++;
+
+    if (type == RTM_GETLINK_ || type == RTM_GETADDR_ || type == RTM_GETROUTE_) {
+        long sr = -1;
+        struct cng_fdid rid;
+        int no_relay = (p->flags & CNG_NL_F_NO_RELAY) != 0;
+        int hostfd = relay_open(&rid, no_relay);
+        if (hostfd >= 0)
+            sr = ((p->flags & CNG_NL_F_DENY_GETLINK) && type == RTM_GETLINK_)
+                     ? -EACCES /* test aid: Android's nlmsg_readpriv refusal */
+                     : relay_request(hostfd, req, rl, is_dump);
+        if (sr >= 0) {
+            p->relayed++;
+            pump(p, hostfd, req, is_dump, scratch);
+            relay_close(hostfd, &rid);
+            return;
+        }
+        relay_close(hostfd, &rid);
+        /* The host refuses to answer this query — on Android RTM_GETLINK is
+         * denied outright (nlmsg_readpriv), in any request form, while the
+         * other dumps relay fine. Synthesize what the oracle synthesizes
+         * instead of handing back an empty dump that `ip addr` renders as
+         * total silence. */
+        long off = 0;
+        if (type == RTM_GETLINK_)
+            off = synth_links(scratch, NL_REPLY_MAX - 24, req, rl, seq, pid,
+                              is_dump, no_relay);
+        else if (type == RTM_GETADDR_)
+            off = synth_addrs(scratch, NL_REPLY_MAX - 24, req, rl, seq, pid,
+                              is_dump);
+        /* RTM_GETROUTE with no relay: an empty dump, as the oracle serves. */
+        if (is_dump)
+            off += put_done(scratch + off, seq, pid);
+        /* A get answered rather than refused (ENODEV) is acked after its
+         * reply when it asked, as the kernel acks it. */
+        if (off > 0 && !is_dump && (rh->flags & NLM_F_ACK_) &&
+            !is_error(scratch, off))
+            off = put_ack(scratch, off, NL_REPLY_MAX, seq, pid, req);
+        if (off > 0) {
+            p->synthesized++;
+            push_msgs(p, scratch, off);
+            return;
+        }
+        /* Non-dump GETROUTE (or an unparseable request): ack it below, which
+         * is the oracle's answer too. */
+    }
+
+    if (is_dump) {
+        push(p, scratch, put_done(scratch, seq, pid));
+        return;
+    }
+    /* Anything else gets a success ack, which is what lets bubblewrap's
+     * loopback_setup() (RTM_NEWADDR/RTM_NEWLINK) proceed instead of aborting.
+     * It is the ack a get's is, flagged as the 6.1 the emulation advertises
+     * flags it: unflagged, it was a pre-4.12 kernel's on every host. */
+    push(p, scratch, put_ack(scratch, 0, NL_REPLY_MAX, seq, pid, req));
+}
+
+/* Serve the requests queued on a peer's end, at most `max` of them — every
+ * route the guest has to send one ends here, so each is answered in the
+ * order it was sent. The 256-byte cap is the oracle's own request cap; a GET
+ * request is routed on its header and family byte, both well inside it, and
+ * a longer record is cut to it (the rest of it is discarded by the receive).
+ * An empty record is no request: the kernel's netlink has nothing to answer
+ * in one either. (Past a shutdown(SHUT_WR) of the guest's end a receive reads
+ * empty for good, which is why every caller bounds this, and the poll round
+ * lets such an end go once it has been drained.) Returns 0 once the queue is
+ * empty, 1 if the bound was reached first. */
+static int peer_drain(struct nl_peer *p, int max) {
+    unsigned char req[256];
+    unsigned char scratch[NL_REPLY_MAX];
+    for (int i = 0; i < max; i++) {
+        long r = CNG_SYS(__NR_recvfrom, p->fd, (long)req, sizeof req,
+                         MSG_DONTWAIT_, 0, 0);
+        if (r < 0)
+            return 0;
+        if (r > 0)
+            process_request(p, req, r, scratch);
+    }
+    return 1;
+}
+
+static void peer_free(struct nl_peer *p) {
+    sys_close(p->fd);
+    memset(p, 0, sizeof *p); /* used = 0 */
+    g_npeer--;
+}
+
+long cng_nl_serve_register(int fd, unsigned port, int flags) {
+    for (int i = 0; i < CNG_NL_SOCK_MAX; i++) {
+        struct nl_peer *p = &g_peer[i];
+        if (p->used)
+            continue;
+        /* An id the guest's side keeps for as long as the socket lives: never
+         * 0 (a fresh slot's), and positive, since it is answered as a reply's
+         * s32 ret. Wrapping takes 2^31 registrations; the live ones by then
+         * are recent ones, so a wrapped id meets no live twin. */
+        if (++g_next_id > 0x7fffffffu)
+            g_next_id = 1;
+        memset(p, 0, sizeof *p);
+        p->used = 1;
+        p->id = g_next_id;
+        p->fd = fd;
+        p->port = port;
+        p->flags = flags;
+        g_npeer++;
+        return (long)p->id;
+    }
+    sys_close(fd);
+    return -ENOBUFS;
+}
+
+static struct nl_peer *peer_by_id(unsigned id) {
+    for (int i = 0; i < CNG_NL_SOCK_MAX; i++)
+        if (g_peer[i].used && g_peer[i].id == id)
+            return &g_peer[i];
+    return 0;
+}
+
+long cng_nl_serve_sync(unsigned id, struct cng_bresp *r) {
+    struct nl_peer *p = peer_by_id(id);
+    if (!p)
+        return -ENOENT;
+    /* Bounded, so a guest that keeps writing cannot keep its own sync, or the
+     * daemon, here for ever: what is still queued past the bound was sent
+     * after the call that is waiting, and the poll round serves it. */
+    peer_drain(p, 1024);
+    long n = (long)p->served;
+    r->size = p->relayed;
+    r->nattch = p->synthesized;
+    p->served = p->relayed = p->synthesized = 0;
+    return n;
+}
+
+int cng_nl_poll_add(struct cng_pollfd *pf, int n, int cap) {
+    int k = 0;
+    for (int i = 0; i < CNG_NL_SOCK_MAX && n < cap; i++) {
+        if (!g_peer[i].used)
+            continue;
+        pf[n].fd = g_peer[i].fd;
+        pf[n].events = CNG_POLLIN | CNG_POLLRDHUP;
+        pf[n].revents = 0;
+        g_pollpeer[k++] = (short)i;
+        n++;
+    }
+    return n;
+}
+
+void cng_nl_poll_ready(struct cng_pollfd *pf, int from, int n) {
+    for (int k = from; k < n; k++) {
+        short ev = pf[k].revents;
+        if (!ev)
+            continue;
+        struct nl_peer *p = &g_peer[g_pollpeer[k - from]];
+        if (!p->used || p->fd != pf[k].fd)
+            continue;
+        /* The guest's last close of its end: no one is left to answer, and
+         * whatever it sent before going is dropped with the end. */
+        if (ev & (CNG_POLLHUP | CNG_POLLERR | CNG_POLLNVAL)) {
+            peer_free(p);
+            continue;
+        }
+        /* Half a hang-up: shut down for writing, so nothing more can come.
+         * What did is answered, and the end is let go — it would otherwise
+         * read as ready, and empty, every round from now on. */
+        if (ev & CNG_POLLRDHUP) {
+            peer_drain(p, 1024);
+            peer_free(p);
+            continue;
+        }
+        /* Fair to the other sockets and to the listener: a guest that keeps
+         * writing is served 32 at a time, a round each. */
+        if (ev & CNG_POLLIN)
+            peer_drain(p, 32);
+    }
+}
+
+int cng_nl_any_live(void) { return g_npeer > 0; }
+
+void cng_nl_free_all(void) {
+    for (int i = 0; i < CNG_NL_SOCK_MAX; i++)
+        if (g_peer[i].used)
+            peer_free(&g_peer[i]);
+}
+
+/* ------------------------------------------------------------------------- */
+/* The guest's side.                                                          */
+
+/* Hand the daemon its end of a new socket's pair. 0 with *sock its id, or -1
+ * when no daemon would take it. */
+static int nl_register(int end, unsigned *sock) {
+    struct cng_breq q;
+    memset(&q, 0, sizeof q);
+    q.op = CNG_REQ_NLSOCK;
+    q.arg = (cng_nl_no_relay ? CNG_NL_F_NO_RELAY : 0) |
+            (cng_nl_deny_getlink ? CNG_NL_F_DENY_GETLINK : 0);
+    struct cng_bresp r;
+    if (cng_broker_rpc_fd(&q, end, &r, 0) != 0 || r.ret <= 0)
+        return -1;
+    *sock = (unsigned)r.ret;
+    return 0;
+}
+
+/* Wait for the daemon to have served socket `sock` (CNG_REQ_NLSYNC). A daemon
+ * that cannot be reached leaves the request queued, which is all a failed sync
+ * can do: the call it follows has already happened. */
+static void nl_sync(int fd, unsigned sock) {
+    struct cng_breq q;
+    memset(&q, 0, sizeof q);
+    q.op = CNG_REQ_NLSYNC;
+    q.id = (s32)sock;
+    struct cng_bresp r;
+    if (cng_broker_rpc(&q, &r, 0) != 0)
+        return;
+    if (cng_g_debug && r.ret > 0)
+        cng_dprintf(2,
+                    "[cng] nl served fd=%d: %d request(s) -> %llu relayed, "
+                    "%llu synthesized\n",
+                    fd, (int)r.ret, (unsigned long long)r.size,
+                    (unsigned long long)r.nattch);
+}
+
+long cng_nl_socket(long domain, long type, long protocol) {
+    if (domain != AF_NETLINK_ || protocol != NETLINK_ROUTE_)
+        return -1; /* not ours: let the real syscall run */
+    if (!host_blocks())
+        return -1; /* rtnetlink works here; nothing to emulate */
+    /* What the socket type is, is the kernel's to say — and this interface has
+     * to say it in the kernel's place. On the hosts this emulation exists for,
+     * the real syscall answers about the POLICY (EACCES from the security hook,
+     * which runs before netlink_create is ever reached) and never about the
+     * type, so a malformed request could not be handed to it for a verdict.
+     * Nothing asked, nothing refused: socket(AF_NETLINK, SOCK_STREAM,
+     * NETLINK_ROUTE) came back a working emulated socket, where every kernel
+     * refuses one.
+     *
+     * The order below is the kernel's own: __sys_socket rejects unknown flag
+     * bits, then __sock_create a type outside its table, and only then does
+     * netlink_create get to say that it takes exactly two types — SOCK_RAW and
+     * SOCK_DGRAM, which netlink treats alike. SOCK_CLOEXEC and SOCK_NONBLOCK
+     * are the O_ bits of the same names. */
+    if ((type & ~(long)SOCK_TYPE_MASK) &
+        ~(long)(CNG_O_CLOEXEC | CNG_O_NONBLOCK))
+        return -EINVAL;
+    long sotype = type & SOCK_TYPE_MASK;
+    if (sotype >= SOCK_MAX_)
+        return -EINVAL;
+    if (sotype != SOCK_RAW_ && sotype != SOCK_DGRAM_)
+        return -ESOCKTNOSUPPORT;
+    /* A slot: a free one, or a live one whose fd the guest has since closed
+     * and reused, or a new one at the end of the table. Each is taken with a
+     * CAS, so two threads opening sockets at once cannot share one. */
+    struct nl_slot *s = 0;
+    unsigned mine = 0;
+    for (unsigned long i = 0; !s; i++) {
+        struct nl_slot *c = cng_tab_at(&g_slots, i);
+        if (!c)
+            return -1; /* no page for the record: the host's own refusal */
+        unsigned st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+        struct nl_snap sn;
+        if (NL_KIND(st) == NL_FREE) {
+            if (slot_claim(c, st, &mine))
+                s = c;
+        } else if (slot_snap(c, &st, &sn) && !cng_fd_is(sn.fd, &sn.id)) {
+            if (slot_retire(c, st, &mine)) /* emptied, and still claimed */
+                s = c;
+        }
+    }
+    /* A connected AF_UNIX sequenced-packet socketpair stands in: the guest
+     * gets one end (so close/dup/poll/fcntl all behave), and the daemon is
+     * handed the other, to serve every request that reaches it and push the
+     * replies back. The guest's SOCK_CLOEXEC and SOCK_NONBLOCK bits are
+     * preserved; our copy of the daemon's end is closed as soon as the daemon
+     * has its own, or has refused it — and then there is no emulated socket to
+     * give, and the host's own refusal is the answer. */
+    int sv[2] = {-1, -1};
+    struct cng_fdid gid;
+    unsigned sock = 0;
+    if (CNG_SYS(__NR_socketpair, CNG_AF_UNIX,
+                CNG_SOCK_SEQPACKET | (type & ~(long)SOCK_TYPE_MASK), 0,
+                (long)sv, 0, 0) < 0) {
+        __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
+        slot_settle(s, mine, NL_FREE);
+        return -1;
+    }
+    int ok = cng_fdid_of(sv[0], &gid) == 0 && nl_register(sv[1], &sock) == 0;
+    sys_close(sv[1]);
+    if (!ok) {
+        sys_close(sv[0]);
+        __atomic_store_n(&s->fd, -1, __ATOMIC_RELAXED);
+        slot_settle(s, mine, NL_FREE);
+        return -1;
+    }
+    __atomic_store_n(&s->id.dev, gid.dev, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->id.ino, gid.ino, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->sock, sock, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->port, (unsigned)sys_getpid(), __ATOMIC_RELAXED);
+    __atomic_store_n(&s->fd, sv[0], __ATOMIC_RELAXED);
+    slot_settle(s, mine, NL_LIVE);
+    if (cng_g_debug)
+        cng_dprintf(2,
+                    "[cng] netlink: emulating fd %d (host denies rtnetlink), "
+                    "daemon socket %u\n",
+                    sv[0], sock);
+    return sv[0];
+}
+
+/* ---- the audit interface --------------------------------------------------
+ *
+ * NETLINK_AUDIT is the other netlink protocol Android's policy takes away, and
+ * unlike rtnetlink there is nothing to emulate: the guest cannot have a view of
+ * the host's audit log, and does not want one. What it needs is the *right
+ * refusal*, because libaudit's callers branch on which one they get.
+ *
+ * `audit_open()` is a bare socket(PF_NETLINK, SOCK_RAW, NETLINK_AUDIT), and
+ * shadow-utils wraps it in audit_help_open(), which treats EINVAL /
+ * EPROTONOSUPPORT / EAFNOSUPPORT as "this kernel was built without audit" and
+ * carries on — and treats anything else as fatal:
+ *
+ *     useradd: Cannot open audit interface - aborting.
+ *
+ * That is what a Debian/Ubuntu rootfs prints on a device for `useradd`,
+ * `usermod`, `passwd`, `chage`, `groupadd` and shadow's `su`: the socket is
+ * refused by SELinux (EACCES on the app domain's netlink_audit_socket, no
+ * capability involved), which is not one of the three the tool survives. The
+ * kernel's own way of saying "no audit here" is EPROTONOSUPPORT — netlink_create
+ * returns exactly that for a protocol nobody registered — so that is what the
+ * guest is told, and every one of those tools proceeds.
+ *
+ * Deviation from the oracle, deliberate: arm64chroot gates this on
+ * `fake_id && euid == 0`, framing it as part of the pretend-to-be-root story.
+ * Here it is gated on the host's refusal alone, for two reasons. The refusal is
+ * the SELinux policy's and does not depend on the guest's credentials — real or
+ * synthetic — so "this container has no audit subsystem" is equally true for
+ * every guest in it; and the rest of this file already answers the same policy's
+ * rtnetlink denial without asking who the guest claims to be. Gating on fake
+ * root would leave `useradd` aborting in a rootfs whose files the invoking user
+ * already owns, which is the one case where it would otherwise have worked.
+ *
+ * Called with the result of the real socket(2); returns what the guest sees. */
+long cng_nl_audit_refusal(long domain, long protocol, long r) {
+    if (domain != AF_NETLINK_ || protocol != NETLINK_AUDIT_)
+        return r;
+    if (cng_nl_deny_audit && r >= 0) {
+        sys_close((int)r); /* test aid: Android's SELinux refusal, on a host
+                            * that grants the socket */
+        r = -EACCES;
+    }
+    if (r != -EPERM && r != -EACCES)
+        return r; /* the host answered: its answer is the guest's */
+    if (cng_g_debug)
+        cng_dprintf(2,
+                    "[cng] netlink: audit socket refused (%ld) -> "
+                    "EPROTONOSUPPORT (no audit in this kernel)\n",
+                    r);
+    return -EPROTONOSUPPORT;
+}
+
+int cng_nl_sync(int fd) {
+    struct nl_snap sn;
+    if (!slot_find(fd, &sn))
+        return 0;
+    nl_sync(fd, sn.sock);
+    return 1;
+}
+
+/* Would a receive on `fd` with `flags` have returned at once? Only such a
+ * receive can find the daemon still at work on a request already sent: a
+ * blocking one waits for the reply as it would for the kernel's. */
+static int nonblocking(int fd, long flags) {
+    if (flags & MSG_DONTWAIT_)
+        return 1;
+    long fl = CNG_SYS(__NR_fcntl, fd, 3 /*F_GETFL*/, 0, 0, 0, 0);
+    return fl >= 0 && (fl & CNG_O_NONBLOCK);
+}
+
+int cng_nl_recv(int fd, void *buf, long len, long flags, long *out) {
+    struct nl_snap sn;
+    if (!slot_find(fd, &sn))
+        return 0;
+    /* The real receive, against the guest's own end of the pair, with the
+     * guest's own flags: MSG_PEEK, MSG_TRUNC, O_NONBLOCK and blocking are all
+     * the kernel's genuine article — which is how glibc sizes a dump before
+     * reading it, and why no message ever needs splitting by us. */
+    long n = CNG_SYS(__NR_recvfrom, fd, (long)buf, len, flags, 0, 0);
+    /* One that would not wait can be ahead of the daemon: a request written
+     * with an untrapped write(2) is served when the daemon gets to it, and the
+     * kernel's would have been served inside the write. So the daemon is asked
+     * to finish what it has, and the queue looked at once more. */
+    if (n == -EAGAIN && nonblocking(fd, flags)) {
+        nl_sync(fd, sn.sock);
+        n = CNG_SYS(__NR_recvfrom, fd, (long)buf, len, flags, 0, 0);
+    }
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] nl recv fd=%d len=%ld flags=%lx -> %ld\n", fd,
+                    len, flags, n);
+    *out = n;
+    return 1;
+}
+
+/* recvmsg's form of cng_nl_recv: the kernel's own recvmsg on the guest's end of
+ * the pair with the header the caller built — the guest's iovecs, scattered
+ * into, truncated and flagged by the kernel, which also reads and validates the
+ * iovec array itself — and the same second look for one that would not wait. */
+int cng_nl_recvmsg(int fd, void *msg, long flags, long *out) {
+    struct nl_snap sn;
+    if (!slot_find(fd, &sn))
+        return 0;
+    long n = CNG_SYS(__NR_recvmsg, fd, (long)msg, flags, 0, 0, 0);
+    if (n == -EAGAIN && nonblocking(fd, flags)) {
+        nl_sync(fd, sn.sock);
+        n = CNG_SYS(__NR_recvmsg, fd, (long)msg, flags, 0, 0, 0);
+    }
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] nl recvmsg fd=%d flags=%lx -> %ld\n", fd, flags,
+                    n);
+    *out = n;
+    return 1;
+}
+
+/* Hand a sockaddr_nl back to the guest by the kernel's rules for handing back
+ * any address (move_addr_to_user): the caller's length is read first, and is
+ * EINVAL when negative; as much of the address as fits is copied — a prefix,
+ * into a buffer shorter than the address — and the length written back is the
+ * address's own, not what was copied ("fromlen shall refer to the value before
+ * truncation", 1003.1g) — for a recvmsg whose msg_namelen was 0 as well, since
+ * the kernel fills its own copy of the address whatever the caller's room. A
+ * NULL buffer with a length to copy is EFAULT, and so is a NULL length — the
+ * kernel reads it before anything else.
+ *
+ * This used to answer success and write nothing whenever the buffer was
+ * shorter than a sockaddr_nl, or either pointer was NULL, and to copy the whole
+ * address whatever the (negative) length said: a caller checking the length it
+ * got back saw its own, and one probing with a zero length learned nothing.
+ *
+ * Both pointers are the guest's, and this address is synthesized rather than
+ * fetched — so the kernel never validates either, and a bad one has to answer
+ * -EFAULT instead of faulting inside the handler, where SIGSEGV is masked and
+ * fatal. */
+static long put_nladdr(unsigned pid, void *addr, void *alen) {
+    int klen = (int)sizeof(struct sockaddr_nl_);
+    struct sockaddr_nl_ sa;
+    memset(&sa, 0, sizeof sa);
+    sa.family = AF_NETLINK_;
+    sa.pid = pid;
+    int len;
+    if (cng_user_copyin(&len, alen, sizeof len) < 0)
+        return -EFAULT;
+    if (len > klen)
+        len = klen;
+    if (len < 0)
+        return -EINVAL;
+    if (len && cng_user_copyout(addr, &sa, (unsigned long)len) < 0)
+        return -EFAULT;
+    if (cng_user_copyout(alen, &klen, sizeof klen) < 0)
+        return -EFAULT;
+    return 0;
+}
+
+/* `peer` distinguishes the two, and getting either wrong is not cosmetic.
+ * getsockname must report our own port id — the one the daemon stamps on
+ * every reply (fix_pid), which is what a client matches each nlmsg_pid
+ * against: the pid of the process that opened the socket, in a fork child
+ * that shares it too. getpeername reports the socket's destination, and an
+ * emulated socket's only peer is the kernel: port id 0, which is also what
+ * the kernel answers for a netlink socket that never connected. */
+long cng_nl_getname(int fd, void *addr, unsigned *alen, int peer) {
+    /* The real AF_UNIX answer is an unnamed 2-byte sockaddr, and iproute2
+     * rejects that with "Wrong address length 2". Report the sockaddr_nl it
+     * expects. */
+    struct nl_snap sn;
+    unsigned port = 0;
+    if (!peer)
+        port = slot_find(fd, &sn) ? sn.port : (unsigned)sys_getpid();
+    return put_nladdr(port, addr, alen);
+}
+
+/* A netlink client discards any reply whose *source* address is not
+ * nl_pid == 0, because that is what "came from the kernel" means: filling it
+ * with our own port id made glibc skip every message and wait for an
+ * NLMSG_DONE it would never accept. Nothing is written for a NULL buffer —
+ * the kernel does not hand an address back where none was asked for. */
+long cng_nl_srcaddr(int fd, void *addr, unsigned *alen) {
+    if (!addr)
+        return 0;
+    return put_nladdr(0, addr, alen);
+}
+
+int cng_nl_bind(int fd) { return slot_of(fd) != 0; }
+
+/* ---- the SIOCGIF* family -------------------------------------------------
+ *
+ * These arrive on an ordinary AF_INET socket, not on a netlink one, and they
+ * answer the same questions the dumps do: `ifconfig` and `getifaddrs`'s oldest
+ * fallback are built on them. Where the netlink emulation is engaged they have
+ * to agree with it — otherwise a guest told by `ip addr` that it has only
+ * loopback is shown the host's entire interface list by `ifconfig`, which is
+ * both a contradiction and a description of a network the guest cannot reach.
+ * So both views come from one enumeration.
+ *
+ * Where the host's own rtnetlink works nothing is emulated, here or there, and
+ * these pass straight through: the kernel's answer is the truth and the dumps
+ * are the same kernel's. Only the getters are modelled; SIOCSIF* changes the
+ * host's network configuration and stays unemulated (and unprivileged, so the
+ * host refuses it anyway). */
+
+/* One interface as the guest sees it: the link facts, plus the first IPv4
+ * address of the interface — all this family can express. */
+struct ifview {
+    struct ifinfo fi;
+    unsigned addr; /* network byte order; 0 = the interface has none */
+    unsigned char plen;
+};
+
+static int enum_ifviews(struct ifview *out, int cap) {
+    /* Not static: cng_nl_ioctl reaches this from the SIGSYS handler, on any
+     * thread, with no lock anywhere on the path. A process-wide parse buffer
+     * would have two threads' recvfrom writing into it while the other walks
+     * it — two guest threads in getifaddrs(3) is all that takes — and the
+     * damage is not confined to a wrong answer: addr_dump_indices derives every
+     * bound from a length it reads back out of this buffer, so a value landing
+     * there mid-walk sends the attribute loop past the end of it, and a fault
+     * in the handler is unblockable. 8 KiB on the 256 KiB scratch stack. Every
+     * other receive area in this file is already per-slot or automatic. */
+    unsigned char scratch[NL_REPLY_MAX];
+    int idx[32];
+    unsigned v4[32];
+    unsigned char pl[32];
+    int nidx = addr_dump_indices(idx, v4, pl, 32, scratch, sizeof scratch,
+                                 cng_nl_no_relay);
+    long ioctlfd = CNG_SYS(__NR_socket, AF_INET_, SOCK_DGRAM_ | CNG_O_CLOEXEC,
+                           0, 0, 0, 0);
+    int n = 0;
+    for (int i = 0; i < nidx && n < cap; i++) {
+        if (!gather_ifinfo(ioctlfd, idx[i], &out[n].fi))
+            continue;
+        out[n].addr = v4[i];
+        out[n].plen = pl[i];
+        n++;
+    }
+    if (ioctlfd >= 0)
+        sys_close((int)ioctlfd);
+    if (!n && cap > 0) {
+        /* Enumeration unavailable: loopback is still real, and it is exactly
+         * what the link dump falls back to (synth_links). */
+        memset(&out[0], 0, sizeof out[0]);
+        out[0].fi.index = 1;
+        out[0].fi.flags = IFF_UP_ | IFF_LOOPBACK_ | IFF_RUNNING_;
+        out[0].fi.mtu = 65536;
+        out[0].fi.hwtype = ARPHRD_LOOPBACK_;
+        out[0].fi.hwlen = 6;
+        out[0].fi.name[0] = 'l';
+        out[0].fi.name[1] = 'o';
+        out[0].addr = 0x0100007f; /* 127.0.0.1, network order */
+        out[0].plen = 8;
+        n = 1;
+    }
+    return n;
+}
+
+/* A sockaddr_in carrying `a` into the 24-byte ifreq union. */
+static void put_sin(unsigned char *u, unsigned a) {
+    memset(u, 0, 24);
+    *(unsigned short *)u = AF_INET_;
+    memcpy(u + 4, &a, 4);
+}
+
+static unsigned mask_of(unsigned char plen) {
+    if (plen == 0)
+        return 0;
+    if (plen > 32)
+        plen = 32;
+    unsigned m = 0xffffffffu << (32 - plen); /* host order */
+    return __builtin_bswap32(m);             /* the ifreq wants network order */
+}
+
+int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out) {
+    (void)fd;
+    /* Only the interface-query band is ours, and the filter traps exactly that.
+     * It is not the only way in: under -R, and at any `svc` the lazy patcher
+     * has caught -- one site serves every request of its syscall, which is all
+     * of a musl or bionic stub -- the dispatcher is handed every ioctl the guest
+     * makes. Past this point `arg` is an ifreq, and a request that merely has
+     * an argument of another shape took the copy below for its own: a NULL one
+     * (TIOCSCTTY, FIONCLEX) or one that ends a mapping (FIONREAD into the last
+     * word of a page) was EFAULT where the host answers. */
+    if (req < CNG_SIOC_BAND_LO || req > CNG_SIOC_BAND_HI)
+        return 0;
+    if (!host_blocks())
+        return 0; /* the host's own answers and its dumps agree already */
+
+    struct ifview v[32];
+    int n = enum_ifviews(v, 32);
+
+    if (req == SIOCGIFCONF_) {
+        /* struct ifconf { int ifc_len; char *ifc_buf; } — 16 bytes on LP64.
+         * A NULL buffer asks for the size only, which is how every caller
+         * sizes its allocation. */
+        struct {
+            int len;
+            int pad;
+            char *buf;
+        } ifc;
+        if (cng_user_copyin(&ifc, arg, sizeof ifc) < 0) {
+            *out = -EFAULT;
+            return 1;
+        }
+        int len = ifc.len;
+        char *buf = ifc.buf;
+        /* SIOCGIFCONF is an IPv4 interface list: the kernel reports only
+         * interfaces that carry an AF_INET address, and an interface with none
+         * simply is not in it (it is still nameable by every getter below). */
+        int nv4 = 0;
+        for (int i = 0; i < n; i++)
+            if (v[i].addr)
+                nv4++;
+        int need = nv4 * (int)sizeof(struct ifreq_);
+        /* Only ifc_len is written back — the kernel leaves ifc_buf alone. */
+        if (!buf) {
+            if (cng_user_copyout(arg, &need, sizeof need) < 0) {
+                *out = -EFAULT;
+                return 1;
+            }
+            *out = 0;
+            return 1;
+        }
+        if (len > need)
+            len = need;
+        /* No up-front probe of the whole buffer. The kernel writes one whole
+         * ifreq at a time and stops at the first that will not go, so a range
+         * that goes bad partway keeps the entries already written and never
+         * touches the tail that no entry fits in — while the write probe
+         * validates by ZEROING (see uaccess.c), which would have wiped both.
+         * The per-entry copyout below is the same check in the same shape.
+         * A negative ifc_len needs no check of its own either: it is smaller
+         * than an ifreq, so the loop writes nothing and reports a length of 0,
+         * which is what the host answers for it (measured). */
+        int w = 0;
+        for (int i = 0; i < n && w + (int)sizeof(struct ifreq_) <= len; i++) {
+            if (!v[i].addr)
+                continue;
+            struct ifreq_ r;
+            memset(&r, 0, sizeof r);
+            cng_strlcpy(r.name, v[i].fi.name, IFNAMSIZ_);
+            put_sin(r.u, v[i].addr);
+            if (cng_user_copyout(buf + w, &r, sizeof r) < 0) {
+                *out = -EFAULT;
+                return 1;
+            }
+            w += (int)sizeof r;
+        }
+        if (cng_user_copyout(arg, &w, sizeof w) < 0) {
+            *out = -EFAULT;
+            return 1;
+        }
+        *out = 0;
+        return 1;
+    }
+
+    /* Taken as a copy: every request here names its target in the same buffer
+     * it answers into, so the name has to be read out before anything is
+     * written back — and reading it where it lies would leave the answer
+     * decided by bytes the guest can still change (see uaccess.c). */
+    struct ifreq_ ifr;
+    if (cng_user_copyin(&ifr, arg, sizeof ifr) < 0) {
+        *out = -EFAULT;
+        return 1;
+    }
+    ifr.name[IFNAMSIZ_ - 1] = '\0';
+
+    /* SIOCGIFNAME is the one that names its target by index; every other form
+     * names it by ifr_name.
+     *
+     * An interface we did not enumerate is left to the host rather than refused.
+     * Refusing it would be the tidier story — "what the dump did not show does
+     * not exist" — but a guest can learn a name from /proc/net/dev, which is a
+     * host passthrough, and busybox `ifconfig` does exactly that: an ENODEV
+     * there stops it on its first interface. This emulation exists to answer
+     * where the host will not, so it never takes away an answer the host is
+     * willing to give. */
+    const struct ifview *f = 0;
+    for (int i = 0; i < n && !f; i++) {
+        if (req == SIOCGIFNAME_) {
+            if (v[i].fi.index == *(int *)ifr.u)
+                f = &v[i];
+        } else if (!strcmp(v[i].fi.name, ifr.name)) {
+            f = &v[i];
+        }
+    }
+    if (!f)
+        return 0;
+
+    memset(ifr.u, 0, sizeof ifr.u);
+    switch (req) {
+    case SIOCGIFNAME_:
+        cng_strlcpy(ifr.name, f->fi.name, IFNAMSIZ_);
+        break;
+    case SIOCGIFINDEX_:
+        *(int *)ifr.u = f->fi.index;
+        break;
+    case SIOCGIFFLAGS_:
+        *(unsigned short *)ifr.u = (unsigned short)f->fi.flags;
+        break;
+    case SIOCGIFMTU_:
+        *(int *)ifr.u = (int)f->fi.mtu;
+        break;
+    case SIOCGIFTXQLEN_:
+        *(int *)ifr.u = 1000; /* what the link dump reports for every device */
+        break;
+    case SIOCGIFMETRIC_:
+        *(int *)ifr.u = 0; /* the kernel has always answered 0 here */
+        break;
+    case SIOCGIFMAP_:
+        break; /* no memory/irq/dma to report: all zeros, as for any modern nic */
+    case SIOCGIFHWADDR_:
+        *(unsigned short *)ifr.u = f->fi.hwtype;
+        if (f->fi.hwlen)
+            memcpy(ifr.u + 2, f->fi.hwaddr, f->fi.hwlen);
+        break;
+    case SIOCGIFADDR_:
+    case SIOCGIFDSTADDR_:
+        if (!f->addr) {
+            *out = -EADDRNOTAVAIL; /* the interface has no IPv4 address */
+            return 1;
+        }
+        put_sin(ifr.u, f->addr);
+        break;
+    case SIOCGIFNETMASK_:
+        if (!f->addr) {
+            *out = -EADDRNOTAVAIL;
+            return 1;
+        }
+        put_sin(ifr.u, mask_of(f->plen));
+        break;
+    case SIOCGIFBRDADDR_:
+        if (!f->addr) {
+            *out = -EADDRNOTAVAIL;
+            return 1;
+        }
+        put_sin(ifr.u, (f->addr & mask_of(f->plen)) | ~mask_of(f->plen));
+        break;
+    default:
+        return 0; /* not one of ours: let the host answer */
+    }
+    if (cng_user_copyout(arg, &ifr, sizeof ifr) < 0) {
+        *out = -EFAULT;
+        return 1;
+    }
+    *out = 0;
+    return 1;
+}
+

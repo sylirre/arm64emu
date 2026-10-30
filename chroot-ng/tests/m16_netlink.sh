@@ -1,0 +1,666 @@
+# M16 NETLINK_ROUTE emulation (sourced by tests/run.sh).
+#
+# Android denies app domains rtnetlink, and everything that asks the kernel about
+# interfaces goes through it: getifaddrs(3), iproute2, bubblewrap's
+# loopback_setup(), glibc's source-address selection. Without a shim they all
+# fail inside the guest.
+#
+# What a host can prove splits in two, and the milestone asks the unemulated
+# guest which case this one is:
+#
+#   raw rtnetlink WORKS here (a devbox) — then the emulation, forced on with
+#     CNG_NETLINK_FORCE_BLOCK=1, must reproduce the real kernel byte for byte,
+#     and must stay entirely out of the way when it is not forced.
+#   the kernel REFUSES it (a device: the case the shim exists for) — then there
+#     is nothing to diff against and the emulation is *supposed* to diverge.
+#     What to assert instead is that it engages on its own and turns each refusal
+#     into a working answer, which is the one thing a devbox cannot check.
+#
+# The deciding question is the raw path, not getifaddrs. Bionic carries its own
+# fallback for exactly the restriction being emulated, so on a device getifaddrs
+# succeeds while bind/sendto on a NETLINK_ROUTE socket are refused — and keying
+# the gate on "getifaddrs: ok" took the devbox branch there and failed every
+# differential leg for precisely the reason the emulation exists.
+echo "== M16: NETLINK_ROUTE emulation =="
+
+# Guest runs are wrapped in a timeout: a netlink dump that never terminates would
+# otherwise wedge the whole suite instead of failing one check.
+# shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+m16run() { run_t 60 $GUEST_BINDS "$@"; }
+m16_has() { # needle, haystack
+    case "$2" in
+    *"$1"*) return 0 ;;
+    esac
+    return 1
+}
+M16D=$(mktemp -d)
+
+if ! guest_xlate_ready "rtnetlink emulation scenarios"; then
+    :
+elif ! guest_cc_report "$M16D/netif" tests/guests/netif.c; then
+    :
+else
+    R=$(mktemp -d); mkdir -p "$R/bin"; cp "$M16D/netif" "$R/bin/netif"
+
+    # The reference: the same binary with no emulation at all, talking to
+    # whatever this kernel is willing to do.
+    base=$(emu_t 60 "$M16D/netif" 2>/dev/null)
+    m16_raw=0
+    if m16_has "bind: ok" "$base" && m16_has "sendto: ok" "$base" &&
+        m16_has "dump: got>0=1" "$base"; then
+        m16_raw=1
+    fi
+
+    if [ -z "$base" ]; then
+        skip "rtnetlink legs: the unemulated guest produced no output at all"
+    else
+        em=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/netif 2>/dev/null)
+
+        # --- 1. the emulation's own properties, assertable on any host ------
+        check_contains "m16 getifaddrs works under the emulation" \
+            "getifaddrs: ok" "$em"
+        check_contains "m16 the loopback interface is visible" "lo=1" "$em"
+        check_contains "m16 socket(AF_NETLINK) is served" "socket: ok" "$em"
+        # ...and only for the types netlink takes. The emulation reads the
+        # family and the protocol; the type went unread, so a SOCK_STREAM
+        # netlink socket — which no kernel grants — was served as readily as a
+        # SOCK_RAW one. On the hosts this shim exists for, the real syscall
+        # cannot be left to say so: it answers about the SELinux policy, from a
+        # hook that runs before netlink_create is reached.
+        check_contains "m16 netlink's other type, SOCK_DGRAM, is served too" \
+            "socktype dgram: 0" "$em"
+        check_contains "m16 a socket type netlink does not take is ESOCKTNOSUPPORT" \
+            "socktype stream: 94" "$em"
+        check_contains "m16 ...for every one of them" \
+            "socktype seqpacket: 94" "$em"
+        check_contains "m16 ...including type 0" "socktype zero: 94" "$em"
+        check_contains "m16 a type outside the kernel's table is EINVAL" \
+            "socktype outofrange: 22" "$em"
+        check_contains "m16 bind on an emulated socket succeeds" "bind: ok" "$em"
+        # iproute2 refuses a getsockname answer that is not sockaddr_nl-sized;
+        # the underlying AF_UNIX socket would report 2 bytes.
+        check_contains "m16 getsockname reports a 12-byte sockaddr_nl" \
+            "getsockname: len=12 family=16" "$em"
+        # accept(2) does not apply to a datagram socket, and netlink is one.
+        # The stand-in shares the getsockname branch, so it used to answer
+        # success with a sockaddr_nl — handing back fd 0 as a connection.
+        check_contains "m16 accept on a netlink socket is EOPNOTSUPP" \
+            "accept: rc=-1 errno=95" "$em"
+        # A dump the guest can parse: messages present, its own sequence number
+        # echoed, and real RTM_NEWLINK records in it.
+        check_contains "m16 an RTM_GETLINK dump is relayed and parseable" \
+            "dump: got>0=1 msgs>0=1 seq_ok=1 newlink>0=1" "$em"
+        # recvmmsg fills a source address per message, and a netlink client
+        # discards any reply whose source is not the kernel — so the array form
+        # has to answer sockaddr_nl with nl_pid 0, exactly as recvmsg does. The
+        # underlying socketpair would report an unnamed AF_UNIX address instead.
+        check_contains "m16 recvmmsg sources each reply from the kernel" \
+            "mmsg: got>0=1 msgs>0=1 src_nl=1 src_pid0=1" "$em"
+        # The SIOCGIF* family answers the same questions over an AF_INET socket
+        # (`ifconfig`, getifaddrs's oldest fallback). It comes from the same
+        # enumeration as the dump, so the two views cannot contradict each
+        # other -- a guest told it has only loopback must not be shown the
+        # host's whole interface list here.
+        check_contains "m16 SIOCGIFCONF lists the same interfaces the dump did" \
+            "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$em"
+        # It writes whole ifreqs and nothing else: bytes past the last entry
+        # that fits stay as the caller left them, and a negative ifc_len is a
+        # length no entry fits in rather than an error. Validating the buffer
+        # with the write probe -- which checks a range by ZEROING it -- wiped
+        # that tail on every call and turned the negative length into EFAULT.
+        check_contains "m16 SIOCGIFCONF leaves the tail and takes a negative length" \
+            "ifconf_edge: tail=1 neg=1" "$em"
+        check_contains "m16 the per-interface getters agree with it" \
+            "ifget: lo idx=1 up=1 loopback=1 mtu=65536 mask8=1 byidx=1" "$em"
+        # A name nobody has is still ENODEV. An interface the host DOES know but
+        # our enumeration did not is deliberately left to the host: a guest can
+        # learn a name from /proc/net/dev (a passthrough), and busybox
+        # `ifconfig` reads exactly that, so refusing it would stop the tool on
+        # its first interface. This emulation answers where the host will not;
+        # it never takes away an answer the host is willing to give.
+        check_contains "m16 an interface nobody has is ENODEV" \
+            "ifget: nodev=1" "$em"
+        # A non-dump RTM_GET* is a different request from the dump of the same
+        # type: its payload *is* the request, and the kernel parses it with a
+        # header length of its own before the handler runs. Relaying every
+        # RTM_GET* in the minimal dump form — the shape that gets past Android's
+        # refusal of the attribute-bearing dump — hands the kernel a message
+        # four bytes short of that and it answers EINVAL, so `ip link show dev
+        # eth0` and `ip route get 8.8.8.8` printed "Invalid argument" for
+        # requests the host would have answered.
+        check_contains "m16 a non-dump RTM_GETLINK is answered, not refused" \
+            "getlink1: msgs>0=1 newlink=1 err=0" "$em"
+
+        # --- 2. against the kernel, where there is a kernel to compare to ---
+        if [ "$m16_raw" = 1 ]; then
+            # A policy may refuse accept on a netlink socket before the family
+            # answers it (Android 8's SELinux: EACCES). That is the host's
+            # policy, not the kernel the emulation answers as; the leg above
+            # holds the emulation to the family's answer. (Copies: the
+            # passthrough leg below wants the host's whole answer.)
+            kb=$base
+            ke=$em
+            case "$base" in
+            *"accept: rc=-1 errno=13"*)
+                skip "m16 accept against the real kernel: the host's policy refuses it first (EACCES)"
+                kb=$(printf '%s\n' "$base" | grep -v '^accept: ')
+                ke=$(printf '%s\n' "$em" | grep -v '^accept: ') ;;
+            esac
+            if [ "$ke" = "$kb" ]; then
+                pass=$((pass + 1))
+                echo "  ok   m16 emulated rtnetlink matches the real kernel"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL m16 emulated rtnetlink matches the real kernel"
+                echo "    want: $kb"
+                echo "    got:  $ke"
+            fi
+
+            # Without forcing, rtnetlink works here, so the emulation must stay
+            # out of the way entirely rather than shadowing a working kernel.
+            pt=$(m16run -R "$R" /bin/netif 2>/dev/null)
+            if [ "$pt" = "$base" ]; then
+                pass=$((pass + 1)); echo "  ok   m16 passthrough is unchanged"
+            else
+                fail=$((fail + 1)); echo "  FAIL m16 passthrough is unchanged"
+                echo "    got: $pt"
+            fi
+            dbg=$(CNG_DEBUG=1 m16run -R "$R" /bin/netif 2>&1 \
+                >/dev/null | grep -c 'netlink: emulating')
+            check "m16 the emulation does not engage where rtnetlink works" \
+                0 "$dbg"
+        else
+            # This host is the target. Nothing to diff against, so assert the
+            # thing that actually matters here: the guest never asked to be
+            # rescued, and still was.
+            printf '  (this kernel refuses the raw path: %s)\n' \
+                "$(printf %s "$base" | tr '\n' ' ')"
+            pt=$(m16run -R "$R" /bin/netif 2>/dev/null)
+            dbg=$(CNG_DEBUG=1 m16run -R "$R" /bin/netif 2>&1 \
+                >/dev/null | grep -c 'netlink: emulating')
+            if [ "$dbg" -gt 0 ]; then
+                pass=$((pass + 1))
+                echo "  ok   m16 the emulation engages unforced where the kernel refuses rtnetlink"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL m16 the emulation engages unforced where the kernel refuses rtnetlink"
+                echo "    (no 'netlink: emulating' trace; guest got: $pt)"
+            fi
+            check_contains "m16 unforced: bind succeeds where the kernel refused it" \
+                "bind: ok" "$pt"
+            check_contains "m16 unforced: the refused dump is served and parseable" \
+                "dump: got>0=1 msgs>0=1 seq_ok=1 newlink>0=1" "$pt"
+            check_contains "m16 unforced: getifaddrs works" "getifaddrs: ok" "$pt"
+            check_contains "m16 unforced: the loopback interface is visible" \
+                "lo=1" "$pt"
+            check_contains "m16 unforced: SIOCGIFCONF answers from the same view" \
+                "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$pt"
+            check_contains "m16 unforced: it leaves the tail and takes a negative length" \
+                "ifconf_edge: tail=1 neg=1" "$pt"
+            check_contains "m16 unforced: the per-interface getters agree" \
+                "ifget: lo idx=1 up=1 loopback=1 mtu=65536 mask8=1 byidx=1" \
+                "$pt"
+        fi
+
+        # --- 3. iproute2's dump contract, which glibc's getifaddrs does NOT
+        #    check -- and which is why a malformed terminator passed every test
+        #    here and still broke `ip addr` on a device with "DONE truncated".
+        #    NLMSG_DONE must carry a 4-byte error int (nlmsg_len >= 20), and every
+        #    reply must survive iproute2's pid/seq filter or the whole dump is
+        #    dropped silently. `ip addr` buffers the link dump before printing, so
+        #    any of these failing yields no output at all rather than a partial
+        #    listing.
+        if guest_cc "$M16D/nldone" tests/guests/nldone.c; then
+            cp "$M16D/nldone" "$R/bin/nldone"
+            kem=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nldone \
+                2>/dev/null)
+            check_contains "m16 the dump satisfies iproute2's contract" \
+                "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
+                "$kem"
+            if [ "$m16_raw" = 1 ]; then
+                kbase=$(emu_t 60 "$M16D/nldone" 2>/dev/null)
+                if [ "$kem" = "$kbase" ]; then
+                    pass=$((pass + 1))
+                    echo "  ok   m16 the dump contract matches the real kernel"
+                else
+                    fail=$((fail + 1))
+                    echo "  FAIL m16 the dump contract matches the real kernel"
+                    echo "    want: $kbase"
+                    echo "    got:  $kem"
+                fi
+            else
+                # The on-device acceptance bar, and literally what makes `ip
+                # addr` print anything there: unforced, over whatever the kernel
+                # does allow, the contract still has to hold.
+                knf=$(m16run -R "$R" /bin/nldone 2>/dev/null)
+                check_contains "m16 unforced: the dump contract holds on a refusing kernel" \
+                    "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
+                    "$knf"
+            fi
+            # Android refuses the link dump itself (nlmsg_readpriv), in every
+            # request form, while the address dump relays fine — so a refused
+            # RTM_GETLINK must be synthesized from the address dump plus
+            # ioctls, not degraded to an empty dump that `ip addr` renders as
+            # total silence. CNG_NETLINK_DENY_GETLINK simulates that split.
+            kdg=$(CNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/nldone \
+                2>/dev/null)
+            check_contains "m16 a refused RTM_GETLINK is synthesized" \
+                "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
+                "$kdg"
+            edg=$(CNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/netif \
+                2>/dev/null)
+            check_contains "m16 getifaddrs works over a synthesized link dump" \
+                "getifaddrs: ok" "$edg"
+            check_contains "m16 loopback survives the synthesized link dump" \
+                "lo=1" "$edg"
+            # With no relay at all the guest still gets a well-formed dump
+            # presenting loopback — the oracle's exact degradation when even
+            # getifaddrs fails, and what bubblewrap/glibc want to see.
+            knr=$(CNG_NETLINK_NO_RELAY=1 m16run -R "$R" /bin/nldone \
+                2>/dev/null)
+            check_contains "m16 a relay-less dump presents loopback only" \
+                "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
+                "$knr"
+            # ...and the ioctl view degrades with it, to the same one interface.
+            # Without that, `ifconfig` would still be listing the host's real
+            # network while `ip addr` showed loopback alone.
+            enr=$(CNG_NETLINK_NO_RELAY=1 m16run -R "$R" /bin/netif 2>/dev/null)
+            check_contains "m16 a relay-less SIOCGIFCONF presents loopback only" \
+                "ifcount: 1" "$enr"
+            check_contains "m16 that loopback carries 127.0.0.1" \
+                "ifconf: size_ok=1 entries>0=1 lo=1 lo_addr=1" "$enr"
+
+            # busybox ip submits its request with plain write(2) — a syscall
+            # deliberately left untrapped — and that is what Alpine runs. The
+            # socketpair stand-in queues the write; the trapped recv drains and
+            # serves it. Real `ip addr` output is the acceptance bar: at least
+            # one interface line and one inet line, under the Android split.
+            M16_ALPINE="${M16_ALPINE:-$CNG_ALPINE}"
+            if [ -n "$M16_ALPINE" ] && [ -x "$M16_ALPINE/bin/busybox" ]; then
+                bb=$(CNG_NETLINK_DENY_GETLINK=1 run_t 60 -R \
+                    "$M16_ALPINE" /bin/busybox ip addr 2>/dev/null)
+                check_contains "m16 busybox ip addr lists loopback" \
+                    ": lo: <LOOPBACK,UP" "$bb"
+                check_contains "m16 busybox ip addr lists an address" \
+                    "inet 127.0.0.1/8" "$bb"
+            else
+                skip "busybox ip leg: no alpine rootfs"
+            fi
+        else
+            skip "iproute2 dump-contract legs: could not build tests/guests/nldone.c"
+        fi
+    fi
+
+    # --- 4. M16c: the audit interface ---------------------------------------
+    #
+    # The other netlink protocol Android's policy takes away. Nothing is
+    # emulated -- the guest has no business seeing the host's audit log -- but
+    # the refusal has to be one libaudit's callers recognise, because they
+    # branch on it: EINVAL/EPROTONOSUPPORT/EAFNOSUPPORT mean "no audit in this
+    # kernel" and every shadow-utils tool carries on, while the EACCES the
+    # policy actually returns is fatal ("Cannot open audit interface -
+    # aborting", which is what `useradd` and shadow's `su` print in a rootfs on
+    # a device). These legs do not depend on the rtnetlink probe above.
+    if guest_cc "$M16D/auditsock" tests/guests/auditsock.c; then
+        cp "$M16D/auditsock" "$R/bin/auditsock"
+        # The reference: the same binary with no emulation, on this kernel.
+        abase=$(emu_t 60 "$M16D/auditsock" 2>/dev/null | grep '^audit:')
+        a_raw=0
+        case "$abase" in *"open=1"*) a_raw=1 ;; esac
+
+        # Forced: the refusal Android returns, turned into the one the tools
+        # survive. EPROTONOSUPPORT is 93 -- what netlink_create itself returns
+        # for a protocol nobody registered, i.e. a kernel built without audit.
+        ad=$(CNG_NETLINK_DENY_AUDIT=1 m16run -R "$R" /bin/auditsock 2>/dev/null)
+        check_contains "m16c a refused audit socket reads as 'no audit in this kernel'" \
+            "audit: open=0 errno=93 survives=1" "$ad"
+        # ...and it is that narrow: no other socket is touched by the answer.
+        check_contains "m16c the audit answer leaves other sockets alone" \
+            "other: route=1 inet=1" "$ad"
+
+        if [ "$a_raw" = 1 ]; then
+            # This kernel grants the socket (audit built in, no policy in the
+            # way). Then there is no refusal to rephrase and the guest must see
+            # exactly what it would have seen unemulated.
+            apt=$(m16run -R "$R" /bin/auditsock 2>/dev/null | grep '^audit:')
+            if [ "$apt" = "$abase" ]; then
+                pass=$((pass + 1))
+                echo "  ok   m16c a granted audit socket is passed through untouched"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL m16c a granted audit socket is passed through untouched"
+                echo "    want: $abase"
+                echo "    got:  $apt"
+            fi
+        else
+            # This host is the target: the kernel (or its policy) refuses the
+            # socket on its own, so the guest must be rescued without being
+            # asked -- the on-device acceptance bar, and the whole reason
+            # `useradd` aborts there today.
+            printf '  (this kernel refuses the audit socket: %s)\n' "$abase"
+            apt=$(m16run -R "$R" /bin/auditsock 2>/dev/null)
+            check_contains "m16c unforced: the refusal is rephrased where the kernel refuses it" \
+                "audit: open=0 errno=93 survives=1" "$apt"
+        fi
+    else
+        skip "audit interface legs: could not build tests/guests/auditsock.c"
+    fi
+
+    # --- 4. more emulated sockets than the table used to hold --------------
+    # Four slots, and the fifth concurrent socket fell through to the host's
+    # own refusal — on a device, where the shim exists because the host
+    # refuses. The guest holds twelve open at once, closes and reopens them,
+    # then has four threads open three each at the same moment (the claim
+    # race). On a host that grants rtnetlink a fallen-through socket is a real
+    # one and works, so the guest's own counts cannot tell; the emulator's
+    # debug log names every socket it stands in for, and all 36 must be there.
+    if guest_cc "$M16D/nlmany" tests/guests/nlmany.c -pthread; then
+        cp "$M16D/nlmany" "$R/bin/nlmany"
+        many=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlmany 2>"$M16D/nlmany.err")
+        check_contains "m16 twelve emulated sockets at once, reopened, and from four threads" \
+            "many: opened=12 dumps=12 reopened=12 redumps=12 threaded=1" "$many"
+        check "m16 ...and every one of the 36 was the emulation's" \
+            36 "$(grep -c 'netlink: emulating fd' "$M16D/nlmany.err")"
+    else
+        skip "many-socket leg: could not build tests/guests/nlmany.c with -pthread"
+    fi
+    # ...and the table's own churn. A slot whose fd the guest closed is
+    # retired by whoever finds it, and found, judged and claimed were three
+    # steps: judged from one occupant, it could be claimed from the next, and
+    # the new socket in it was released under its owner — whose next call then
+    # went to the host as an AF_UNIX socket's (bind EINVAL; the four-thread leg
+    # above lost a dump to that now and then). A lookup that retired a stale
+    # slot with its number also stopped there. Eight threads open, bind, name
+    # and close sockets in a loop: every one must stay the emulation's. The
+    # previous build had about twenty go wrong a run.
+    #
+    # The other end of each is the broker daemon's, which holds at most
+    # CNG_NL_SOCK_MAX (1024) and gives one up when the guest's last close of
+    # its own end hangs up the pair. 3600 sockets are past that bound threefold,
+    # so all of them can be emulated only if every close was noticed. Where the
+    # host's rtnetlink works a socket the daemon refused falls through to a
+    # real one and the guest's own counts cannot tell; the debug log names
+    # every socket the emulation stands in for.
+    if guest_cc "$M16D/nlchurn" tests/guests/nlchurn.c -pthread; then
+        cp "$M16D/nlchurn" "$R/bin/nlchurn"
+        st=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlchurn \
+            2>"$M16D/nlchurn.err")
+        check_contains "m16 sockets opened and closed by eight threads stay emulated" \
+            "nlchurn: sockets=3600 bad=0" "$st"
+        check "m16 ...every one of the 3600, past what the daemon holds at once" \
+            3600 "$(grep -c 'netlink: emulating fd' "$M16D/nlchurn.err")"
+    else
+        skip "slot-churn leg: could not build tests/guests/nlchurn.c with -pthread"
+    fi
+
+    # --- 5. the hidden descriptors and the guest's own -----------------------
+    # An emulated socket was three descriptors, and the guest knows one. A
+    # close-all loop closes the others too and the next opens get the
+    # numbers back; the slot's reclaim used to close them again, on the
+    # evidence of the guest's fd alone — two files of the program's. And the
+    # relay socket was close-on-exec while a netlink socket without SOCK_CLOEXEC
+    # is not: after an exec the inherited socket's dump went through, and read
+    # from, whatever the new program had opened on the relay's number. (The
+    # other end and the relays are the broker daemon's now, in a table of its
+    # own; the legs stand for what they check.)
+    if guest_cc "$M16D/nlstale" tests/guests/nlstale.c; then
+        cp "$M16D/nlstale" "$R/bin/nlstale"
+        st=$(CNG_DEBUG=1 CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlstale \
+            2>"$M16D/nlstale.err")
+        check_contains "m16 a close-all loop costs the guest none of its own files" \
+            "closeall: dump=1 files=16 reclaim=-1/88 kept=16 redump=1" "$st"
+        check_contains "m16 a netlink socket without SOCK_CLOEXEC works after an exec" \
+            "exec: inherited_open=1 dump=1 files=16 kept=16" "$st"
+        if [ "$m16_raw" = 1 ]; then
+            # The dump after the exec is relayed like the two before it, not
+            # synthesized through the guest's file on an old number. Each
+            # send waits for the daemon to have served it, and the wait
+            # reports what was done (the daemon's own stderr is /dev/null).
+            check "m16 ...and its dump is still relayed, on a relay socket of ours" \
+                3 "$(grep -c -- '-> 1 relayed' "$M16D/nlstale.err")"
+        fi
+    else
+        skip "hidden-descriptor leg: could not build tests/guests/nlstale.c"
+    fi
+
+    # --- 6. concurrent relays on one socket ---------------------------------
+    # The relay was a descriptor the socket kept, re-opened when it went stale,
+    # and two threads finding it gone at once could leave the published one
+    # recorded under the loser's identity: taken for stale by the next call and
+    # replaced without a close, a descriptor lost per race. Each round closes
+    # the monitor's netlink sockets (what a close-all loop does), and eight
+    # threads relay on the one socket at the same moment; a relay belongs to
+    # its request now, so none may be left once they are done. The previous
+    # build leaves its one relay behind every round, and more when it races.
+    if guest_cc "$M16D/nlrace" tests/guests/nlrace.c -pthread; then
+        cp "$M16D/nlrace" "$R/bin/nlrace"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlrace 2>/dev/null)
+        check_contains "m16 concurrent relays leave no relay socket behind" \
+            "nlrace: rounds=60 left=0 leaked=0" "$st"
+    else
+        skip "concurrent-relay leg: could not build tests/guests/nlrace.c with -pthread"
+    fi
+
+    # --- 7. the address an emulated socket hands back ----------------------
+    # getsockname, getpeername and the source address of the three receives
+    # go out by the kernel's rules for any address (move_addr_to_user): a
+    # prefix into a short buffer, the address's own length written back, EINVAL
+    # for a negative length (before anything is received, for recvmsg), EFAULT
+    # for no buffer or no length, and nothing at all after a failed receive.
+    # The previous build wrote nothing into a short buffer and kept its length,
+    # answered success for every bad pointer and length, gave getpeername our
+    # own port id, and wrote the source into the buffer of a receive that
+    # failed. The text is the kernel's, measured; where rtnetlink works here
+    # the kernel is asked again.
+    nladdr_want='getsockname 4: r=0 l=12 b=10000000aa
+getsockname 0: r=0 l=12 b=aa
+getsockname -1: r=-1 e=22 l=-1
+getsockname nobuf: r=-1 e=14 l=12
+getsockname nobuf 0: r=0 e=0 l=12
+getsockname nolen: r=-1 e=14
+getpeername: r=0 l=12 family=16 pid=0 groups=0
+recvfrom 6: got=1 l=12 b=100000000000aa
+recvfrom again: r=-1 e=11 l=12 b=aa
+recvmsg 5: got=1 namelen=12 b=1000000000
+recvmsg 0: got=1 namelen=12 b=aa
+recvmsg -1: r=-1 e=22 then=1
+recvmmsg: r=2 namelen=12 family=16 pid=0 namelen0=12 b=aa'
+    if guest_cc "$M16D/nladdr" tests/guests/nladdr.c; then
+        cp "$M16D/nladdr" "$R/bin/nladdr"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nladdr 2>/dev/null)
+        if [ "$st" = "$nladdr_want" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 an emulated socket hands its address back as the kernel does"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 an emulated socket hands its address back as the kernel does"
+            printf '%s\n' "$nladdr_want" >"$M16D/nladdr.want"
+            printf '%s\n' "$st" >"$M16D/nladdr.got"
+            diff "$M16D/nladdr.want" "$M16D/nladdr.got" | sed 's/^/    /'
+        fi
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nladdr" 2>/dev/null)
+            # An older kernel dropped the name of a recvmsg whose msg_namelen
+            # is 0 before the family saw it, and the length came back 0
+            # (Android 8's 3.18, measured); the text above is what a current
+            # kernel says, and what the emulation answers as.
+            case "$kst" in
+            *"recvmsg 0: got=1 namelen=0 "*)
+                skip "m16 address writeback against the kernel: the host kernel drops a zero-length recvmsg name (an older kernel), so it is no reference" ;;
+            *)
+                check "m16 ...and the kernel here says the same" "$nladdr_want" "$kst" ;;
+            esac
+        fi
+    else
+        skip "address writeback leg: could not build tests/guests/nladdr.c"
+    fi
+
+    # --- 8. the rest of a recvmsg header -----------------------------------
+    # The datagram scattered over every iovec, MSG_TRUNC for a cut one in
+    # msg_flags, msg_controllen written back (0: the stand-in carries no
+    # ancillary data), a datagram offered no room consumed all the same, and a
+    # header the kernel cannot read refused with the reply left queued. The
+    # previous build received into the first iovec only, left msg_flags and
+    # msg_controllen as the caller had them, and answered 0 for a NULL header
+    # and success for 1025 iovecs. Kernel text, and the kernel where it works.
+    nlhdr_want='scatter: r=32 second=1 flags=0x20 controllen=0
+whole: got=1 flags=0 controllen=0
+empty: r=0 flags=0x20 controllen=0 consumed=1
+nullhdr: r=-1 e=14
+bigiov: r=-1 e=90
+badiov: r=-1 e=14 then=1
+recvmmsg: r=1 len=32 second=1 flags=0x20 controllen=0'
+    if guest_cc "$M16D/nlhdr" tests/guests/nlhdr.c; then
+        cp "$M16D/nlhdr" "$R/bin/nlhdr"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlhdr 2>/dev/null)
+        if [ "$st" = "$nlhdr_want" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 an emulated recvmsg writes its header as the kernel does"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 an emulated recvmsg writes its header as the kernel does"
+            printf '%s\n' "$nlhdr_want" >"$M16D/nlhdr.want"
+            printf '%s\n' "$st" >"$M16D/nlhdr.got"
+            diff "$M16D/nlhdr.want" "$M16D/nlhdr.got" | sed 's/^/    /'
+        fi
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nlhdr" 2>/dev/null)
+            check "m16 ...and the kernel here writes the same" "$nlhdr_want" "$kst"
+        fi
+    else
+        skip "recvmsg header leg: could not build tests/guests/nlhdr.c"
+    fi
+
+    # --- 9. requests the monitor never sees ---------------------------------
+    # Mozilla's mtu crate, which Firefox's HTTP/3 stack asks for the path MTU
+    # of every connection, write(2)s an RTM_GETROUTE and read(2)s the reply,
+    # then the same for RTM_GETLINK. The seccomp tier traps neither, and a
+    # request was served only at the next trapped call on its socket: the
+    # read slept for good, and Firefox's socket thread with it. A poll(2)
+    # between them slept under either tier, and a sendmmsg naming the kernel
+    # was refused by the datagram stand-in (EINVAL). The daemon that holds the
+    # other end serves a request whichever way it came. Each leg runs under
+    # its own alarm in the guest, so a request nobody answers is a timeout
+    # line, not a wedged suite.
+    nlrw_want='write: route=24 oif=1 link=16 name=lo mtu=65536
+poll: ready=1 route=24 oif=1
+writev: route=24 oif=1
+sendmmsg: sent=1 route=24 oif=1'
+    if guest_cc "$M16D/nlrw" tests/guests/nlrw.c; then
+        cp "$M16D/nlrw" "$R/bin/nlrw"
+        for _tier in -R plain; do
+            if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+                skip "m16 netlink requests by write(2), seccomp tier: the filter is inert here"
+                continue
+            fi
+            _opt=""
+            [ "$_tier" = -R ] && _opt=-R
+            # shellcheck disable=SC2086  # $_opt is a flag or deliberately empty
+            st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run $_opt "$R" /bin/nlrw \
+                2>/dev/null)
+            check "m16 requests by write(2), poll(2), writev(2), sendmmsg(2) are served ($_tier)" \
+                "$nlrw_want" "$st"
+        done
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nlrw" 2>/dev/null)
+            check "m16 ...and the kernel here answers the same" "$nlrw_want" "$kst"
+        fi
+    else
+        skip "requests-by-write leg: could not build tests/guests/nlrw.c"
+    fi
+
+    # --- 10. the ACK a get asks for ---------------------------------------
+    # A non-dump get with NLM_F_ACK is answered by the object and then by an
+    # ACK — error 0, NLM_F_CAPPED, the request's header echoed — and a dump by
+    # NLMSG_DONE alone, whatever it asked. The emulation sent the object
+    # alone: a relayed get left the kernel's ACK on the relay socket it then
+    # closed, and a synthesized one never had any, so a client waiting for the
+    # ACK (libnl's nl_wait_for_ack) waited for good. Both paths: relayed, and
+    # with the link refused as Android refuses it (synthesized). A kernel
+    # older than the flag relayed its ACK unflagged, so one socket answered a
+    # synthesized link flagged and a relayed route not.
+    nlack_want='getlink ack: objects=1 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=18/32/0x5/1
+getlink: objects=1 errors=0 acks=0 dones=0 more=0
+getroute ack: objects=1 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=26/36/0x5/3
+getroute: objects=1 errors=0 acks=0 dones=0 more=0
+dump ack: objects>0=1 errors=0 acks=0 dones=1 more=0'
+    if guest_cc "$M16D/nlack" tests/guests/nlack.c; then
+        cp "$M16D/nlack" "$R/bin/nlack"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlack 2>/dev/null)
+        check "m16 a get that asks for an ACK gets one after its answer, a dump none" \
+            "$nlack_want" "$st"
+        st=$(CNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/nlack 2>/dev/null)
+        check "m16 ...and so does a synthesized one" "$nlack_want" "$st"
+        # A request the emulation does not model (bubblewrap's RTM_NEWADDR of
+        # 127.0.0.1 on lo) is acked as a success, with the same ACK a get gets.
+        # It was the one ACK still sent unflagged, a pre-4.12 kernel's on every
+        # host. A kernel is no reference here: it answers an unprivileged
+        # caller EPERM (Android's policy refuses the send, EACCES), and root
+        # finds the address already there.
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlack unmodelled \
+            2>/dev/null)
+        check "m16 a request it does not model is acked as a current kernel acks" \
+            'newaddr ack: objects=0 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=20/32/0x605/6' \
+            "$st"
+        if [ "$m16_raw" = 1 ]; then
+            kst=$(emu_t 60 "$M16D/nlack" 2>/dev/null)
+            # A kernel before 4.12 (extended ACK reporting) sends its ACK with
+            # no flags (Android 8's 3.18, measured): no reference for
+            # NLM_F_CAPPED, which the emulation sets as the 6.1 it advertises,
+            # relayed ACKs included. The rest is still the kernel's to judge.
+            case "$kst" in
+            *" ack=0 flags=0 len="*)
+                skip "m16 NLM_F_CAPPED against the kernel: the host kernel predates it (4.12), so it is no reference"
+                check "m16 ...and the kernel here answers the same, the flag aside" \
+                    "$(printf '%s\n' "$nlack_want" | sed 's/ flags=0x100 / flags=0 /')" \
+                    "$kst" ;;
+            *)
+                check "m16 ...and the kernel here answers the same" "$nlack_want" "$kst" ;;
+            esac
+        fi
+    else
+        skip "ACK leg: could not build tests/guests/nlack.c"
+    fi
+
+    # The interface-query band is all cng_nl_ioctl answers for. Every other
+    # request used to be taken for an ifreq as well wherever the dispatcher saw
+    # it (all of them under -R, and every request at a patched site), so a NULL
+    # argument, or one at the end of a mapping, was EFAULT where the host
+    # answers: once anything had asked for the interface list, TIOCSCTTY,
+    # FIONCLEX and FIONREAD stopped working on Android. The text is a kernel's.
+    ioctlband_want='siocgifconf=0
+fioclex=0 cloexec=1
+fionclex=0 cloexec=0
+fionread_edge=0 n=3'
+    if guest_cc "$M16D/ioctlband" tests/guests/ioctlband.c; then
+        cp "$M16D/ioctlband" "$R/bin/ioctlband"
+        st=$(CNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/ioctlband 2>/dev/null)
+        if [ "$st" = "$ioctlband_want" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 an ioctl beside the interface band is the host's, whatever its argument"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 an ioctl beside the interface band is the host's, whatever its argument"
+            printf '%s\n' "$ioctlband_want" >"$M16D/ioctlband.want"
+            printf '%s\n' "$st" >"$M16D/ioctlband.got"
+            diff "$M16D/ioctlband.want" "$M16D/ioctlband.got" | sed 's/^/    /'
+        fi
+        kst=$(emu_t 60 "$M16D/ioctlband" 2>/dev/null)
+        # The kernel's own text, where its first line is the same: a host that
+        # refuses SIOCGIFCONF would differ in that row alone.
+        if [ "$(printf '%s\n' "$kst" | tail -n +2)" = \
+            "$(printf '%s\n' "$ioctlband_want" | tail -n +2)" ]; then
+            pass=$((pass + 1))
+            echo "  ok   m16 ...and the host kernel here agrees on the other three"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL m16 ...and the host kernel here agrees on the other three"
+            printf '%s\n' "$kst" | sed 's/^/    /'
+        fi
+    else
+        skip "ioctl beside the interface band leg: could not build tests/guests/ioctlband.c"
+    fi
+
+    rm -rf "$R"
+fi
+rm -rf "$M16D"

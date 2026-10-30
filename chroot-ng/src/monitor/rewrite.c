@@ -1,0 +1,866 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+#include "cng/rewrite.h"
+#include "cng/elf.h"
+#include "cng/loader.h"
+#include "cng/monitor.h"
+#include "cng/ptrace.h"
+#include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/tab.h"
+#include "cng/uapi.h"
+
+#include <stdint.h>
+
+int cng_g_rewrite = 0;
+
+/* Trampoline template (src/monitor/tramp.S). */
+extern char cng_svc_tramp_tpl[];
+extern char cng_svc_tramp_tpl_end[];
+extern char cng_svc_tramp_disp[];
+extern char cng_svc_tramp_ret[];
+extern char cng_svc_tramp_back[];
+
+#define SVC0_INSN    0xD4000001u /* `svc #0` */
+#define B_OPCODE     0x14000000u /* unconditional branch */
+#define BRANCH_REACH (1L << 27)  /* +-128 MiB */
+/* movz x8 or w8, #imm16 (hw=0): the width bit is left out, since bionic loads
+ * its syscall numbers as `mov w8, #nr`, and musl and glibc as `mov x8, #nr`. */
+#define MOVZ_X8_MASK 0x7FE0001Fu
+#define MOVZ_X8      0x52800008u
+#define NR_RT_SIGRETURN 139u
+#define NR_MUNMAP       215u
+#define NR_EXIT         93u
+
+/* Section headers we are willing to walk, and how many at a time: a page's
+ * worth, which is 4 KiB of the caller's frame — the loader's, or the
+ * dispatcher's on its 256 KiB scratch stack — and one pread for any object
+ * in a Debian/Alpine aarch64 rootfs (the biggest has 61 sections). */
+#define MAX_SHDR   1024
+#define SHDR_CHUNK 64
+
+/* How far back a candidate's syscall number may have been set, in
+ * instructions. Measured over ~1800 real `svc` sites in Alpine/Debian aarch64
+ * rootfs images: 97.1% set x8 within 8 instructions, and every data word that
+ * collided with the encoding had nothing resembling one. */
+#define X8_LOOKBACK 8
+
+unsigned long cng_tramp_size(void) {
+    return (unsigned long)(cng_svc_tramp_tpl_end - cng_svc_tramp_tpl);
+}
+
+/* Encode `b <target>` at `at`; 0 if the target is out of a branch's reach. */
+static uint32_t b_insn(unsigned long at, unsigned long target) {
+    long delta = (long)target - (long)at;
+    if (delta < -BRANCH_REACH || delta >= BRANCH_REACH || (delta & 3))
+        return 0;
+    return B_OPCODE | (uint32_t)(((unsigned long)delta >> 2) & 0x03FFFFFFu);
+}
+
+/* Copy a trampoline into pool+*used, patch its two literals and its return
+ * branch, advance *used. The branch is what lets the common exit put the guest
+ * back at S+4 without spending a register on the address — which is how x16/x17
+ * survive (see tramp.S). */
+static char *emit(unsigned long pool, unsigned long cap, unsigned long *used,
+                  unsigned long ret_site) {
+    unsigned long tsz = cng_tramp_size();
+    if (*used + tsz > cap)
+        return 0;
+    char *slot = (char *)(pool + *used);
+    size_t back_off = (size_t)(cng_svc_tramp_back - cng_svc_tramp_tpl);
+    uint32_t back = b_insn((unsigned long)slot + back_off, ret_site);
+    if (!back)
+        return 0; /* the site is reachable but the way back is not */
+    memcpy(slot, cng_svc_tramp_tpl, tsz);
+    size_t disp_off = (size_t)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
+    size_t ret_off = (size_t)(cng_svc_tramp_ret - cng_svc_tramp_tpl);
+    *(unsigned long *)(slot + disp_off) = (unsigned long)&cng_tramp_dispatch;
+    *(unsigned long *)(slot + ret_off) = ret_site;
+    *(uint32_t *)(slot + back_off) = back;
+    *used += tsz;
+    return slot;
+}
+
+/* pread exactly n bytes at off, or fail. */
+static int pread_all(int fd, void *buf, unsigned long n, unsigned long off) {
+    unsigned long done = 0;
+    while (done < n) {
+        long r = sys_pread64(fd, (char *)buf + done, n - done,
+                             (long)(off + done));
+        if (r < 0) {
+            if (r == -EINTR)
+                continue;
+            return 0;
+        }
+        if (r == 0)
+            return 0; /* short of what was asked for: not the file we expect */
+        done += (unsigned long)r;
+    }
+    return 1;
+}
+
+/* Where an object says its code is.
+ *
+ * A `PF_X PT_LOAD` is not a code segment: a musl/Alpine link puts the whole
+ * read-only image — .rela.dyn, .dynstr, .rodata, .eh_frame, .gcc_except_table —
+ * into the one R+E segment, and even a `-z separate-code` link leaves .rodata
+ * and the unwind tables in there. Measured over 1717 aarch64 objects, 58% of
+ * the bytes inside PF_X segments are not instructions at all, and ten data
+ * words in stock Alpine/Debian rootfs images (libstdc++, libapt-pkg, libicuuc,
+ * sqv, libgo, libgphobos — every one of them in .gcc_except_table, whose
+ * uleb128 call-site records produce the byte string `01 00 00 d4` at a rate
+ * some 10^5 times chance) equal `svc #0` exactly. Rewriting one corrupts an
+ * LSDA the C++ personality routine later reads; nothing on the path from the
+ * store to the wrong landing pad reports anything.
+ *
+ * The section headers separate the two exactly — all 1837 real `svc` words in
+ * that corpus are inside SHF_EXECINSTR sections and all ten data words are
+ * outside — and they survive `strip` (not one of those objects was without
+ * them). They are guest-controlled input, but they can only ever narrow what
+ * the caller scans, so nonsense here costs rewriting and never correctness. */
+int cng_code_ranges(int fd, struct cng_code_ranges *cr) {
+    cr->n = 0;
+    if (fd < 0)
+        return 0;
+
+    Elf64_Ehdr eh;
+    if (!pread_all(fd, &eh, sizeof eh, 0))
+        return 0;
+    if (eh.e_ident[0] != ELF_MAG0 || eh.e_ident[1] != ELF_MAG1 ||
+        eh.e_ident[2] != ELF_MAG2 || eh.e_ident[3] != ELF_MAG3 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_machine != EM_AARCH64)
+        return 0;
+    if (!eh.e_shoff || !eh.e_shnum || eh.e_shnum > MAX_SHDR ||
+        eh.e_shentsize != sizeof(Elf64_Shdr))
+        return 0; /* incl. e_shnum == 0's extended numbering: not worth a case */
+
+    Elf64_Shdr sh[SHDR_CHUNK];
+    for (unsigned i = 0; i < eh.e_shnum; i += SHDR_CHUNK) {
+        unsigned k = (unsigned)eh.e_shnum - i;
+        if (k > SHDR_CHUNK)
+            k = SHDR_CHUNK;
+        if (!pread_all(fd, sh, (unsigned long)k * sizeof *sh,
+                       eh.e_shoff + (unsigned long)i * sizeof *sh))
+            goto give_up;
+        for (unsigned j = 0; j < k; j++) {
+            if (sh[j].sh_type == SHT_NOBITS || !sh[j].sh_size)
+                continue;
+            if ((sh[j].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) !=
+                (SHF_ALLOC | SHF_EXECINSTR))
+                continue;
+            unsigned long lo = sh[j].sh_offset, hi = lo + sh[j].sh_size;
+            if (hi < lo)
+                goto give_up; /* a header that wraps describes nothing */
+            /* .init/.plt/.text/.fini are laid out end to end, so the four
+             * become one range and the table never fills on a real object. */
+            if (cr->n && cr->hi[cr->n - 1] == lo) {
+                cr->hi[cr->n - 1] = hi;
+                continue;
+            }
+            if (cr->n == CNG_CODE_RANGES_MAX)
+                goto give_up;
+            cr->lo[cr->n] = lo;
+            cr->hi[cr->n] = hi;
+            cr->n++;
+        }
+    }
+    return cr->n;
+
+give_up:
+    cr->n = 0;
+    return 0;
+}
+
+/* Does this instruction write x8, the register a syscall number arrives in?
+ * Deliberately broad — a false accept only means the filter did not fire —
+ * covering the forms a syscall stub actually uses: `movz/movk x8, #nr`, `mov
+ * x8, xN` (an orr), `add/sub x8, ...`, and a load into x8. */
+static int writes_x8(uint32_t w) {
+    if ((w & 0x1Fu) != 8u)
+        return 0; /* Rd/Rt is not x8 */
+    uint32_t g = w & 0x7F800000u;
+    if (g == 0x52800000u || g == 0x72800000u)
+        return 1; /* movz / movk, both widths */
+    if (g == 0x11000000u || g == 0x51000000u)
+        return 1; /* add / sub immediate */
+    g = w & 0x7FC00000u;
+    if (g == 0x0A000000u || g == 0x2A000000u || g == 0x4A000000u)
+        return 1; /* and / orr / eor shifted register — `mov x8, xN` is an orr */
+    g = w & 0x3B000000u;
+    if (g == 0x39000000u || g == 0x18000000u)
+        return 1; /* load/store unsigned offset, or a literal load */
+    return 0;
+}
+
+/* Is the word at `a` an `svc #0` with `mov x8, #nr` (or w8) in the word before
+ * it? Reads `a - 4` and `a`, so the caller keeps both inside the mapping. */
+static int svc_nr(unsigned long a, unsigned long floor, unsigned nr) {
+    if (a < floor + 4 || *(uint32_t *)a != SVC0_INSN)
+        return 0;
+    uint32_t prev = *(uint32_t *)(a - 4);
+    return (prev & MOVZ_X8_MASK) == MOVZ_X8 && ((prev >> 5) & 0xFFFFu) == nr;
+}
+
+/* One of the two `svc` of a thread freeing its own stack: unmap the stack it is
+ * standing on, then exit. musl's __unmapself is exactly
+ *     mov x8,#215; svc 0; mov x8,#93; svc 0
+ * and bionic's _exit_with_stack_teardown has a `mov x0,#0` between them and
+ * the numbers in w8 (Android 8 to 15 alike), which went unrecognised while
+ * only x8 was matched. The
+ * munmap is told from the others by the exit that follows it, and the exit by
+ * the munmap before it, so that a program's ordinary munmap and exit are as
+ * they were. `hi` bounds the look ahead, which is the only read that could
+ * leave the code. */
+static int stack_teardown(unsigned long a, unsigned long floor,
+                          unsigned long hi) {
+    if (svc_nr(a, floor, NR_MUNMAP)) {
+        for (unsigned long j = 2; j <= 3; j++)
+            if (a + 4 * j + 4 <= hi && svc_nr(a + 4 * j, floor, NR_EXIT))
+                return 1;
+    } else if (svc_nr(a, floor, NR_EXIT)) {
+        for (unsigned long j = 2; j <= 3; j++)
+            if (a >= floor + 4 * j + 4 && svc_nr(a - 4 * j, floor, NR_MUNMAP))
+                return 1;
+    }
+    return 0;
+}
+
+/* Scan [lo,hi) for sites, never reading below `floor` for context. `verify`
+ * asks for the syscall-context filter, which the caller sets when it has no
+ * code map to trust. */
+static int scan(unsigned long lo, unsigned long hi, unsigned long floor,
+                int verify, unsigned long pool, unsigned long cap,
+                unsigned long *used) {
+    int count = 0;
+    /* Round the start up, never down: with a code map, `lo` is a section's
+     * start, and rounding down would read the word before it. */
+    for (unsigned long a = (lo + 3) & ~3UL; a + 4 <= hi; a += 4) {
+        if (*(uint32_t *)a != SVC0_INSN)
+            continue;
+
+        /* Never rewrite a signal-return site (`mov x8,#139; svc 0` — the
+         * sa_restorer every handler returns through): rt_sigreturn must
+         * execute with sp still at the kernel's signal frame, which a
+         * trampoline call abandons — the kernel then restores a garbage
+         * context (SIGSEGV on the first signal, e.g. a shell's SIGCHLD).
+         * It carries no path anyway; leave it for the kernel. */
+        if (a >= floor + 4) {
+            uint32_t prev = *(uint32_t *)(a - 4);
+            if ((prev & MOVZ_X8_MASK) == MOVZ_X8 &&
+                ((prev >> 5) & 0xFFFFu) == NR_RT_SIGRETURN)
+                continue;
+        }
+
+        /* Nor the pair a thread uses to free its own stack. A trampoline builds
+         * its frame on the caller's stack and reads every register back from
+         * it, and here that stack is the very thing the first call removes:
+         * the thread came back from the munmap to a frame that was no longer
+         * mapped (SEGV, which with the default action takes the whole process
+         * with it — every musl thread that is detached, as the JVM's all are,
+         * and every bionic one, died so on its way out under -R). Neither
+         * call is one the filter traps, so left native they behave as they
+         * always did. */
+        if (stack_teardown(a, floor, hi))
+            continue;
+
+        /* No code map: the word is a syscall only if something nearby put a
+         * number in x8. Costs the ~3% of real sites that load it from further
+         * away (they keep the SIGSYS floor) and rejects data that collides
+         * with the encoding, which is the trade this direction is worth. */
+        if (verify) {
+            int seen = 0;
+            for (int k = 1; k <= X8_LOOKBACK; k++) {
+                if (a < floor + 4UL * (unsigned long)k)
+                    break;
+                if (writes_x8(*(uint32_t *)(a - 4UL * (unsigned long)k))) {
+                    seen = 1;
+                    break;
+                }
+            }
+            if (!seen)
+                continue;
+        }
+
+        /* Reachability of the next slot from this site via a `b`. The way back
+         * is checked inside emit(), against the same limit from a few dozen
+         * bytes further along, so a site right at the edge of reach is left to
+         * the SIGSYS floor rather than half-rewritten. */
+        uint32_t br = b_insn(a, pool + *used);
+        if (!br)
+            continue; /* leave for the SIGSYS floor */
+        if (*used + cng_tramp_size() > cap)
+            break; /* pool exhausted: so is every site after this one */
+        if (!emit(pool, cap, used, a + 4))
+            continue; /* the way back is out of reach; the way out was not */
+
+        *(uint32_t *)a = br;
+        count++;
+    }
+    return count;
+}
+
+int cng_rewrite_seg(unsigned long lo, unsigned long hi, unsigned long foff,
+                    const struct cng_code_ranges *cr, unsigned long pool,
+                    unsigned long cap, unsigned long *used) {
+    if (!cng_g_rewrite || hi <= lo)
+        return 0;
+
+    if (!cr || !cr->n)
+        return scan(lo, hi, lo, /*verify=*/1, pool, cap, used);
+
+    int count = 0;
+    for (int i = 0; i < cr->n; i++) {
+        /* The code map is in file offsets and the caller holds a mapping of
+         * [foff, foff + (hi - lo)); clip each range to the part it has. */
+        unsigned long clo = cr->lo[i], chi = cr->hi[i];
+        if (clo < foff)
+            clo = foff;
+        if (chi > foff + (hi - lo))
+            chi = foff + (hi - lo);
+        if (chi <= clo)
+            continue;
+        /* `floor` stays at the mapping's own start: the word before a code
+         * section is mapped and readable, and the sigreturn guard wants it. */
+        count += scan(lo + (clo - foff), lo + (chi - foff), lo, /*verify=*/0,
+                      pool, cap, used);
+    }
+    return count;
+}
+
+/* ---- a ptrace kick inside a trampoline -----------------------------------
+ *
+ * A kick can land on any instruction of a copy, and its frame is then neither
+ * the guest's nor the dispatcher's: sp lowered over the trampoline's frame,
+ * x16/x17 and the flags spent on the clone test, x0 on the call. A stop needs
+ * the guest's state, and it is all there: up to the call the trampoline has
+ * only saved, so the guest's state is that of a call not yet made, at the
+ * site's branch; after it the frame holds the guest's state as the dispatch
+ * left it, which is the call made. The copy is recognized by its words (only
+ * the two branches and the literals differ from the template), so nothing has
+ * to keep a list of pools. */
+extern char cng_svc_tramp_clone[];
+extern char cng_svc_tramp_call[];
+extern char cng_svc_tramp_gen[];
+
+#define TRAMP_WORDS 128 /* comfortably more than the template has */
+
+/* Is `w` (the template's size, read from a candidate copy) a trampoline? */
+static int tramp_is_copy(const uint32_t *w) {
+    const uint32_t *t = (const uint32_t *)cng_svc_tramp_tpl;
+    unsigned long code = (unsigned long)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
+    unsigned long b1 = (unsigned long)(cng_svc_tramp_clone - cng_svc_tramp_tpl) + 4,
+                  b2 = (unsigned long)(cng_svc_tramp_back - cng_svc_tramp_tpl);
+    for (unsigned long o = 0; o < code; o += 4) {
+        if (o == b1 || o == b2) {
+            if ((w[o / 4] & 0xFC000000u) != B_OPCODE)
+                return 0;
+        } else if (w[o / 4] != t[o / 4]) {
+            return 0;
+        }
+    }
+    return *(const unsigned long *)((const char *)w + code) ==
+           (unsigned long)&cng_tramp_dispatch;
+}
+
+int cng_tramp_unwind(struct cng_uregs *u) {
+    unsigned long tsz = cng_tramp_size();
+    if (tsz > TRAMP_WORDS * 4 || (u->pc & 3))
+        return 0;
+    uint32_t cur;
+    if (cng_user_copyin(&cur, (const void *)u->pc, 4) < 0)
+        return 0;
+    const uint32_t *t = (const uint32_t *)cng_svc_tramp_tpl;
+    unsigned long code = (unsigned long)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
+    unsigned long clone = (unsigned long)(cng_svc_tramp_clone - cng_svc_tramp_tpl),
+                  call = (unsigned long)(cng_svc_tramp_call - cng_svc_tramp_tpl),
+                  back = (unsigned long)(cng_svc_tramp_back - cng_svc_tramp_tpl),
+                  gen = (unsigned long)(cng_svc_tramp_gen - cng_svc_tramp_tpl),
+                  ret = (unsigned long)(cng_svc_tramp_ret - cng_svc_tramp_tpl);
+    for (unsigned long o = 0; o < code; o += 4) {
+        int br = o == clone + 4 || o == back;
+        if (br ? (cur & 0xFC000000u) != B_OPCODE : cur != t[o / 4])
+            continue;
+        uint32_t w[TRAMP_WORDS];
+        if (cng_user_copyin(w, (const void *)(u->pc - o), tsz) < 0 ||
+            !tramp_is_copy(w))
+            continue;
+        u64 site4 = *(const u64 *)((const char *)w + ret); /* S+4 */
+        if (o == clone + 4 || o == back) {
+            u->pc = site4; /* the call is over and every register restored */
+            return 1;
+        }
+        if (o == gen + 20) {
+            u->pc = u->x[16]; /* `br x16`: only pc is left to set */
+            return 1;
+        }
+        /* Up to the call: the guest's registers are the live ones, except
+         * what the trampoline has spent and saved so far. At the clone's svc
+         * everything is back already, and before the first save nothing has
+         * been spent but sp. */
+        if (o == clone || o < 8) {
+            if (o != clone && o >= 4)
+                u->sp += 288;
+            u->pc = site4 - 4;
+            return 1;
+        }
+        struct cng_uregs f; /* the trampoline's frame, at sp */
+        if (cng_user_copyin(&f, (const void *)u->sp, sizeof f) < 0)
+            return 0;
+        u64 nzcv = f.pstate & 0xF0000000ull;
+        if (o > call) {
+            /* The dispatch has returned and the epilogue is restoring from the
+             * frame: what it ends with is the frame, sp and pc included. */
+            f.pstate = (u->pstate & ~0xF0000000ull) | nzcv;
+            *u = f;
+            return 1;
+        }
+        u->sp += 288;
+        u->x[16] = f.x[16];
+        u->x[17] = f.x[17];
+        if (o >= 20) /* the clone test has spent the flags */
+            u->pstate = (u->pstate & ~0xF0000000ull) | nzcv;
+        if (o >= call - 4) /* `mov x0, sp` is made */
+            u->x[0] = f.x[0];
+        u->pc = site4 - 4;
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- lazy rewriting: the site the CPU just trapped from ------------------
+ *
+ * Everything above has to decide what is code before any of it runs, which is
+ * why it needs the section headers and a filter behind them. A SIGSYS trap
+ * needs neither: `si_call_addr - 4` is a word the CPU fetched and executed as
+ * `svc #0`, so patching it cannot be wrong about what it is. What it cannot do
+ * is find a site nothing has run yet, and where the filter never traps at all
+ * (qemu-user, a pre-3.5 kernel) it finds nothing — so this runs alongside the
+ * ahead-of-time pass rather than instead of it, and picks up exactly what that
+ * pass could not reach: a library the kernel mapped natively (there is no copy
+ * for the rewriter to walk), code a guest JIT wrote itself, and any site left
+ * behind by an exhausted pool, a branch out of reach, or an object whose
+ * headers named no code.
+ *
+ * Replacing `svc` with `b` is also the one edit that needs no stopping of the
+ * world: both are in the set the architecture allows to be modified while
+ * another PE is executing them (B, BL, BRK, HVC, ISB, NOP, SMC, SVC), so a
+ * thread in that instruction sees the old word or the new one, and the old one
+ * simply traps again. */
+
+#define LAZY_POOL 0x20000UL /* 128 KiB: ~800 trampolines per mapping */
+
+/* What a record knows is where a mapping WAS, and the pool placed within reach
+ * of it — never what the page is now. A guest unmaps, remaps and reprotects
+ * its own text without a word to us (dlclose and a new library at the same
+ * address; a JIT flipping W^X), so everything a patch depends on — whether the
+ * page is private, what it goes back to, whether it is there at all — is asked
+ * again at the patch (cng_rewrite_site). The record is the cache that keeps a
+ * mapping that cannot be patched from costing anything per trap. */
+struct lazy_region {
+    unsigned long lo, hi;  /* the mapping, as /proc/self/maps had it */
+    unsigned long pool;    /* 0: none was placed; else ours until the exec */
+    unsigned long used;
+    int live;              /* sites here may still be patched */
+};
+
+/* One entry per executable mapping a trap has come out of, on a table that
+ * grows (tab.c). It was 32 fixed entries, and the 33rd mapping was simply not
+ * remembered: every trap out of it, and out of every mapping after it, read
+ * /proc/self/maps again — the very cost this table exists to take away, paid
+ * on every syscall, by exactly the processes with the most code (a JIT, a
+ * program that dlopens by the hundred). Entries are appended under the busy
+ * flag and only ever read under it, so the count needs no publication of its
+ * own. */
+static struct cng_tab g_lazy = CNG_TAB_INIT(struct lazy_region);
+static unsigned long g_lazy_n;
+static struct lazy_region *g_lazy_last; /* the entry the last lookup found */
+static int g_lazy_off; /* no /proc/self/maps or /proc/self/mem: stop asking */
+/* Not a lock to wait on: a thread that finds the table busy leaves this site to
+ * the floor, which is what would have answered it anyway. That also keeps a
+ * nested trap (one of our own syscalls refused by Android, answered by the
+ * gate-net) from ever meeting a table it is already inside. */
+static volatile int g_lazy_busy;
+
+unsigned long cng_pool_at(unsigned long want, unsigned long size) {
+    if (!want || cng_hits_image(want, size))
+        return 0;
+    void *p = sys_mmap((void *)want, size, CNG_PROT_READ | CNG_PROT_WRITE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS |
+                           CNG_MAP_FIXED_NOREPLACE,
+                       -1, 0);
+    if (cng_is_err((long)p))
+        return 0;
+    if ((unsigned long)p != want) {
+        sys_munmap(p, size); /* a kernel without the flag placed it elsewhere */
+        return 0;
+    }
+    return want;
+}
+
+static unsigned long hex_at(char **p) {
+    unsigned long v = 0;
+    for (;; (*p)++) {
+        char c = **p;
+        int d = (c >= '0' && c <= '9')   ? c - '0'
+                : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                                         : -1;
+        if (d < 0)
+            return v;
+        v = v * 16 + (unsigned long)d;
+    }
+}
+
+/* One read of /proc/self/maps answers two questions at once, which is why it is
+ * one function: what the mapping holding `addr` is — bounds, protection, and
+ * whether it is private, since a store into a shared file mapping would not
+ * patch our copy but edit the file on disk — and where the nearest hole big
+ * enough to hold a pool is. The hole matters as much as the mapping: a pool has
+ * to be within a branch's reach of the sites that use it, and the addresses
+ * around a loaded library are exactly the ones the linker has already taken.
+ * Returns 0 if there is no line covering `addr` to find. */
+static int lazy_vma(unsigned long addr, unsigned long *lo_out,
+                    unsigned long *hi_out, int *prot_out, int *shared_out,
+                    unsigned long *hole_out) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/maps",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0) {
+        g_lazy_off = 1;
+        return 0;
+    }
+    /* Small on purpose: this can run on a guest thread's own stack. A line
+     * split across two reads is carried over at the front of the next. */
+    char buf[1024];
+    long n, keep = 0;
+    int found = 0;
+    unsigned long prev_end = 0, best = 0, best_d = ~0UL;
+    while ((n = sys_read((int)fd, buf + keep, sizeof buf - 1 - (size_t)keep)) >
+           0) {
+        n += keep;
+        buf[n] = 0;
+        char *p = buf, *nl;
+        while ((nl = strchr(p, '\n'))) {
+            *nl = 0;
+            char *q = p;
+            unsigned long lo = hex_at(&q); /* "lo-hi perms ..." */
+            p = nl + 1;
+            if (*q != '-')
+                continue;
+            q++;
+            unsigned long hi = hex_at(&q);
+            if (*q != ' ')
+                continue;
+            if (prev_end && lo - prev_end >= LAZY_POOL) {
+                /* A pool fits at either end of the gap: at its bottom, just
+                 * above the mapping before it, or at its top, just below the
+                 * mapping after it. Distance from each to the site, kept as
+                 * the unsigned magnitude so the nearest one wins — the gap
+                 * below a library is usually vast, and only its top is within
+                 * a branch's reach of the library. */
+                unsigned long cand[2] = {prev_end, lo - LAZY_POOL};
+                for (int k = 0; k < 2; k++) {
+                    unsigned long d = cand[k] > addr ? cand[k] - addr
+                                                     : addr - cand[k];
+                    if (d < best_d) {
+                        best_d = d;
+                        best = cand[k];
+                    }
+                }
+            }
+            prev_end = hi;
+            if (!found && addr >= lo && addr < hi) {
+                *lo_out = lo;
+                *hi_out = hi;
+                *prot_out = (q[1] == 'r' ? CNG_PROT_READ : 0) |
+                            (q[2] == 'w' ? CNG_PROT_WRITE : 0) |
+                            (q[3] == 'x' ? CNG_PROT_EXEC : 0);
+                *shared_out = (q[4] == 's');
+                found = 1;
+            }
+        }
+        keep = (long)strlen(p);
+        if (keep >= (long)sizeof buf - 1)
+            keep = 0; /* pathological line: drop it */
+        else
+            memmove(buf, p, (size_t)keep);
+    }
+    sys_close((int)fd);
+    *hole_out = best;
+    return found;
+}
+
+/* A pool the whole mapping can reach with a `b`: the hole the maps survey found
+ * first, then immediately above the mapping and immediately below it (both
+ * usually taken — a library's segments abut each other), then wherever the
+ * kernel cares to put one. The pool is executable from the start: a trampoline
+ * that is already live cannot be made unexecutable to write its neighbour, so
+ * what happens per trampoline is the far smaller window of adding W to a page
+ * that keeps X throughout.
+ *
+ * Every site in the mapping has to be able to branch into it — the two
+ * extremes bound the rest — because a pool out of reach is worse than no pool
+ * at all: the table would keep the mapping alive and every trap out of it
+ * would go looking for a slot it can never use. Measured on the device before
+ * this check existed, where the kernel's own choice of address landed outside
+ * ±128 MiB: `ls -lR` took 3.9 s against 2.0 s, all of it /proc/self/maps read
+ * once per trapped syscall. A placement that maps but is out of reach is given
+ * back and the next one tried: it used to end the search, so a survey hole
+ * that lay beyond reach (the one after our own image, when nothing nearer
+ * qualified) cost the mapping its pool although the space beside it was free.
+ *
+ * Where anonymous executable memory is denied outright (Android's execmem,
+ * revoked by NO_NEW_PRIVS) there is no lazy tier to have at all; that is found
+ * out here, once per mapping, rather than once per site. */
+static unsigned long pool_try(unsigned long lo, unsigned long hi,
+                              unsigned long want) {
+    unsigned long p = 0;
+    if (want) {
+        p = cng_pool_at(want, LAZY_POOL);
+    } else {
+        void *any = sys_mmap(0, LAZY_POOL, CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (!cng_is_err((long)any))
+            p = (unsigned long)any;
+    }
+    if (!p)
+        return 0;
+    if (!b_insn(lo, p + LAZY_POOL) || !b_insn(hi - 4, p) ||
+        sys_mprotect((void *)p, LAZY_POOL, CNG_PROT_READ | CNG_PROT_EXEC) < 0) {
+        sys_munmap((void *)p, LAZY_POOL);
+        return 0;
+    }
+    return p;
+}
+
+static unsigned long lazy_pool(unsigned long lo, unsigned long hi,
+                               unsigned long hole) {
+    unsigned long p = pool_try(lo, hi, hole);
+    if (!p)
+        p = pool_try(lo, hi, hi);
+    if (!p && lo >= LAZY_POOL)
+        p = pool_try(lo, hi, lo - LAZY_POOL);
+    if (!p)
+        p = pool_try(lo, hi, 0);
+    return p;
+}
+
+/* The table entry for the mapping holding `site`, or nothing. An entry that
+ * is not live is a mapping we know we cannot patch (or have stopped patching),
+ * kept precisely so the next trap out of it costs nothing — not even the read
+ * of /proc/self/maps, which is the whole reason the table exists. A live one
+ * is only a pool to use: the patch asks what the page is now (see struct
+ * lazy_region). The entry found last is tried first: the sites that keep
+ * arriving are the ones a mapping that cannot be patched traps out of, and
+ * they arrive in runs. Read and written under the busy flag, like the table. */
+static struct lazy_region *lazy_known(unsigned long site) {
+    struct lazy_region *last = g_lazy_last;
+    if (last && site >= last->lo && site < last->hi)
+        return last;
+    struct cng_tab_iter it;
+    unsigned long i = 0;
+    for (struct lazy_region *r = cng_tab_first(&g_lazy, &it);
+         r && i < g_lazy_n; r = cng_tab_next(&g_lazy, &it), i++)
+        if (site >= r->lo && site < r->hi) {
+            g_lazy_last = r;
+            return r;
+        }
+    return 0;
+}
+
+/* Remember a mapping the first time a site in it traps, with the pool its sites
+ * will branch into — or with none, when the mapping is one we must not write,
+ * which is remembered just as carefully so the next trap out of it is answered
+ * from this table and costs nothing. */
+static struct lazy_region *lazy_add(unsigned long lo, unsigned long hi,
+                                    int usable, unsigned long hole) {
+    struct lazy_region *r = cng_tab_at(&g_lazy, g_lazy_n);
+    if (!r)
+        return 0; /* no page for the record: this site stays with the floor */
+    g_lazy_n++;
+    r->lo = lo;
+    r->hi = hi;
+    r->used = 0;
+    r->pool = usable ? lazy_pool(lo, hi, hole) : 0;
+    r->live = r->pool != 0;
+    return r;
+}
+
+/* Patchable at all: a private mapping we may read and that executes. A store
+ * into a shared one would not patch our copy but edit the object behind it —
+ * the file on disk, or a memfd another mapping (a JIT's writable view) reads. */
+static int lazy_usable(int prot, int shared) {
+    return !shared && (prot & (CNG_PROT_READ | CNG_PROT_EXEC)) ==
+                          (CNG_PROT_READ | CNG_PROT_EXEC);
+}
+
+/* Stop patching in a mapping. Its pool goes back only while nothing branches
+ * into it: a trampoline already in use is the only way back for every site
+ * patched to reach it, and unmapping it — which this used to do whenever a
+ * later site failed, the pool filling up after hundreds of good ones — sent
+ * all of those sites into unmapped memory. A pool kept is handed back with
+ * the rest at the exec (cng_rewrite_lazy_reset). */
+static void lazy_close(struct lazy_region *r) {
+    r->live = 0;
+    if (r->pool && !r->used) {
+        sys_munmap((void *)r->pool, LAZY_POOL);
+        r->pool = 0;
+    }
+}
+
+/* /proc/self/mem, for the one read and the one write a patch makes of guest
+ * text. Neither may be a load or a store of ours: the page is the guest's, and
+ * a sibling thread may unmap or reprotect it at any moment, where a fault of
+ * ours — in a handler running with every signal masked — kills the process.
+ * Through the file the kernel does the access with the mapping held still,
+ * and answers EIO for a page that is not there; a write also gets the
+ * instruction-cache maintenance for an executable one (copy_to_user_page on
+ * arm64: what makes a debugger's breakpoint visible), which a flush of our
+ * own by address would have faulted on too.
+ *
+ * Opened for each patch rather than kept: the file is bound to the address
+ * space it was opened in, so a descriptor inherited across a fork writes into
+ * the parent's text, and the guest can close a number of ours and have it
+ * handed back for a file of its own. A patch happens once per site. Returns
+ * the descriptor, or -1 — having turned the tier off where the file cannot be
+ * had at all, so that is not asked again on every trap. */
+static int lazy_mem_open(void) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/mem",
+                         CNG_O_RDWR | CNG_O_CLOEXEC, 0);
+    if (fd >= 0)
+        return (int)fd;
+    if (fd != -EMFILE && fd != -ENFILE && fd != -ENOMEM && fd != -EINTR)
+        g_lazy_off = 1;
+    return -1;
+}
+
+/* One trampoline, into a pool that stays executable while it is written. */
+static char *lazy_emit(struct lazy_region *r, unsigned long site) {
+    unsigned long tsz = cng_tramp_size();
+    if (r->used + tsz > LAZY_POOL)
+        return 0;
+    unsigned long slot = r->pool + r->used;
+    if (!b_insn(site, slot))
+        return 0; /* out of a branch's reach: leave the site to the floor */
+    unsigned long p0 = cng_page_down(slot), p1 = cng_page_up(slot + tsz);
+    if (sys_mprotect((void *)p0, p1 - p0,
+                     CNG_PROT_READ | CNG_PROT_WRITE | CNG_PROT_EXEC) < 0)
+        return 0;
+    unsigned long used = r->used;
+    char *got = emit(r->pool, LAZY_POOL, &used, site + 4);
+    if (got) {
+        cng_flush_icache(got, got + tsz);
+        r->used = used;
+    }
+    sys_mprotect((void *)p0, p1 - p0, CNG_PROT_READ | CNG_PROT_EXEC);
+    return got;
+}
+
+int cng_rewrite_site(unsigned long site) {
+    if (!cng_g_rewrite || (site & 3) || g_lazy_off)
+        return 0;
+    int idle = 0;
+    if (!__atomic_compare_exchange_n(&g_lazy_busy, &idle, 1, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return 0;
+
+    int done = 0, mfd = -1, fresh = 0;
+    unsigned long lo, hi, hole;
+    int prot = 0, shared = 1;
+    struct lazy_region *r = lazy_known(site);
+    if (!r) {
+        /* The first site to trap out of a mapping reads /proc/self/maps to
+         * make the record: the mapping's bounds and a pool within a branch's
+         * reach of all of it — or the verdict that it cannot be patched,
+         * which every later trap out of it is answered from without a
+         * syscall. That verdict is the whole reason the table exists. */
+        if (!lazy_vma(site, &lo, &hi, &prot, &shared, &hole))
+            goto out;
+        r = lazy_add(lo, hi, lazy_usable(prot, shared), hole);
+        fresh = 1;
+    }
+    if (!r || !r->live)
+        goto out; /* known to be none of ours: answered without a syscall */
+
+    /* Not a `svc` any more is the ordinary outcome of two threads trapping the
+     * same site at once: the first patched it, and this one is finishing the
+     * syscall it was already in the middle of. A word that cannot be read is
+     * a page that went away since the trap, or one no longer readable: the
+     * mapping is not what the record says, so stop asking it. */
+    mfd = lazy_mem_open();
+    if (mfd < 0)
+        goto out;
+    uint32_t w = 0;
+    if (sys_pread64(mfd, &w, sizeof w, (long)site) != (long)sizeof w)
+        goto close;
+    if (w != SVC0_INSN)
+        goto out;
+
+    /* What the page is now, asked at the patch: once per site patched rather
+     * than once per mapping. The protection put back after the store used to
+     * be the one the record was made with, so a guest that had reprotected its
+     * text since — a JIT making its code writable — had it taken away again;
+     * and a record outlives its mapping, so a library closed and another
+     * mapped over the same addresses, shared perhaps, was written as if it
+     * were the first. What is left is a sibling thread changing this very
+     * page in the few syscalls from here to the restore, which the in-process
+     * design cannot close (see the threat model in docs/DESIGN.md). */
+    if (!fresh && !lazy_vma(site, &lo, &hi, &prot, &shared, &hole))
+        goto close;
+    if (!lazy_usable(prot, shared))
+        goto close;
+
+    char *slot = lazy_emit(r, site);
+    uint32_t br = slot ? b_insn(site, (unsigned long)slot) : 0;
+    if (!br)
+        goto close; /* the pool is full: this mapping has had its share */
+
+    /* The page gains write for the store, which is also the policy's say on
+     * it: an SELinux execmod denial or PR_SET_MDWE refuses exactly this, and
+     * a refusal means the mapping is not ours to patch. X is held throughout,
+     * so a thread executing this page while the store lands neither faults
+     * nor has to be stopped — and `svc` to `b` is one of the substitutions the
+     * architecture allows under exactly that condition. The store itself goes
+     * through the kernel (lazy_mem_open), which also makes it visible to
+     * instruction fetch. */
+    unsigned long p0 = cng_page_down(site), p1 = cng_page_up(site + 4);
+    int add_w = !(prot & CNG_PROT_WRITE);
+    if (add_w && sys_mprotect((void *)p0, p1 - p0, prot | CNG_PROT_WRITE) < 0)
+        goto close; /* the mapping cannot be written at all: stop asking */
+    long wr = sys_pwrite64(mfd, &br, sizeof br, (long)site);
+    if (add_w)
+        sys_mprotect((void *)p0, p1 - p0, prot);
+    if (wr != (long)sizeof br)
+        goto close;
+    done = 1;
+    goto out;
+
+close:
+    /* Whatever stopped this site stops every other site in the mapping too. */
+    lazy_close(r);
+out:
+    if (mfd >= 0)
+        sys_close(mfd);
+    __atomic_store_n(&g_lazy_busy, 0, __ATOMIC_RELEASE);
+    if (done && cng_g_debug)
+        cng_dprintf(2, "[cng] lazy: patched the svc site at %lx\n", site);
+    return done;
+}
+
+void cng_rewrite_lazy_reset(void) {
+    /* An emulated execve is where every mapping these describe goes away at
+     * once — pools kept for a closed entry included — and by now it is
+     * single-threaded: the exec's de_thread has killed every
+     * other thread (execve.c), so nothing is running in a pool, and nothing is
+     * inside this table — a thread killed while it held the busy flag left it
+     * set, which is why it is cleared here rather than trusted. Handing the
+     * address space back is the point: an exec chain must not accumulate pools
+     * the way M32 stopped it accumulating images. */
+    __atomic_store_n(&g_lazy_busy, 0, __ATOMIC_RELEASE);
+    struct cng_tab_iter it;
+    unsigned long i = 0;
+    for (struct lazy_region *r = cng_tab_first(&g_lazy, &it);
+         r && i < g_lazy_n; r = cng_tab_next(&g_lazy, &it), i++)
+        if (r->pool)
+            sys_munmap((void *)r->pool, LAZY_POOL);
+    g_lazy_n = 0;
+    g_lazy_last = 0;
+}

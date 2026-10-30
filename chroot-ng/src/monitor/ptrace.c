@@ -1,0 +1,3122 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Guest ptrace(2): the shared link registry, the tracee's stop/service loop,
+ * and the tracer's request and wait4 handling. See include/cng/ptrace.h for the
+ * model; this file is its implementation.
+ *
+ * Two things make the in-process design work where a cross-process one would
+ * need host ptrace permission we do not have:
+ *
+ *  - the tracee answers requests about *itself*. It is parked inside our own
+ *    code at the stop, so its memory is simply our memory (guest VA == host VA
+ *    here) and its register file is the frame the kernel handed us.
+ *  - the registry is one MAP_SHARED anonymous mapping created before the first
+ *    guest fork, so every guest process sees the same links at the same
+ *    addresses, and a futex in one of them is a cross-process wakeup.
+ *
+ * Everything is lock-free: a stopped tracee and its tracer alternate through a
+ * sequence-numbered mailbox, and the registry's slots are CAS-claimed. That is
+ * not for speed — it is because all of this runs inside the SIGSYS handler,
+ * where a sleeping lock could deadlock against the thread it interrupted.
+ */
+#include "cng/loader.h"
+#include "cng/monitor.h"
+#include "cng/ownmap.h"
+#include "cng/procreg.h"
+#include "cng/ptrace.h"
+#include "cng/rewrite.h"
+#include "cng/rt.h"
+#include "cng/seccomp.h"
+#include "cng/syscall.h"
+#include "cng/tab.h"
+#include "cng/uapi.h"
+
+int cng_g_no_ptrace = 0;
+
+/* Set once the SIGSYS handler is installed (cng_install_monitor). The stacked
+ * ptrace filters are gated on it: a RET_TRAP with no handler for the signal
+ * would kill the task outright, which is what a self-test driving this code
+ * with no monitor installed would otherwise do to itself. */
+int cng_g_sigsys_ready = 0;
+
+#define PT_MAX  128  /* concurrent traced tasks in one session */
+#define PT_MBOX 1024 /* mailbox payload cap (>= the largest regset, 528) */
+
+/* Link state. */
+enum { PT_ST_RUNNING = 0, PT_ST_STOPPED = 1, PT_ST_EXITED = 2 };
+
+/* Mailbox commands (tracer -> parked tracee). Requests answerable from the
+ * link's own published fields (GETEVENTMSG, GETSIGINFO, GET_SYSCALL_INFO,
+ * SETOPTIONS) never reach the mailbox at all. */
+enum {
+    PT_CMD_NONE = 0,
+    PT_CMD_PEEK,    /* addr -> 8 bytes in data[] */
+    PT_CMD_POKE,    /* addr, arg = value; writes through a read-only text page */
+    PT_CMD_READ,    /* addr, arg = len: tracee memory -> data[]; result = bytes */
+    PT_CMD_WRITE,   /* addr, arg = len: data[] -> tracee memory */
+    PT_CMD_GETREGS, /* addr = NT_* -> regset in data[], rlen bytes */
+    PT_CMD_SETREGS, /* addr = NT_*, rlen bytes in data[] */
+    PT_CMD_RESUME,  /* addr = inject sig, arg = PT_RES_* */
+    PT_CMD_DETACH,  /* addr = inject sig */
+};
+
+/* Resume submodes. */
+enum { PT_RES_CONT = 0, PT_RES_SYSCALL = 1, PT_RES_SINGLESTEP = 2 };
+
+/* PTRACE_GET_SYSCALL_INFO ops. */
+#define PT_SCI_NONE  0
+#define PT_SCI_ENTRY 1
+#define PT_SCI_EXIT  2
+
+struct pt_link {
+    s32 tracee; /* 0 = free (CAS-claimed); tid (a main thread's tid is its pid) */
+    s32 tgid;   /* the tracee's thread group */
+    s32 tracer; /* tracer pid, 0 once detached */
+    u32 options;
+    u32 state;             /* PT_ST_*; release/acquire flag for the stop fields */
+    u32 reported;          /* a wait already consumed the current stop */
+    u32 stop_sig;          /* WSTOPSIG of the current stop */
+    u32 event;             /* PTRACE_EVENT_* of the current stop (0 = none) */
+    u32 syscall_stop;      /* current stop is a syscall-entry/exit stop */
+    u32 attach_pending;    /* a tracer ATTACH/SEIZE'd us; adopt at the next stop point */
+    u32 interrupt_pending; /* PTRACE_INTERRUPT */
+    u32 stopsig_pending;   /* a stop signal to report as a cooperative group-stop */
+    u32 seize;             /* attached with SEIZE (no initial SIGSTOP; group stops) */
+    u32 listening;         /* PTRACE_LISTEN: parked awaiting SIGCONT */
+    s32 exit_status;       /* PT_ST_EXITED: the wait-status word for the tracer */
+    u64 eventmsg;          /* PTRACE_GETEVENTMSG payload */
+    s32 si_signo, si_code, si_errno;
+    u64 fault_addr; /* siginfo si_addr of a fault stop */
+    /* PTRACE_GET_SYSCALL_INFO, published at each syscall stop. */
+    u32 sc_op;
+    s64 sc_nr; /* the in-flight syscall number: the arm64 kernel's regs->syscallno,
+                * which is what NT_ARM_SYSTEM_CALL reads and writes (x8 itself is
+                * not re-read after the entry stop) */
+    u64 sc_args[6], sc_pc, sc_sp;
+    s64 sc_rval;
+    /* Mailbox: the tracer bumps cmd_seq to submit, the tracee bumps done_seq. */
+    u32 cmd_seq, done_seq;
+    u32 cmd;
+    u64 addr, arg;
+    s64 result;
+    u32 rlen;
+    u8 data[PT_MBOX];
+};
+
+struct pt_tab {
+    u32 global_gen; /* bumped on every stop/exit; the wait-poll sleep futex */
+    u32 any_trace;  /* set once anything in the session starts tracing */
+    struct pt_link links[PT_MAX];
+};
+
+static struct pt_tab *g_tab;
+
+/* Per-task state. chroot-ng cannot use __thread: it runs on the guest's own
+ * threads, whose TPIDR_EL0 belongs to the guest's libc, so a thread-local of
+ * ours would be resolved against the guest's TLS block. Per-task state is
+ * therefore a tid-keyed table, claimed lock-free exactly like the SIGSYS
+ * handler's scratch stacks. Only traced or tracing tasks ever claim a slot.
+ *
+ * The table grows (cng_tab), and a slot is given back: by the task's own
+ * exit, or — for one whose task died without passing there (exit_group, a
+ * fatal signal, an exec's de_thread) — taken over by the next claimant once
+ * no free slot is left, as the scratch-stack table does. It used to be 128
+ * slots that were never given back, so the 129th task ever traced or tracing
+ * in a process found none: a tracer was told its attach succeeded, and the
+ * tracee, with nowhere to keep its state, never stopped for it. */
+struct pt_self {
+    long tid; /* 0 = free */
+    struct pt_link *link;
+    struct cng_uregs *regs;  /* the frame this entry into monitor code runs on */
+    struct cng_ucontext *uc; /* and the signal frame it came from, if any */
+    struct cng_ucontext *fpuc; /* a stop's FP/SIMD frame, when not that one */
+    int active;              /* this task is a tracee */
+    int armed;               /* resumed with PTRACE_SYSCALL */
+    int entry_seen;          /* an entry stop was reported for the syscall in
+                              * flight, so its exit stop is owed */
+    int step;                /* resumed with PTRACE_SINGLESTEP */
+    int skip_exit_stop;      /* one-shot: skip the next syscall-exit stop */
+    int in_stop;             /* re-entrancy guard */
+    int traceall;            /* the trap-everything filter is installed here */
+    int tracer_armed;        /* the tracer filter is installed here */
+    struct cng_pt_step bkpt; /* the single-step breakpoint this task planted */
+};
+static struct cng_tab g_self = CNG_TAB_INIT(struct pt_self);
+
+/* Does this *process* have any traced or tracing task? An ordinary global, so
+ * it is inherited by fork exactly as the seccomp filter and the dispositions
+ * are. Every hot-path entry point tests it before touching anything else. */
+static int g_pt_local;
+
+/* How many of this process's tasks are tracees. Signal dispositions are
+ * process-wide, so our handlers may only be taken down when the last of them is
+ * gone — one thread detaching must not stop its siblings' stops from being
+ * reported. */
+static int g_pt_traced;
+
+/* Has any task of this process entered the tracer role (cng_pt_arm_tracer)?
+ * The -R tier's counterpart of the tracer filter, and as permanent: from then
+ * on its waits go through the registry, never straight to the kernel
+ * (cng_pt_wait_native). A fork starts over, as the child traces nothing. */
+static int g_pt_tracer;
+
+/* How many of this process's tasks are in a native wait right now, so that
+ * becoming a tracer knows to kick them out of it. */
+static int g_pt_nwait;
+
+/* Bumped by every ptrace kick this process takes; the word cng_wait_unless
+ * compares, so a kick taken between a wait's look at the registry and its svc
+ * is not slept through. */
+static volatile u32 g_pt_kicks;
+
+static void pt_traced_inc(void) {
+    if (__atomic_add_fetch(&g_pt_traced, 1, __ATOMIC_SEQ_CST) == 1)
+        cng_pt_sig_trace_enter();
+}
+
+static void pt_traced_dec(int restore) {
+    if (__atomic_sub_fetch(&g_pt_traced, 1, __ATOMIC_SEQ_CST) <= 0 && restore)
+        cng_pt_sig_trace_leave();
+}
+
+/* ---- futex ---- */
+
+struct pt_timespec {
+    long tv_sec, tv_nsec;
+};
+
+#define PT_FUTEX_WAIT 0
+#define PT_FUTEX_WAKE 1
+
+static void fx_wake(volatile u32 *a) {
+    /* No FUTEX_PRIVATE_FLAG: tracer and tracee are different processes. */
+    CNG_SYS(__NR_futex, a, PT_FUTEX_WAKE, 0x7fffffff, 0, 0, 0);
+}
+
+static void fx_wait(volatile u32 *a, u32 val, int ms) {
+    struct pt_timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    CNG_SYS(__NR_futex, a, PT_FUTEX_WAIT, val, ms >= 0 ? &ts : 0, 0, 0);
+}
+
+/* ---- registry ---- */
+
+void cng_pt_init(void) {
+    if (g_tab || cng_g_no_ptrace)
+        return;
+    void *p = cng_own_map(sys_mmap(0, sizeof(struct pt_tab),
+                                   CNG_PROT_READ | CNG_PROT_WRITE,
+                                   CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0),
+                          sizeof(struct pt_tab));
+    if (p == CNG_MAP_FAILED || cng_is_err((long)p))
+        return; /* no registry: ptrace answers -EPERM, as with --no-ptrace */
+    g_tab = (struct pt_tab *)p;
+    cng_pt_pick_kicksig();
+}
+
+static struct pt_link *pt_find(s32 tid) {
+    if (!g_tab || tid <= 0)
+        return 0;
+    for (int i = 0; i < PT_MAX; i++)
+        if (__atomic_load_n(&g_tab->links[i].tracee, __ATOMIC_ACQUIRE) == tid)
+            return &g_tab->links[i];
+    return 0;
+}
+
+/* Reserves a slot while its body is cleared, so no scan ever sees a link that
+ * is about to be wiped. Never a valid tid, which is always > 0. */
+/* A slot reserved but not yet filled in, keyed by the tid it is being claimed
+ * for: negative, so no scan that looks for a tid can match it. */
+#define PT_CLAIMING(tid) (-(tid))
+
+/* Wait out a claim in progress at `i` for `tid`; 1 if it resolved to that tid.
+ * The claimant only has a memset between the reservation and the publish, so
+ * this is a handful of yields — bounded anyway, since a claimant killed inside
+ * that window would never publish. */
+static int pt_claim_settled(int i, s32 tid) {
+    for (int spin = 0; spin < 4096; spin++) {
+        s32 v = __atomic_load_n(&g_tab->links[i].tracee, __ATOMIC_SEQ_CST);
+        if (v == tid)
+            return 1;
+        if (v != PT_CLAIMING(tid))
+            return 0;
+        __asm__ volatile("yield");
+    }
+    return 0;
+}
+
+/* Find or create the link for `tid`.
+ *
+ * The find and the create cannot be one atomic step, and both callers of the
+ * fork pair race for the same key: the parent publishes the child from
+ * cng_pt_report_event while the child claims itself from cng_pt_fork_child, and
+ * a fork gives pid == tid so both ask for the same value. The scan is not
+ * quick — a link is ~1.2 KiB and PT_MAX of them is well over 100 KiB of shared
+ * memory — so the window between "not found" and "claimed" is microseconds, and
+ * a followed fork lands two links for one tid often enough to be seen: it is
+ * what made `pt_case fork` flaky here, reporting a death for a pid that had
+ * already been reaped.
+ *
+ * Two links for one tid is not merely untidy. pt_find takes the lowest index,
+ * and the ghost the parent made has state PT_ST_RUNNING, so every
+ * PTRACE_CONT/SYSCALL/GETREGS against the real stop answers -ESRCH and the
+ * tracee is never resumed — the tracer then waits for an exit that cannot come.
+ *
+ * So publish, then look below: whoever holds the lower index keeps it, and the
+ * other releases and adopts it. Each racer scans only strictly below itself, so
+ * exactly one can conclude it lost — and the SEQ_CST publish is what guarantees
+ * the loser sees the winner.
+ *
+ * That is not enough on its own, and the hang above is what is left when it is
+ * missed: a racer that has taken a lower slot but published only the
+ * reservation is invisible to the one above, which keeps its own link, while
+ * the lower one scans below itself and sees nothing. Both survive. The
+ * reservation therefore carries the tid it is for — as its negative, which no
+ * tid scan can match — so a claim in progress can be recognised and waited
+ * out, both here and in the loser test. */
+static struct pt_link *pt_claim(s32 tid, s32 tgid) {
+    if (!g_tab || tid <= 0)
+        return 0;
+    for (int i = 0; i < PT_MAX; i++) {
+        s32 v = __atomic_load_n(&g_tab->links[i].tracee, __ATOMIC_SEQ_CST);
+        if (v == tid)
+            return &g_tab->links[i];
+        if (v == PT_CLAIMING(tid) && pt_claim_settled(i, tid))
+            return &g_tab->links[i];
+    }
+    struct pt_link *e;
+    for (int i = 0; i < PT_MAX; i++) {
+        s32 expect = 0;
+        if (!__atomic_compare_exchange_n(&g_tab->links[i].tracee, &expect,
+                                         PT_CLAIMING(tid), 0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_RELAXED))
+            continue;
+        e = &g_tab->links[i];
+        /* Everything but the claim key: a recycled slot must not inherit the
+         * previous tenant's stop state or mailbox sequence. Done under the
+         * reservation, so a concurrent pt_find cannot be handed the link
+         * between its key going in and its body being cleared. */
+        memset((char *)e + sizeof(s32), 0, sizeof *e - sizeof(s32));
+        e->tgid = tgid;
+        __atomic_store_n(&e->tracee, tid, __ATOMIC_SEQ_CST);
+        for (int j = 0; j < i; j++) {
+            s32 v = __atomic_load_n(&g_tab->links[j].tracee, __ATOMIC_SEQ_CST);
+            if (v == PT_CLAIMING(tid))
+                v = pt_claim_settled(j, tid) ? tid : 0;
+            if (v != tid)
+                continue;
+            __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE);
+            return &g_tab->links[j];
+        }
+        return e;
+    }
+    return 0; /* registry full: the caller degrades to untraced */
+}
+
+static void pt_free(struct pt_link *e) {
+    if (!e)
+        return;
+    __atomic_store_n(&e->tracer, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&e->tracee, 0, __ATOMIC_RELEASE); /* slot free */
+}
+
+static void pt_bump_gen(void) {
+    if (!g_tab)
+        return;
+    __atomic_add_fetch(&g_tab->global_gen, 1, __ATOMIC_SEQ_CST);
+    fx_wake(&g_tab->global_gen);
+}
+
+/* Wake tracer `tr` after publishing a stop or an exit. Three channels, because
+ * a tracer can be waiting in any of three ways: the poll futex (our own wait4),
+ * SIGCHLD exactly as the kernel raises it on a tracee state change (a gdb-style
+ * event loop), and the reserved kick signal, for a tracer still blocked in a
+ * *native* wait4: on -R one that went to the kernel before the tracer knew it
+ * was one, which the kick's handler ends (cng_pt_kick_taken), and on the
+ * seccomp tier one from before its first trapped wait, which the kernel
+ * restarts once the handler returns, into the filter an arming kick has
+ * stacked by then. A repeated wake for a stop still uncollected says so with
+ * its own magic (cng_pt_kick_taken). */
+static void pt_kick_tracer(s32 tr, int magic) {
+    if (tr <= 0)
+        return;
+    CNG_SYS(__NR_kill, tr, 17 /*SIGCHLD*/, 0, 0, 0, 0);
+    cng_pt_kick(tr, tr, magic);
+}
+
+static void pt_wake_tracer(s32 tr) { pt_kick_tracer(tr, CNG_PT_KICK_WAKE); }
+
+/* Queue the reserved kick signal at one task, carrying `magic` in si_value so
+ * the handler can tell it from a guest-directed signal of the same number.
+ * Thread-targeted (rt_tgsigqueueinfo): the kick sets per-task state, and a
+ * process-directed signal could land on any thread. A `tid` of 0 asks for
+ * exactly that, for a kick any thread can act on: the kernel hands it to one
+ * that does not block it. */
+void cng_pt_kick(s32 tgid, s32 tid, int magic) {
+    struct {
+        int signo, errno_, code;
+        int pad;
+        int pid;
+        unsigned uid;
+        int sival_int;
+        int pad2;
+        u64 rest[12];
+    } si;
+    memset(&si, 0, sizeof si);
+    si.signo = cng_g_kicksig;
+    si.code = -1; /* SI_QUEUE: the kernel refuses si_code >= 0 from a stranger */
+    si.pid = (int)sys_getpid();
+    si.uid = 0;
+    si.sival_int = magic;
+    if (tid <= 0 ||
+        CNG_SYS(__NR_rt_tgsigqueueinfo, tgid, tid, cng_g_kicksig, &si, 0, 0) < 0)
+        CNG_SYS(__NR_rt_sigqueueinfo, tgid, cng_g_kicksig, &si, 0, 0, 0);
+}
+
+/* The first `pat` in the NUL-terminated `s`, or 0. */
+static const char *pt_strfind(const char *s, const char *pat) {
+    size_t n = strlen(pat);
+    for (; *s; s++)
+        if (!strncmp(s, pat, n))
+            return s;
+    return 0;
+}
+
+/* Does thread `tid` of `tgid` hold the kick blocked? Asked of its own status
+ * file (SigBlk), which is the kernel's answer for the moment of reading: the
+ * guest's mask while it runs its own code, ours (everything) while it is in a
+ * handler of ours. 0 when it cannot be read. */
+static int pt_kick_blocked(s32 tgid, s32 tid) {
+    char path[64], buf[2048];
+    cng_snprintf(path, sizeof path, "/proc/%d/task/%d/status", (int)tgid,
+                 (int)tid);
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    /* SigBlk sits past the Groups line, which a process with many groups
+     * makes long: a window at a time, the tail carried over. */
+    long keep = 0, n;
+    int blocked = 0;
+    while ((n = sys_read((int)fd, buf + keep, sizeof buf - 1 - (size_t)keep)) >
+           0) {
+        n += keep;
+        buf[n] = 0;
+        const char *f = pt_strfind(buf, "\nSigBlk:");
+        if (f && strchr(f + 1, '\n')) {
+            f += 9;
+            while (*f == ' ' || *f == '\t')
+                f++;
+            unsigned long long m = 0;
+            for (;; f++) {
+                int d = (*f >= '0' && *f <= '9')   ? *f - '0'
+                        : (*f >= 'a' && *f <= 'f') ? *f - 'a' + 10
+                                                   : -1;
+                if (d < 0)
+                    break;
+                m = m * 16 + (unsigned long long)d;
+            }
+            blocked = (m >> (cng_g_kicksig - 1)) & 1;
+            break;
+        }
+        keep = n > 64 ? 64 : n; /* enough for a field name split in two */
+        memmove(buf, buf + n - keep, (size_t)keep);
+    }
+    sys_close((int)fd);
+    return blocked;
+}
+
+/* Can a task of this session take a SIGSYS of ours? Every guest process has
+ * the handler from the moment the monitor is installed, which this process
+ * says for all of them; one without it — a self-test's — would be killed by
+ * the signal's default action. */
+static int pt_sigsys_kickable(void) { return cng_g_sigsys_ready; }
+
+/* The same request as a SIGSYS, which no guest mask holds back (see the
+ * request's side in sigsys.c, sigsys_kick). A standard signal: one already
+ * pending absorbs it, so sending it again costs nothing. */
+static void pt_sigsys_kick(s32 tgid, s32 tid) {
+    struct {
+        int signo, errno_, code;
+        int pad;
+        int pid;
+        unsigned uid;
+        int sival_int;
+        int pad2;
+        u64 rest[12];
+    } si;
+    memset(&si, 0, sizeof si);
+    si.signo = CNG_SIGSYS;
+    si.code = -1; /* SI_QUEUE */
+    si.pid = (int)sys_getpid();
+    si.sival_int = CNG_PT_KICK_ATTACH;
+    CNG_SYS(__NR_rt_tgsigqueueinfo, tgid, tid, CNG_SIGSYS, &si, 0, 0);
+}
+
+/* A request that stops task `tid` — an attach, an interrupt, a routed stop
+ * signal: the kick, and the SIGSYS as well when the task holds the kick
+ * blocked, as GLib's threads do (the kernel's SIGSTOP stops them all the
+ * same). The kick stays pending there, and finds nothing left to do if it is
+ * ever let in. */
+static void pt_kick_attach(s32 tgid, s32 tid) {
+    cng_pt_kick(tgid, tid, CNG_PT_KICK_ATTACH);
+    if (tid > 0 && pt_sigsys_kickable() && pt_kick_blocked(tgid, tid))
+        pt_sigsys_kick(tgid, tid);
+}
+
+/* ---- per-task state ---- */
+
+static struct pt_self *pt_self_find(long tid) {
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it))
+        if (__atomic_load_n(&s->tid, __ATOMIC_ACQUIRE) == tid)
+            return s;
+    return 0;
+}
+
+/* A slot just claimed, its fields cleared for the new owner. `tid` is already
+ * ours, and the step record is already down (see pt_self_get). */
+static struct pt_self *pt_self_init(struct pt_self *s) {
+    s->link = 0;
+    s->regs = 0;
+    s->uc = 0;
+    s->fpuc = 0;
+    s->active = s->armed = s->step = 0;
+    s->entry_seen = s->skip_exit_stop = s->in_stop = 0;
+    s->traceall = s->tracer_armed = 0;
+    memset(&s->bkpt, 0, sizeof s->bkpt);
+    return s;
+}
+
+/* This task's slot, claimed on first use when `create` is set: a free one, or
+ * failing that one whose task is gone, or failing that a new one at the end
+ * of the table. 0 only when the host would not give the page for it. */
+static struct pt_self *pt_self_get(int create) {
+    long tid = sys_gettid();
+    struct pt_self *s = pt_self_find(tid);
+    if (s || !create)
+        return s;
+    long pid = sys_getpid();
+    for (;;) {
+        unsigned long n = 0; /* slots the table has */
+        for (int pass = 0; pass < 2; pass++) {
+            struct cng_tab_iter it;
+            for (s = cng_tab_first(&g_self, &it); s;
+                 s = cng_tab_next(&g_self, &it)) {
+                if (!pass)
+                    n++;
+                long t = __atomic_load_n(&s->tid, __ATOMIC_ACQUIRE);
+                /* Free slots first; a dead task's only once there is none,
+                 * since telling one costs a syscall per slot. */
+                if (pass ? t == 0 || CNG_SYS(__NR_tgkill, pid, t, 0, 0, 0, 0) !=
+                                          -ESRCH
+                         : t != 0)
+                    continue;
+                if (!__atomic_compare_exchange_n(&s->tid, &t, tid, 0,
+                                                 __ATOMIC_ACQ_REL,
+                                                 __ATOMIC_RELAXED))
+                    continue; /* another claimant got there first */
+                /* Ours now. A step breakpoint the dead task left planted is
+                 * accounted for by this record alone: take it down as the
+                 * task's own next stop would have, before the record goes. */
+                if (pass)
+                    cng_pt_step_clear();
+                return pt_self_init(s);
+            }
+        }
+        /* None to be had: the first slot of a chunk that did not exist. A
+         * claimant that maps the same chunk first takes that slot, and the
+         * rest of the chunk is free for the pass above to find. */
+        s = cng_tab_at(&g_self, n);
+        if (!s)
+            return 0;
+        long zero = 0;
+        if (__atomic_compare_exchange_n(&s->tid, &zero, tid, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return pt_self_init(s);
+    }
+}
+
+/* The slot given back by its own task, at its exit. Nothing of it may be in
+ * use by then: the link is dropped and the step record is down. */
+static void pt_self_put(struct pt_self *s) {
+    __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
+}
+
+struct cng_pt_step *cng_pt_step_self(int create) {
+    struct pt_self *s = pt_self_get(create);
+    return s ? &s->bkpt : 0;
+}
+
+int cng_pt_step_shared(u64 addr, u32 *orig) {
+    long tid = sys_gettid(), pid = sys_getpid();
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it)) {
+        long t = __atomic_load_n(&s->tid, __ATOMIC_ACQUIRE);
+        if (!t || t == tid)
+            continue;
+        struct cng_pt_step *st = &s->bkpt;
+        if (!__atomic_load_n(&st->live, __ATOMIC_ACQUIRE) || st->addr != addr)
+            continue;
+        if (CNG_SYS(__NR_tgkill, pid, t, 0, 0, 0, 0) == -ESRCH) {
+            /* The task that planted it is gone. Its record is the only
+             * account of the original there is: put it back and take the
+             * record down, the way its own next stop would have. */
+            int one = 1;
+            if (__atomic_compare_exchange_n(&st->live, &one, 0, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                cng_pt_poke_text(st->addr, &st->orig, 4);
+            continue;
+        }
+        if (orig)
+            *orig = st->orig;
+        return 1;
+    }
+    return 0;
+}
+
+void cng_pt_step_mask(u64 addr, void *buf, unsigned long len) {
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it)) {
+        if (!__atomic_load_n(&s->tid, __ATOMIC_ACQUIRE) ||
+            !__atomic_load_n(&s->bkpt.live, __ATOMIC_ACQUIRE))
+            continue;
+        u64 a = s->bkpt.addr;
+        u32 orig = s->bkpt.orig;
+        /* The four bytes of the word, wherever they fall in the window. */
+        for (unsigned k = 0; k < 4; k++)
+            if (a + k >= addr && a + k < addr + len)
+                ((u8 *)buf)[a + k - addr] = (u8)(orig >> (8 * k));
+    }
+}
+
+void cng_pt_step_clear_all(void) {
+    struct cng_tab_iter it;
+    for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+         s = cng_tab_next(&g_self, &it)) {
+        struct cng_pt_step *st = &s->bkpt;
+        if (!s->tid || !st->live)
+            continue;
+        st->live = 0;
+        cng_pt_poke_text(st->addr, &st->orig, 4);
+        st->addr = 0;
+    }
+}
+
+int cng_pt_active(void) {
+    if (!g_pt_local || !g_tab)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s && s->active;
+}
+
+int cng_pt_syscall_armed(void) {
+    if (!g_pt_local || !g_tab)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s && s->active && s->armed;
+}
+
+int cng_pt_traceall(void) {
+    if (!g_pt_local)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s && s->traceall;
+}
+
+/* A task can carry a filter of ours that it did not stack: a thread created by
+ * a traced one, whose clone the tracee's filter lets run natively, or a fork
+ * child its tracer does not follow (cng_pt_fork_child) — both inherit every
+ * filter, and neither inherits the creator's record, which is keyed by tid.
+ * The dispatcher read every trap such a task took for a call it does not
+ * handle as one an Android filter makes, and answered ENOSYS: write,
+ * sched_yield and getpid failed in a thread made after an attach, and a fork
+ * child of a tracee could make nearly no call at all. The tag on the trap
+ * (monitor.h) says which filter caught it, so the record is made here from the
+ * first such trap, before the dispatcher asks. g_pt_local follows: the record
+ * is what it guards. */
+void cng_pt_note_trap(int tag) {
+    if (tag != CNG_TRAP_TAG_TRACEALL && tag != CNG_TRAP_TAG_TRACER)
+        return;
+    int all = tag == CNG_TRAP_TAG_TRACEALL;
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    if (s && (all ? s->traceall : s->tracer_armed))
+        return;
+    if (!(s = pt_self_get(1)))
+        return;
+    if (all)
+        s->traceall = 1;
+    else
+        s->tracer_armed = 1;
+    g_pt_local = 1;
+}
+
+void cng_pt_set_frame(struct cng_uregs *r, struct cng_ucontext *uc) {
+    if (!g_pt_local)
+        return;
+    struct pt_self *s = pt_self_get(0);
+    if (s) {
+        s->regs = r;
+        s->uc = uc;
+    }
+}
+
+struct cng_uregs *cng_pt_cur_regs(void) {
+    if (!g_pt_local)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s ? s->regs : 0;
+}
+
+struct cng_ucontext *cng_pt_cur_uc(void) {
+    if (!g_pt_local)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s ? s->uc : 0;
+}
+
+/* ---- regset marshalling (runs in the tracee, on its own live frame) ---- */
+
+/* NT_PRFPREG: the FP/SIMD register file, as the kernel's struct
+ * user_fpsimd_state lays it out — 32 q registers, then fpsr, fpcr and two
+ * reserved words. The kernel has it for every stop, so this answers at every
+ * stop too; where it is read from depends on how the stop was reached.
+ *
+ * In a signal frame — a SIGSYS trap, a signal- or attach-stop taken in one of
+ * our handlers — it is the frame's: the kernel appends an _aarch64_ctx-tagged
+ * record list to the sigcontext and restores whatever we leave there on
+ * sigreturn, so the frame is both the read and the write path. Its FPSIMD
+ * record is *not* a user_fpsimd_state: fpsr and fpcr come first, after the
+ * header, and the q registers follow, which is why the two are converted
+ * rather than copied.
+ *
+ * With no signal frame — an -R trampoline's syscall stop, or a rewritten site's
+ * on the seccomp tier, or the emulated execve's — the registers are the live
+ * ones, read and written in place. They are the guest's own there: nothing in
+ * the monitor is built to spend them (-mgeneral-regs-only, see the Makefile),
+ * and the kernel preserves them across every syscall made since, so what the
+ * trampoline returns to is exactly what the stop left in them. */
+#define PT_FPSIMD_MAGIC 0x46508001
+#define PT_SVE_MAGIC    0x53564501
+#define PT_EXTRA_MAGIC  0x45585401
+
+struct pt_aarch64_ctx {
+    u32 magic, size;
+};
+
+#define PT_FPSIMD_SZ 528 /* struct user_fpsimd_state */
+#define PT_FP_VREGS  0   /* its q0..q31 */
+#define PT_FP_FPSR   512
+#define PT_FP_FPCR   516
+#define PT_REC_FPSR  8 /* and the same in a frame's FPSIMD record */
+#define PT_REC_FPCR  12
+#define PT_REC_VREGS 16
+
+/* Find the `magic` record in the frame of the current stop, following an
+ * EXTRA record to the part of the list the kernel spills beyond the frame
+ * (it does for a large SVE vector length). 0 when the stop has no signal
+ * frame, or the frame has no such record.
+ *
+ * The frame has to be the one `r` is in: a stop taken in a guest handler that
+ * ran over a dispatch leaves the handler's frame recorded, dead, by the time
+ * the dispatch reports its own. The one exception is named: a stop taken
+ * inside a dispatch from guest context reports the guest's registers from the
+ * dispatch's record, and the FP/SIMD state from the frame of the kick that
+ * stopped it (s->fpuc, see pt_inflight_stop). */
+static u8 *pt_frame_rec(struct pt_self *s, struct cng_uregs *r, u32 magic) {
+    if (!s)
+        return 0;
+    struct cng_ucontext *uc = s->fpuc;
+    if (!uc) {
+        if (!s->uc || cng_pt_uregs(s->uc) != r)
+            return 0;
+        uc = s->uc;
+    }
+    u8 *p = uc->uc_mcontext.__reserved;
+    u8 *end = p + sizeof uc->uc_mcontext.__reserved;
+    while (p + sizeof(struct pt_aarch64_ctx) <= end) {
+        struct pt_aarch64_ctx *c = (struct pt_aarch64_ctx *)p;
+        if (c->magic == 0 || c->size < sizeof *c || c->size > end - p)
+            return 0; /* end of the record list */
+        if (c->magic == magic)
+            return p;
+        if (c->magic == PT_EXTRA_MAGIC && c->size >= 24) {
+            /* struct extra_context { head; u64 datap; u32 size; ... }: the
+             * list goes on at datap, and this record is its last here. */
+            u8 *data = (u8 *)(unsigned long)*(u64 *)(p + 8);
+            u32 dsize = *(u32 *)(p + 16);
+            if (!data)
+                return 0;
+            p = data;
+            end = data + dsize;
+            continue;
+        }
+        p += c->size;
+    }
+    return 0;
+}
+
+/* The live registers, saved and loaded. The directives are for clang, whose
+ * assembler takes -mgeneral-regs-only to mean no FP instruction at all, inline
+ * asm included; gcc's leaves inline asm alone either way. */
+#define PT_FP_ARCH ".arch_extension fp\n\t.arch_extension simd\n\t"
+
+static void pt_fp_live_save(u8 *out) {
+    __asm__ volatile(PT_FP_ARCH
+                     "stp q0, q1, [%0, #0]\n\t"
+                     "stp q2, q3, [%0, #32]\n\t"
+                     "stp q4, q5, [%0, #64]\n\t"
+                     "stp q6, q7, [%0, #96]\n\t"
+                     "stp q8, q9, [%0, #128]\n\t"
+                     "stp q10, q11, [%0, #160]\n\t"
+                     "stp q12, q13, [%0, #192]\n\t"
+                     "stp q14, q15, [%0, #224]\n\t"
+                     "stp q16, q17, [%0, #256]\n\t"
+                     "stp q18, q19, [%0, #288]\n\t"
+                     "stp q20, q21, [%0, #320]\n\t"
+                     "stp q22, q23, [%0, #352]\n\t"
+                     "stp q24, q25, [%0, #384]\n\t"
+                     "stp q26, q27, [%0, #416]\n\t"
+                     "stp q28, q29, [%0, #448]\n\t"
+                     "stp q30, q31, [%0, #480]\n\t"
+                     "mrs x9, fpsr\n\t"
+                     "str w9, [%0, #512]\n\t"
+                     "mrs x9, fpcr\n\t"
+                     "str w9, [%0, #516]\n\t"
+                     "str xzr, [%0, #520]"
+                     :
+                     : "r"(out)
+                     : "x9", "memory");
+}
+
+/* No clobbers to declare: the registers written are the guest's, which is the
+ * point, and the compiler is not allowed to keep anything of its own there. */
+static void pt_fp_live_load(const u8 *in) {
+    __asm__ volatile(PT_FP_ARCH
+                     "ldp q0, q1, [%0, #0]\n\t"
+                     "ldp q2, q3, [%0, #32]\n\t"
+                     "ldp q4, q5, [%0, #64]\n\t"
+                     "ldp q6, q7, [%0, #96]\n\t"
+                     "ldp q8, q9, [%0, #128]\n\t"
+                     "ldp q10, q11, [%0, #160]\n\t"
+                     "ldp q12, q13, [%0, #192]\n\t"
+                     "ldp q14, q15, [%0, #224]\n\t"
+                     "ldp q16, q17, [%0, #256]\n\t"
+                     "ldp q18, q19, [%0, #288]\n\t"
+                     "ldp q20, q21, [%0, #320]\n\t"
+                     "ldp q22, q23, [%0, #352]\n\t"
+                     "ldp q24, q25, [%0, #384]\n\t"
+                     "ldp q26, q27, [%0, #416]\n\t"
+                     "ldp q28, q29, [%0, #448]\n\t"
+                     "ldp q30, q31, [%0, #480]\n\t"
+                     "ldr w9, [%0, #512]\n\t"
+                     "msr fpsr, x9\n\t"
+                     "ldr w9, [%0, #516]\n\t"
+                     "msr fpcr, x9"
+                     :
+                     : "r"(in)
+                     : "x9", "memory");
+}
+
+static void pt_fp_get(struct pt_self *s, struct cng_uregs *r, u8 *out) {
+    u8 *f = pt_frame_rec(s, r, PT_FPSIMD_MAGIC);
+    if (!f) {
+        pt_fp_live_save(out);
+        return;
+    }
+    memcpy(out + PT_FP_VREGS, f + PT_REC_VREGS, 512);
+    memcpy(out + PT_FP_FPSR, f + PT_REC_FPSR, 4);
+    memcpy(out + PT_FP_FPCR, f + PT_REC_FPCR, 4);
+    memset(out + PT_FP_FPCR + 4, 0, 8);
+}
+
+/* A write replaces the leading `len` bytes and keeps the rest, as the kernel's
+ * fpr_set copies in over the current state.
+ *
+ * A frame taken while the thread's SVE state was live carries it in an SVE
+ * record too, and then that is what sigreturn restores the vector registers
+ * from — the FPSIMD record only supplies fpsr and fpcr — so a write that
+ * stopped at the FPSIMD record would be silently undone. The kernel's own
+ * answer to a NT_PRFPREG write over live SVE state is to zero the whole SVE
+ * register file and put the new q registers in the bottom of the z registers
+ * (sve_sync_from_fpsimd_zeropad); the record is given the same. */
+static void pt_fp_set(struct pt_self *s, struct cng_uregs *r, const u8 *in,
+                      u32 len) {
+    u8 st[PT_FPSIMD_SZ];
+    pt_fp_get(s, r, st);
+    memcpy(st, in, len > sizeof st ? sizeof st : len);
+    u8 *f = pt_frame_rec(s, r, PT_FPSIMD_MAGIC);
+    if (!f) {
+        pt_fp_live_load(st);
+        return;
+    }
+    memcpy(f + PT_REC_VREGS, st + PT_FP_VREGS, 512);
+    memcpy(f + PT_REC_FPSR, st + PT_FP_FPSR, 4);
+    memcpy(f + PT_REC_FPCR, st + PT_FP_FPCR, 4);
+    /* struct sve_context { head; u16 vl; u16 flags; u16 reserved[2]; }, its
+     * registers from offset 16: z0..z31 of vl bytes each, then the predicates.
+     * A record no bigger than its header has none (the state was not live). */
+    u8 *z = pt_frame_rec(s, r, PT_SVE_MAGIC);
+    if (!z)
+        return;
+    u32 size = ((struct pt_aarch64_ctx *)z)->size;
+    u32 vl = *(u16 *)(z + 8);
+    if (size <= 16 || vl < 16 || (u64)vl * 32 > size - 16)
+        return;
+    memset(z + 16, 0, size - 16);
+    for (int i = 0; i < 32; i++)
+        memcpy(z + 16 + (u64)vl * i, st + PT_FP_VREGS + 16 * i, 16);
+}
+
+/* PACIA <Xd>, <Xn>: 0xDAC10000 | (Rn << 5) | Rd, spelled as a raw instruction
+ * word so a baseline armv8-a assembler accepts it. Only ever executed once
+ * AT_HWCAP has said the CPU has address authentication — it is UNDEFINED, not a
+ * NOP, on one that does not. */
+static u64 pt_pac_sign(u64 ptr, u64 mod) {
+    register u64 x0 __asm__("x0") = ptr;
+    register u64 x1 __asm__("x1") = mod;
+    __asm__ volatile(".inst 0xdac10020" : "+r"(x0) : "r"(x1));
+    return x0;
+}
+
+static unsigned long pt_auxval(unsigned long tag) {
+    unsigned long *a = cng_host_auxv;
+    if (!a)
+        return 0;
+    for (; a[0]; a += 2)
+        if (a[0] == tag)
+            return a[1];
+    return 0;
+}
+
+/* The pointer-authentication mask, for NT_ARM_PAC_MASK.
+ *
+ * The kernel's answer is GENMASK(54, vabits_actual) — the bits a signed user
+ * pointer carries its PAC in — and we have no way to ask it for that: reading
+ * it back is itself a ptrace request, and the VA size is not exported anywhere
+ * a program can read. So it is measured instead. Sign one pointer under many
+ * modifiers and OR the differences: every bit of the PAC field flips in about
+ * half the samples, so after this many the union *is* the field, while every
+ * bit outside it never moves. Bits above 54 are dropped, since the kernel's
+ * mask never includes the top byte whether or not TBI is on.
+ *
+ * gdb asks for this whenever AT_HWCAP advertises PACA — which we forward from
+ * the host verbatim — and treats a failure as fatal, so an -EINVAL here is the
+ * "unable to fetch pauth registers" that stops a session before it starts. */
+#define PT_HWCAP_PACA (1UL << 30)
+
+static u64 pt_pac_mask(void) {
+    static u64 cached;
+    static int done;
+    if (__atomic_load_n(&done, __ATOMIC_ACQUIRE))
+        return cached;
+    u64 mask = 0;
+    if (pt_auxval(16 /*AT_HWCAP*/) & PT_HWCAP_PACA) {
+        u64 p = (u64)(unsigned long)&cached & 0x00FFFFFFFFFFFFFFuLL;
+        for (int i = 0; i < 96; i++)
+            mask |= pt_pac_sign(p, (u64)i * 0x9E3779B97F4A7C15uLL) ^ p;
+        mask &= 0x007FFFFFFFFFFFFFuLL;
+    }
+    cached = mask;
+    __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
+    return mask;
+}
+
+/* The kernel's geometry for each regset served here, which ptrace_regset
+ * applies before the regset is so much as asked: a length that is not a whole
+ * number of `unit`s is EINVAL, a longer one is cut to `size`, and the cut
+ * length is what iov_len says afterwards — for a write as for a read. 0 for a
+ * regset this does not have. */
+static u32 pt_regset_geom(u64 which, u32 *size) {
+    switch (which) {
+    case CNG_NT_PRSTATUS:
+        *size = (u32)sizeof(struct cng_uregs);
+        return 8;
+    case CNG_NT_PRFPREG:
+        *size = PT_FPSIMD_SZ;
+        return 4;
+    case CNG_NT_ARM_TLS:
+    case CNG_NT_ARM_TAGGED_ADDR_CTRL:
+        *size = 8;
+        return 8;
+    case CNG_NT_ARM_SYSTEM_CALL:
+        *size = 4;
+        return 4;
+    case CNG_NT_ARM_PAC_MASK:
+        *size = 16;
+        return 8;
+    }
+    return 0;
+}
+
+/* pstate bits a write may not set: an exception level other than EL0t, the
+ * AArch32 bit, and the D/A/I/F masks. The kernel's gpr_set refuses such a file
+ * whole (valid_user_regs) rather than return to user mode with it; here,
+ * sigreturn would kill the task for it instead. */
+#define PT_PSTATE_BAD 0x3dfull
+
+static u32 pt_build_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
+                           u8 *out) {
+    switch (which) {
+    case CNG_NT_PRSTATUS:
+        memcpy(out, r, sizeof *r);
+        return (u32)sizeof *r;
+    case CNG_NT_PRFPREG:
+        pt_fp_get(s, r, out);
+        return PT_FPSIMD_SZ;
+    case CNG_NT_ARM_TLS: {
+        u64 tls;
+        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
+        memcpy(out, &tls, 8);
+        return 8;
+    }
+    case CNG_NT_ARM_SYSTEM_CALL: {
+        s32 nr = s && s->link ? (s32)s->link->sc_nr : -1;
+        memcpy(out, &nr, 4);
+        return 4;
+    }
+    case CNG_NT_ARM_PAC_MASK: {
+        /* struct user_pac_mask { data_mask, insn_mask } — one value twice, as
+         * the kernel reports it (the two can differ only under TCR_EL1.TBID*,
+         * which Linux does not use). */
+        u64 m = pt_pac_mask();
+        if (!m)
+            return 0; /* no address authentication: -EINVAL, as the kernel says */
+        u64 pac[2] = {m, m};
+        memcpy(out, pac, sizeof pac);
+        return (u32)sizeof pac;
+    }
+    case CNG_NT_ARM_TAGGED_ADDR_CTRL: {
+        /* MTE's tagged-address control. gdb asks for it whenever AT_HWCAP2 says
+         * MTE, and is fatal about a failure the same way. The task can read its
+         * own through prctl, so no ptrace is needed to answer. */
+        long v = sys_prctl(CNG_PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0);
+        if (v < 0)
+            return 0;
+        u64 ctl = (u64)v;
+        memcpy(out, &ctl, sizeof ctl);
+        return (u32)sizeof ctl;
+    }
+    default:
+        return 0;
+    }
+}
+
+static long pt_apply_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
+                            const u8 *in, u32 len) {
+    switch (which) {
+    case CNG_NT_PRSTATUS: {
+        /* A short write replaces that much of the file and keeps the rest,
+         * as the kernel's copies in over the current registers. */
+        struct cng_uregs nr = *r;
+        memcpy(&nr, in, len > sizeof nr ? sizeof nr : len);
+        if (nr.pstate & PT_PSTATE_BAD)
+            return -EINVAL;
+        *r = nr;
+        return 0;
+    }
+    case CNG_NT_PRFPREG:
+        pt_fp_set(s, r, in, len);
+        return 0;
+    case CNG_NT_ARM_TLS: {
+        u64 tls;
+        if (len < 8)
+            return -EINVAL;
+        memcpy(&tls, in, 8);
+        __asm__ volatile("msr tpidr_el0, %0" ::"r"(tls));
+        return 0;
+    }
+    case CNG_NT_ARM_TAGGED_ADDR_CTRL: {
+        u64 ctl;
+        if (len < 8)
+            return -EINVAL;
+        memcpy(&ctl, in, 8);
+        return sys_prctl(CNG_PR_SET_TAGGED_ADDR_CTRL, (long)ctl, 0, 0, 0) < 0
+                   ? -EINVAL
+                   : 0;
+    }
+    /* NT_ARM_PAC_MASK is read-only in the kernel too (its regset has no
+     * setter), so it falls through to the -EINVAL below. */
+    case CNG_NT_ARM_SYSTEM_CALL: {
+        s32 nr;
+        if (len < 4)
+            return -EINVAL;
+        memcpy(&nr, in, 4);
+        /* Redirect or cancel (-1) the in-flight syscall — the only way to do
+         * that on arm64, where the kernel does not re-read x8 after the stop. */
+        if (s && s->link)
+            s->link->sc_nr = nr;
+        return 0;
+    }
+    default:
+        return -EINVAL;
+    }
+}
+
+/* ---- tracee memory access ---- */
+
+/* Protection of the mapping holding `addr`, from /proc/self/maps, or -1 if it
+ * cannot be determined. Only used to put a text page back the way it was after
+ * a breakpoint poke, so a miss falls back to the r-xp that text always is. */
+static u64 pt_hex(char **p) {
+    u64 v = 0;
+    for (;; (*p)++) {
+        char c = **p;
+        int d = (c >= '0' && c <= '9')   ? c - '0'
+                : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                                         : -1;
+        if (d < 0)
+            return v;
+        v = v * 16 + (u64)d;
+    }
+}
+
+static int pt_prot_of(u64 addr) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/maps",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    /* Small on purpose: a POKETEXT can be serviced from a stop taken on a
+     * guest thread's stack, which for a Go goroutine is 8 KiB and already holds
+     * the kernel's ~4.5 KiB signal frame. A line split across two reads is
+     * carried over by keeping the tail at the front of the next buffer. */
+    char buf[1024];
+    int prot = -1;
+    long n, keep = 0;
+    while ((n = sys_read((int)fd, buf + keep, sizeof buf - 1 - (size_t)keep)) >
+           0) {
+        n += keep;
+        buf[n] = 0;
+        char *p = buf, *nl;
+        while (prot < 0 && (nl = strchr(p, '\n'))) {
+            *nl = 0;
+            char *q = p;
+            u64 lo = pt_hex(&q); /* "lo-hi perms ..." */
+            if (*q == '-') {
+                q++;
+                u64 hi = pt_hex(&q);
+                if (*q == ' ' && addr >= lo && addr < hi) {
+                    prot = (q[1] == 'r' ? CNG_PROT_READ : 0) |
+                           (q[2] == 'w' ? CNG_PROT_WRITE : 0) |
+                           (q[3] == 'x' ? CNG_PROT_EXEC : 0);
+                }
+            }
+            p = nl + 1;
+        }
+        if (prot >= 0)
+            break;
+        keep = (long)strlen(p);
+        if (keep >= (long)sizeof buf - 1)
+            keep = 0; /* pathological line: drop it */
+        else
+            memmove(buf, p, (size_t)keep);
+    }
+    sys_close((int)fd);
+    return prot;
+}
+
+/* Write `len` bytes at `addr` the way PTRACE_POKETEXT does: through a
+ * write-protected mapping (a breakpoint lands in read-only text), and coherent
+ * with the instruction stream afterwards. Returns 0 or -EIO. */
+/* One poke into protected text at a time, process-wide. The write is a
+ * three-step dance — make the page writable, store, put it back — and two
+ * tasks dancing on the same page at once stepped on each other: one restored
+ * read-only between the other's mprotect and its store, which came back EIO,
+ * or read the page's protection while the other had it writable and left it
+ * so. Two threads single-stepped through the same instruction do exactly this.
+ * Held by tid so a task that holds it can poke again from a handler, and taken
+ * over from a task that died holding it. */
+static long g_poke_owner;
+static int g_poke_depth;
+
+static void pt_poke_lock(void) {
+    long me = sys_gettid(), cur;
+    for (int spin = 0;; spin++) {
+        cur = __atomic_load_n(&g_poke_owner, __ATOMIC_ACQUIRE);
+        if (cur == me) {
+            g_poke_depth++;
+            return;
+        }
+        long none = 0;
+        if (cur == 0 &&
+            __atomic_compare_exchange_n(&g_poke_owner, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            g_poke_depth = 1;
+            return;
+        }
+        if (spin > 100 && cur &&
+            CNG_SYS(__NR_tgkill, sys_getpid(), cur, 0, 0, 0, 0) == -ESRCH)
+            __atomic_compare_exchange_n(&g_poke_owner, &cur, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+static void pt_poke_unlock(void) {
+    if (--g_poke_depth == 0)
+        __atomic_store_n(&g_poke_owner, 0, __ATOMIC_RELEASE);
+}
+
+long cng_pt_poke_text(u64 addr, const void *src, unsigned len) {
+    unsigned char word[8];
+    if (len > sizeof word || cng_user_copyin(word, src, len) < 0)
+        return -EIO;
+    pt_poke_lock();
+    long w = cng_user_copyout((void *)addr, word, len);
+    if (w == 0) {
+        cng_flush_icache((void *)addr, (void *)(addr + len));
+        pt_poke_unlock();
+        return 0;
+    }
+    /* The page this lands in, at whatever the page size is here: mprotect takes
+     * a page-aligned address, so rounding to 4 KiB on a 16 KiB kernel — which
+     * is what the Android devices this targets run — refuses the call with
+     * EINVAL and a breakpoint into read-only text comes back -EIO. */
+    unsigned long page = cng_page_down((unsigned long)addr);
+    unsigned long end = cng_page_up((unsigned long)addr + len);
+    int prot = pt_prot_of(addr);
+    if (prot < 0)
+        prot = CNG_PROT_READ | CNG_PROT_EXEC;
+    if (sys_mprotect((void *)page, (size_t)(end - page),
+                     prot | CNG_PROT_READ | CNG_PROT_WRITE) < 0) {
+        pt_poke_unlock();
+        return -EIO;
+    }
+    w = cng_user_copyout((void *)addr, word, len);
+    cng_flush_icache((void *)addr, (void *)(addr + len));
+    sys_mprotect((void *)page, (size_t)(end - page), prot);
+    pt_poke_unlock();
+    return w < 0 ? -EIO : 0;
+}
+
+/* Copy as much of [addr, addr+len) as is accessible, the way process_vm_readv
+ * reports a partial transfer. Returns the byte count. */
+static u32 pt_copy_out(u64 addr, u8 *dst, u32 len) {
+    if (cng_user_copyin(dst, (const void *)addr, len) == 0)
+        return len;
+    u32 done = 0;
+    while (done < len &&
+           cng_user_copyin(dst + done, (const void *)(addr + done), 1) == 0)
+        done++;
+    return done;
+}
+
+static u32 pt_copy_in(u64 addr, const u8 *src, u32 len) {
+    if (cng_user_copyout((void *)addr, src, len) == 0)
+        return len;
+    u32 done = 0;
+    while (done < len &&
+           cng_user_copyout((void *)(addr + done), src + done, 1) == 0)
+        done++;
+    return done;
+}
+
+/* ---- tracee: leaving traced state ---- */
+
+static void pt_self_detach(struct pt_self *s) {
+    if (!s)
+        return;
+    struct pt_link *e = s->link;
+    int was = s->active;
+    s->link = 0;
+    s->active = s->armed = s->step = s->skip_exit_stop = 0;
+    if (e) {
+        __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE);
+        pt_free(e);
+    }
+    if (was) {
+        cng_pt_step_clear();
+        pt_traced_dec(1);
+    }
+}
+
+/* Is task `tid` gone (reaped) or a zombie? A tracer that died leaves its
+ * tracees parked forever otherwise. `ppid_out`, when asked for, gets the task's
+ * parent — 0 if there was no /proc entry to read it from. A task /proc does
+ * not show counts as gone, and that is more than the reaped ones: under
+ * hidepid=2 (every Android since 7) a kernel before 4.10 shows only a task the
+ * reader may ptrace, and one whose mm is gone — exiting, or a zombie — is
+ * nobody's to ptrace. */
+static int pt_task_dead(s32 tid, s32 *ppid_out) {
+    if (ppid_out)
+        *ppid_out = 0;
+    char path[64];
+    cng_snprintf(path, sizeof path, "/proc/%d/stat", (int)tid);
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 1; /* gone */
+    char buf[256];
+    long n = sys_read((int)fd, buf, sizeof buf - 1);
+    sys_close((int)fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    char *rp = strrchr(buf, ')'); /* comm can hold spaces and parens */
+    if (!rp || !rp[1])
+        return 0;
+    const char *p = rp + 1;
+    while (*p == ' ')
+        p++;
+    char st = *p++;
+    if (ppid_out) { /* the field after the state is the parent's pid */
+        while (*p == ' ')
+            p++;
+        s32 par = 0;
+        while (*p >= '0' && *p <= '9')
+            par = par * 10 + (*p++ - '0');
+        *ppid_out = par;
+    }
+    return st == 'Z' || st == 'X' || st == 'x';
+}
+
+/* Is task `tid` a child of ours, exited or not? Asked of the kernel, for
+ * where /proc will not say (see pt_task_dead): a waitid that only peeks at
+ * what it would collect fails ECHILD for anything else. waitid takes __WALL
+ * only since 4.7 and refuses it EINVAL before, where a child whose exit
+ * signal is not SIGCHLD cannot be asked about at all. */
+static int pt_our_child(s32 tid) {
+    u8 si[128];
+    long opts = 4 /*WEXITED*/ | 1 /*WNOHANG*/ | 0x01000000 /*WNOWAIT*/;
+    long r = CNG_SYS(__NR_waitid, 1 /*P_PID*/, tid, si, opts | CNG_WALL, 0, 0);
+    if (r == -EINVAL)
+        r = CNG_SYS(__NR_waitid, 1 /*P_PID*/, tid, si, opts, 0, 0);
+    return r == 0;
+}
+
+/* ---- tracee: the service loop ---- */
+
+/* Answer tracer commands while parked. Returns the signal to inject on resume
+ * (0 = none/suppressed). `seen` is the cmd_seq sampled *before* the stop was
+ * published: the tracer can only post a command after observing STOPPED, so any
+ * command it posts advances past `seen` and cannot be missed. */
+static int pt_service_loop(struct pt_self *s, struct cng_uregs *r,
+                           struct pt_link *e, u32 seen) {
+    int inject = 0;
+    for (;;) {
+        while (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) == seen) {
+            fx_wait(&e->cmd_seq, seen, 500);
+            if (__atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE) != seen)
+                break;
+            s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+            if (tr <= 0 || pt_task_dead(tr, 0)) {
+                /* The tracer died. The kernel detaches its tracees (killing
+                 * them first under PTRACE_O_EXITKILL); do the same rather than
+                 * park here forever. */
+                u32 opts = __atomic_load_n(&e->options, __ATOMIC_ACQUIRE);
+                pt_self_detach(s);
+                if (opts & CNG_PTRACE_O_EXITKILL)
+                    CNG_SYS(__NR_exit_group, 0, 0, 0, 0, 0, 0);
+                return 0;
+            }
+            /* Still unreaped after 500 ms: our publish-time wake may have raced
+             * the tracer's entry into its wait. Re-kick until it is collected. */
+            if (!__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE))
+                pt_kick_tracer(tr, CNG_PT_KICK_REWAKE);
+        }
+        seen = __atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE);
+        int leave = 0;
+        switch (e->cmd) {
+        case PT_CMD_PEEK: {
+            u64 w = 0;
+            e->result = pt_copy_out(e->addr, (u8 *)&w, 8) == 8 ? 0 : -EIO;
+            cng_pt_step_mask(e->addr, &w, 8); /* no task's step brk is shown */
+            memcpy(e->data, &w, 8);
+            e->rlen = 8;
+            break;
+        }
+        case PT_CMD_POKE:
+            e->result = cng_pt_poke_text(e->addr, &e->arg, 8);
+            break;
+        case PT_CMD_READ: {
+            u32 n = e->arg > PT_MBOX ? PT_MBOX : (u32)e->arg;
+            e->rlen = pt_copy_out(e->addr, e->data, n);
+            cng_pt_step_mask(e->addr, e->data, e->rlen);
+            e->result = (s64)e->rlen;
+            break;
+        }
+        case PT_CMD_WRITE: {
+            u32 n = e->arg > PT_MBOX ? PT_MBOX : (u32)e->arg;
+            e->rlen = pt_copy_in(e->addr, e->data, n);
+            e->result = (s64)e->rlen;
+            break;
+        }
+        case PT_CMD_GETREGS: {
+            u32 n = pt_build_regset(s, r, (u32)e->addr, e->data);
+            e->rlen = n;
+            e->result = n ? 0 : -EINVAL;
+            break;
+        }
+        case PT_CMD_SETREGS:
+            e->result = pt_apply_regset(s, r, (u32)e->addr, e->data, e->rlen);
+            break;
+        case PT_CMD_RESUME:
+            s->armed = (e->arg == PT_RES_SYSCALL);
+            s->step = (e->arg == PT_RES_SINGLESTEP);
+            inject = (int)e->addr;
+            e->result = 0;
+            __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE);
+            leave = 1;
+            break;
+        case PT_CMD_DETACH:
+            inject = (int)e->addr;
+            e->result = 0;
+            pt_self_detach(s);
+            leave = 1;
+            break;
+        default:
+            e->result = -EIO;
+            break;
+        }
+        __atomic_add_fetch(&e->done_seq, 1, __ATOMIC_RELEASE);
+        fx_wake(&e->done_seq);
+        if (leave)
+            return inject;
+    }
+}
+
+/* Publish a stop and park until the tracer resumes us. Returns the signal it
+ * asked us to inject (0 = none). */
+static int pt_stop(struct pt_self *s, struct cng_uregs *r, int stop_sig,
+                   int event, int sc_stop, int si_code, u64 addr) {
+    struct pt_link *e = s ? s->link : 0;
+    if (!e || s->in_stop)
+        return stop_sig;
+    s->in_stop = 1;
+    /* Our own step breakpoint must not be visible to the tracer's PEEKTEXT. */
+    cng_pt_step_clear();
+    int inject = 0;
+    for (;;) {
+        u32 seen = __atomic_load_n(&e->cmd_seq, __ATOMIC_ACQUIRE);
+        e->stop_sig = (u32)stop_sig;
+        e->event = (u32)event;
+        e->syscall_stop = (u32)sc_stop;
+        e->sc_op = sc_stop == 1   ? PT_SCI_ENTRY
+                   : sc_stop == 2 ? PT_SCI_EXIT
+                                  : PT_SCI_NONE;
+        e->si_signo = stop_sig;
+        e->si_code =
+            si_code ? si_code : (event ? ((event << 8) | 5 /*SIGTRAP*/) : 0);
+        e->fault_addr = addr;
+        e->si_errno = 0;
+        __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
+        pt_bump_gen();
+        pt_wake_tracer(__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE));
+        inject = pt_service_loop(s, r, e, seen);
+        /* Resumed with PTRACE_SINGLESTEP: arm the temporary breakpoint that
+         * brings us back after one instruction. Not at a syscall-*entry* stop,
+         * where the step is the syscall itself and the stop is reported once it
+         * returns (cng_pt_step_report) — exactly where TIF_SINGLESTEP reports
+         * it. */
+        if (!s->step || !s->active || sc_stop == 1)
+            break;
+        if (cng_pt_step_plant(r) == 0)
+            break;
+        /* The instruction cannot be decoded (a pointer-authenticated branch),
+         * so there is nowhere to put the breakpoint. Report the step stop again
+         * at the same pc — a step that did not advance, which a debugger can
+         * see and act on — rather than resume a "stepping" tracee that would
+         * then run to the next syscall or signal without stopping. */
+        stop_sig = 5 /*SIGTRAP*/;
+        event = 0;
+        sc_stop = 0;
+        si_code = 2 /*TRAP_TRACE*/;
+        addr = r->pc;
+    }
+    s->in_stop = 0;
+    return inject;
+}
+
+/* ---- tracee: stop reports ---- */
+
+int cng_pt_syscall_entry(struct cng_uregs *r, long *nr_out) {
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->link)
+        return 1;
+    struct pt_link *e = s->link;
+    long nr = (long)r->x[8];
+    s->entry_seen = s->armed;
+    if (!s->armed) {
+        e->sc_nr = nr;
+        *nr_out = nr;
+        return 1;
+    }
+    e->sc_nr = nr;
+    for (int i = 0; i < 6; i++)
+        e->sc_args[i] = r->x[i];
+    e->sc_pc = r->pc;
+    e->sc_sp = r->sp;
+    /* A syscall the guest itself issued with an invalid number answers -ENOSYS,
+     * and the tracer sees that as the pending result — exactly as arm64's
+     * el0_svc_common sets it before the entry stop. */
+    if (nr < 0)
+        r->x[0] = (u64)(s64)-ENOSYS;
+    u64 x8_before = r->x[8];
+    pt_stop(s, r, 5 /*SIGTRAP*/, 0, 1, 0, 0);
+    if (!s->active) { /* detached at the stop */
+        *nr_out = (long)r->x[8];
+        return 1;
+    }
+    /* The syscall number after the stop. NT_ARM_SYSTEM_CALL is the kernel's
+     * only channel for this on arm64 (x8 is not re-read), and it is what
+     * proot-style tracers use; we also honor a plain x8 rewrite, which the
+     * kernel ignores, so a tracer carrying x86 habits still works here. */
+    long nr2 = (long)e->sc_nr;
+    if (r->x[8] != x8_before)
+        nr2 = (long)r->x[8];
+    e->sc_nr = nr2;
+    *nr_out = nr2;
+    if (nr2 == -1)
+        return 0; /* cancelled: x0 is whatever the tracer left */
+    return 1;
+}
+
+void cng_pt_syscall_exit(struct cng_uregs *r) {
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->link || !s->armed)
+        return;
+    /* Only a syscall whose entry stop was reported owes an exit stop. Without
+     * this, a tracer that armed PTRACE_SYSCALL from a stop taken *inside* a
+     * syscall — the group-stop of a self-directed SIGSTOP, which is where every
+     * strace session starts — would be handed a stray exit stop and have its
+     * entry/exit pairing inverted for the rest of the run. */
+    if (!s->entry_seen)
+        return;
+    s->entry_seen = 0;
+    if (s->skip_exit_stop) {
+        s->skip_exit_stop = 0;
+        return;
+    }
+    struct pt_link *e = s->link;
+    e->sc_rval = (s64)r->x[0];
+    e->sc_pc = r->pc;
+    e->sc_sp = r->sp;
+    pt_stop(s, r, 5 /*SIGTRAP*/, 0, 2, 0, 0);
+}
+
+int cng_pt_entry_owed(void) {
+    if (!g_pt_local)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s && s->entry_seen;
+}
+
+void cng_pt_entry_set(int owed) {
+    if (!g_pt_local)
+        return;
+    struct pt_self *s = pt_self_get(0);
+    if (s)
+        s->entry_seen = owed;
+}
+
+int cng_pt_stepping(void) {
+    if (!g_pt_local || !g_tab)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    return s && s->active && s->step;
+}
+
+void cng_pt_step_report(struct cng_uregs *r) {
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->step || !s->link)
+        return;
+    cng_pt_step_clear();
+    /* si_code TRAP_TRACE: a step completed, as opposed to the TRAP_BRKPT of a
+     * breakpoint. gdb distinguishes them. */
+    pt_stop(s, r, 5 /*SIGTRAP*/, 0, 0, 2 /*TRAP_TRACE*/, r->pc);
+}
+
+void cng_pt_report_exec(struct cng_uregs *r) {
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->link)
+        return;
+    int event = (__atomic_load_n(&s->link->options, __ATOMIC_ACQUIRE) &
+                 CNG_PTRACE_O_TRACEEXEC)
+                    ? CNG_PTRACE_EVENT_EXEC
+                    : 0;
+    /* A freshly exec'd tracee is stopped and must be re-armed by its tracer. */
+    s->armed = 0;
+    s->step = 0;
+    pt_stop(s, r, 5 /*SIGTRAP*/, event, 0, 0, 0);
+}
+
+/* Publish the new child's link from the parent, before the event stop that
+ * announces it. The child claims the same link when it runs its own
+ * cng_pt_fork_child, but the tracer typically waits on the new pid the instant
+ * it sees the event — and that pid is not the tracer's own child, so a host
+ * wait4 answers ECHILD. Without a link already in the registry that ECHILD is
+ * terminal, and the tracer misses a child that is about to stop. */
+static void pt_child_claim(s32 pid, struct pt_link *parent) {
+    if (pid <= 0 || !parent)
+        return;
+    struct pt_link *e = pt_claim(pid, pid);
+    if (!e)
+        return;
+    __atomic_store_n(&e->options,
+                     __atomic_load_n(&parent->options, __ATOMIC_ACQUIRE),
+                     __ATOMIC_RELAXED);
+    e->seize = parent->seize;
+    s32 zero = 0;
+    __atomic_compare_exchange_n(&e->tracer, &zero,
+                                __atomic_load_n(&parent->tracer, __ATOMIC_ACQUIRE),
+                                0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
+void cng_pt_report_event(struct cng_uregs *r, int event, u64 msg) {
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->link || !event)
+        return;
+    /* The fork-family events arrive here already gated on their option (see
+     * cng_pt_clone_event); VFORK_DONE's callers report it for every vfork and
+     * it is gated here, as ptrace_event() gates every event on its option. A
+     * tracer that asked only for PTRACE_O_TRACEVFORK used to get a second,
+     * unasked-for stop after the vfork event. */
+    if (event == CNG_PTRACE_EVENT_VFORK_DONE &&
+        !(__atomic_load_n(&s->link->options, __ATOMIC_ACQUIRE) &
+          CNG_PTRACE_O_TRACEVFORKDONE))
+        return;
+    if (event == CNG_PTRACE_EVENT_FORK || event == CNG_PTRACE_EVENT_VFORK ||
+        event == CNG_PTRACE_EVENT_CLONE)
+        pt_child_claim((s32)msg, s->link);
+    s->link->eventmsg = msg;
+    pt_stop(s, r, 5 /*SIGTRAP*/, event, 0, 0, 0);
+}
+
+/* What a followed child inherits from its creator. Captured in the parent (by
+ * cng_pt_clone_event, which every clone path calls before cloning) because the
+ * child cannot look it up: the per-task table is keyed by tid, and in the child
+ * that key is new. Plain memory, so the fork carries it across. */
+static struct {
+    s32 tracer;
+    u32 options;
+    u32 seize;
+} g_fork_inherit;
+
+int cng_pt_clone_event(unsigned long flags) {
+    if (!g_pt_local || !g_tab)
+        return 0;
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->link)
+        return 0;
+    u32 o = __atomic_load_n(&s->link->options, __ATOMIC_ACQUIRE);
+    /* The kernel's rule, in order: CLONE_UNTRACED disables following; a clone
+     * carrying an exit signal other than SIGCHLD is a "clone" event, a vfork is
+     * a vfork event, anything else a fork event. */
+    int ev = 0;
+    if (!(flags & 0x00800000UL /*CLONE_UNTRACED*/)) {
+        if (flags & CNG_CLONE_VFORK)
+            ev = (o & CNG_PTRACE_O_TRACEVFORK) ? CNG_PTRACE_EVENT_VFORK : 0;
+        else if ((flags & 0xff) != 17 /*SIGCHLD*/)
+            ev = (o & CNG_PTRACE_O_TRACECLONE) ? CNG_PTRACE_EVENT_CLONE : 0;
+        else
+            ev = (o & CNG_PTRACE_O_TRACEFORK) ? CNG_PTRACE_EVENT_FORK : 0;
+    }
+    if (ev) {
+        g_fork_inherit.tracer =
+            __atomic_load_n(&s->link->tracer, __ATOMIC_ACQUIRE);
+        g_fork_inherit.options = o;
+        g_fork_inherit.seize = s->link->seize;
+    }
+    return ev;
+}
+
+void cng_pt_fork_child(struct cng_uregs *r, int event) {
+    /* A single-step breakpoint planted in the parent came across the fork in
+     * our copy-on-write text, and the bookkeeping that would take it out again
+     * (g_step_addr/g_step_orig, plain BSS) came with it. The parent unplants
+     * its own copy when the step lands; nothing unplants ours. An unfollowed
+     * child never reaches a stop that would, so it runs into a `brk` nobody is
+     * expecting — a SIGTRAP with no tracer to report it to, at an instruction
+     * that re-executes, forever.
+     *
+     * Cleared here, before the table wipe below, while the inherited addresses
+     * still describe this process's own text. Ahead of the `!g_tab` return too:
+     * an untraced child of a traced parent is exactly the case that has nobody
+     * left to fix it up later. Every task's, not the forking one's alone: the
+     * text is a copy of the whole process's, breakpoints of every stepping
+     * thread included, and none of those threads exists here. */
+    cng_pt_step_clear_all();
+    if (!g_tab)
+        return;
+    /* The per-task table came across the fork describing the *parent's*
+     * threads; only the forking thread exists here, and it has a new tid. Clear
+     * it wholesale so a recycled tid can never match a stale entry. */
+    {
+        struct cng_tab_iter it;
+        for (struct pt_self *s = cng_tab_first(&g_self, &it); s;
+             s = cng_tab_next(&g_self, &it))
+            memset(s, 0, sizeof *s);
+    }
+    __atomic_store_n(&g_pt_traced, 0, __ATOMIC_SEQ_CST);
+    /* The parent's tracees are its own, and the only thread here was in the
+     * fork, not in a wait. */
+    __atomic_store_n(&g_pt_tracer, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_pt_nwait, 0, __ATOMIC_SEQ_CST);
+    s32 tracer = g_fork_inherit.tracer;
+    u32 opts = g_fork_inherit.options;
+    u32 seize = g_fork_inherit.seize;
+    if (!event || tracer <= 0) {
+        /* Not followed: an ordinary untraced process. It still carries the
+         * inherited trap-everything filter, which costs time and nothing else. */
+        g_pt_local = 0;
+        return;
+    }
+    s32 me = (s32)sys_getpid();
+    struct pt_link *e = pt_claim(me, me);
+    if (!e) {
+        g_pt_local = 0;
+        return; /* registry full: degrade to untraced */
+    }
+    __atomic_store_n(&e->options, opts, __ATOMIC_RELAXED);
+    e->seize = seize;
+    __atomic_store_n(&e->tracer, tracer, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
+    struct pt_self *s = pt_self_get(1);
+    if (!s) {
+        pt_free(e);
+        g_pt_local = 0;
+        return;
+    }
+    s->link = e;
+    s->active = 1;
+    g_pt_local = 1;
+    cng_pt_arm_tracee();
+    pt_traced_inc();
+    /* The initial attach stop the kernel gives an auto-attached child: SIGSTOP
+     * for a PTRACE_ATTACH'd tracer, PTRACE_EVENT_STOP for a SEIZE'd one. */
+    if (seize)
+        pt_stop(s, r, 5 /*SIGTRAP*/, CNG_PTRACE_EVENT_STOP, 0, 0, 0);
+    else
+        pt_stop(s, r, 19 /*SIGSTOP*/, 0, 0, 0, 0);
+    /* The tracer has typically armed PTRACE_SYSCALL by now; suppress the
+     * syscall-exit stop of the clone we were born from, which we never entered
+     * at an entry stop and which would desync the tracer's entry/exit pairing. */
+    if (s->armed)
+        s->skip_exit_stop = 1;
+}
+
+void cng_pt_exit_stop(struct cng_uregs *r, int wstatus) {
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->link)
+        return;
+    if (!(__atomic_load_n(&s->link->options, __ATOMIC_ACQUIRE) &
+          CNG_PTRACE_O_TRACEEXIT))
+        return;
+    s->link->eventmsg = (u64)(u32)wstatus;
+    pt_stop(s, r, 5 /*SIGTRAP*/, CNG_PTRACE_EVENT_EXIT, 0, 0, 0);
+}
+
+void cng_pt_exit_report(int wstatus) {
+    if (!g_tab)
+        return;
+    struct pt_self *s = pt_self_get(0);
+    struct pt_link *e = s ? s->link : 0;
+    if (s) {
+        int was = s->active;
+        s->link = 0;
+        s->active = s->armed = s->step = s->skip_exit_stop = 0;
+        if (was)
+            pt_traced_dec(0); /* dying: no point putting dispositions back */
+        /* The slot goes back with the task. A step it still had planted goes
+         * first: nothing else accounts for the original word. */
+        cng_pt_step_clear();
+        pt_self_put(s);
+    }
+    if (!e) {
+        cng_pt_wake_waiters();
+        return;
+    }
+    /* Publish a synthetic exit whenever the tracer cannot reap this death
+     * through its own wait4: a tracer that is not our parent (strace -p, an
+     * auto-attached child) never sees the host notification. A direct child's
+     * tracer IS its parent and reaps it for real, so just drop the link. */
+    s32 tr = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+    s32 me = (s32)sys_getpid();
+    s32 tid = (s32)sys_gettid();
+    long ppid = CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0);
+    if (tr > 0 && (tid != me || tr != (s32)ppid)) {
+        e->exit_status = wstatus;
+        __atomic_store_n(&e->state, PT_ST_EXITED, __ATOMIC_RELEASE);
+        pt_bump_gen();
+        pt_wake_tracer(tr);
+        return; /* the tracer frees the link when it collects the exit */
+    }
+    pt_free(e);
+    cng_pt_wake_waiters();
+}
+
+void cng_pt_wake_waiters(void) {
+    if (!g_tab || !__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return;
+    pt_bump_gen();
+}
+
+int cng_pt_report_signal(struct cng_uregs *r, int sig, int si_code, u64 addr) {
+    struct pt_self *s = pt_self_get(0);
+    if (!s || !s->active || !s->link || sig == 9 /*SIGKILL*/)
+        return sig;
+    /* A SEIZE'd tracee reports a job-control stop signal as a group-stop
+     * (PTRACE_EVENT_STOP); an ATTACH'd one sees a plain signal-delivery-stop. */
+    int stopsig = (sig == 19 || sig == 20 || sig == 21 || sig == 22);
+    int event = (s->link->seize && stopsig) ? CNG_PTRACE_EVENT_STOP : 0;
+    return pt_stop(s, r, sig, event, 0, si_code, addr);
+}
+
+/* ---- where a kick's stop finds the thread ----
+ *
+ * The kick is a signal, and its frame is wherever the thread was — which for a
+ * stop has to be the guest's state, and is not always. The kernel shows a
+ * thread blocked in a syscall at that syscall's svc, its arguments in x0..x5,
+ * the call to be made again when the stop ends (it rewinds pc before the stop
+ * for exactly this), and a thread between two instructions of its own exactly
+ * as it is. A guest thread can be in three places of ours instead: one of the
+ * bounce stubs (sigsys.c), one of the -R trampolines (rewrite.c), or the
+ * dispatcher itself, run from guest context by either. The first two keep the
+ * guest's registers in a record the frame can be put back from, and are put
+ * back, as if the call were not yet made or already over. The third cannot be
+ * stepped out of: its stop reports the guest's registers from the dispatch's
+ * record instead (pt_inflight_stop).
+ *
+ * A call whose entry stop its tracer saw owes it an exit stop first, as the
+ * kernel gives one with the restart code in x0 before the stop that cut it
+ * short. */
+
+/* That owed exit stop, on the frame `uc` just put back, which `undone` says is
+ * at the svc (x0 the argument) rather than after it (x0 the result); `rval` is
+ * the x0 the tracer sees. A tracer that changes a restart code there takes the
+ * restart away, as do_signal decides it from x0 after that stop: the thread
+ * then resumes after the svc with what the tracer left. */
+static void pt_owed_exit(struct pt_self *s, struct cng_ucontext *uc,
+                         int undone, long rval) {
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    struct cng_uregs v = *r;
+    if (undone)
+        v.pc += 4;
+    v.x[0] = (u64)rval;
+    s->entry_seen = 1;
+    s->fpuc = uc;
+    cng_pt_syscall_exit(&v);
+    s->fpuc = 0;
+    u64 pc = r->pc, x0 = r->x[0];
+    *r = v;
+    if (undone && (s64)v.x[0] == rval) {
+        r->pc = pc;
+        r->x[0] = x0;
+    }
+}
+
+/* The stops a kick asks for — the attach's SIGSTOP, an INTERRUPT's event stop,
+ * a routed stop signal — taken on `r`. */
+static void pt_kick_take(struct pt_self *s, struct cng_uregs *r, int attach,
+                         int intr, int ss) {
+    struct pt_link *e = s->link;
+    if (attach)
+        pt_stop(s, r, 19 /*SIGSTOP*/, 0, 0, 0, 0);
+    if (intr && s->link == e)
+        pt_stop(s, r, 5 /*SIGTRAP*/, CNG_PTRACE_EVENT_STOP, 0, 0, 0);
+    if (ss && s->link == e)
+        pt_stop(s, r, ss, e->seize ? CNG_PTRACE_EVENT_STOP : 0, 0, 0, 0);
+}
+
+/* Is `pc` a gate svc the kernel has a restart pending at — a blocking call of
+ * the dispatcher's, cut short by this kick? */
+static int pt_gate_svc(u64 pc) {
+    if (pc < (u64)__cng_gate_start || pc + 4 > (u64)__cng_gate_end || (pc & 3))
+        return 0;
+    return *(const u32 *)(unsigned long)pc == 0xD4000001u /* svc #0 */;
+}
+
+/* A stop inside a dispatch running from guest context (see cng_gframe). The
+ * dispatcher's frames are live on its stack and cannot be stepped out of, so
+ * the stop is taken on a copy of the guest's registers: at the svc while the
+ * call is in flight, after it once it is done. The FP/SIMD state is the
+ * kick's frame's, which the dispatcher (built without FP code) leaves the
+ * guest's. A tracer that changes the copy abandons the call in flight: the
+ * blocking call is cut short if it is the one the kick interrupted, the
+ * dispatch's result is dropped when it returns, and the guest resumes with the
+ * registers the tracer set — which at the svc means the call is made again,
+ * with whatever the tracer put in them (cng_dispatch_bounced, tramp_body). */
+static void pt_inflight_stop(struct pt_self *s, struct cng_ucontext *uc,
+                             struct cng_gframe *gf, int attach, int intr,
+                             int ss) {
+    int done = gf->done;
+    struct cng_uregs before = *gf->r;
+    if (!done)
+        before.pc -= 4;
+    struct cng_uregs v = before;
+    s->fpuc = uc;
+    if (!done && gf->owed) {
+        /* The exit stop first, with the restart code; the dispatch's own is
+         * then not given. A tracer that answers it otherwise is answering the
+         * call, which is then abandoned with that answer. */
+        gf->owed = 0;
+        struct cng_uregs ev = *gf->r;
+        ev.x[0] = (u64)(s64)-512 /*ERESTARTSYS*/;
+        s->entry_seen = 1;
+        cng_pt_syscall_exit(&ev);
+        if ((s64)ev.x[0] != -512) {
+            s->fpuc = 0;
+            *gf->r = ev;
+            gf->abandon = 1;
+            goto cut;
+        }
+        v = ev;
+        v.x[0] = before.x[0];
+        v.pc = before.pc;
+    }
+    pt_kick_take(s, &v, attach, intr, ss);
+    int changed = memcmp(&v, &before, sizeof v) != 0;
+    if (done) {
+        s->fpuc = 0;
+        if (changed)
+            *gf->r = v; /* over already: what the trampoline's exit installs */
+        return;
+    }
+    if (changed) {
+        /* Made again from the svc, with its own entry stop, if the tracer
+         * left it there (tramp_body); otherwise the thread goes where it was
+         * sent. */
+        s->fpuc = 0;
+        *gf->r = v;
+        gf->abandon = 1;
+        goto cut;
+    }
+    /* Resumed into syscall tracing: the kernel's restart of the call is a
+     * syscall like any other and stops at its entry, so this one does too, as
+     * that restart — after the svc, where an entry stop is. The call goes on
+     * as it was if the tracer lets it; one it changes there is made again as
+     * the tracer left it, and one it cancels has its answer. */
+    if (s->active && s->link && s->armed) {
+        struct cng_uregs ev = v, eb;
+        ev.pc += 4;
+        eb = ev;
+        long nr2 = (long)ev.x[8];
+        int run = cng_pt_syscall_entry(&ev, &nr2);
+        gf->owed = s->entry_seen;
+        if (!run || nr2 != (long)eb.x[8] || memcmp(&ev, &eb, sizeof ev)) {
+            s->fpuc = 0;
+            *gf->r = ev;
+            gf->abandon = 1;
+            gf->entered = 1;
+            gf->nr = run ? nr2 : -1;
+            goto cut;
+        }
+    }
+    s->fpuc = 0;
+    return;
+cut:
+    if (pt_gate_svc(cng_pt_uregs(uc)->pc)) {
+        cng_pt_uregs(uc)->pc += 4;
+        cng_pt_uregs(uc)->x[0] = (u64)(s64)-EINTR;
+    }
+}
+
+/* Take the stops, with the thread wherever the kick found it (see above). */
+static void pt_kick_stops(struct pt_self *s, struct cng_ucontext *uc,
+                          int attach, int intr, int ss) {
+    /* Already parked in a stop (our trace handler mirrors the guest's mask,
+     * and the kick is not in it): a stop cannot be taken inside a stop, so
+     * there is nothing to report, and nothing of the call underneath — the
+     * exit stop it owes among it — is touched. */
+    if (s->in_stop)
+        return;
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    int owed = 0;
+    long rval = 0;
+    int how = cng_bounce_unwind(uc, 1, &owed, &rval);
+    if (how == CNG_UNWIND_NONE) {
+        struct cng_gframe *gf;
+        if (!cng_tramp_unwind(r) && r->pc >= (u64)__cng_image_start &&
+            r->pc < (u64)__cng_image_end && (gf = cng_gframe_cur())) {
+            pt_inflight_stop(s, uc, gf, attach, intr, ss);
+            return;
+        }
+    } else if (owed) {
+        pt_owed_exit(s, uc, how == CNG_UNWIND_UNDONE, rval);
+    }
+    s->regs = r;
+    s->uc = uc;
+    pt_kick_take(s, r, attach, intr, ss);
+}
+
+void cng_pt_service_kick(struct cng_ucontext *uc) {
+    if (!g_tab)
+        return;
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    struct pt_self *s = pt_self_get(0);
+    /* Parked in a stop already (a request carried by SIGSYS reaches a thread
+     * in any handler of ours): no stop can be taken inside one. What is
+     * pending stays so, for the next request to find. */
+    if (s && s->active && s->in_stop)
+        return;
+    if (!s || !s->active) {
+        /* A pending PTRACE_ATTACH/SEIZE keyed by this task's own tid. */
+        struct pt_link *e = pt_find((s32)sys_gettid());
+        if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0 ||
+            !__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE))
+            return;
+        /* The state first, the flag after: the tracer was told its attach
+         * succeeded, so a slot that cannot be had (the host would not give
+         * the page) leaves the attach pending for the next stop point rather
+         * than consumed with nothing to show for it. The flag is claimed,
+         * not cleared: a request carried by SIGSYS can be taken on this same
+         * thread, nested over this one, and only one of the two may attach
+         * (each would stop the thread, and the tracer collects one stop). */
+        s = pt_self_get(1);
+        if (!s || !__atomic_exchange_n(&e->attach_pending, 0, __ATOMIC_ACQ_REL))
+            return;
+        s->link = e;
+        s->active = 1;
+        g_pt_local = 1;
+        /* The frame the kick handler could not record: cng_pt_set_frame keeps
+         * it only for a task that already has a slot, and this one got its
+         * slot just now. Without it the attach stop had registers but no
+         * signal frame, so it could not say where the FP/SIMD state was —
+         * crashpad, which attaches to every thread of a crashed process and
+         * reads NT_PRFPREG from each, got EINVAL for all of them. */
+        s->regs = r;
+        s->uc = uc;
+        cng_pt_arm_tracee();
+        pt_traced_inc();
+        if (!e->seize) {
+            pt_kick_stops(s, uc, 1, 0, 0);
+            return;
+        }
+        /* SEIZE attaches without a stop; fall through in case an INTERRUPT
+         * kick coalesced with the attach kick. */
+    }
+    struct pt_link *e = s->link;
+    if (!e)
+        return;
+    /* Claimed, for the same reason as the attach above. */
+    int intr = __atomic_exchange_n(&e->interrupt_pending, 0, __ATOMIC_ACQ_REL) != 0;
+    u32 ss = __atomic_exchange_n(&e->stopsig_pending, 0, __ATOMIC_ACQ_REL);
+    if (intr || ss)
+        pt_kick_stops(s, uc, 0, intr, (int)ss);
+}
+
+/* Did the request this SIGSYS carries displace a trap? A thread takes the
+ * request at the first return to user mode after it was sent, and a trap
+ * taken while it was pending is merged into it: the kernel skips the call,
+ * puts back its first argument (x0 = orig_x0), and delivers our siginfo
+ * instead. That leaves the frame just past the svc — and so does a call that
+ * was made, native or answered by a handler of ours that has just returned.
+ * The first is told apart by asking the filters whether the call traps at
+ * all, the second because the frame is the one that handler returned with. */
+/* Which of the tracee's and the tracer's filters this task carries: its
+ * record, which knows every filter it stacked and every one a tagged trap has
+ * shown it (cng_pt_note_trap), and failing that the kernel, asked by a call
+ * only that filter traps (cng_sig_filter_stacked). The record does not know
+ * one a task inherited and has not trapped through yet, and the trap this is
+ * asked about carried no tag — ours replaced its siginfo. */
+static int pt_filter_stacked(int tag) {
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    if (s && (tag == CNG_TRAP_TAG_TRACEALL ? s->traceall : s->tracer_armed))
+        return 1;
+    if (!cng_sig_filter_stacked(tag))
+        return 0;
+    cng_pt_note_trap(tag);
+    return 1;
+}
+
+static int pt_trap_displaced(const struct cng_ucontext *uc) {
+    const struct cng_uregs *r =
+        (const struct cng_uregs *)&uc->uc_mcontext.regs[0];
+    u32 w;
+    if ((r->pc & 3) || r->pc < 4 ||
+        cng_user_copyin(&w, (const void *)(unsigned long)(r->pc - 4), 4) < 0 ||
+        w != 0xD4000001u /* svc #0 */)
+        return 0;
+    if (cng_sig_returned_to(uc))
+        return 0;
+    /* The base filter first, then each stacked one only where it would make
+     * the difference, so the kernel is asked only then. The tracee's filter
+     * traps everything the tracer's does, which it is asked about second. */
+    long nr = (long)(s32)r->x[8];
+    unsigned long pc = (unsigned long)r->pc;
+    if (cng_seccomp_traps(nr, r->x, pc, 0, 0))
+        return 1;
+    if (cng_seccomp_traps(nr, r->x, pc, 1, 0) &&
+        pt_filter_stacked(CNG_TRAP_TAG_TRACEALL))
+        return 1;
+    return cng_seccomp_traps(nr, r->x, pc, 0, 1) &&
+           pt_filter_stacked(CNG_TRAP_TAG_TRACER);
+}
+
+void cng_pt_sigsys_kick(struct cng_ucontext *uc, int direct) {
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    /* The displaced call is made again once the stops are over, from its svc,
+     * which is also where the kernel shows a call it is about to make. Only a
+     * request delivered straight onto the guest's frame can have displaced
+     * one: taken later, on the frame of the handler it was left for, the
+     * frame is that handler's, and whatever call it shows was made — with the
+     * filters as they were then, which an attach since may have added to. */
+    if (direct && pt_trap_displaced(uc))
+        r->pc -= 4;
+    cng_pt_set_frame(r, uc);
+    cng_pt_service_kick(uc);
+    cng_pt_kick_unwind(uc);
+    cng_pt_kick_taken(uc, CNG_PT_KICK_ATTACH);
+}
+
+/* Any other kick of ours: no stop, but a wait it cut short that the kernel
+ * would have restarted is put back to be made again (cng_bounce_unwind), with
+ * the exit stop a tracee owes for it. */
+void cng_pt_kick_unwind(struct cng_ucontext *uc) {
+    int owed = 0;
+    long rval = 0;
+    if (cng_bounce_unwind(uc, 0, &owed, &rval) != CNG_UNWIND_UNDONE || !owed)
+        return;
+    struct pt_self *s = pt_self_get(0);
+    if (s && s->active && s->link)
+        pt_owed_exit(s, uc, 1, rval);
+}
+
+/* ---- tracer: mailbox round-trip ---- */
+
+static void pt_cmd(struct pt_link *e, u32 cmd, u64 addr, u64 arg) {
+    e->cmd = cmd;
+    e->addr = addr;
+    e->arg = arg;
+    u32 d = __atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE);
+    __atomic_add_fetch(&e->cmd_seq, 1, __ATOMIC_RELEASE);
+    fx_wake(&e->cmd_seq);
+    while (__atomic_load_n(&e->done_seq, __ATOMIC_ACQUIRE) == d) {
+        /* The tracee vanished while we waited — its slot freed, or its exit
+         * published by a sibling's exit_group fan-out. Checked while done_seq
+         * is still unbumped, so an answer that did land is never discarded. */
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0 ||
+            __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED) {
+            e->result = -ESRCH;
+            return;
+        }
+        fx_wait(&e->done_seq, d, 500);
+    }
+}
+
+/* ---- tracer: PTRACE_TRACEME ---- */
+
+static long pt_traceme(void) {
+    if (!g_tab)
+        return -EPERM;
+    struct pt_self *s = pt_self_get(1);
+    if (!s)
+        return -ENOMEM;
+    if (s->link)
+        return -EPERM; /* already traced */
+    s32 me = (s32)sys_getpid();
+    struct pt_link *e = pt_claim((s32)sys_gettid(), me);
+    if (!e)
+        return -ENOMEM;
+    long ppid = CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0);
+    __atomic_store_n(&e->tracer, (s32)ppid, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
+    s->link = e;
+    s->active = 1;
+    g_pt_local = 1;
+    cng_pt_arm_tracee();
+    pt_traced_inc();
+    /* Our parent is now a tracer, but it has not called ptrace yet — the whole
+     * point of TRACEME — so nothing has armed its side of the interception.
+     * Kick it: its handler installs the tracer filter, and a native wait4 it is
+     * already blocked in is restarted by the kernel when the handler returns,
+     * which makes the svc again — into that filter, so the wait becomes the
+     * trapped one that can see our stops. Any of its
+     * threads will do — arming kicks the rest (cng_pt_arm_tracer) — and one
+     * that does not block the kick has to: a parent whose main thread blocks
+     * every signal while another thread waits never armed at all. */
+    cng_pt_kick((s32)ppid, 0, CNG_PT_KICK_ARM);
+    return 0;
+}
+
+/* ---- tracer: the guest's ptrace(2) ---- */
+
+/* Does the host kernel know PTRACE_O_SUSPEND_SECCOMP at all? It exists only in
+ * a kernel built with CONFIG_CHECKPOINT_RESTORE (and seccomp), and one built
+ * without answers EINVAL to the option ahead of every privilege question —
+ * Android's GKI kernels are, so there the option is not a privilege a guest
+ * lacks but a request nothing understands. A kernel before 4.3 has no such
+ * bit at all: it is outside that kernel's PTRACE_O_MASK, and SEIZE refuses it
+ * EIO with any other bit it does not know (Android 8's 3.18, measured). Asked
+ * of the kernel itself, once: a SEIZE of our own pid carrying the option is
+ * refused whichever way it goes (the option is judged before the
+ * same-thread-group refusal, which is what keeps this from ever attaching to
+ * anything), and only EINVAL and EIO say "no such option". A host that cannot
+ * be asked — ptrace refused by its filter, or an emulator with none — is taken
+ * to have it, as every kernel with the config does. */
+#define PT_SUSP_UNASKED 0
+#define PT_SUSP_HAVE    1
+#define PT_SUSP_NOCFG   2 /* EINVAL: built without it */
+#define PT_SUSP_NOBIT   3 /* EIO: predates it */
+static int g_susp_host;
+
+static int host_suspend_seccomp(void) {
+    int k = __atomic_load_n(&g_susp_host, __ATOMIC_ACQUIRE);
+    if (k != PT_SUSP_UNASKED)
+        return k;
+    long r = -ENOSYS;
+    if (!cng_blocked[__NR_ptrace])
+        r = CNG_SYS(__NR_ptrace, CNG_PTRACE_SEIZE, sys_getpid(), 0,
+                    CNG_PTRACE_O_SUSPEND_SECCOMP, 0, 0);
+    k = r == -EINVAL ? PT_SUSP_NOCFG
+        : r == -EIO  ? PT_SUSP_NOBIT
+                     : PT_SUSP_HAVE;
+    __atomic_store_n(&g_susp_host, k, __ATOMIC_RELEASE);
+    return k;
+}
+
+/* The option word as the host kernel knows it: PTRACE_O_MASK, less the
+ * SUSPEND_SECCOMP bit on a kernel that predates it, where SEIZE refuses the
+ * bit EIO and SETOPTIONS EINVAL like any other unknown one. The host is asked
+ * only by a request that carries the bit. */
+static u64 pt_o_mask(u64 data) {
+    if ((data & CNG_PTRACE_O_SUSPEND_SECCOMP) &&
+        host_suspend_seccomp() == PT_SUSP_NOBIT)
+        return CNG_PTRACE_O_MASK & ~(u64)CNG_PTRACE_O_SUSPEND_SECCOMP;
+    return CNG_PTRACE_O_MASK;
+}
+
+/* check_ptrace_options(): the one option with a privilege attached.
+ * PTRACE_O_SUSPEND_SECCOMP wants CAP_SYS_ADMIN and a tracer that is not itself
+ * under seccomp, else EPERM (measured) — or is EINVAL outright where the host
+ * kernel was built without the option (host_suspend_seccomp; one that predates
+ * it never gets here, pt_o_mask having refused the bit). Both are judged as the
+ * guest sees itself: fake-root holds every capability, and no guest sees a
+ * filter on itself (PR_GET_SECCOMP answers 0), so it comes down to the
+ * identity. What the option would suspend is the tracee's own filters, of which
+ * it has none it can see, so accepting it has nothing further to do. */
+static long pt_check_options(u32 data) {
+    if (data & CNG_PTRACE_O_SUSPEND_SECCOMP) {
+        if (host_suspend_seccomp() == PT_SUSP_NOCFG)
+            return -EINVAL;
+        if (!cng_fake_root())
+            return -EPERM;
+    }
+    return 0;
+}
+
+long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
+    if (cng_g_no_ptrace)
+        return -EPERM;
+    if (req == CNG_PTRACE_TRACEME)
+        return pt_traceme();
+    if (!g_tab)
+        return -EPERM;
+    cng_pt_arm_tracer();
+
+    s32 me = (s32)sys_getpid();
+    if (req == CNG_PTRACE_ATTACH || req == CNG_PTRACE_SEIZE) {
+        /* In the kernel's order (measured): the task is looked up first, so a
+         * pid nothing owns is ESRCH whatever else is wrong with the call — a
+         * non-positive one included, which used to be EPERM here; then SEIZE
+         * validates its arguments, addr and the option word both EIO rather
+         * than the SETOPTIONS EINVAL, and the word's privilege check; only
+         * then does the caller's own thread group draw EPERM. The option
+         * word used to be masked to the known bits instead, so a tracer
+         * asking for a bit this kernel does not have was told it was set. */
+        if (pid <= 0)
+            return -ESRCH;
+        s32 tgid = (s32)pid;
+        if (!cng_procreg_has((int)pid)) {
+            /* Not a guest pid: it may be a secondary thread's tid, whose thread
+             * group must itself be a live guest process. */
+            tgid = (s32)cng_proc_tgid((int)pid);
+            if (tgid <= 0 || !cng_procreg_has((int)tgid))
+                return -ESRCH;
+        }
+        if (req == CNG_PTRACE_SEIZE) {
+            if (addr != 0 || (data & ~pt_o_mask(data)))
+                return -EIO;
+            long bad = pt_check_options((u32)data);
+            if (bad)
+                return bad;
+        }
+        if (tgid == me)
+            return -EPERM; /* our own thread group: the kernel's rule */
+        struct pt_link *e = pt_claim((s32)pid, tgid);
+        if (!e)
+            return -ENOMEM;
+        s32 zero = 0;
+        if (!__atomic_compare_exchange_n(&e->tracer, &zero, me, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return -EPERM; /* already traced by someone */
+        e->seize = (req == CNG_PTRACE_SEIZE);
+        __atomic_store_n(&e->options, e->seize ? (u32)data : 0,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&e->attach_pending, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_tab->any_trace, 1, __ATOMIC_RELEASE);
+        g_pt_local = 1;
+        pt_kick_attach(tgid, (s32)pid);
+        return 0;
+    }
+
+    struct pt_link *e = pt_find((s32)pid);
+    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me)
+        return -ESRCH;
+
+    if (req == CNG_PTRACE_INTERRUPT) {
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_STOPPED)
+            return 0; /* already stopped */
+        __atomic_store_n(&e->interrupt_pending, 1, __ATOMIC_RELEASE);
+        pt_kick_attach(e->tgid, (s32)pid);
+        return 0;
+    }
+
+    /* PTRACE_KILL is the one request besides INTERRUPT that the kernel takes
+     * on a tracee in any state (ptrace_check_attach's ignore_state). */
+    if (req == CNG_PTRACE_KILL) {
+        CNG_SYS(__NR_kill, e->tgid, 9 /*SIGKILL*/, 0, 0, 0, 0);
+        return 0;
+    }
+
+    /* Everything else needs the tracee parked. */
+    if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED)
+        return -ESRCH;
+
+    /* A listening tracee (post-LISTEN, parked awaiting SIGCONT) is stopped but
+     * counts as running to data operations, exactly as the kernel treats it. */
+    if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE)) {
+        switch (req) {
+        case CNG_PTRACE_CONT:
+        case CNG_PTRACE_SYSCALL:
+        case CNG_PTRACE_SINGLESTEP:
+        case CNG_PTRACE_DETACH:
+            __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+            break;
+        case CNG_PTRACE_LISTEN:
+            return 0;
+        default:
+            return -ESRCH;
+        }
+    }
+
+    switch (req) {
+    /* Answered from the link, but only for a parked tracee: the kernel's
+     * ptrace_check_attach() refuses every request but KILL and INTERRUPT with
+     * ESRCH while the tracee runs (measured for SETOPTIONS on a freshly SEIZE'd,
+     * still-running child), and these used to be answered regardless. */
+    case CNG_PTRACE_SETOPTIONS: {
+        if (data & ~pt_o_mask(data))
+            return -EINVAL;
+        long bad = pt_check_options((u32)data);
+        if (bad)
+            return bad;
+        __atomic_store_n(&e->options, (u32)data, __ATOMIC_RELEASE);
+        return 0;
+    }
+    case CNG_PTRACE_GETEVENTMSG: {
+        u64 msg = e->eventmsg;
+        if (cng_user_copyout((void *)data, &msg, sizeof msg) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case CNG_PTRACE_GETSIGINFO: {
+        u8 si[128];
+        memset(si, 0, sizeof si);
+        s32 *w = (s32 *)si;
+        w[0] = e->si_signo;
+        w[1] = e->si_errno;
+        w[2] = e->si_code;
+        /* si_addr lives in the _sigfault member, at offset 16 on arm64 (after
+         * signo/errno/code and the pointer-alignment pad). gdb reads it for
+         * SIGSEGV/SIGBUS, and for the TRAP_BRKPT of a breakpoint. */
+        switch (e->si_signo) {
+        case 4: case 5: case 7: case 8: case 11: /* ILL TRAP BUS FPE SEGV */
+            memcpy(si + 16, &e->fault_addr, 8);
+            break;
+        }
+        if (cng_user_copyout((void *)data, si, sizeof si) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case CNG_PTRACE_GET_SYSCALL_INFO: {
+        /* struct ptrace_syscall_info: op, pad[3], arch, ip, sp, then the
+         * per-op union. Modern strace prefers this over pairing entry and exit
+         * stops itself, and it is exact here — the tracee published it at the
+         * stop. The kernel keys the op off the stop's si_code, which only
+         * carries the syscall marker when PTRACE_O_TRACESYSGOOD is set, so
+         * without that option even a syscall stop answers "none"; strace always
+         * sets it, and a tracer that does not must not be told otherwise. */
+        u8 info[88];
+        memset(info, 0, sizeof info);
+        u32 op = e->sc_op;
+        if (!(__atomic_load_n(&e->options, __ATOMIC_ACQUIRE) &
+              CNG_PTRACE_O_TRACESYSGOOD))
+            op = PT_SCI_NONE;
+        info[0] = (u8)op;
+        *(u32 *)(info + 4) = 0xC00000B7u; /* AUDIT_ARCH_AARCH64 */
+        *(u64 *)(info + 8) = e->sc_pc;
+        *(u64 *)(info + 16) = e->sc_sp;
+        /* The size the kernel reports (and copies up to) is the end of the
+         * member the op actually fills, not the whole struct. */
+        u64 actual = 24;
+        if (op == PT_SCI_ENTRY) {
+            *(u64 *)(info + 24) = (u64)e->sc_nr;
+            for (int i = 0; i < 6; i++)
+                *(u64 *)(info + 32 + 8 * i) = e->sc_args[i];
+            actual = 80;
+        } else if (op == PT_SCI_EXIT) {
+            *(s64 *)(info + 24) = e->sc_rval;
+            info[32] = (u8)(e->sc_rval < 0 && e->sc_rval >= -4095);
+            actual = 33;
+        }
+        u64 n = addr < actual ? addr : actual;
+        if (n && cng_user_copyout((void *)data, info, (unsigned long)n) < 0)
+            return -EFAULT;
+        return (long)actual;
+    }
+    case CNG_PTRACE_PEEKTEXT:
+    case CNG_PTRACE_PEEKDATA:
+        pt_cmd(e, PT_CMD_PEEK, addr, 0);
+        if (e->result < 0)
+            return -EIO;
+        if (cng_user_copyout((void *)data, e->data, 8) < 0)
+            return -EFAULT;
+        return 0;
+    case CNG_PTRACE_POKETEXT:
+    case CNG_PTRACE_POKEDATA:
+        pt_cmd(e, PT_CMD_POKE, addr, data);
+        return e->result < 0 ? -EIO : 0;
+    case CNG_PTRACE_PEEKUSR:
+    case CNG_PTRACE_POKEUSR:
+        return -EIO; /* arm64 has no user area; the kernel answers this too */
+    case CNG_PTRACE_GETREGSET: {
+        u64 iov[2]; /* {base, len} */
+        if (cng_user_copyin(iov, (void *)data, sizeof iov) < 0)
+            return -EFAULT;
+        u32 size, unit = pt_regset_geom(addr, &size);
+        if (!unit || iov[1] % unit)
+            return -EINVAL;
+        pt_cmd(e, PT_CMD_GETREGS, addr, 0);
+        if (e->result < 0)
+            return -EINVAL;
+        u32 n = e->rlen;
+        if (iov[1] < n)
+            n = (u32)iov[1];
+        if (n && cng_user_copyout((void *)iov[0], e->data, n) < 0)
+            return -EFAULT;
+        iov[1] = n;
+        if (cng_user_copyout((void *)data, iov, sizeof iov) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case CNG_PTRACE_SETREGSET: {
+        u64 iov[2];
+        if (cng_user_copyin(iov, (void *)data, sizeof iov) < 0)
+            return -EFAULT;
+        u32 size, unit = pt_regset_geom(addr, &size);
+        if (!unit || iov[1] % unit)
+            return -EINVAL;
+        u32 n = (u32)(iov[1] > size ? size : iov[1]);
+        if (n && cng_user_copyin(e->data, (void *)iov[0], n) < 0)
+            return -EFAULT;
+        if (n) {
+            e->rlen = n;
+            pt_cmd(e, PT_CMD_SETREGS, addr, 0);
+            if (e->result < 0)
+                return (long)e->result;
+        }
+        iov[1] = n;
+        if (cng_user_copyout((void *)data, iov, sizeof iov) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case CNG_PTRACE_CONT:
+        pt_cmd(e, PT_CMD_RESUME, data, PT_RES_CONT);
+        return 0;
+    case CNG_PTRACE_SYSCALL:
+        pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SYSCALL);
+        return 0;
+    case CNG_PTRACE_SINGLESTEP:
+        pt_cmd(e, PT_CMD_RESUME, data, PT_RES_SINGLESTEP);
+        return 0;
+    case CNG_PTRACE_DETACH:
+        pt_cmd(e, PT_CMD_DETACH, data, 0);
+        return 0;
+    case CNG_PTRACE_LISTEN:
+        /* Only for a SEIZE'd tracee in a group/INTERRUPT stop. It stays parked
+         * but "listening": a later SIGCONT ends the group-stop with a fresh
+         * PTRACE_EVENT_STOP (cng_pt_signal_route). */
+        if (!e->seize || e->event != CNG_PTRACE_EVENT_STOP)
+            return -EIO;
+        __atomic_store_n(&e->listening, 1, __ATOMIC_RELEASE);
+        return 0;
+    default:
+        return -EIO;
+    }
+}
+
+/* ---- tracer: wait4 / waitid ---- */
+
+static int pt_have_tracee(s32 wpid) {
+    if (!g_tab)
+        return 0;
+    s32 me = (s32)sys_getpid();
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0)
+            continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me)
+            continue;
+        if (wpid > 0 && wpid != e->tracee)
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+/* What a caller is willing to be handed. wait4 always takes both — the kernel
+ * reports a *traced* child's stop whether or not WUNTRACED was given — but
+ * waitid's flags are explicit, and it must be told each one separately. */
+#define PT_COLLECT_STOPS 1
+#define PT_COLLECT_EXITS 2
+
+/* Consume one ready stop or synthetic exit matching wpid (<=0 means any), of a
+ * kind the caller asked for. Fills *status with a wait-status word and returns
+ * the tid, or 0. With `peek` (waitid's WNOWAIT) the event is reported but left
+ * where it is — a stop stays unreported, an exit stays collectable — so the
+ * next wait finds it again, as the kernel leaves a child's state in place for
+ * that flag (measured: a WNOWAIT'd ptrace stop is handed over by the next
+ * WNOHANG wait, and only then consumed). */
+static s32 pt_collect(s32 wpid, int *status, int want, int peek) {
+    if (!g_tab)
+        return 0;
+    s32 me = (s32)sys_getpid();
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE) <= 0)
+            continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me)
+            continue;
+        s32 t = e->tracee;
+        if (wpid > 0 && wpid != t)
+            continue;
+        u32 st = __atomic_load_n(&e->state, __ATOMIC_ACQUIRE);
+        if (st == PT_ST_EXITED) {
+            if (!(want & PT_COLLECT_EXITS))
+                continue; /* leave it for a wait that asked for exits */
+            *status = e->exit_status;
+            if (!peek)
+                pt_free(e);
+            return t;
+        }
+        if (st != PT_ST_STOPPED)
+            continue;
+        if (!(want & PT_COLLECT_STOPS))
+            continue;
+        if (__atomic_load_n(&e->reported, __ATOMIC_ACQUIRE))
+            continue;
+        if (__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE))
+            continue;
+        int sig = (int)e->stop_sig;
+        int w;
+        if (e->event) {
+            /* A group-stop reports its own stop signal with EVENT_STOP in the
+             * high bits; every other event reports SIGTRAP. */
+            if (e->event == CNG_PTRACE_EVENT_STOP && sig != 5)
+                w = (CNG_PTRACE_EVENT_STOP << 16) | ((sig & 0xff) << 8) | 0x7f;
+            else
+                w = (((int)e->event << 8) | 5 /*SIGTRAP*/) << 8 | 0x7f;
+        } else {
+            if (e->syscall_stop &&
+                (__atomic_load_n(&e->options, __ATOMIC_ACQUIRE) &
+                 CNG_PTRACE_O_TRACESYSGOOD))
+                sig |= 0x80;
+            w = (sig << 8) | 0x7f;
+        }
+        if (!peek)
+            __atomic_store_n(&e->reported, 1, __ATOMIC_RELEASE);
+        *status = w;
+        return t;
+    }
+    return 0;
+}
+
+/* A tracee that vanished without publishing an exit was killed by an
+ * uncatchable SIGKILL (every catchable death is mediated). Report a synthetic
+ * WIFSIGNALED(SIGKILL) so a tracer polling on it does not hang forever. */
+static s32 pt_reap_dead(s32 wpid, int *status) {
+    if (!g_tab)
+        return 0;
+    s32 me = (s32)sys_getpid();
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0)
+            continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me)
+            continue;
+        if (wpid > 0 && wpid != t)
+            continue;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_RUNNING)
+            continue;
+        s32 par = 0;
+        if (!pt_task_dead(t, &par))
+            continue;
+        /* "Dead" here includes a zombie, and a zombie child of ours is not ours
+         * to invent a death for: the host wait4 this call sits behind reports
+         * the real one, this turn or the next. Under qemu-user that takes a few
+         * more turns — /proc says Z long before its wait4 will hand the child
+         * over, in 89% of zombie sightings (measured; a real kernel never
+         * disagrees with itself that way) — and inventing one in the gap
+         * reported an ordinary exit(12) to the tracer as killed by SIGKILL.
+         * What this exists for is a tracee that is NOT our child: PTRACE_ATTACH'd
+         * or auto-attached through a fork, whose death nothing else tells us
+         * about. A task with no /proc entry left has no parent to read, and was
+         * taken to be no child of ours, since the host wait would have freed
+         * the link of one already — but /proc hides more than the reaped (see
+         * pt_task_dead): on Android 8's 3.18 every child of ours that left as
+         * a tracee was reported killed by SIGKILL, the window between its mm
+         * going and wait4 finding a zombie being the one this runs in. Where
+         * there is no parent to read, the kernel's own wait is asked. */
+        if (par == me || (par == 0 && pt_our_child(t)))
+            continue;
+        /* It may also have published an exit of its own while /proc was being
+         * read — every check above is on state sampled before that. Claim the
+         * transition rather than assume it: losing the CAS means a real status
+         * is in the link now, and the next pt_collect hands that over. */
+        u32 expect = PT_ST_RUNNING;
+        if (!__atomic_compare_exchange_n(&e->state, &expect, PT_ST_EXITED, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        *status = 9; /* WIFSIGNALED(SIGKILL) */
+        pt_free(e);
+        return t;
+    }
+    return 0;
+}
+
+void cng_pt_note_reaped(long pid) {
+    struct pt_link *e = pt_find((s32)pid);
+    if (e && __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) == (s32)sys_getpid())
+        pt_free(e);
+}
+
+/* Is a signal pending that the guest would have taken delivery of? Our handler
+ * runs with everything but SIGSYS masked, so a signal that arrives while we
+ * poll here cannot interrupt the poll by itself — but the guest's wait4 must
+ * still answer -EINTR for it, or a tracer becomes unkillable while waiting. The
+ * guest's own mask is the one the signal frame will restore, and a signal the
+ * guest would not have been interrupted by — one it ignores, or SIGCHLD and its
+ * kind still at the default — is no interruption: a tracee's own stop raises
+ * SIGCHLD at its tracer (pt_wake_tracer), which sits pending here for as long
+ * as the tracer is inside the handler, and a real waitid is not cut short by it;
+ * nor by the kick (measured: the first wait after a PTRACE_SYSCALL answered
+ * EINTR on one run in seven). */
+static int pt_signal_pending(const struct cng_ucontext *uc) {
+    return cng_sig_deliverable_in(uc);
+}
+/* Every request of this tracer's that has not been taken, sent again by SIGSYS
+ * where its task holds the kick blocked now: one sent while the task had the
+ * kick open can find it blocked by the time it arrives, and a SIGSYS sent
+ * while the task's own trap was pending was absorbed by that trap's. Asked
+ * once per slice of a wait, and of the status file only for a request still
+ * outstanding. */
+static void pt_rekick_blocked(void) {
+    if (!g_tab || !pt_sigsys_kickable())
+        return;
+    s32 me = (s32)sys_getpid();
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != me)
+            continue;
+        if (!__atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&e->interrupt_pending, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&e->stopsig_pending, __ATOMIC_ACQUIRE))
+            continue;
+        if (pt_kick_blocked(e->tgid, t))
+            pt_sigsys_kick(e->tgid, t);
+    }
+}
+
+/* A ptrace kick is not a signal of the guest's, and must not end its wait the
+ * way one does. But masked in the handler, it could not land while the wait
+ * lasted, and a tracer attaching to this task (or interrupting it) would hang
+ * for as long as that: so the wait is made again from its svc instead
+ * (CNG_ERESTART), which is where the kernel shows a wait it is going to
+ * restart, and the kick lands there on the way. */
+static int pt_kick_waiting(const struct cng_ucontext *uc) {
+    return cng_sig_kick_pending(uc);
+}
+
+#define PT_WNOHANG   1
+#define PT_WPOLL_MS  50
+
+/* May a wait be left to the kernel? Only while it cannot be owed an emulated
+ * stop: this process has never been a tracer, and nothing in the registry
+ * names it as one — a child's PTRACE_TRACEME does that before the kick that
+ * arms us lands. Without a registry there are no emulated stops at all. */
+static int pt_wait_untraced(void) {
+    if (!g_tab)
+        return 1;
+    if (__atomic_load_n(&g_pt_tracer, __ATOMIC_SEQ_CST))
+        return 0;
+    if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return 1;
+    return !pt_have_tracee(-1);
+}
+
+void (*cng_g_wait_native_probe)(void); /* test aid, see ptrace.h */
+
+int cng_pt_wait_native(long nr, long a0, long a1, long a2, long a3, long a4,
+                       long *out) {
+    if (!pt_wait_untraced())
+        return 0;
+    long options = nr == __NR_wait4 ? a2 : a3;
+    long r;
+    if ((options & PT_WNOHANG) || !g_tab) {
+        r = CNG_SYS(nr, a0, a1, a2, a3, a4, 0);
+    } else {
+        /* Blocking, so it must stay reachable by the kick that makes this
+         * process a tracer while it sleeps: with no kick that can be
+         * delivered, or this one blocked, the wait goes through the
+         * registry, as every -R wait used to. */
+        unsigned long blocked = 0;
+        if (!cng_g_kick_live ||
+            CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &blocked,
+                    sizeof blocked, 0, 0) < 0 ||
+            (blocked & (1UL << (cng_g_kicksig - 1))))
+            return 0;
+        __atomic_add_fetch(&g_pt_nwait, 1, __ATOMIC_SEQ_CST);
+        for (;;) {
+            u32 seen = __atomic_load_n(&g_pt_kicks, __ATOMIC_SEQ_CST);
+            if (!pt_wait_untraced()) {
+                r = CNG_WAIT_KICKED;
+                break;
+            }
+            /* A kick taken from here on, up to the svc or during it, comes
+             * back as CNG_WAIT_KICKED (see cng_pt_kick_taken); most are no
+             * news for this wait, which is then simply made again. */
+            if (cng_g_wait_native_probe)
+                cng_g_wait_native_probe();
+            r = cng_wait_unless(a0, a1, a2, a3, a4, nr, &g_pt_kicks, seen);
+            if (r != CNG_WAIT_KICKED)
+                break;
+        }
+        __atomic_sub_fetch(&g_pt_nwait, 1, __ATOMIC_SEQ_CST);
+        if (r == CNG_WAIT_KICKED)
+            return 0; /* a tracer now: the registry-aware wait takes over */
+    }
+    /* As the registry-aware wait does: a child reaped here may have been
+     * traced through a PTRACE_TRACEME whose kick this wait never needed. */
+    if (nr == __NR_wait4 && r > 0 && g_tab &&
+        __atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        cng_pt_note_reaped(r);
+    *out = r;
+    return 1;
+}
+
+long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
+                  const struct cng_ucontext *uc) {
+    for (;;) {
+        u32 gen = g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
+        int st = 0;
+        s32 t = pt_collect((s32)pid, &st, PT_COLLECT_STOPS | PT_COLLECT_EXITS, 0);
+        if (t > 0) {
+            if (status && cng_user_copyout((void *)status, &st, sizeof st) < 0)
+                return -EFAULT;
+            return t;
+        }
+        long r = CNG_SYS(__NR_wait4, pid, status, options | PT_WNOHANG, rusage,
+                         0, 0);
+        if (r > 0) {
+            cng_pt_note_reaped(r);
+            return r;
+        }
+        /* ECHILD is not terminal while we trace something: a tracee attached to
+         * with PTRACE_ATTACH is not our child, so its stops arrive through the
+         * registry and never through the host wait. */
+        if (r < 0 && !(r == -ECHILD && pt_have_tracee((s32)pid)))
+            return r;
+        if (options & PT_WNOHANG)
+            return r == -ECHILD ? 0 : r;
+        if ((t = pt_reap_dead((s32)pid, &st)) > 0) {
+            if (status && cng_user_copyout((void *)status, &st, sizeof st) < 0)
+                return -EFAULT;
+            return t;
+        }
+        if (pt_signal_pending(uc))
+            return -EINTR;
+        if (pt_kick_waiting(uc))
+            return -CNG_ERESTART;
+        pt_rekick_blocked();
+        if (g_tab)
+            fx_wait(&g_tab->global_gen, gen, PT_WPOLL_MS);
+    }
+}
+
+#define PT_WSTOPPED  2
+#define PT_WEXITED   4
+#define PT_WNOWAIT   0x01000000
+#define PT_CLD_EXITED   1
+#define PT_CLD_KILLED   2
+#define PT_CLD_DUMPED   3
+#define PT_CLD_TRAPPED  4
+
+long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
+                   const struct cng_ucontext *uc) {
+    /* P_ALL = 0, P_PID = 1, P_PGID = 2. Only a specific pid narrows the
+     * registry scan; a process-group wait cannot match an emulated stop, so it
+     * is left to the host wait entirely. */
+    s32 wpid = (idtype == 1) ? (s32)id : (idtype == 0) ? -1 : 0;
+    for (;;) {
+        u32 gen = g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
+        int st = 0;
+        s32 t = 0;
+        /* waitid names the states it wants and the kernel refuses a call that
+         * names none. Gating the whole registry on WSTOPPED meant a
+         * WEXITED-only wait — which is what a tracer reaping a dead tracee
+         * issues — never saw the synthetic exit at all: the host waitid answers
+         * ECHILD for a tracee that is not our child, and the loop below treats
+         * that as "keep waiting", so it spun until something else woke it. */
+        int want = ((options & PT_WSTOPPED) ? PT_COLLECT_STOPS : 0) |
+                   ((options & PT_WEXITED) ? PT_COLLECT_EXITS : 0);
+        /* WNOWAIT reports without consuming. The bit was known here and
+         * passed to the host wait below, but the registry side consumed the
+         * stop or freed the exit all the same, so the wait that was meant to
+         * follow found nothing. */
+        int peek = (options & PT_WNOWAIT) != 0;
+        if (wpid && want && (t = pt_collect(wpid, &st, want, peek)) > 0) {
+            if (infop) {
+                /* The siginfo the kernel's wait_task_stopped/zombie fill in.
+                 * For a stop, si_status is the whole exit code the wait status
+                 * carries above the 0x7f — (event << 8) | SIGTRAP for a ptrace
+                 * event, sig | 0x80 for a TRACESYSGOOD syscall stop — not its
+                 * low byte, which dropped the event and the marker (measured:
+                 * 0x605 for EVENT_EXIT, 0x85 for a syscall stop). A death by
+                 * signal is CLD_DUMPED when the status carries the core bit.
+                 * si_uid is the tracee's, which here is the same user as its
+                 * tracer, shown through the fake identity like every other
+                 * uid the guest is told. */
+                u8 si[128];
+                memset(si, 0, sizeof si);
+                s32 *w = (s32 *)si;
+                w[0] = 17; /* SIGCHLD */
+                int stopped = (st & 0xff) == 0x7f;
+                int exited = !stopped && (st & 0x7f) == 0;
+                w[2] = stopped  ? PT_CLD_TRAPPED
+                       : exited ? PT_CLD_EXITED
+                       : (st & 0x80) ? PT_CLD_DUMPED
+                                     : PT_CLD_KILLED;
+                w[4] = t;                                        /* si_pid */
+                w[5] = (s32)cng_remap_uid((unsigned)sys_getuid()); /* si_uid */
+                w[6] = stopped  ? (st >> 8) & 0xffff
+                       : exited ? (st >> 8) & 0xff
+                                : (st & 0x7f);                   /* si_status */
+                if (cng_user_copyout((void *)infop, si, sizeof si) < 0)
+                    return -EFAULT;
+            }
+            return 0;
+        }
+        if (infop) {
+            u8 zero[128];
+            memset(zero, 0, sizeof zero);
+            cng_user_copyout((void *)infop, zero, sizeof zero);
+        }
+        long r = CNG_SYS(__NR_waitid, idtype, id, infop, options | PT_WNOHANG,
+                         rusage, 0);
+        if (r == 0) {
+            /* WNOHANG semantics: si_pid == 0 means nothing was ready — which is
+             * only readable because the buffer was zeroed just above. */
+            int got = 1;
+            int si_pid;
+            if (infop &&
+                cng_user_copyin(&si_pid, (char *)infop + 16, sizeof si_pid) == 0)
+                got = si_pid != 0;
+            if (got || (options & PT_WNOHANG))
+                return 0;
+        } else if (!(r == -ECHILD && pt_have_tracee(wpid))) {
+            return r;
+        } else if (options & PT_WNOHANG) {
+            return r;
+        }
+        if (pt_signal_pending(uc))
+            return -EINTR;
+        if (pt_kick_waiting(uc))
+            return -CNG_ERESTART;
+        pt_rekick_blocked();
+        if (g_tab)
+            fx_wait(&g_tab->global_gen, gen, PT_WPOLL_MS);
+    }
+}
+
+/* ---- tracer: process_vm_readv/writev against a stopped tracee ---- */
+
+int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
+                 u64 flags, long *out) {
+    if (!g_tab || !g_pt_local)
+        return 0;
+    struct pt_link *e = pt_find((s32)pid);
+    if (!e || __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) != (s32)sys_getpid())
+        return 0; /* not our tracee: let the host answer */
+    /* The flags word is reserved and must be 0: process_vm_rw() refuses
+     * anything else with EINVAL before it so much as looks the pid up
+     * (measured: a nonexistent pid with flags=1 is EINVAL, with flags=0
+     * ESRCH). The emulated path dropped the argument on the floor, so a
+     * tracer probing for the refusal was told the call worked. */
+    if (flags) {
+        *out = -EINVAL;
+        return 1;
+    }
+    if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != PT_ST_STOPPED) {
+        *out = -ESRCH;
+        return 1;
+    }
+    int write = (nr == __NR_process_vm_writev);
+    u64 *lv = (u64 *)lvec, *rv = (u64 *)rvec;
+    /* Narrow the counts the way the kernel does before anything else looks at
+     * them: import_iovec takes nr_segs as an `unsigned`, so the top half of a
+     * 64-bit count is simply dropped, and only then is what is left refused
+     * above UIO_MAXIOV. Both halves of that matter here.
+     *
+     * The bound is what keeps `count * 16` from being a 64-bit multiply that
+     * wraps. A count whose low 60 bits are small wrapped the product to almost
+     * nothing — 1<<60 gives exactly 0, and cng_user_readable answers 1 for a
+     * zero-length range — so the validation passed having probed nothing, and
+     * the walk below then indexed lv[]/rv[] for as many entries as the count
+     * claimed, off the end of whatever the guest had mapped. In the handler
+     * that is an unblockable SIGSEGV.
+     *
+     * The truncation is what keeps the answer the kernel's: a guest passing
+     * 1<<60 is not refused there, it is read as *zero* segments and gets back
+     * 0, and (1<<60)+1 transfers one. Rejecting those with -EINVAL would have
+     * been a divergence of its own. */
+    unsigned lc = (unsigned)lcnt, rc = (unsigned)rcnt;
+    if (lc > CNG_UIO_MAXIOV || rc > CNG_UIO_MAXIOV) {
+        *out = -EINVAL;
+        return 1;
+    }
+    if (!cng_user_readable(lv, (unsigned long)lc * 16) ||
+        !cng_user_readable(rv, (unsigned long)rc * 16)) {
+        *out = -EFAULT;
+        return 1;
+    }
+    /* Walk the two iovec lists in lockstep, as the kernel does — but out of our
+     * own copy of each entry, taken the first time that entry is used.
+     *
+     * The probe above says the arrays were readable when it ran, which is
+     * neither a promise that they stay readable nor that they stay what they
+     * were: the guest owns this memory for the whole walk. A thread of it that
+     * unmaps a page the probe just blessed turns the -EFAULT this returns into
+     * a fault inside the handler, where SIGSEGV is masked and the fault is
+     * fatal; one that rewrites a slot the walk has not reached yet has the
+     * transfer running on a base and a length nothing ever checked. The kernel
+     * has no such gap — import_iovec copies both arrays before anything looks
+     * at them — and this closes it the same way. Cached by index, so it costs
+     * one copy per entry rather than one per PT_MBOX chunk. */
+    unsigned long li = 0, ri = 0, loff = 0, roff = 0, total = 0;
+    u64 lent[2] = {0, 0}, rent[2] = {0, 0};
+    unsigned long lhave = ~0UL, rhave = ~0UL; /* which entry each copy holds */
+    int gone = 0;
+    while (li < lc && ri < rc) {
+        if (lhave != li) {
+            if (cng_user_copyin(lent, lv + li * 2, sizeof lent) < 0) {
+                gone = 1;
+                break;
+            }
+            lhave = li;
+        }
+        if (rhave != ri) {
+            if (cng_user_copyin(rent, rv + ri * 2, sizeof rent) < 0) {
+                gone = 1;
+                break;
+            }
+            rhave = ri;
+        }
+        u64 lbase = lent[0] + loff, llen = lent[1] - loff;
+        u64 rbase = rent[0] + roff, rlen = rent[1] - roff;
+        if (!llen) { li++, loff = 0; continue; }
+        if (!rlen) { ri++, roff = 0; continue; }
+        u64 n = llen < rlen ? llen : rlen;
+        if (n > PT_MBOX)
+            n = PT_MBOX;
+        if (write) {
+            if (cng_user_copyin(e->data, (void *)lbase, (unsigned long)n) < 0)
+                break;
+            pt_cmd(e, PT_CMD_WRITE, rbase, n);
+        } else {
+            pt_cmd(e, PT_CMD_READ, rbase, n);
+        }
+        if (e->result < 0)
+            break;
+        u64 got = (u64)e->result;
+        if (!write && got &&
+            cng_user_copyout((void *)lbase, e->data, (unsigned long)got) < 0)
+            break;
+        total += got;
+        loff += got;
+        roff += got;
+        if (got < n)
+            break; /* a fault on the tracee side: short, as the kernel reports */
+    }
+    /* An array that went away under the walk, with nothing transferred yet: the
+     * -EFAULT the probe would have given had it run a moment later. Once bytes
+     * have moved the count is the answer, as it is for a fault on the tracee's
+     * side. */
+    if (gone && !total) {
+        *out = -EFAULT;
+        return 1;
+    }
+    *out = (long)total;
+    return 1;
+}
+
+/* ---- signal routing: cooperative group-stops ---- */
+
+static int pt_is_stopsig(int sig) {
+    return sig == 19 || sig == 20 || sig == 21 || sig == 22; /* STOP TSTP TTIN TTOU */
+}
+
+int cng_pt_signal_route(long pid, int sig) {
+    if (!g_tab || pid <= 0)
+        return 0;
+    if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
+        return 0;
+    if (!pt_is_stopsig(sig) && sig != 18 /*SIGCONT*/)
+        return 0;
+    /* Resolve to a thread group: an exact link match maps a tid to its group,
+     * otherwise treat the argument as a tgid (whose main thread may be
+     * untraced). */
+    struct pt_link *hit = pt_find((s32)pid);
+    s32 tgid = hit ? hit->tgid : (s32)pid;
+    int routed = 0;
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || e->tgid != tgid)
+            continue;
+        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0)
+            continue;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED)
+            continue;
+        if (sig == 18) {
+            /* SIGCONT ends a listening group-stop with a fresh EVENT_STOP. The
+             * tracee never left its service loop, so only the link is re-armed
+             * and the tracer woken. */
+            if (!__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE))
+                continue;
+            __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+            e->stop_sig = 5 /*SIGTRAP*/;
+            e->event = CNG_PTRACE_EVENT_STOP;
+            e->syscall_stop = 0;
+            e->si_signo = 5;
+            e->si_code = (CNG_PTRACE_EVENT_STOP << 8) | 5;
+            __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
+            pt_bump_gen();
+            pt_wake_tracer(__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE));
+            routed = 1;
+            continue;
+        }
+        /* A real SIGSTOP would freeze the tracee inside its service loop, and
+         * every later tracer request would deadlock — so a stop signal aimed at
+         * a tracee becomes a cooperative group-stop instead. The kernel stops
+         * every thread of the group and each traced one reports its own stop;
+         * we kick each live link, which is the same thing for a group whose
+         * threads are all traced. */
+        __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
+        pt_kick_attach(e->tgid, t);
+        routed = 1;
+    }
+    return routed;
+}
+
+/* ---- arming ---- */
+
+void cng_pt_arm_tracee(void) {
+    struct pt_self *s = pt_self_get(1);
+    if (!s || s->traceall)
+        return;
+    s->traceall = 1;
+    g_pt_local = 1;
+    if (!cng_g_sigsys_ready)
+        return;
+    /* Our base filter traps only the path-bearing set; a tracee must stop on
+     * every syscall, so stack a filter that traps everything. Filters cannot be
+     * removed, so this outlives a later detach — a cost, never a correctness
+     * problem (the dispatcher re-issues what it does not handle). */
+    cng_install_seccomp_traceall();
+}
+
+/* Kick every other thread of this process to arm itself as a tracer too. The
+ * kick also ends a native wait the thread sleeps in (cng_pt_kick_taken), which
+ * then finds this process a tracer and goes to the registry. */
+static void pt_kick_siblings(void) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return;
+    s32 me = (s32)sys_getpid(), self = (s32)sys_gettid();
+    char buf[1024];
+    long n;
+    while ((n = CNG_SYS(__NR_getdents64, (int)fd, buf, sizeof buf, 0, 0, 0)) > 0) {
+        for (long o = 0; o < n;) {
+            struct {
+                u64 ino, off;
+                u16 reclen;
+                u8 type;
+                char name[];
+            } *d = (void *)(buf + o);
+            o += d->reclen;
+            s32 tid = 0;
+            const char *p = d->name;
+            if (*p < '0' || *p > '9')
+                continue;
+            while (*p >= '0' && *p <= '9')
+                tid = tid * 10 + (*p++ - '0');
+            if (*p || tid == self)
+                continue;
+            cng_pt_kick(me, tid, CNG_PT_KICK_ARM);
+        }
+    }
+    sys_close((int)fd);
+}
+
+void cng_pt_arm_tracer(void) {
+    /* The process-wide half first, and ahead of anything that can fail: what a
+     * wait on -R reads to decide it may no longer go straight to the kernel.
+     * A sibling already blocked in such a wait made that decision before this
+     * store, so it is kicked out of it to look again (cng_pt_wait_native) —
+     * the store and its count of waiters are read crosswise, so either it sees
+     * the store or this sees it counted. */
+    int kick = !__atomic_exchange_n(&g_pt_tracer, 1, __ATOMIC_SEQ_CST) &&
+               __atomic_load_n(&g_pt_nwait, __ATOMIC_SEQ_CST) > 0;
+    struct pt_self *s = pt_self_get(1);
+    if (s && !s->tracer_armed) {
+        s->tracer_armed = 1;
+        g_pt_local = 1;
+        /* A multithreaded tracer (gdb) may wait on a thread other than the one
+         * that attached, and a seccomp filter is per-task, so kick the siblings
+         * to install it too. Threads created later inherit it. */
+        if (cng_g_sigsys_ready && cng_install_seccomp_tracer() == 0)
+            kick = 1;
+    }
+    if (kick)
+        pt_kick_siblings();
+}
+
+void cng_pt_kick_taken(struct cng_ucontext *uc, int magic) {
+    __atomic_add_fetch(&g_pt_kicks, 1, __ATOMIC_SEQ_CST);
+    /* Interrupted inside a native wait (cng_wait_unless): between its compare
+     * and its svc the kick count it read is stale, and at the svc a restart
+     * may be pending that would put the thread back to sleep on it, so resume
+     * at the bail instead. That pending restart is what the kick leaves on a
+     * wait it interrupts, being SA_RESTART; an -EINTR on the svc would be ours
+     * too, not the guest's, and is answered the same way. */
+    struct cng_uregs *r = cng_pt_uregs(uc);
+    if (r->pc >= (u64)cng_wait_unless_check &&
+        r->pc <= (u64)cng_wait_unless_svc)
+        r->pc = (u64)cng_wait_unless_bail;
+    else if (r->pc == (u64)cng_wait_unless_svc + 4 && (s64)r->x[0] == -EINTR)
+        r->x[0] = (u64)(s64)CNG_WAIT_KICKED;
+    /* A tracer's tracee re-kicks it while a stop goes uncollected, but at its
+     * main thread. A sibling still in a native wait has missed the kick that
+     * should have ended it — one that landed while a guest handler ran on top
+     * of the wait, which the kernel then restarted — and only another kick
+     * can reach it there. */
+    if (magic == CNG_PT_KICK_REWAKE &&
+        __atomic_load_n(&g_pt_tracer, __ATOMIC_SEQ_CST) &&
+        __atomic_load_n(&g_pt_nwait, __ATOMIC_SEQ_CST) > 0)
+        pt_kick_siblings();
+}

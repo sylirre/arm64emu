@@ -1,0 +1,150 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Startup probe of the ambient (Android zygote) seccomp filter.
+ *
+ * We can re-issue a translated path syscall through the gate, but if Android
+ * blocks that syscall (e.g. fchownat, mknodat) the re-issue traps to SIGSYS —
+ * and on kernels that don't honor nested delivery, a re-issue from inside our
+ * handler force-kills the process. Rather than guess the block-list or rely on
+ * the gate-net, we measure it: fork a child that (with only Android's filter
+ * active) invokes each candidate syscall with harmless NULL args and records
+ * which ones trap. dispatch then emulates the blocked ones as ENOSYS instead of
+ * re-issuing. Off Android nothing is blocked, so everything re-issues normally.
+ */
+#include "cng/monitor.h"
+#include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/uapi.h"
+#include "cng/ucontext.h"
+
+unsigned char cng_blocked[CNG_NR_MAX];
+
+/* Candidate syscalls: the set dispatch may re-issue to the real kernel. */
+static const int probe_set[] = {
+    __NR_openat,     __NR_openat2,   __NR_newfstatat, __NR_statx,
+    __NR_faccessat,  __NR_faccessat2, __NR_readlinkat, __NR_mkdirat,
+    __NR_mknodat,    __NR_unlinkat,  __NR_fchownat,   __NR_fchmodat,
+    __NR_utimensat,  __NR_symlinkat, __NR_linkat,     __NR_renameat,
+    __NR_renameat2,  __NR_truncate,  __NR_statfs,     __NR_chdir,
+    __NR_fchown,     __NR_fchmod,    __NR_fstat,
+    __NR_getdents64,
+    __NR_name_to_handle_at,
+    __NR_setxattr,   __NR_lsetxattr,  __NR_getxattr,   __NR_lgetxattr,
+    __NR_listxattr,  __NR_llistxattr, __NR_removexattr, __NR_lremovexattr,
+    __NR_inotify_add_watch,
+    /* Not re-issued on a guest's behalf: this pair is how the guest-pointer
+     * probe asks whether a range is accessible (uaccess.c). Measuring it here
+     * is what keeps that question out of the SIGSYS handler, where a refused
+     * syscall would need nested delivery to survive. */
+    __NR_process_vm_readv, __NR_process_vm_writev,
+    /* Nor this one: it is how an emulated execve drops the robust futex list
+     * the old program left behind (execve.c). Android blocks the pair outright
+     * — measured on an Android 13 device — so without this entry the reset
+     * traps once per exec and is answered by the gate-net, which is the nested
+     * delivery the design goes out of its way not to need. */
+    __NR_set_robust_list,
+    /* And this one, which the same reset issues to drop the old program's
+     * rseq registration — only ever with the parameters of a registration
+     * that went through, so a host that refuses rseq is never asked to
+     * unregister; but the -t drivers record a registration through the
+     * dispatcher with no handler behind them, and reissue() must know. (The
+     * probe's arguments, -1 for an area and 0 for a length, are refused
+     * EINVAL before anything is registered.) */
+    __NR_rseq,
+    __NR_fchmodat2,
+    /* The 6.13/6.17 dirfd forms of the xattr and file-attribute calls. A kernel
+     * without them answers ENOSYS itself, which is not a trap and not a mark;
+     * an Android filter that predates them traps, and the mark keeps their
+     * re-issue out of the handler. */
+    __NR_setxattrat, __NR_getxattrat, __NR_listxattrat, __NR_removexattrat,
+    __NR_file_getattr, __NR_file_setattr,
+    /* The pidfd pair dispatch re-issues once the hidden-process view has
+     * judged it. A filter that predates them traps both (Android 8 on a 3.18
+     * kernel, measured), where the kernel itself would answer ENOSYS. pid -1
+     * and fd -1 are refused before anything is looked up. */
+    __NR_pidfd_open, __NR_pidfd_getfd,
+    __NR_bind,      __NR_connect,    __NR_sendto,     __NR_sendmsg,
+    __NR_getsockname, __NR_getpeername, __NR_accept,   __NR_accept4,
+    __NR_recvfrom,   __NR_recvmsg,    __NR_sendmmsg,   __NR_recvmmsg,
+    /* The credential family, re-issued without --fake-id (cred.c), and the
+     * readers a refused setter is answered from. Android's app filter refuses
+     * every uid and gid setter but setresuid. Last, because four of them can
+     * act on these arguments — setre[ug]id(-1, 0) and setres[ug]id(-1, 0, 0)
+     * are a real change for a child holding the capability — and the child
+     * exits straight after; everything else here fails on -1 or a NULL
+     * pointer, or (setfsuid, setfsgid) takes -1 as no id at all. */
+    __NR_getresuid,  __NR_getresgid,  __NR_getgroups,  __NR_capget,
+    __NR_capset,     __NR_setfsuid,   __NR_setfsgid,   __NR_setuid,
+    __NR_setgid,     __NR_setgroups,  __NR_setresuid,  __NR_setreuid,
+    __NR_setregid,   __NR_setresgid,
+};
+#define NPROBE ((int)(sizeof probe_set / sizeof probe_set[0]))
+
+/* What CNG_SETID_DENY takes as refused: the uid and gid setters bionic's
+ * SECCOMP_BLOCKLIST_APP.TXT lists, which is all of them but setresuid. */
+int cng_g_setid_deny = 0;
+const int cng_setid_deny_nrs[] = {
+    __NR_setuid,   __NR_setgid,   __NR_setreuid, __NR_setregid,
+    __NR_setresgid, __NR_setfsuid, __NR_setfsgid, __NR_setgroups,
+};
+const int cng_setid_deny_n =
+    (int)(sizeof cng_setid_deny_nrs / sizeof cng_setid_deny_nrs[0]);
+
+/* What CNG_OPENAT2_DENY takes as refused: openat2 alone, which Android's
+ * filter refuses from 13 on. */
+int cng_g_openat2_deny = 0;
+
+/* The knobs' marks, on top of whatever the probe measured. */
+static void knob_deny(void) {
+    if (cng_g_setid_deny)
+        for (int i = 0; i < cng_setid_deny_n; i++)
+            cng_blocked[cng_setid_deny_nrs[i]] = 1;
+    if (cng_g_openat2_deny)
+        cng_blocked[__NR_openat2] = 1;
+}
+
+static unsigned char *g_probe_map; /* MAP_SHARED page: child marks, parent reads */
+
+static void probe_sigsys(int sig, cng_siginfo_t *si, void *ucv) {
+    (void)sig;
+    int nr = si->_u._sigsys.syscall;
+    if (si->si_code == CNG_SYS_SECCOMP && nr >= 0 && nr < CNG_NR_MAX &&
+        g_probe_map)
+        g_probe_map[nr] = 1;
+    /* Skip the trapped syscall: seccomp already advanced pc past the svc. */
+    ((struct cng_ucontext *)ucv)->uc_mcontext.regs[0] = 0;
+}
+
+void cng_probe_blocked(void) {
+    g_probe_map = sys_mmap(0, 4096, CNG_PROT_READ | CNG_PROT_WRITE,
+                           CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0);
+    if (g_probe_map == CNG_MAP_FAILED || cng_is_err((long)g_probe_map)) {
+        g_probe_map = 0;
+        knob_deny();
+        return; /* no probe -> nothing blocked; gate-net remains the backstop */
+    }
+    memset(g_probe_map, 0, CNG_NR_MAX);
+
+    long child = sys_fork();
+    if (child == 0) {
+        cng_sig_install(CNG_SIGSYS, probe_sigsys);
+        for (int i = 0; i < NPROBE; i++)
+            /* arg0 = -1: a seccomp filter matches on the syscall number before
+             * the kernel reads any argument, so a blocked call still traps —
+             * while an allowed one dies on EBADF/EFAULT instantly. Zeros here
+             * made arg0 name fd 0, and the probes really ran against stdin:
+             * utimensat(0, NULL, ...) is futimens and STAMPED it, fchown hit
+             * it, and recvfrom(0, NULL, 0, 0) blocked startup forever when
+             * stdin was a silent datagram socket (ssh/CI harnesses). */
+            cng_syscall6(-1, 0, 0, 0, 0, 0, probe_set[i]);
+        sys_exit_group(0);
+    }
+    if (child > 0) {
+        int st = 0;
+        sys_wait4((int)child, &st, 0, 0);
+        memcpy(cng_blocked, g_probe_map, CNG_NR_MAX);
+    }
+    sys_munmap(g_probe_map, 4096);
+    g_probe_map = 0;
+    knob_deny();
+}

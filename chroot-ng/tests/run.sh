@@ -1,0 +1,128 @@
+#!/usr/bin/env sh
+# chroot-ng test harness. Runs the AArch64 binary — natively on an AArch64 host,
+# under qemu-aarch64 on a cross host — and checks behaviour. Extend per
+# milestone. Everything host-dependent (emulator, guest toolchain, which
+# translation tier is live, rootfs images) is resolved in tests/lib.sh; see the
+# header there for the environment knobs.
+set -u
+
+cd "$(dirname "$0")/.." || exit 1
+. tests/lib.sh
+
+if [ ! -x "$BIN" ]; then
+    echo "build first: make" >&2
+    exit 1
+fi
+
+check() { # desc, expected_rc, actual_rc
+    if [ "$2" = "$3" ]; then
+        pass=$((pass + 1))
+        printf '  ok   %s\n' "$1"
+    else
+        fail=$((fail + 1))
+        printf '  FAIL %s (rc want %s got %s)\n' "$1" "$2" "$3"
+    fi
+}
+
+check_contains() { # desc, needle, haystack
+    case "$3" in
+    *"$2"*)
+        pass=$((pass + 1))
+        printf '  ok   %s\n' "$1"
+        ;;
+    *)
+        fail=$((fail + 1))
+        printf '  FAIL %s (missing: %s)\n' "$1" "$2"
+        ;;
+    esac
+}
+
+check_absent() { # desc, needle, haystack
+    case "$3" in
+    *"$2"*)
+        fail=$((fail + 1))
+        printf '  FAIL %s (present: %s)\n' "$1" "$2"
+        ;;
+    *)
+        pass=$((pass + 1))
+        printf '  ok   %s\n' "$1"
+        ;;
+    esac
+}
+
+cng_platform_init
+trap 'rm -rf "$CNG_TMP"' EXIT INT TERM
+cng_platform_banner
+if [ "$CNG_EMU_MISSING" = 1 ]; then
+    echo "no qemu-aarch64 emulator found on a $HOST_ARCH host: install" \
+        "qemu-user-static, or set QEMU= if AArch64 binaries run here anyway" >&2
+    exit 1
+fi
+echo
+
+echo "== M1: CLI =="
+out=$(run --help 2>&1); check "help rc" 0 $?
+check_contains "help usage line" "chroot-ng [options] <rootfs> <program>" "$out"
+check_contains "help OPTIONS section" "OPTIONS" "$out"
+out=$(run -h 2>&1); check "short -h rc" 0 $?
+# The help is reflowed to the terminal, and where no terminal answers
+# TIOCGWINSZ -- every redirected run, this one included -- to $COLUMNS. That
+# value arrives from the environment, so the parse has to survive anything sent
+# through it: an accumulator that overflowed was undefined behaviour, which the
+# compiler is entitled to act on rather than wrap. The width is clamped to
+# HELP_MIN_COLS..HELP_MAX_COLS, and the help is long enough that some line fills
+# whatever width it is given. The help asks stdin as well as stdout and stderr,
+# and a suite started from a terminal has one there, so stdin is detached too:
+# without it a terminal answers and $COLUMNS is never consulted.
+help_width() { run --help </dev/null 2>&1 | awk '{ if (length > m) m = length } END { print m+0 }'; }
+export COLUMNS
+COLUMNS=40
+check "COLUMNS renders the help at that width" 40 "$(help_width)"
+COLUMNS=1
+check "a COLUMNS under the floor clamps up" 32 "$(help_width)"
+COLUMNS=4294967296
+check "a COLUMNS past an int's range clamps to the ceiling" 92 "$(help_width)"
+COLUMNS=99999999999999999999
+check "...and so does one past every range" 92 "$(help_width)"
+COLUMNS=abc
+check "a COLUMNS that is not a number is ignored" 80 "$(help_width)"
+unset COLUMNS
+run >/dev/null 2>&1; check "no-args rc" 2 $?
+run --frobnicate >/dev/null 2>&1; check "unknown-option rc" 2 $?
+run / >/dev/null 2>&1; check "rootfs but no program rc" 2 $?
+run -t frobnicate >/dev/null 2>&1; check "unknown test rc" 2 $?
+
+# M2+ tests are appended as milestones land.
+if [ -f tests/m2_probe.sh ]; then . tests/m2_probe.sh; fi
+if [ -f tests/m3_loader.sh ]; then . tests/m3_loader.sh; fi
+if [ -f tests/m4_dynamic.sh ]; then . tests/m4_dynamic.sh; fi
+if [ -f tests/m5_xlate.sh ]; then . tests/m5_xlate.sh; fi
+if [ -f tests/m5b_monitor.sh ]; then . tests/m5b_monitor.sh; fi
+if [ -f tests/m6_execve.sh ]; then . tests/m6_execve.sh; fi
+if [ -f tests/m7_fidelity.sh ]; then . tests/m7_fidelity.sh; fi
+if [ -f tests/m8_rewrite.sh ]; then . tests/m8_rewrite.sh; fi
+if [ -f tests/m9_androidnet.sh ]; then . tests/m9_androidnet.sh; fi
+if [ -f tests/m10_l2s_shell.sh ]; then . tests/m10_l2s_shell.sh; fi
+if [ -f tests/m11_proc.sh ]; then . tests/m11_proc.sh; fi
+if [ -f tests/m12_shm.sh ]; then . tests/m12_shm.sh; fi
+if [ -f tests/m14_dev.sh ]; then . tests/m14_dev.sh; fi
+if [ -f tests/m15_unixsock.sh ]; then . tests/m15_unixsock.sh; fi
+if [ -f tests/m16_netlink.sh ]; then . tests/m16_netlink.sh; fi
+if [ -f tests/m17_fault.sh ]; then . tests/m17_fault.sh; fi
+if [ -f tests/m17_seccomp.sh ]; then . tests/m17_seccomp.sh; fi
+if [ -f tests/m17_uname.sh ]; then . tests/m17_uname.sh; fi
+if [ -f tests/m17_env.sh ]; then . tests/m17_env.sh; fi
+if [ -f tests/m17_workdir.sh ]; then . tests/m17_workdir.sh; fi
+if [ -f tests/m18_ptrace.sh ]; then . tests/m18_ptrace.sh; fi
+if [ -f tests/m19_scripts.sh ]; then . tests/m19_scripts.sh; fi
+if [ -f tests/m20_sysvipc.sh ]; then . tests/m20_sysvipc.sh; fi
+if [ -f tests/m23_execmap.sh ]; then . tests/m23_execmap.sh; fi
+if [ -f tests/m24_openat2.sh ]; then . tests/m24_openat2.sh; fi
+if [ -f tests/m25_fdview.sh ]; then . tests/m25_fdview.sh; fi
+if [ -f tests/m26_pinned.sh ]; then . tests/m26_pinned.sh; fi
+if [ -f tests/m27_tty.sh ]; then . tests/m27_tty.sh; fi
+if [ -f tests/m28_dacroot.sh ]; then . tests/m28_dacroot.sh; fi
+
+echo
+echo "== summary: $pass passed, $fail failed, $skipped skipped =="
+[ "$fail" -eq 0 ]

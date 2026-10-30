@@ -1,0 +1,1009 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+#include "cng/path.h"
+#include "cng/monitor.h" /* cng_g_fs */
+#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+#include "cng/procreg.h"
+#include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/uapi.h"
+
+int cng_g_no_proc = 0;
+
+/* /proc passes through to the host rather than resolving inside the rootfs: a
+ * plain directory tree has no /proc, and we cannot mount one without
+ * privileges. A -b bind for the same guest path outranks this (below). */
+static int proc_zone(const char *canon) {
+    return !cng_g_no_proc && strncmp(canon, "/proc", 5) == 0 &&
+           (canon[5] == '\0' || canon[5] == '/');
+}
+
+int cng_g_no_dev = 0;
+
+/* The /dev zone. A rootfs directory tree ships no device nodes and mknod(2)
+ * needs privileges we do not have, so a fixed whitelist of harmless host
+ * devices passes through and everything else under /dev resolves into the
+ * rootfs — usually ENOENT. The alternative users reach for, `-b /dev:/dev`, is
+ * far coarser: it hands the guest the host's whole /dev, block devices and all.
+ *
+ * Order matters against the binds: cng_fs_translate matches binds first, so an
+ * explicit -b for /dev or a subpath still overrides this.
+ *
+ * `fd` and the std* aliases point into /proc/self/fd. Guest fd == host fd here,
+ * so that link is already the right answer, and it reaches the anonymous files
+ * (pipes, memfd, O_TMPFILE) that no re-rooted name could describe at all. The
+ * resolver rewrites those to their /proc spelling a step earlier (dev_magic in
+ * dispatch.c) so the walk treats them as the magic links they are rather than
+ * readlink'ing them as ordinary symlinks; this table is what a direct
+ * cng_fs_translate call falls back on, and the two agree. */
+/* Where the guest's /dev/shm lives. Mutable, and the table below points at it:
+ * see cng_dev_shm_init for what may end up here and why. The two directory
+ * nodes, this and pts, are stored the way the kernel spells them (as the
+ * rootfs and the binds are: canon_host_root), because a name below one is
+ * pinned for its syscall against the kernel's own name for the directory
+ * (cng/pin.h) — a /dev/shm that is the host's symlink to /run/shm would
+ * otherwise never agree with itself. */
+static char g_shm_host[CNG_PATH_MAX] = "/dev/shm";
+static char g_pts_host[CNG_PATH_MAX] = "/dev/pts";
+
+const struct cng_dev_node cng_dev_nodes[] = {
+    {"null", "/dev/null"},         {"zero", "/dev/zero"},
+    {"full", "/dev/full"},         {"random", "/dev/random"},
+    {"urandom", "/dev/urandom"},   {"tty", "/dev/tty"},
+    {"ptmx", "/dev/ptmx"},         {"console", "/dev/tty"},
+    {"pts", g_pts_host},           {"shm", g_shm_host},
+    {"fd", "/proc/self/fd"},       {"stdin", "/proc/self/fd/0"},
+    {"stdout", "/proc/self/fd/1"}, {"stderr", "/proc/self/fd/2"},
+};
+const int cng_dev_nnodes =
+    (int)(sizeof cng_dev_nodes / sizeof cng_dev_nodes[0]);
+
+/* Is `path` a directory we can reach? Follows symlinks: what matters is what a
+ * guest's open under it would find, not how the name got there. */
+static int is_dir(const char *path) {
+    char st[144]; /* struct stat; st_mode is at 16 on every arch we build for */
+    if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)path, (long)st, 0, 0, 0) !=
+        0)
+        return 0;
+    return (*(unsigned *)(st + 16) & 0170000) == 0040000;
+}
+
+int cng_dev_shm_ok(void) { return !cng_g_no_dev && is_dir(g_shm_host); }
+
+/* The guest's /dev/shm.
+ *
+ * Where the host has one, that is what the guest gets, and nothing here runs:
+ * a real /dev/shm is one tmpfs global to the machine, and the passthrough hands
+ * the guest exactly that.
+ *
+ * Android has none — there is no such directory at all, and no way for us to
+ * mount one — so glibc's shm_open() and sem_open(), which are `open()` under
+ * /dev/shm and nothing more, had nowhere to go. Worse, the synthesized
+ * /proc/mounts told the guest a tmpfs was mounted there, so a program that
+ * checked first still got ENOENT when it opened. A directory of our own stands
+ * in: $TMPDIR by preference, which on Termux is inside $PREFIX and therefore
+ * writable, then the same places the broker looks for shared state.
+ *
+ * One directory per uid, shared by every invocation, deliberately: that is what
+ * a passthrough /dev/shm already is, and a per-rootfs one would make POSIX
+ * shared memory behave differently depending on whether the host happened to
+ * have a /dev/shm. (Abstract sockets are isolated per rootfs, but nothing else
+ * can scope those — see the -A note in the help — while this has a real
+ * directory and inherits its scope.)
+ *
+ * Best effort throughout: a host with no writable temp directory anywhere keeps
+ * the old behaviour, which is that /dev/shm resolves to a name that is not
+ * there, is left out of the listing, and — now — is left out of the mount
+ * tables too. That much the guest can live with, but nothing in it points at
+ * the cause: shm_open fails ENOENT far from the launcher whose $TMPDIR was
+ * the trouble (an Android app's files directory, which the framework makes
+ * 0771). So the reasons each candidate was passed over are kept, and cng_run
+ * prints them on the way in (cng_dev_shm_missing).
+ *
+ * The name is predictable, and the last candidate is a directory every user
+ * shares, so what is found under it is not ours by being there. mkdirat's
+ * EEXIST used to be the end of the question, and any directory — another
+ * user's, made ahead of us, or a symlink to one where the host follows it —
+ * became the guest's /dev/shm: its shm objects and semaphores stored where
+ * that user could read, replace or delete them, or refused them outright.
+ * One is adopted now only as procreg adopts its shared file: reached without
+ * a symlink at the name, a directory, ours, and private (shm_dir_ours) — in a
+ * parent nobody else can rename it out of (tmp_parent_unsafe). Anything else on
+ * the name moves the search to the next candidate. Squatting every candidate
+ * still leaves the guest without a /dev/shm, which is the degraded answer
+ * above; nothing can keep a name in a shared directory from being taken
+ * first, and taking a different one would split the one directory every
+ * invocation shares. */
+static int canon_host_root(char *dst, size_t dstsz, const char *src);
+
+/* Why the candidate `dir` cannot hold a directory of ours, or 0 when it can:
+ * a directory nobody but us — and root — can take an entry of away, owned by
+ * one of the two and writable by anyone else only with the sticky bit, which
+ * leaves an entry to its own owner (/tmp's 1777). Followed: it is the
+ * directory the candidate names that holds ours. The answer is the tail of a
+ * sentence about `dir`, for the warning cng_dev_shm_missing feeds. */
+static const char *tmp_parent_unsafe(const char *dir) {
+    char st[144]; /* struct stat: st_mode at 16, st_uid at 24 */
+    long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)dir, (long)st, 0, 0,
+                     0);
+    if (r != 0)
+        return r == -ENOENT ? "does not exist" : "cannot be reached";
+    unsigned mode = *(unsigned *)(st + 16), uid = *(unsigned *)(st + 24);
+    if ((mode & 0170000) != 0040000)
+        return "is not a directory";
+    if (uid != 0 && uid != (unsigned)sys_getuid())
+        return "is owned by another user";
+    if ((mode & 022) && !(mode & 01000))
+        return "is group- or world-writable and not sticky";
+    return 0;
+}
+
+/* The stand-in directory at `path` is ours to adopt: the name itself not a
+ * symlink, a directory, owned by us, and nobody else's to enter — what the
+ * mkdirat below creates, and what procreg's file_ours asks of its file. */
+static int shm_dir_ours(const char *path) {
+    long fd = sys_openat(CNG_AT_FDCWD, path,
+                         CNG_O_PATH | CNG_O_DIRECTORY | CNG_O_NOFOLLOW |
+                             CNG_O_CLOEXEC,
+                         0);
+    if (fd < 0)
+        return 0;
+    char st[144];
+    int ok = 0;
+    if (sys_fstat((int)fd, st) == 0) {
+        unsigned mode = *(unsigned *)(st + 16), uid = *(unsigned *)(st + 24);
+        ok = (mode & 0170000) == 0040000 && (mode & 077) == 0 &&
+             uid == (unsigned)sys_getuid();
+    }
+    sys_close((int)fd);
+    return ok;
+}
+
+/* The directory node's host path, as the kernel spells it (see g_shm_host):
+ * a symlink-free spelling that the readback of a descriptor on it, or below
+ * it, agrees with. A path that does not resolve keeps its spelling. */
+static void canon_dev_dir(char *node, size_t sz) {
+    char tmp[CNG_PATH_MAX];
+    if (canon_host_root(tmp, sizeof tmp, node) == 0 && tmp[0])
+        cng_strlcpy(node, tmp, sz);
+}
+
+/* Why the stand-in could not be made, while g_shm_none says it was not. */
+static char g_shm_why[1024];
+static int g_shm_none;
+
+void cng_dev_shm_init(void) {
+    if (cng_g_no_dev)
+        return;
+    canon_dev_dir(g_pts_host, sizeof g_pts_host);
+    /* CNG_DEVSHM_FORCE_TMP=1 takes the stand-in even where /dev/shm exists,
+     * which is the only way a host that has one can exercise this at all. */
+    if (!cng_broker_env("CNG_DEVSHM_FORCE_TMP") && is_dir("/dev/shm")) {
+        canon_dev_dir(g_shm_host, sizeof g_shm_host);
+        return;
+    }
+    g_shm_none = cng_private_tmp_dir("chroot-ng-shm.v1", g_shm_host,
+                                     sizeof g_shm_host, g_shm_why,
+                                     sizeof g_shm_why) != 0;
+    /* Under the force knob the host's own /dev/shm is still there, on the
+     * name a failed stand-in leaves, so the guest would have one after all
+     * and the knob would stop pretending just where a device differs. A
+     * name in the root-owned /dev that nothing makes gives the guest what a
+     * device gives it: nothing. */
+    if (g_shm_none && is_dir(g_shm_host))
+        cng_strlcpy(g_shm_host, "/dev/.chroot-ng-no-shm", sizeof g_shm_host);
+}
+
+const char *cng_dev_shm_missing(void) { return g_shm_none ? g_shm_why : 0; }
+
+int cng_private_tmp_dir(const char *stem, char *out, size_t sz, char *why,
+                        size_t whysz) {
+    /* Not cng_broker_shared_dir(): that list starts at /dev/shm, which is the
+     * one place the /dev/shm stand-in cannot use — it is made because that is
+     * unusable, and under the force knob because we are pretending it is. */
+    const struct {
+        const char *var, *dir;
+    } cand[] = {{"TMPDIR", cng_broker_env("TMPDIR")},
+                {"XDG_RUNTIME_DIR", cng_broker_env("XDG_RUNTIME_DIR")},
+                {0, "/data/local/tmp"},
+                {0, "/tmp"}};
+    /* CNG_TMP_ENV_ONLY=1 passes over the fixed candidates, which is the only
+     * way a host whose /tmp would serve can see what a device sees. */
+    int env_only = cng_broker_env("CNG_TMP_ENV_ONLY") != 0;
+    size_t wn = 0;
+    if (why && whysz)
+        why[0] = '\0';
+    for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+        const char *dir = cand[i].dir;
+        if (!dir || (env_only && !cand[i].var))
+            continue;
+        char path[CNG_PATH_MAX], no_buf[128];
+        const char *no = tmp_parent_unsafe(dir);
+        /* Same shape as the broker's own files: named, versioned, per-uid. */
+        if (!no && cng_snprintf(path, sizeof path, "%s/%s.%u", dir, stem,
+                                (unsigned)sys_getuid()) >= sizeof path)
+            no = "is too long a path to hold one";
+        long r = no ? 0
+                    : CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)path, 0700, 0,
+                              0, 0);
+        if (r != 0 && r != -EEXIST) {
+            cng_snprintf(no_buf, sizeof no_buf,
+                         "refused a directory (errno %ld)", -r);
+            no = no_buf;
+        }
+        if (!no && !shm_dir_ours(path)) {
+            /* something else is sitting on the name */
+            cng_snprintf(no_buf, sizeof no_buf,
+                         "has a %s.%u that is not a private directory of ours",
+                         stem, (unsigned)sys_getuid());
+            no = no_buf;
+        }
+        if (!no) {
+            cng_strlcpy(out, path, sz);
+            canon_dev_dir(out, sz);
+            return 0;
+        }
+        if (why && wn < whysz)
+            wn += cng_snprintf(why + wn, whysz - wn, "%s%s%s%s%s %s",
+                               wn ? "; " : "", cand[i].var ? "$" : "",
+                               cand[i].var ? cand[i].var : "",
+                               cand[i].var ? "=" : "", dir, no);
+    }
+    return -1;
+}
+
+/* The whitelist node a canonical guest path names, itself or by a subpath:
+ * its index, with `*rest` the part below it ("" or "/..."); -1 when the path
+ * is not the zone's to answer and falls through to the rootfs — "/dev"
+ * itself included, which is the rootfs directory the whitelist is listed
+ * into. */
+static int dev_zone_node(const char *canon, const char **rest) {
+    if (cng_g_no_dev)
+        return -1;
+    if (strncmp(canon, "/dev", 4) != 0 || (canon[4] && canon[4] != '/'))
+        return -1;
+    if (!canon[4])
+        return -1;
+    const char *leaf = canon + 5;
+    for (int i = 0; i < cng_dev_nnodes; i++) {
+        size_t nl = strlen(cng_dev_nodes[i].name);
+        if (strncmp(leaf, cng_dev_nodes[i].name, nl) != 0)
+            continue;
+        char c = leaf[nl];
+        if (c == '\0' || c == '/') {
+            *rest = leaf + nl;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Fill `out` for a guest path inside the /dev zone. Returns 1 when it did, 0 to
+ * fall through to ordinary rootfs prefixing, -1 when the name did not fit. */
+static int dev_zone(const char *canon, char *out, size_t outsz) {
+    const char *rest;
+    int i = dev_zone_node(canon, &rest);
+    if (i < 0)
+        return 0;
+    if (!*rest) {
+        cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
+        return 1;
+    }
+    /* A subpath rides along on the host node, whichever kind it is. For the
+     * directory-valued entries that is the entry the guest asked for
+     * (pts/<n>, shm/<name>, fd/<n>). For a device node it is a name *under*
+     * a character device, and the host kernel answers the ENOTDIR Linux
+     * gives for /dev/null/x — which is the point: falling through to the
+     * rootfs instead made the answer depend on the tree, so a rootfs
+     * carrying a real dev/null/x had it opened, reached through a name the
+     * guest was told is a device. The std* aliases resolve through the fd
+     * they name, exactly as following the symlink they are on Linux does. */
+    size_t n = cng_strlcpy(out, cng_dev_nodes[i].host, outsz);
+    if (n >= outsz || cng_strlcpy(out + n, rest, outsz - n) >= outsz - n)
+        return -1; /* truncated: the caller must not use `out` */
+    return 1;
+}
+
+/* The hidden-process view: a numeric entry of the host's real /proc that is not
+ * a guest process must appear not to exist, so the guest sees only its own
+ * session. The test is on the RESOLVED HOST path, not on the guest one, so it
+ * holds however the path got there — the passthrough above, or an explicit
+ * `-b /proc:/proc`, which otherwise would have handed the guest the host's
+ * whole process list. Every path syscall funnels through cng_fs_translate, so
+ * this one check covers open/stat/readlink/execve and the *at forms alike.
+ *
+ * Non-numeric names (self, sys, net, version, ...) are global or virtualized
+ * elsewhere, and always pass through. */
+static int host_proc_hidden(const char *host) {
+    if (cng_g_no_proc || strncmp(host, "/proc/", 6) != 0)
+        return 0;
+    const char *p = host + 6;
+    if (*p < '0' || *p > '9')
+        return 0;
+    long pid = 0;
+    for (; *p && *p != '/'; p++) {
+        if (*p < '0' || *p > '9')
+            return 0; /* not a pid ("1abc"): an ordinary host name */
+        pid = pid * 10 + (*p - '0');
+        if (pid > 0x7fffffff)
+            return 0;
+    }
+    return !cng_procreg_has((int)pid);
+}
+
+/* Redirect a hidden process's path to /proc/0, which never exists: pid 0 is the
+ * idle task and the kernel gives it no /proc entry. That yields the ENOENT a
+ * guest reads as "no such process", whatever the rootfs is — prefixing the
+ * rootfs instead would not hide anything under an identity ("/") root. */
+static void hide_proc_pid(char *out, size_t outsz) {
+    const char *rest = out + 6;
+    while (*rest && *rest != '/')
+        rest++;
+    char tmp[CNG_PATH_MAX];
+    size_t n = cng_strlcpy(tmp, "/proc/0", sizeof tmp);
+    cng_strlcpy(tmp + n, rest, sizeof tmp - n);
+    cng_strlcpy(out, tmp, outsz);
+}
+
+/* Strip a trailing '/'; treat "/" as "" (root of host). Returns 0, or -1 when
+ * `src` did not fit — a truncation is not something to tolerate here: this is a
+ * prefix every guest path is joined to, so a short one silently roots the guest
+ * at some ancestor of the tree that was asked for, or
+ * — since the cut lands wherever 512 bytes happen to end — at a path that is
+ * not a directory at all. The caller refuses instead. */
+static int normalize_root(char *dst, size_t dstsz, const char *src) {
+    size_t n = cng_strlcpy(dst, src, dstsz);
+    if (n >= dstsz) {
+        /* cng_strlcpy reports the length of the SOURCE, so n is past the end of
+         * dst: the trim below would read there, and write there for a byte that
+         * happened to be '/'. */
+        dst[0] = '\0';
+        return -1;
+    }
+    while (n > 1 && dst[n - 1] == '/')
+        dst[--n] = '\0';
+    if (n == 1 && dst[0] == '/')
+        dst[0] = '\0'; /* "/" => "" */
+    return 0;
+}
+
+/* Does `fd` still name the file at `path`?
+ *
+ * A /proc/self/fd readback is not a usable name on its own. The kernel spells
+ * an unlinked directory "<path> (deleted)" and answers "pipe:[N]" and its kin
+ * for what has no path at all, and neither is a prefix that can be matched
+ * against host paths. Asking the inode settles it exactly, and it settles the
+ * one case no suffix test can: a directory whose own name really does end in
+ * " (deleted)" is a legal name that reads back identically. */
+static int fd_names(int fd, const char *path) {
+    /* AArch64 struct stat: st_dev at 0 and st_ino at 8, adjacent. */
+    char a[128], b[128];
+    if (sys_fstat(fd, a) != 0 ||
+        CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)path, (long)b, 0, 0, 0) != 0)
+        return 0;
+    return memcmp(a, b, 16) == 0;
+}
+
+/* Store a host prefix (the rootfs, a bind source) the way the kernel spells it:
+ * symlink-free. These prefixes are not only prepended to guest paths, they are
+ * matched against host paths the kernel *produced* — getcwd() after the guest
+ * fchdir()s, a /proc/self/fd readback — and the kernel always reports those
+ * fully resolved. An unresolved prefix therefore matches nothing coming back,
+ * and every reverse lookup falls out of the guest view.
+ *
+ * Android is where this bites: the app hands us the rootfs under
+ * /data/user/0/<pkg>, a symlink to /data/data/<pkg>. apk runs a package script
+ * by fchdir()ing to its root fd and exec'ing a *relative* path; getcwd() then
+ * answered /data/data/..., which cng_fs_untranslate could not reverse, so the
+ * virtual cwd stayed where it was and the script resolved under it — ENOENT.
+ *
+ * Resolved by opening the path and reading back the kernel's own name for it.
+ * Anything that does not resolve (a nonexistent path — diagnosed by the caller
+ * — or the synthetic roots the self-tests use, which have no host inode) is
+ * kept verbatim, exactly as before.
+ *
+ * The open is O_PATH, which refers to a file of any kind without opening it.
+ * O_RDONLY|O_DIRECTORY was two restrictions the reverse map cannot afford: a
+ * bind source that is a FILE — `-b /etc/resolv.conf:/etc/resolv.conf`, the
+ * commonest bind there is — could not be opened at all and so kept the
+ * caller's spelling, and a guest that opened it then read the host path back
+ * out of /proc/self/fd; and a directory that grants search but not read
+ * (mode 0111, and every /data/data/<pkg> ancestor on Android) failed the same
+ * way. O_PATH needs neither permission and takes every file type.
+ *
+ * What used to stand in for "is this readback a name at all" was refusing any
+ * that contained a space, on the grounds that " (deleted)" has one. So did
+ * every rootfs and every bind source with a space anywhere in its path — a
+ * `/sdcard/My Files/alpine`, a `~/Downloads/debian rootfs` — and those kept the
+ * caller's spelling while the kernel went on producing the resolved one. That
+ * is the same reverse-lookup failure the symlink case above describes, reached
+ * a different way, and on the same paths a phone hands out. */
+static int canon_host_root(char *dst, size_t dstsz, const char *src) {
+    long fd = sys_openat(CNG_AT_FDCWD, src, CNG_O_PATH | CNG_O_CLOEXEC, 0);
+    if (fd >= 0) {
+        char link[40], real[CNG_PATH_MAX];
+        cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)fd);
+        long n = sys_readlinkat(CNG_AT_FDCWD, link, real, sizeof real - 1);
+        int named = 0;
+        if (n > 0 && (size_t)n < sizeof real && real[0] == '/') {
+            real[n] = '\0';
+            named = fd_names((int)fd, real);
+        }
+        sys_close((int)fd);
+        if (named)
+            return normalize_root(dst, dstsz, real);
+    }
+    return normalize_root(dst, dstsz, src);
+}
+
+/* ---- the published view ------------------------------------------------
+ *
+ * cng_g_fs is read by every path syscall and rewritten by chdir, fchdir and
+ * chroot, from any thread. The kernel takes its cwd and root under a lock and
+ * a path walk sees one or the other; here the cwd was a char array overwritten
+ * in place while another thread was copying it out, and a chroot compacted the
+ * bind table in place under a walk of it — a torn cwd is a different
+ * directory, and a torn bind a different host tree.
+ *
+ * So the view is published, not edited. Two buffers: the active one is what
+ * cng_g_fs points at and is never written; a writer copies it into the other,
+ * changes that, and swaps the pointer, bumping a sequence number after. A
+ * reader takes the sequence, the pointer, does its work, and re-reads the
+ * sequence: unchanged means no swap happened, so the buffer it read was the
+ * active one throughout and untouched. Changed means a swap did happen and a
+ * second writer may since have started on the buffer it read — the work is
+ * redone. Readers never wait; a writer waits only for another writer.
+ *
+ * The writer runs with every signal blocked. On the -R tier the dispatcher
+ * runs on the guest's own mask, and a guest handler delivered inside the copy
+ * that itself called chdir would take the lock its own thread holds. The lock
+ * is by tid, and one whose holder is gone — a fork child inherits it from the
+ * thread that held it in the parent — is taken over.
+ *
+ * A struct that is not one of the two buffers is private: the initial view
+ * cng_run builds before anything else runs, a self-test's own. Those are read
+ * and written in place, as before, and cng_fs_publish makes one the view. */
+struct cng_fs *cng_g_fs = 0;
+
+static struct cng_fs g_fs_view[2];
+static unsigned g_fs_seq;
+static long g_fs_owner;
+
+static int fs_live(const struct cng_fs *fs) {
+    return fs == &g_fs_view[0] || fs == &g_fs_view[1];
+}
+
+/* The used part of `src` into `dst`: the rootfs, the binds it has, the cwd.
+ * The buffers are static and start zeroed, so every string in them keeps a
+ * NUL within its bounds whatever prefix has been copied over it. */
+static void fs_copy(struct cng_fs *dst, const struct cng_fs *src) {
+    cng_strlcpy(dst->rootfs, src->rootfs, sizeof dst->rootfs);
+    dst->rlen = src->rlen;
+    for (int i = 0; i < src->nbinds; i++)
+        dst->binds[i] = src->binds[i];
+    dst->nbinds = src->nbinds;
+    dst->has_ro = src->has_ro;
+    cng_strlcpy(dst->cwd, src->cwd, sizeof dst->cwd);
+}
+
+unsigned cng_fs_read_begin(const struct cng_fs **fs) {
+    unsigned s = __atomic_load_n(&g_fs_seq, __ATOMIC_ACQUIRE);
+    *fs = __atomic_load_n(&cng_g_fs, __ATOMIC_ACQUIRE);
+    return s;
+}
+
+int cng_fs_read_retry(unsigned s) {
+    return __atomic_load_n(&g_fs_seq, __ATOMIC_ACQUIRE) != s;
+}
+
+struct cng_fs *cng_fs_publish(const struct cng_fs *src) {
+    fs_copy(&g_fs_view[0], src);
+    __atomic_store_n(&cng_g_fs, &g_fs_view[0], __ATOMIC_RELEASE);
+    return &g_fs_view[0];
+}
+
+struct fs_write {
+    struct cng_fs *dst;
+    unsigned long mask;
+};
+
+static struct cng_fs *fs_write_begin(struct fs_write *w) {
+    unsigned long all = ~0UL;
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &all, &w->mask, 8, 0, 0);
+    long me = sys_gettid();
+    for (int spin = 0;; spin++) {
+        long none = 0;
+        if (__atomic_compare_exchange_n(&g_fs_owner, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+        if (spin > 100 && none &&
+            CNG_SYS(__NR_tgkill, sys_getpid(), none, 0, 0, 0, 0) == -ESRCH)
+            __atomic_compare_exchange_n(&g_fs_owner, &none, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
+    const struct cng_fs *src = __atomic_load_n(&cng_g_fs, __ATOMIC_ACQUIRE);
+    w->dst = src == &g_fs_view[0] ? &g_fs_view[1] : &g_fs_view[0];
+    fs_copy(w->dst, src);
+    return w->dst;
+}
+
+static void fs_write_end(struct fs_write *w) {
+    __atomic_store_n(&cng_g_fs, w->dst, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&g_fs_seq, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_fs_owner, 0, __ATOMIC_RELEASE);
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &w->mask, 0, 8, 0, 0);
+}
+
+size_t cng_fs_cwd(char *out, size_t sz) {
+    const struct cng_fs *v;
+    size_t n;
+    do {
+        unsigned s = cng_fs_read_begin(&v);
+        n = cng_strlcpy(out, v->cwd[0] ? v->cwd : "/", sz);
+        if (!cng_fs_read_retry(s))
+            break;
+    } while (1);
+    return n;
+}
+
+size_t cng_fs_rootfs(char *out, size_t sz) {
+    const struct cng_fs *v;
+    size_t n;
+    do {
+        unsigned s = cng_fs_read_begin(&v);
+        n = cng_strlcpy(out, v->rootfs, sz);
+        if (!cng_fs_read_retry(s))
+            break;
+    } while (1);
+    return n;
+}
+
+int cng_fs_init(struct cng_fs *fs, const char *rootfs) {
+    memset(fs, 0, sizeof *fs);
+    int r = canon_host_root(fs->rootfs, sizeof fs->rootfs, rootfs ? rootfs : "/");
+    fs->rlen = (unsigned)strlen(fs->rootfs);
+    fs->cwd[0] = '/';
+    fs->cwd[1] = '\0';
+    return r;
+}
+
+/* The cached lengths of a bind whose strings are set: see the struct. The
+ * guest prefix is canonical, so its last component follows its last slash,
+ * and for "/" that is the empty name. */
+static void bind_measure(struct cng_bind *b) {
+    b->glen = (unsigned)strlen(b->guest);
+    b->hlen = (unsigned)strlen(b->host);
+    unsigned base = 0;
+    for (unsigned i = 0; i < b->glen; i++)
+        if (b->guest[i] == '/')
+            base = i + 1;
+    b->base = base;
+}
+
+int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
+                    int ro) {
+    if (fs->nbinds >= CNG_MAX_BINDS)
+        return -1;
+    struct cng_bind *b = &fs->binds[fs->nbinds];
+    char canon[CNG_PATH_MAX];
+    if (guest[0] == '/') {
+        if (cng_path_canon(guest, canon, sizeof canon) < 0)
+            return -1;
+    } else {
+        return -1; /* bind guest paths must be absolute */
+    }
+    /* Same reasoning as the rootfs: a bind prefix that does not fit would be
+     * cut to some shorter guest path, and then the host directory is exposed
+     * at a name nobody asked for. */
+    if (cng_strlcpy(b->guest, canon, sizeof b->guest) >= sizeof b->guest)
+        return -1;
+    if (canon_host_root(b->host, sizeof b->host, host) != 0)
+        return -1;
+    bind_measure(b);
+    b->ro = ro ? 1u : 0u;
+    fs->nbinds++;
+    if (b->ro)
+        fs->has_ro = 1;
+    return 0;
+}
+
+static int host_ro_1(const struct cng_fs *fs, const char *host) {
+    if (!fs->has_ro)
+        return 0;
+    int best = -1;
+    size_t blen = 0;
+    for (int i = 0; i < fs->nbinds; i++) {
+        const char *bh = fs->binds[i].host;
+        size_t hl = fs->binds[i].hlen;
+        if (hl && strncmp(host, bh, hl) == 0 &&
+            (host[hl] == '/' || host[hl] == '\0') && hl > blen) {
+            best = i;
+            blen = hl;
+        }
+    }
+    return best >= 0 && fs->binds[best].ro;
+}
+
+int cng_fs_host_ro(const struct cng_fs *fs, const char *host) {
+    if (!fs_live(fs))
+        return host_ro_1(fs, host);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = host_ro_1(fs, host);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}
+
+/* Rebase a canonical guest path onto a new root: under root "/a", "/a/b"
+ * becomes "/b" and "/a" itself becomes "/". Returns 0 when `p` falls outside
+ * the new root (a real chroot makes it unreachable). `rlen` is 0 for "/". */
+static int rebase(char *dst, size_t dstsz, const char *p, const char *root,
+                  size_t rlen) {
+    if (rlen == 0) {
+        cng_strlcpy(dst, p, dstsz);
+        return 1;
+    }
+    if (strncmp(p, root, rlen) != 0 || (p[rlen] && p[rlen] != '/'))
+        return 0;
+    cng_strlcpy(dst, p[rlen] ? p + rlen : "/", dstsz);
+    return 1;
+}
+
+static void chroot_1(struct cng_fs *fs, const char *guest_root,
+                     const char *host_root) {
+    char root[CNG_PATH_MAX];
+    if (cng_path_canon(guest_root, root, sizeof root) < 0)
+        return;
+    size_t rlen = strlen(root);
+    if (rlen == 1) /* "/": everything stays where it is */
+        rlen = 0;
+
+    /* Binds are mounts: chroot doesn't unmount them, it only moves the root
+     * they are named from. Those under the new root keep working (rebased);
+     * the rest fall out of the guest's view. A bind *at* the new root needs no
+     * entry — its host side becomes the rootfs below. */
+    int w = 0;
+    fs->has_ro = 0;
+    for (int i = 0; i < fs->nbinds; i++) {
+        char g[sizeof fs->binds[0].guest];
+        if (!rebase(g, sizeof g, fs->binds[i].guest, root, rlen) ||
+            strcmp(g, "/") == 0)
+            continue;
+        if (w != i)
+            fs->binds[w] = fs->binds[i];
+        cng_strlcpy(fs->binds[w].guest, g, sizeof fs->binds[w].guest);
+        bind_measure(&fs->binds[w]);
+        if (fs->binds[w].ro)
+            fs->has_ro = 1;
+        w++;
+    }
+    fs->nbinds = w;
+
+    char cwd[CNG_PATH_MAX];
+    if (rebase(cwd, sizeof cwd, fs->cwd, root, rlen))
+        cng_strlcpy(fs->cwd, cwd, sizeof fs->cwd);
+    else
+        cng_strlcpy(fs->cwd, "/", sizeof fs->cwd);
+
+    normalize_root(fs->rootfs, sizeof fs->rootfs, host_root);
+    fs->rlen = (unsigned)strlen(fs->rootfs);
+}
+
+void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
+                   const char *host_root) {
+    if (!fs_live(fs)) {
+        chroot_1(fs, guest_root, host_root);
+        return;
+    }
+    struct fs_write w;
+    chroot_1(fs_write_begin(&w), guest_root, host_root);
+    fs_write_end(&w);
+}
+
+static void set_cwd_1(struct cng_fs *fs, const char *guest_cwd) {
+    char canon[CNG_PATH_MAX];
+    if (guest_cwd[0] == '/' &&
+        cng_path_canon(guest_cwd, canon, sizeof canon) == 0)
+        cng_strlcpy(fs->cwd, canon, sizeof fs->cwd);
+}
+
+void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd) {
+    if (!fs_live(fs)) {
+        set_cwd_1(fs, guest_cwd);
+        return;
+    }
+    struct fs_write w;
+    set_cwd_1(fs_write_begin(&w), guest_cwd);
+    fs_write_end(&w);
+}
+
+int cng_path_canon(const char *abs, char *out, size_t outsz) {
+    size_t olen = 0;
+    const char *p = abs;
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && *p != '/')
+            p++;
+        size_t clen = (size_t)(p - start);
+        if (clen == 1 && start[0] == '.')
+            continue;
+        if (clen == 2 && start[0] == '.' && start[1] == '.') {
+            while (olen > 0 && out[olen - 1] != '/')
+                olen--; /* drop last component */
+            if (olen > 0)
+                olen--; /* drop its leading '/' */
+            continue;
+        }
+        if (olen + 1 + clen >= outsz)
+            return -1;
+        out[olen++] = '/';
+        memcpy(out + olen, start, clen);
+        olen += clen;
+    }
+    if (olen == 0)
+        out[olen++] = '/';
+    out[olen] = '\0';
+    return 0;
+}
+
+/* See the header for what this asks. Scanned backwards over any run of slashes
+ * and "." components, so "d/", "d/.", "d/./" and "d//." all answer the same.
+ *
+ * ".." is deliberately not one of them. "f/.." is ENOTDIR to the kernel too,
+ * but for a different reason — it walks INTO f before it goes back up — and the
+ * answer to it is not about the final component at all: the path it names is
+ * f's parent, which is a directory whatever f is. What that case needs is a
+ * check on the component being left, not on the one arrived at. */
+int cng_path_wants_dir(const char *path) {
+    size_t n = strlen(path);
+    int want = 0;
+    while (n) {
+        if (path[n - 1] == '/') {
+            want = 1;
+            n--;
+            continue;
+        }
+        /* A "." component: preceded by a slash, or the whole of a bare ".". */
+        if (path[n - 1] == '.' && (n == 1 || path[n - 2] == '/')) {
+            want = 1;
+            n--;
+            continue;
+        }
+        break;
+    }
+    return want;
+}
+
+static int abscanon_1(const struct cng_fs *fs, const char *path, char *out,
+                      size_t outsz) {
+    /* Every copy here is checked, because a cut path is a different path — the
+     * same reason cng_fs_translate_mnt refuses one rather than shortening it.
+     * The joins were unchecked, and cng_strlcpy truncates: a cwd within a
+     * component's length of CNG_PATH_MAX had "x" appended to a buffer with no
+     * room for it, and what came back was the cwd itself. Under an identity
+     * root a 4095-byte cwd made open("x") name the DIRECTORY the guest was
+     * standing in — an unlink or an O_CREAT aimed at whatever the cwd is, not
+     * at the file that was asked for. Nothing fits and no answer is right, so
+     * -1, which every caller already turns into the -ENAMETOOLONG a kernel
+     * whose PATH_MAX the name exceeded would have given. */
+    char tmp[CNG_PATH_MAX];
+    if (path[0] == '/') {
+        if (cng_strlcpy(tmp, path, sizeof tmp) >= sizeof tmp)
+            return -1;
+    } else {
+        size_t n = cng_strlcpy(tmp, fs->cwd, sizeof tmp);
+        if (n >= sizeof tmp)
+            return -1;
+        if (n && tmp[n - 1] != '/') {
+            if (n + 1 >= sizeof tmp)
+                return -1; /* no room for the separator, let alone the name */
+            tmp[n++] = '/';
+            tmp[n] = '\0';
+        }
+        if (cng_strlcpy(tmp + n, path, sizeof tmp - n) >= sizeof tmp - n)
+            return -1;
+    }
+    return cng_path_canon(tmp, out, outsz);
+}
+
+int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
+                    size_t outsz) {
+    if (!fs_live(fs))
+        return abscanon_1(fs, path, out, outsz);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = abscanon_1(fs, path, out, outsz);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}
+
+int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
+                     size_t outsz) {
+    return cng_fs_translate_mnt(fs, path, out, outsz, 0);
+}
+
+/* Which mount answers a canonical guest path: the longest-prefix bind, else
+ * the /proc passthrough, else a /dev whitelist node, else the rootfs. The one
+ * statement of that precedence — the translation below fills `out` from the
+ * verdict, and cng_fs_mount_of reports it alone. A bind wins over both
+ * zones: an explicit -b DIR:/proc is the user overriding the host view. */
+static int mount_of_1(const struct cng_fs *fs, const char *canon) {
+    int best = -1;
+    unsigned blen = 0;
+    for (int i = 0; i < fs->nbinds; i++) {
+        const struct cng_bind *b = &fs->binds[i];
+        if (strncmp(canon, b->guest, b->glen) == 0 &&
+            (canon[b->glen] == '/' || canon[b->glen] == '\0')) {
+            if (b->glen > blen) {
+                best = i;
+                blen = b->glen;
+            }
+        }
+    }
+    if (best >= 0)
+        return best;
+    if (proc_zone(canon))
+        return CNG_MOUNT_PROC;
+    const char *rest;
+    if (dev_zone_node(canon, &rest) >= 0)
+        return CNG_MOUNT_DEV;
+    return CNG_MOUNT_ROOTFS;
+}
+
+int cng_fs_mount_of(const struct cng_fs *fs, const char *canon) {
+    if (!fs_live(fs))
+        return mount_of_1(fs, canon);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = mount_of_1(fs, canon);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}
+
+static int translate_mnt_1(const struct cng_fs *fs, const char *path,
+                           char *out, size_t outsz, int *mount_out) {
+    char canon[CNG_PATH_MAX];
+    if (mount_out)
+        *mount_out = CNG_MOUNT_ROOTFS;
+    if (abscanon_1(fs, path, canon, sizeof canon) < 0)
+        return -1;
+
+    int m = mount_of_1(fs, canon);
+    if (mount_out)
+        *mount_out = m;
+
+    /* A prefix that does not fit is a failure, never a shorter path. cng_strlcpy
+     * reports what the source needed, so truncation is visible — and it has to
+     * be acted on: silently cut, "<rootfs>/very/long/name" becomes a different
+     * name that exists, so an unlink deletes the wrong entry and an O_CREAT
+     * makes the wrong file. The caller answers -ENAMETOOLONG, which is what a
+     * kernel whose PATH_MAX the name exceeded would have said. */
+    if (m >= 0) {
+        const char *suffix = canon + fs->binds[m].glen; /* "" or "/rest" */
+        size_t n = cng_strlcpy(out, fs->binds[m].host, outsz);
+        if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
+            return -1;
+    } else if (m == CNG_MOUNT_PROC) {
+        if (cng_strlcpy(out, canon, outsz) >= outsz)
+            return -1;
+    } else if (m == CNG_MOUNT_DEV) {
+        if (dev_zone(canon, out, outsz) < 0)
+            return -1; /* filled by the zone, unless it did not fit */
+    } else {
+        size_t n = cng_strlcpy(out, fs->rootfs, outsz); /* "" or "/root" */
+        if (n >= outsz || cng_strlcpy(out + n, canon, outsz - n) >= outsz - n)
+            return -1;
+    }
+    /* Applied to the result, so a bind onto the host /proc is covered too. */
+    if (host_proc_hidden(out))
+        hide_proc_pid(out, outsz);
+    /* The trailing slash the canonicalization dropped, put back on the host
+     * spelling that is about to be handed over. It is not decoration: it is the
+     * caller's statement that this had better be a directory, and the kernel is
+     * what answers it — so "<rootfs>/f/" is the ENOTDIR that "f/" is natively,
+     * an O_CREAT on one is EISDIR, and a bind mount point or a /dev node named
+     * with one is judged by whatever really sits there. Doing it last keeps
+     * every string test above (the bind match, the hidden-pid rewrite) on a
+     * plain path. */
+    if (cng_path_wants_dir(path)) {
+        size_t n = strlen(out);
+        if (n && out[n - 1] != '/') {
+            if (n + 2 > outsz)
+                return -1; /* no room: the same refusal a long name gets */
+            out[n] = '/';
+            out[n + 1] = '\0';
+        }
+    }
+    return 0;
+}
+
+int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
+                         size_t outsz, int *mount_out) {
+    if (!fs_live(fs))
+        return translate_mnt_1(fs, path, out, outsz, mount_out);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = translate_mnt_1(fs, path, out, outsz, mount_out);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}
+
+/* Does `host` start with the host prefix `pfx` (of length `len`) at a component
+ * boundary? A zero-length prefix is the identity rootfs, which covers the whole
+ * filesystem and so matches everything. */
+static int host_under(const char *host, const char *pfx, size_t len) {
+    return len == 0 || (strncmp(host, pfx, len) == 0 &&
+                        (host[len] == '/' || host[len] == '\0'));
+}
+
+static int untranslate_1(const struct cng_fs *fs, const char *host, char *out,
+                         size_t outsz) {
+    /* Longest host-prefix match, with the rootfs standing in the same contest as
+     * the binds rather than being consulted only after they all miss.
+     *
+     * Forward, the rule is "longest *guest* prefix wins", and the rootfs is the
+     * shortest prefix there is ("/"), so every matching bind outranks it for
+     * free. The mirror of that rule is this one — and it is not the same thing
+     * as "binds first, rootfs otherwise", because a rootfs that lives *inside*
+     * a bound directory is reachable both ways, and then the bind is the
+     * shorter, less specific of the two.
+     *
+     * That is not a contrived arrangement: on Termux the suite's own rootfs
+     * comes from mktemp under $TMPDIR, which is inside $PREFIX — and $PREFIX is
+     * bound in so a dynamically linked guest can find its linker. Answering
+     * with the bind spelling then reported the guest's own /bin/prog, its cwd,
+     * and every AF_UNIX name it bound as the host path they sit at on the
+     * device, and left the /dev zone and the bind mount points unrecognizable
+     * when a dirfd was resolved back through here. */
+    int best = -2; /* -2 nothing matched, -1 the rootfs, >= 0 that bind */
+    size_t blen = 0;
+    size_t rl = fs->rlen; /* 0 for an identity rootfs */
+    if (host_under(host, fs->rootfs, rl)) {
+        best = -1;
+        blen = rl;
+    }
+    for (int i = 0; i < fs->nbinds; i++) {
+        const char *bh = fs->binds[i].host;
+        size_t hl = fs->binds[i].hlen;
+        if (hl > blen && host_under(host, bh, hl)) {
+            best = i;
+            blen = hl;
+        }
+    }
+    if (best == -2)
+        return -1; /* outside the guest view */
+
+    /* Truncation is a failure here too, and a bind can make the guest spelling
+     * the LONGER of the two — `-b /x:/a/very/long/mount/point` grows every path
+     * under it — so this direction is not safe by construction either. Callers
+     * read a non-zero return as "outside the guest view" and leave the host
+     * name alone, which is the right answer for a name that cannot be said. */
+    const char *suffix = host + blen;
+    size_t n = cng_strlcpy(out, best >= 0 ? fs->binds[best].guest : "", outsz);
+    if (n >= outsz || cng_strlcpy(out + n, suffix, outsz - n) >= outsz - n)
+        return -1;
+    if (out[0] == '\0')
+        cng_strlcpy(out, "/", outsz);
+    return 0;
+}
+
+int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
+                       size_t outsz) {
+    if (!fs_live(fs))
+        return untranslate_1(fs, host, out, outsz);
+    for (;;) {
+        unsigned s = cng_fs_read_begin(&fs);
+        int r = untranslate_1(fs, host, out, outsz);
+        if (!cng_fs_read_retry(s))
+            return r;
+    }
+}

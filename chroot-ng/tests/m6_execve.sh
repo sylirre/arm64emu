@@ -1,0 +1,826 @@
+# M6 execve-emulation tests (sourced by tests/run.sh). The seccomp trap of
+# execve is inert under qemu, but the two halves of the emulation are covered:
+# loading+stack-building is the same code M3/M4 validate, and the ucontext
+# redirect that resumes into the new program is validated here.
+echo "== M6: execve emulation (ucontext redirect) =="
+
+run -t jmptest >/dev/null 2>&1
+check "ucontext redirect resumes at new pc (exit 7)" 7 $?
+check_contains "landed in redirected context" \
+    "landed in redirected context" \
+    "$(run -t jmptest 2>&1)"
+
+# shebang script exec: #!interp [arg] -> [interp, arg, script, orig-args...]
+# $GUEST_BINDS is empty for a self-contained (static) guest; where the toolchain
+# only links dynamically it exposes the ELF interpreter's own directories, which
+# a rootfs holding nothing but the test binary cannot otherwise provide.
+ER=$(mktemp -d)
+if guest_cc_report "$ER/hello" tests/guests/hello.c; then
+    printf '#!/hello sheb\n' > "$ER/script"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    exectest() { run -t exectest $GUEST_BINDS -r "$ER" "$@"; }
+    out=$(exectest /script AA 2>&1); rc=$?
+    check "shebang exec exit 42" 42 $rc
+    check_contains "shebang interp is argv0"  "argv0=/hello" "$out"
+    check_contains "shebang arg passed"       "argv1=sheb"   "$out"
+    check_contains "script path passed"       "argv2=/script" "$out"
+    check_contains "original arg passed"      "argv3=AA"     "$out"
+    out=$(exectest /hello X 2>&1)
+    check_contains "plain ELF exec via emulate_execve" "argv0=/hello" "$out"
+    # /proc/self/exe fixup updates to the exec'd program (needed for e.g. Go's
+    # GOROOT derivation), with symlinks resolved to match the kernel.
+    check_contains "exec updates /proc/self/exe target" "exe=/hello" "$out"
+    ln -s /hello "$ER/go"
+    out=$(exectest /go X 2>&1)
+    check_contains "exec resolves symlink for /proc/self/exe" "exe=/hello" "$out"
+
+    # apk runs package scripts as execve("/proc/self/fd/N"). That magic link
+    # names an open file of *this* process: its target is a host path (or no
+    # path at all — memfd/O_TMPFILE/deleted), so it must not be re-rooted into
+    # the rootfs the way a guest symlink target is.
+    exec 9< "$ER/script"
+    out=$(exectest /proc/self/fd/9 AA 2>&1); rc=$?
+    check "shebang script exec'd via /proc/self/fd" 42 $rc
+    check_contains "interp gets the fd path as the script" \
+        "argv2=/proc/self/fd/9" "$out"
+    exec 9<&-
+    exec 9< "$ER/hello"
+    out=$(exectest /proc/self/fd/9 X 2>&1); rc=$?
+    check "plain ELF exec'd via /proc/self/fd" 42 $rc
+    check_contains "exec via fd path names the real file for /proc/self/exe" \
+        "exe=/hello" "$out"
+    exec 9<&-
+
+    # ...and the number in that name is a descriptor, which is an int. The
+    # parse accumulated digits with no bound, so a long enough one overflowed
+    # and wrapped: "/proc/self/fd/4294967305" is 2^32 + 9, which came out as 9
+    # and exec'd whatever this process had open there. No such descriptor
+    # exists, and the kernel has no such name either — the answer is ENOENT.
+    exec 9< "$ER/hello"
+    check_contains "an out-of-range fd number names no descriptor" \
+        "emulate_execve failed x0=-2" \
+        "$(exectest /proc/self/fd/4294967305 X 2>&1)"
+    exec 9<&-
+
+    # execve(2) checks *execute* permission; only a reopen needs read. apk's
+    # package scripts are exec'd through an fd whose inode grants exactly that,
+    # so the image has to come from the fd we already hold.
+    if [ "$(id -u)" -ne 0 ]; then
+        cp "$ER/hello" "$ER/xonly"
+        exec 9< "$ER/xonly"
+        chmod 111 "$ER/xonly"
+        out=$(exectest /proc/self/fd/9 X 2>&1); rc=$?
+        check "exec via fd of a file the guest may not read" 42 $rc
+        check_contains "loaded from the fd, not a reopen" \
+            "argv0=/proc/self/fd/9" "$out"
+        exec 9<&-
+    fi
+
+    # a failed exec must report why, like the kernel does: an unreadable target
+    # is EACCES, not a blanket ENOENT.
+    if [ "$(id -u)" -ne 0 ]; then
+        cp "$ER/hello" "$ER/noperm"; chmod 000 "$ER/noperm"
+        check_contains "unreadable exec target reports EACCES" \
+            "emulate_execve failed x0=-13" \
+            "$(exectest /noperm 2>&1)"
+    fi
+
+    # --- M17-10: shebang nesting -------------------------------------------
+    # A script whose interpreter is itself a script is followed a bounded number
+    # of times (BINPRM_MAX_RECURSION) and then answered ELOOP. Each level
+    # prepends its own interpreter and pushes the previous one down, so the whole
+    # chain shows up in the final argv — which is the only way to see that the
+    # levels ran in order rather than being collapsed.
+    #
+    # d1 is one script level, d2 two, and so on. The depth is measured rather
+    # than read: at four the emulation refused a chain the kernel executes, which
+    # no amount of reading fs/exec.c had settled.
+    #
+    # The host kernel's own answer is measured too, but as a sanity range rather
+    # than as the number to match — it is not a constant across kernels. The same
+    # ladder runs six deep on an Android 13 device (5.15 GKI) and five deep on a
+    # 6.17 dev host, both then ELOOP. The emulation carries one number and
+    # advertises 6.1.0, so it matches the device; what every host must show is
+    # that number followed by ELOOP.
+    _d=1
+    printf '#!/hello\n' >"$ER/d1"
+    while [ $_d -lt 8 ]; do
+        printf '#!/d%d\n' $_d >"$ER/d$((_d + 1))"
+        _d=$((_d + 1))
+    done
+    chmod 755 "$ER"/d? 2>/dev/null || :
+
+    NREF=$(mktemp -d)
+    printf '#!%s\nexit 0\n' "$HOST_SH" >"$NREF/d1"
+    _d=1
+    while [ $_d -lt 8 ]; do
+        printf '#!%s/d%d\n' "$NREF" $_d >"$NREF/d$((_d + 1))"
+        _d=$((_d + 1))
+    done
+    chmod 755 "$NREF"/d?
+    KDEPTH=0
+    _d=1
+    while [ $_d -le 8 ]; do
+        "$NREF/d$_d" 2>/dev/null || break
+        KDEPTH=$_d
+        _d=$((_d + 1))
+    done
+    rm -rf "$NREF"
+    check_contains "the host kernel bounds #! nesting somewhere sane" "$KDEPTH" \
+        "$(echo 4 5 6)"
+
+    GDEPTH=0
+    _d=1
+    while [ $_d -le 8 ]; do
+        exectest "/d$_d" AA >/dev/null 2>&1
+        [ $? = 42 ] || break   # 42 is what the exec'd guest exits with
+        GDEPTH=$_d
+        _d=$((_d + 1))
+    done
+    check "a #! chain nests as deep as the emulation bounds it" 6 "$GDEPTH"
+    check_contains "one level past that is ELOOP" "emulate_execve failed x0=-40" \
+        "$(exectest "/d$((GDEPTH + 1))" AA 2>&1)"
+
+    # The whole chain, in order, in the final argv: four levels is enough to
+    # show the pushing-down without depending on where the limit sits.
+    out=$(exectest /d4 AA 2>&1); rc=$?
+    check "a four-deep shebang chain runs" 42 $rc
+    check_contains "the innermost interpreter is argv0" "argv0=/hello" "$out"
+    check_contains "each level pushed its script down (1)" "argv1=/d1" "$out"
+    check_contains "each level pushed its script down (2)" "argv2=/d2" "$out"
+    check_contains "each level pushed its script down (3)" "argv3=/d3" "$out"
+    check_contains "the original script is last" "argv4=/d4" "$out"
+    check_contains "the guest's own argument survives all of it" "argv5=AA" \
+        "$out"
+
+    # --- M17-10: execveat's flags word -------------------------------------
+    # It was never read: a real dirfd resolved against the cwd instead, and
+    # AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW did nothing at all.
+    mkdir -p "$ER/sub"
+    cp "$ER/hello" "$ER/sub/hello"
+    out=$(exectest -D /sub hello X 2>&1); rc=$?
+    check "a relative execveat resolves against its dirfd" 42 $rc
+    check_contains "and runs the program there" "argv0=hello" "$out"
+    # ..-climbing out of a dirfd is clamped at the guest root, not followed onto
+    # the host: /sub/../../hello is /hello inside the rootfs.
+    check_contains "a dirfd-relative '..' is clamped at the guest root" \
+        "exe=/hello" "$(exectest -D /sub ../../hello X 2>&1)"
+    out=$(exectest -e /hello X 2>&1); rc=$?
+    check "AT_EMPTY_PATH executes the fd itself" 42 $rc
+    # ...and /proc/self/exe names the file, not the descriptor it came through.
+    # Those fds are opened O_CLOEXEC (apk's package scripts, every memfd exec),
+    # so the magic link has to be read before the commit point closes them; read
+    # after, it answered ENOENT and the exe link came out as "/". `go` computes
+    # GOROOT from this.
+    check_contains "an fd-exec still reports the file as /proc/self/exe" \
+        "exectest: exe=/hello" "$out"
+    check_contains "AT_SYMLINK_NOFOLLOW refuses a symlinked target" \
+        "emulate_execve failed x0=-40" "$(exectest -N /go X 2>&1)"
+    out=$(exectest -N /hello X 2>&1); rc=$?
+    check "AT_SYMLINK_NOFOLLOW on a real file still runs it" 42 $rc
+    # ...and on an emulated hardlink, which to the guest is a regular file and
+    # not the l2s symlink it is implemented with: the flag used to ELOOP it.
+    # /proc/self/exe then names the hardlink itself, as the kernel names the
+    # dentry it resolved — it used to read the backing file's path in the
+    # store, "/.l2s/.l2s.<ino>", a name the guest cannot even open. On a copy
+    # of the program: -L turns both names into l2s links, and the fixture's own
+    # /hello has legs after this one that want it plain.
+    cp "$ER/hello" "$ER/hello_l"
+    ln -s /hello_l "$ER/go_l"
+    out=$(exectest -l -L /hello_l:/hlink -N /hlink X 2>&1); rc=$?
+    check "AT_SYMLINK_NOFOLLOW runs an l2s name rather than ELOOP it" 42 $rc
+    check_contains "...and /proc/self/exe names the hardlink, not the store" \
+        "exe=/hlink" "$out"
+    # A real symlink leading to an l2s name: the chain ends at the hardlink.
+    check_contains "a symlink to an l2s name reports that name as exe" \
+        "exe=/hello_l" "$(exectest -l /go_l X 2>&1)"
+    check_contains "...while a real symlink is still refused under -l" \
+        "emulate_execve failed x0=-40" "$(exectest -l -N /go X 2>&1)"
+    check_contains "an undefined execveat flag is EINVAL" \
+        "emulate_execve failed x0=-22" "$(exectest -B /hello 2>&1)"
+
+    # --- M17-10: state a real execve drops with the address space ------------
+    # Ours keeps the address space, so the heap, any POSIX timer and the rseq
+    # registration outlive the program that owned them — a timer would go on
+    # firing into a program that never armed it, and the kernel would go on
+    # writing cpu ids into a TCB the next program no longer has (a forced
+    # SIGSEGV once the heap is wound back from under it, which is how a
+    # ptrace tracee died at its exec stop on a real kernel). -R arms all three
+    # before the emulation and reports afterwards. rseq is ENOSYS under
+    # qemu-user, so that part is only measured on a native host.
+    # The timers are a hundred armed through the dispatcher — the record used
+    # to hold 64, and the 65th outlived the exec — plus one armed raw, which the
+    # emulation never saw handed out: only the kernel's own list
+    # (/proc/self/timers) finds that one. Under qemu-user the ids in that list
+    # are the emulator's, not the guest's, and the emulator allows 32 timers in
+    # all, so the hundred and the unseen one are asserted natively.
+    out=$(exectest -R /hello 2>&1); rc=$?
+    check "exec resets the state that would have died with the image" 0 $rc
+    check_contains "the heap is wound back and every recorded timer deleted" \
+        "execreset: brk_back=1 timers_created=" "$out"
+    check_contains "...every one of them" "timers_gone=1" "$out"
+    if [ "$CNG_NATIVE" = 1 ]; then
+        check_contains "...a hundred of them, past the old record's 64" \
+            "timers_created=100" "$out"
+        # The raw timer is found by the kernel's own list and nothing else, so
+        # a kernel that publishes none (Android's GKI has no checkpoint/restore
+        # support, hence no /proc/self/timers) has nothing for the emulation to
+        # find it by: only the timers it was told of can be dropped there.
+        if [ -e /proc/self/timers ]; then
+            check_contains "...a timer the emulation never saw handed out too" \
+                "unseen_timer_gone=1" "$out"
+        else
+            skip "an unseen timer's exec reset: this kernel has no /proc/self/timers to list it by"
+        fi
+        # rseq is registered wherever the host allows it. Where the ambient filter
+        # refuses it (Android 15's does) there is no area to unregister: the driver
+        # says it was refused as unavailable, and nothing else excuses the leg.
+        case "$out" in
+        *"rseq_enosys=1 rseq_registered=0 rseq_gone=0 -> OK"*)
+            skip "rseq area reset: the host refuses rseq (ambient filter), so none was registered"
+            ;;
+        *)
+            check_contains "...and the rseq area unregistered" \
+                "rseq_registered=1 rseq_gone=1 -> OK" "$out"
+            ;;
+        esac
+    else
+        check_contains "...and there was no rseq area to unregister here" \
+            "rseq_registered=0 rseq_gone=0 -> OK" "$out"
+    fi
+fi
+rm -rf "$ER"
+
+# --- M17-10: a failed exec must leave the calling program running -----------
+# A binary whose PT_INTERP names a file that is not there is how an exec fails
+# in a partially populated rootfs — a tree without the loader its binaries were
+# linked against, a musl program under glibc — and the kernel's answer is ENOENT
+# to a program that is still running: it opens and validates the ELF interpreter
+# before it touches the old address space.
+#
+# Ours mapped the program first and looked for the interpreter afterwards. An
+# ET_EXEC image goes down MAP_FIXED at its link-time vaddr — which for two
+# binaries out of one toolchain is the caller's own text — so the errno came back
+# to a program whose code had just been replaced. Measured: rc 139 and no output
+# at all, against the kernel's exec=ENOENT / alive=1 / rc 44.
+#
+# Both halves of the pair have to be non-PIE for anything to be overwritten, and
+# whether a toolchain links that way is not something to assume: the ELF shapes
+# are checked, and a toolchain that cannot produce them skips rather than passing
+# vacuously. qemu-user is no oracle for this one — it emulates execve by
+# re-executing itself, so a missing interpreter is its own loader's complaint and
+# not the kernel's errno — hence a host-native build for the reference side.
+IFD=$(mktemp -d)
+IF_NOINTERP=/cng-no-such-interp.so
+
+# The oracle: on a host that runs AArch64 directly the guest pair is its own
+# reference; otherwise the same two sources built host-native and linked alike.
+if_oracle_build() {
+    if [ -z "$QEMU" ]; then
+        IF_ORACLE=$IFD/interpfail
+        IF_TARGET=$IFD/badinterp
+        return 0
+    fi
+    for _c in ${HOSTCC:-} cc gcc clang; do
+        have "$_c" || continue
+        "$_c" -O2 -no-pie -o "$IFD/if_host" tests/guests/interpfail.c \
+            2>/dev/null || continue
+        "$_c" -O2 -no-pie "-Wl,--dynamic-linker=$IF_NOINTERP" \
+            -o "$IFD/bad_host" tests/guests/hello.c 2>/dev/null || continue
+        IF_ORACLE=$IFD/if_host
+        IF_TARGET=$IFD/bad_host
+        return 0
+    done
+    return 1
+}
+if_host_run() { if [ -n "$TIMEOUT" ]; then "$TIMEOUT" 60 env -u LD_PRELOAD "$@"; else kref "$@"; fi; }
+
+if [ -z "$GUESTCC" ]; then
+    skip "failed-exec survival: no AArch64 guest toolchain"
+elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+    skip "failed-exec survival: no filter is live and -R cannot rewrite without execmem"
+elif ! guest_cc "$IFD/interpfail" tests/guests/interpfail.c -static -no-pie ||
+    ! guest_cc "$IFD/badinterp" tests/guests/hello.c -no-pie \
+        "-Wl,--dynamic-linker=$IF_NOINTERP"; then
+    skip "failed-exec survival: no non-PIE pair builds here ($(head -1 "$GUEST_CC_LOG" 2>/dev/null))"
+elif [ "$(elf_type "$IFD/interpfail")" != EXEC ] ||
+    [ "$(elf_type "$IFD/badinterp")" != EXEC ] ||
+    ! elf_has_interp "$IFD/badinterp"; then
+    skip "failed-exec survival: this toolchain links no ET_EXEC pair carrying a PT_INTERP, so nothing would be overwritten"
+elif ! if_oracle_build; then
+    skip "failed-exec survival: no host compiler for the differential oracle"
+else
+    if_out_k=$(if_host_run "$IF_ORACLE" "$IF_TARGET" 2>/dev/null); if_rc_k=$?
+    if_out_g=$(run_t 90 -R "$IFD" /interpfail /badinterp 2>/dev/null); if_rc_g=$?
+    if [ "$if_out_k" = "$if_out_g" ] && [ "$if_rc_k" = "$if_rc_g" ]; then
+        pass=$((pass + 1))
+        printf '  ok   a missing ELF interpreter is an errno and a live caller, as the kernel has it\n'
+    else
+        fail=$((fail + 1))
+        printf '  FAIL a missing ELF interpreter does not match the kernel\n'
+        printf '       kernel: %s (rc %s)\n' "$(echo "$if_out_k" | tr '\n' '|')" \
+            "$if_rc_k"
+        printf '       cng   : %s (rc %s)\n' "$(echo "$if_out_g" | tr '\n' '|')" \
+            "$if_rc_g"
+    fi
+
+    # The other shape of the same failure: an interpreter that is there but is
+    # not a loadable ELF, which fails in the header pass rather than in the
+    # resolver. The caller has to be alive to be told, which is what this
+    # asserts; which errno it is told is the table below.
+    printf 'not an ELF\n' >"$IFD$IF_NOINTERP"
+    chmod 755 "$IFD$IF_NOINTERP"
+    check_contains "an unloadable interpreter also leaves the caller running" \
+        "alive=1" "$(run_t 90 -R "$IFD" /interpfail /badinterp 2>&1)"
+fi
+rm -rf "$IFD"
+
+# ...and WHICH errno. There are five, not the two we used to answer, and the two
+# roles do not answer alike: a header too short to be one is EIO for an
+# interpreter and ENOEXEC for a program, a header that does not check out is
+# ELIBBAD or ENOEXEC, and an image that is a directory or carries no execute bit
+# is EACCES for both — before its contents are looked at at all. It was
+# invisible while an interpreter failure killed the caller; now the caller
+# survives to read it.
+#
+# Differential, not a table of numbers: the same nine victims built for the host
+# and run with no chroot-ng in the way. qemu-user is no oracle for an exec (it
+# re-execs itself, so a broken interpreter is its own loader's complaint), so
+# the reference side is always the host-native build — including its PT_INTERP
+# strings, which have to be absolute host paths where the guest's are rootfs
+# ones pointing at the same files.
+EED=$(mktemp -d)
+mkdir -p "$EED/brk" "$EED/host" "$EED/p_dir" "$EED/host/p_dir" "$EED/brk/dir"
+: >"$EED/brk/short.tmp"
+head -c 20 /bin/sh >"$EED/brk/short" 2>/dev/null
+head -c 4096 /dev/zero | tr '\0' 'x' >"$EED/brk/junk"
+cp "$EED/brk/junk" "$EED/p_junk"
+cp "$EED/brk/junk" "$EED/host/p_junk"
+chmod 755 "$EED/brk/short" "$EED/brk/junk" "$EED/p_junk" "$EED/host/p_junk"
+rm -f "$EED/brk/short.tmp"
+
+# One victim per way of being broken; the interpreter ones differ only in the
+# PT_INTERP they carry. EE_CASES is the argument list both sides are given.
+EE_INTERP="missing dir noexec short junk"
+EE_PROG="p_noexec p_junk p_dir p_missing"
+
+ee_build() { # ee_build CC OUTDIR INTERP_PREFIX
+    _cc=$1; _dir=$2; _pfx=$3
+    $_cc -O2 -static -o "$_dir/execerrno" tests/guests/execerrno.c 2>/dev/null ||
+        return 1
+    for _n in $EE_INTERP; do
+        $_cc -O2 "-Wl,--dynamic-linker=$_pfx/brk/$_n" -o "$_dir/v_$_n" \
+            tests/guests/hello.c 2>/dev/null || return 1
+    done
+    $_cc -O2 -static -o "$_dir/p_noexec" tests/guests/hello.c 2>/dev/null ||
+        return 1
+    chmod 644 "$_dir/p_noexec"
+    return 0
+}
+
+ee_args() { # the paths to hand the runner, rooted at $1
+    for _n in $EE_INTERP; do printf '%s/v_%s ' "$1" "$_n"; done
+    for _n in $EE_PROG; do printf '%s/%s ' "$1" "$_n"; done
+}
+
+ee_hostcc=""
+for _c in ${HOSTCC:-} cc gcc clang; do have "$_c" && { ee_hostcc=$_c; break; }; done
+
+if [ -z "$GUESTCC" ]; then
+    skip "failed-exec errno: no AArch64 guest toolchain"
+elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+    skip "failed-exec errno: no filter is live and -R cannot rewrite without execmem"
+elif [ -z "$ee_hostcc" ]; then
+    skip "failed-exec errno: no host compiler for the differential oracle"
+# shellcheck disable=SC2086  # $GUESTLD is a flag or deliberately empty
+elif ! ee_build "$GUESTCC" "$EED" "" ; then
+    skip "failed-exec errno: the guest toolchain links no dynamic victim here"
+elif ! ee_build "$ee_hostcc" "$EED/host" "$EED"; then
+    skip "failed-exec errno: the host toolchain links no dynamic victim here"
+else
+    # The interpreter each victim names, made broken in its own way. `missing`
+    # is the one file that must NOT exist.
+    cp "$EED/host/execerrno" "$EED/brk/noexec" 2>/dev/null
+    chmod 644 "$EED/brk/noexec"
+    # shellcheck disable=SC2046  # ee_args is a deliberately split argument list
+    ee_k=$(if_host_run "$EED/host/execerrno" $(ee_args "$EED/host") 2>/dev/null)
+    # shellcheck disable=SC2046
+    ee_g=$(run_t 90 -R "$EED" /execerrno $(ee_args "") 2>/dev/null)
+    if [ -n "$ee_k" ] && [ "$ee_k" = "$ee_g" ]; then
+        pass=$((pass + 1))
+        printf '  ok   a failed exec answers the errno the kernel does, all five\n'
+    else
+        fail=$((fail + 1))
+        printf '  FAIL a failed exec answers an errno the kernel does not\n'
+        printf '       kernel: %s\n' "$(echo "$ee_k" | tr '\n' '|')"
+        printf '       cng   : %s\n' "$(echo "$ee_g" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$EED"
+
+
+# --- how long a single argv string may be -----------------------------------
+# fs/exec.c bounds each argv/envp string at MAX_ARG_STRLEN, which is 32 *pages*:
+# 128 KiB where a page is 4 KiB and 512 KiB on the 16 KiB kernels the Android
+# devices run. The emulation walks argv itself — the kernel never sees it — so
+# the bound is ours to get right, and a constant 32 * 4096 refused strings a
+# real execve on such a device takes, with an -E2BIG of our own invention.
+#
+# Referenced against the same binary with no chroot-ng under it, so the number
+# is the running kernel's rather than one written down here: on an AArch64 host
+# or device that is the kernel directly, and under qemu-user it agrees with the
+# host kernel (measured, both boundaries).
+AMD=$(mktemp -d)
+if ! guest_xlate_ready "argv string bound"; then
+    :
+elif ! guest_cc_report "$AMD/argmax" tests/guests/argmax.c; then
+    :
+elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+    skip "argv string bound: no filter is live and -R cannot rewrite without execmem"
+else
+    am_k=$(emu_t 90 "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
+    am_g=$(run_t 90 -R / "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
+    if [ -n "$am_k" ] && [ "$am_k" = "$am_g" ]; then
+        pass=$((pass + 1))
+        printf '  ok   a single argv string is bounded where the kernel bounds it (%s)\n' \
+            "$(echo "$am_k" | tr '\n' '|')"
+    else
+        fail=$((fail + 1))
+        printf '  FAIL the argv string bound is not the one the kernel keeps\n'
+        printf '       kernel: %s\n' "$(echo "$am_k" | tr '\n' '|')"
+        printf '       cng   : %s\n' "$(echo "$am_g" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$AMD"
+
+# --- what an exec chain costs the address space -----------------------------
+# A real execve throws the whole mm away. The emulated one cannot — the monitor
+# lives in that address space — so it gives back what its own loader mapped for
+# the program being replaced (the image, the interpreter's image, the stack
+# built for it), and then sweeps whatever else in the address space was never
+# the monitor's. Left behind, those accumulated: 66.8 MB of address space per
+# generation, measured, 64 MiB of it the stack.
+#
+# Compared against the same chain with no emulation under it rather than against
+# a constant, since VmSize is whatever the host underneath happens to need. The
+# slack covers what a generation genuinely does keep — the emulator's own
+# per-image bookkeeping — while leaving no room for a whole leaked generation.
+#
+# This one is the guest the harness builds, whatever link mode that is; the leg
+# below it builds a dynamic one deliberately, because a program's own library
+# mappings are the half no recorded extent describes.
+ECD=$(mktemp -d)
+if ! guest_xlate_ready "exec-chain address space"; then
+    :
+elif ! guest_cc_report "$ECD/execchain" tests/guests/execchain.c; then
+    :
+elif elf_has_interp "$ECD/execchain"; then
+    skip "exec-chain address space: the dynamic form of this leg is below, with the binds an ld.so needs"
+else
+    # CNG_EXEC_RECLAIM_FORCE: qemu-user runs a thread of its own (call_rcu)
+    # beside the guest's, so the process never reads as single-threaded from
+    # inside it and the reclaim would sit out. On a host that runs AArch64
+    # directly the flag changes nothing — there really is one thread.
+    ec_k=$(emu_t 90 "$ECD/execchain" 8 2>/dev/null)
+    ec_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECD" /execchain 8 2>/dev/null)
+    case "$ec_k$ec_g" in
+    *growth_kb=*growth_kb=*)
+        ec_kn=${ec_k##*growth_kb=}
+        ec_gn=${ec_g##*growth_kb=}
+        if [ "$ec_gn" -le $((ec_kn + 8192)) ]; then
+            pass=$((pass + 1))
+            printf '  ok   an exec chain gives the address space back (%s kB over 8, kernel %s kB)\n' \
+                "$ec_gn" "$ec_kn"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL an exec chain leaks address space: %s kB over 8 execs, kernel %s kB\n' \
+                "$ec_gn" "$ec_kn"
+        fi
+        ;;
+    *)
+        skip "exec-chain address space: no reference run ($(echo "$ec_k$ec_g" | tr '\n' '|'))"
+        ;;
+    esac
+fi
+rm -rf "$ECD"
+
+# --- execve from a multithreaded process --------------------------------------
+# A real execve kills every other thread (de_thread) and, when the caller is
+# not the group leader, gives it the leader's identity, so what comes out of
+# the exec is one thread whose tid is its pid. The emulation used to do
+# neither: the old threads went on running the old program beside the new one
+# (a Go program's runtime threads hit EBADF on their CLOEXEC-closed netpoll fd
+# and aborted the NEW program), and a non-leader exec'er kept its own tid.
+# Now every sibling is told to die through the one signal a guest can never
+# block, and a non-leader hands its exec to the leader to carry. The helpers
+# are parked in every shape there is, including the waits that install a full
+# signal mask (ppoll, pselect, epoll_pwait, sigsuspend, sigwait): those are
+# trapped so SIGSYS can be taken out of the mask, or the exec would wait for
+# them forever — so completing in time is part of the answer. Differential
+# against the kernel; under qemu-user the thread count includes the
+# emulator's own thread on both sides.
+TED=$(mktemp -d)
+if ! guest_xlate_ready "multithreaded execve"; then
+    :
+elif ! guest_cc "$TED/threadexec" tests/guests/threadexec.c -pthread; then
+    skip "multithreaded execve: could not build tests/guests/threadexec.c with -pthread"
+else
+    mkdir -p "$TED/bin"; cp "$TED/threadexec" "$TED/bin/threadexec"
+    for mode in leader nonleader; do
+        te_k=$(cd "$TED/bin" && emu_t 60 ./threadexec $mode 2>/dev/null)
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        te_g=$(run_t 90 -R $GUEST_BINDS "$TED" /bin/threadexec $mode 2>/dev/null)
+        if [ -n "$te_k" ] && [ "$te_k" = "$te_g" ]; then
+            pass=$((pass + 1))
+            printf '  ok   execve by the %s thread matches the kernel (%s)\n' "$mode" "$te_g"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL execve by the %s thread diverges from the kernel\n' "$mode"
+            printf '       kernel: %s\n       guest : %s\n' "$te_k" "$te_g"
+        fi
+    done
+    # ...and the waits themselves still behave as the kernel's: the mask the
+    # call installs is in force for the wait, the caller's own mask is back
+    # afterwards, the result and errno are the kernel's, a full mask still
+    # works, and a set the kernel would refuse is refused as it would.
+    if guest_cc "$TED/maskwait" tests/guests/maskwait.c -pthread; then
+        cp "$TED/maskwait" "$TED/bin/maskwait"
+        mw_k=$(emu_t 60 "$TED/maskwait" 2>/dev/null)
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        mw_g=$(run_t 90 -R $GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
+        if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_g" ]; then
+            pass=$((pass + 1))
+            echo "  ok   the mask-taking waits answer as the kernel's, SIGSYS taken out"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL the mask-taking waits diverge from the kernel"
+            printf '       kernel: %s\n       guest : %s\n' \
+                "$(echo "$mw_k" | tr '\n' '|')" "$(echo "$mw_g" | tr '\n' '|')"
+        fi
+        # ...and on the SIGSYS tier, where the wait cannot be run by the
+        # handler and is bounced through a second svc in the gate. Whether the
+        # filter lets that svc through depends on where the gate ends relative
+        # to the instruction after it, which the kernel reports as the call's
+        # ip: with the gate one instruction short, every masked wait (musl's
+        # select() is one — it passes a {NULL, size} pair) trapped again from
+        # the stub, each round a record lower on the guest's stack, until it
+        # was gone (a SEGV on Android, a hang under a VM's TCG). The run needs
+        # a live filter and no -R, or it never reaches the handler.
+        if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            skip "masked waits on the SIGSYS tier: the seccomp filter is inert on this host"
+        else
+            # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+            mw_s=$(run_t 90 $GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
+            if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_s" ]; then
+                pass=$((pass + 1))
+                echo "  ok   the mask-taking waits answer as the kernel's on the SIGSYS tier too"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL the mask-taking waits diverge from the kernel on the SIGSYS tier"
+                printf '       kernel: %s\n       guest : %s\n' \
+                    "$(echo "$mw_k" | tr '\n' '|')" "$(echo "$mw_s" | tr '\n' '|')"
+            fi
+        fi
+    else
+        skip "masked waits: could not build tests/guests/maskwait.c with -pthread"
+    fi
+    # The bounce is not for masked waits alone: every trapped call that can
+    # block is made from guest context, or a signal cannot reach it. Made in
+    # the SIGSYS handler, with every signal masked, an accept, a receive, or a
+    # FIFO's open ignored the guest's own handler until it returned, never
+    # failed with EINTR, and outlived SIGTERM. Against the kernel: the handler
+    # runs while the call blocks, SA_RESTART makes the call again and it goes on
+    # waiting, its absence is EINTR, and SIGTERM kills. The AF_UNIX receive with
+    # an address to map back is the one that runs the whole dispatch there. On
+    # the SIGSYS tier the handler must also run on the thread's own stack, as
+    # the kernel delivers it, which takes the dispatch's blocking svc being made
+    # there (`sp`); under -R it still runs on the scratch stack.
+    if guest_cc "$TED/blkcall" tests/guests/blkcall.c -pthread; then
+        cp "$TED/blkcall" "$TED/bin/blkcall"
+        mkdir -p "$TED/tmp"
+        for bc_tier in -R ""; do
+            if [ -z "$bc_tier" ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+                skip "blocking calls on the SIGSYS tier: the seccomp filter is inert on this host"
+                continue
+            fi
+            bc_sp=sp
+            [ -n "$bc_tier" ] && bc_sp=-
+            bc_k=$(emu_t 90 "$TED/blkcall" "$TED/tmp" "$bc_sp" 2>/dev/null)
+            # shellcheck disable=SC2086  # deliberately split arg lists
+            bc_g=$(run_t 120 $bc_tier $GUEST_BINDS "$TED" /bin/blkcall /tmp \
+                "$bc_sp" 2>/dev/null)
+            bc_t=${bc_tier:-the SIGSYS tier}
+            if [ -n "$bc_k" ] && [ "$bc_k" = "$bc_g" ]; then
+                pass=$((pass + 1))
+                echo "  ok   a signal against a blocking call acts as the kernel's ($bc_t)"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL a signal against a blocking call diverges from the kernel ($bc_t)"
+                printf '       kernel: %s\n       guest : %s\n' \
+                    "$(echo "$bc_k" | tr '\n' '|')" "$(echo "$bc_g" | tr '\n' '|')"
+            fi
+        done
+    else
+        skip "blocking calls: could not build tests/guests/blkcall.c with -pthread"
+    fi
+fi
+rm -rf "$TED"
+
+# ...and from a process with more siblings than the de_thread's table held,
+# and from one whose siblings keep making threads. The siblings used to be
+# listed once into a table of 4096 and those told: the 4097th and everything
+# after it went on running the old program beside the new one, without a
+# word — and so did a thread a sibling cloned between being listed and taking
+# its request, which nothing ever told. The list is now the kernel's own,
+# read afresh until its count of threads says nothing but the exec'er (and
+# what cannot take a signal at all: under qemu-user, the emulator's own
+# thread) remains. Differential against the kernel; the chain shape keeps 16
+# chains cloning, where one missed newcomer keeps its chain going for good.
+SED=$(mktemp -d)
+if ! guest_xlate_ready "de_thread beyond a table"; then
+    :
+elif ! guest_cc "$SED/spawnexec" tests/guests/spawnexec.c -pthread; then
+    skip "de_thread beyond a table: could not build tests/guests/spawnexec.c with -pthread"
+else
+    mkdir -p "$SED/bin"; cp "$SED/spawnexec" "$SED/bin/spawnexec"
+    for shape in "many 4500" "chain 16"; do
+        # shellcheck disable=SC2086  # the shape is two words
+        se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec $shape 2>/dev/null | grep '^report:')
+        # shellcheck disable=SC2086
+        se_g=$(run_t 240 -R $GUEST_BINDS "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
+        if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
+            pass=$((pass + 1))
+            printf '  ok   execve reaches every sibling (%s) as the kernel does (%s)\n' "$shape" "$se_g"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL execve leaves siblings behind (%s)\n' "$shape"
+            printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
+        fi
+    done
+    # ...and with each request held at its delivery for a few milliseconds,
+    # as the scheduler holds a thread on a loaded device. A request that has
+    # been delivered is no longer pending, so another one is delivered on top
+    # of it: told every round, a held thread collected a signal frame a round
+    # until there was no room for the next, and the kernel killed the whole
+    # process with a SIGSEGV (a few chain runs in a hundred on Android 8,
+    # where bionic's alternate stack is 16 KiB). The tracer that holds them is
+    # a native program (dtstall.c), so a host that runs the guest's binaries
+    # through qemu-user, whose host tracer would see the emulator's signals,
+    # has no such run.
+    if [ -n "$QEMU" ]; then
+        skip "de_thread with each request held at delivery: a host tracer under qemu-user sees the emulator's signals, not the guest's"
+    elif ! guest_cc "$SED/dtstall" tests/guests/dtstall.c; then
+        skip "de_thread with each request held at delivery: could not build tests/guests/dtstall.c"
+    else
+        se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec chain 16 2>/dev/null | grep '^report:')
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        se_g=$(emu_t 240 "$SED/dtstall" 2 "$BIN" -R $GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
+        se_rc=$?
+        case "$se_g" in
+        SKIP:*)
+            skip "de_thread with each request held at delivery: ${se_g#SKIP: }"
+            ;;
+        *)
+            se_g=$(printf '%s\n' "$se_g" | grep '^report:')
+            if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
+                pass=$((pass + 1))
+                printf '  ok   execve reaches every sibling with each request held at delivery (%s)\n' "$se_g"
+            else
+                fail=$((fail + 1))
+                printf '  FAIL execve with each request held at delivery (rc %s)\n' "$se_rc"
+                printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
+            fi
+            ;;
+        esac
+    fi
+fi
+rm -rf "$SED"
+
+# ...and the same chain by a program with far more mappings than one sweep
+# pass holds. The sweep collects a table's worth of victims per walk of
+# /proc/self/maps and walks again while a pass fills it; the passes were capped
+# at eight of forty-eight, so the 385th reclaimable mapping and everything after
+# it survived every exec — a JIT, a program that dlopens by the hundred, an
+# allocator that reserves by the arena. This guest maps 1500 pages that cannot
+# merge (3001 VMAs with the gaps between them) and execs itself six times;
+# under the cap that leaked 68 MB, against a kernel run that gains nothing.
+ECM=$(mktemp -d)
+if ! guest_xlate_ready "many-mapping exec chain"; then
+    :
+elif ! guest_cc_report "$ECM/manymaps" tests/guests/manymaps.c; then
+    :
+elif elf_has_interp "$ECM/manymaps"; then
+    skip "many-mapping exec chain: needs a static guest (the dynamic form's binds are covered below)"
+else
+    em_k=$(emu_t 90 "$ECM/manymaps" 1500 6 2>/dev/null)
+    em_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECM" /manymaps 1500 6 2>/dev/null)
+    case "$em_k$em_g" in
+    *growth_kb=*growth_kb=*)
+        em_kn=${em_k##*growth_kb=}
+        em_gn=${em_g##*growth_kb=}
+        if [ "$em_gn" -le $((em_kn + 8192)) ]; then
+            pass=$((pass + 1))
+            printf '  ok   an exec chain gives back more mappings than one pass holds (%s kB over 6, kernel %s kB)\n' \
+                "$em_gn" "$em_kn"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL an exec chain leaks past the sweep ceiling: %s kB over 6 execs, kernel %s kB\n' \
+                "$em_gn" "$em_kn"
+        fi
+        ;;
+    *)
+        skip "many-mapping exec chain: no reference run ($(echo "$em_k$em_g" | tr '\n' '|'))"
+        ;;
+    esac
+fi
+rm -rf "$ECM"
+
+# The registry the sweep asks "was this ever ours?" used to hold 96 records and
+# fail closed at the 97th: cng_own_ready() went false for good and the reclaim
+# sat out every later exec of that process. A shm attach list or the ptrace
+# registry adds a record per page it grows by, so the count was reachable. The
+# registry now sits on a table that grows a page at a time (tab.c); the
+# self-test drives both well past the old ceiling.
+out=$(run_t 60 -t tabtest 2>&1); rc=$?
+check "the own-map registry grows past 96 records and stays armed" 0 $rc
+check_contains "growing table: elements stable and in order" \
+    "stable and in order -> OK" "$out"
+check_contains "growing table: every record found, half dropped" \
+    "half dropped, still armed -> OK" "$out"
+
+# ...and the same chain with a guest whose OWN ld.so maps its libraries. That
+# memory is not the loader's and no recorded extent describes it, so it is the
+# half the sweep exists for — and the half that used to hurt. Measured on an
+# Android 13 device before it: 10,790,480 kB per generation, most of it one
+# PROT_NONE reservation bionic's scudo makes at libc init and the next
+# generation makes again. A musl guest cost 20 kB a generation and hid the whole
+# thing, which is why this leg names a dynamic guest rather than trusting
+# whichever one the harness happens to link.
+#
+# No kernel differential here, unlike the leg above: a dynamic bionic guest's
+# VmSize swings ±80 MB between runs of the SAME binary (scudo sizes its regions
+# from what it finds), which is wider than that leg's whole slack and would make
+# the comparison a coin toss. One leaked generation is three orders of magnitude
+# above that swing, so the chain is simply run long enough that a leak cannot
+# survive it: sixty-four generations at the old cost is 690 GB against a 512 GB
+# address space, and the run before the sweep died exactly there — "Fatal signal
+# 6 (SIGABRT)" out of scudo, after 21 seconds of mapping. It now finishes in
+# 0.2 s. Completing at all is most of this assertion; the bound is the rest.
+ECDD=$(mktemp -d)
+cng_dyn_binds
+if [ -z "$GUESTCC" ]; then
+    skip "dynamic exec-chain address space: no AArch64 guest toolchain"
+elif [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+    # A dynamic guest's execve is libc's, in a library our loader never mapped,
+    # so -R cannot have rewritten it and an inert filter leaves nothing to trap:
+    # the call goes to the host kernel with the guest's own path and fails.
+    # Same prerequisite M23's dynamic legs have.
+    skip "dynamic exec-chain address space: filter inert here, so nothing reaches a dynamic guest's own execve"
+elif ! $GUESTCC -O2 -o "$ECDD/execchain" tests/guests/execchain.c \
+    2>"$GUEST_CC_LOG"; then
+    fail=$((fail + 1)); printf '  FAIL could not build a dynamic execchain\n'
+    sed 's/^/    /' "$GUEST_CC_LOG"
+elif ! elf_has_interp "$ECDD/execchain"; then
+    skip "dynamic exec-chain address space: this toolchain links even -O2 guests statically"
+else
+    # shellcheck disable=SC2086  # both are deliberately split arg lists
+    ecd_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 200 $GUEST_DYN_L $GUEST_DYN_BINDS \
+        -R "$ECDD" /execchain 64 2>/dev/null)
+    case "$ecd_g" in
+    *growth_kb=*)
+        ecd_gn=${ecd_g##*growth_kb=}
+        # A generation of this guest costs gigabytes; the run-to-run swing is
+        # tens of megabytes. Anything under a gigabyte over sixty-four execs is
+        # therefore "no generation was kept", with room to spare on both sides.
+        if [ "$ecd_gn" -lt 1048576 ]; then
+            pass=$((pass + 1))
+            printf '  ok   a dynamic chain gives its libraries back too (%s kB over 64)\n' \
+                "$ecd_gn"
+        else
+            fail=$((fail + 1))
+            printf '  FAIL a dynamic exec chain leaks address space: %s kB over 64 execs\n' \
+                "$ecd_gn"
+        fi
+        ;;
+    *)
+        fail=$((fail + 1))
+        printf '  FAIL a dynamic exec chain of 64 did not survive (%s)\n' \
+            "$(echo "$ecd_g" | tr '\n' '|')"
+        ;;
+    esac
+fi
+rm -rf "$ECDD"
+
+# emulated execve must close FD_CLOEXEC fds like a real execve, or fork/exec
+# launchers (git run-command, posix_spawn) block on their O_CLOEXEC notify pipe.
+out=$(run -t cloexectest 2>&1); rc=$?
+check "cloexectest exit 0" 0 "$rc"
+check_contains "emulated execve closes FD_CLOEXEC fds" \
+    "cloexec: cloexec_closed=1 plain_open=1 -> OK" "$out"
+# ...and still does when /proc/self/fd cannot be opened. The pass reads that
+# directory, and a descriptor table filled to RLIMIT_NOFILE refuses the open
+# (EMFILE) -- from exactly the program with the most descriptors to lose. It
+# used to return quietly then and leak every one of them across the exec.
+check_contains "...and with a full descriptor table, where /proc/self/fd will not open" \
+    "cloexec no-proc: table_full=1 cloexec_closed=1 top_closed=1 plain_open=1 -> OK" \
+    "$out"

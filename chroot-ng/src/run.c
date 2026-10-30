@@ -1,0 +1,593 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* cng_run() — load the guest program with the userland loader, install the
+ * path-translation monitor, and transfer control. Command-line parsing lives in
+ * main.c; the parameters below arrive already resolved.
+ *
+ *   rootfs     guest rootfs (host path); "/" means identity (no translation)
+ *   libprefix  resolve the ELF interpreter under this dir (test aid; NULL on
+ *              real hardware, where the interpreter and libraries resolve
+ *              through the rootfs/bind map + the monitor)
+ *   workdir    -w/--work-dir: the guest's initial cwd, a guest path (NULL for
+ *              the default; see set_workdir)
+ *   bind_g/h/ro  nb bind mounts: guest path bind_g[i] is backed by host path
+ *              bind_h[i], read-only when bind_ro[i] (the CLI spells this
+ *              SRC:DST[:ro], host first)
+ *   env_set/ne  the ne -E/--env "VAR=VAL" entries, in command-line order, one
+ *              per name; they and the inherited terminal pair are the guest's
+ *              whole environment (see build_guest_env)
+ *   gargv/gargc  the guest program (gargv[0]) and its arguments
+ *
+ * The credential/rewrite/loader flags (cng_g_fake_id, cng_g_rewrite,
+ * cng_g_loader_file) are set by the option parser before this is called.
+ *
+ * gargv[0] is a guest path resolved through the rootfs/bind map. The monitor
+ * traps the guest's own path syscalls and translates them (see monitor.h).
+ * Under qemu-user the seccomp filter is inert, so translation is only exercised
+ * on a real AArch64 kernel (and via the `-t dtest` self-test).
+ */
+#include "cng/broker.h"
+#include "cng/execmap.h"
+#include "cng/l2s.h"
+#include "cng/loader.h"
+#include "cng/monitor.h"
+#include "cng/netlink.h"
+#include "cng/ownmap.h"
+#include "cng/path.h"
+#include "cng/pin.h"
+#include "cng/procfs.h"
+#include "cng/procreg.h" /* cng_g_shared_proc */
+#include "cng/ptrace.h"
+#include "cng/rewrite.h"
+#include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/tty.h"
+#include "cng/uapi.h"
+
+static struct cng_fs g_fs; /* static: the monitor keeps a pointer after we jump */
+
+static const char *load_err(int rc) {
+    switch (rc) {
+    case CNG_LOAD_EOPEN:
+        return "cannot open (missing or unreadable)";
+    case CNG_LOAD_EFORMAT:
+        return "not an AArch64 ELF64 executable";
+    case CNG_LOAD_EIO:
+        return "short/failed read";
+    case CNG_LOAD_EMAP:
+        return "mmap/mprotect failed (execmem denied?)";
+    case CNG_LOAD_ETOOBIG:
+        return "too many program headers / interp too long";
+    case CNG_LOAD_EACCES:
+        return "not a regular file, or not executable";
+    case CNG_LOAD_ECLOBBER:
+        return "fixed load address overlaps chroot-ng's own image";
+    case CNG_LOAD_EINTERP:
+        return "PT_INTERP names a path the file does not hold";
+    case CNG_LOAD_EINVAL:
+        return "a PT_LOAD the kernel refuses too (file part past its memory "
+               "part, or unmappable at this page size)";
+    default:
+        return "unknown error";
+    }
+}
+
+/* Join `a` and `b` into `dst`. Returns dst, or 0 when the result did not fit:
+ * cng_strlcpy truncates, and a cut path is a different path — the one caller
+ * hands the result straight to the loader, which would then open whatever the
+ * shortened name happens to be, or report "cannot open" about a name nobody
+ * asked for. Same rule as everywhere else a path is assembled here (see
+ * normalize_root and cng_fs_abscanon in path.c). */
+static char *join2(char *dst, size_t size, const char *a, const char *b) {
+    size_t n = cng_strlcpy(dst, a, size);
+    if (n >= size || cng_strlcpy(dst + n, b, size - n) >= size - n)
+        return 0;
+    return dst;
+}
+
+/* Assemble the guest environment into `out` (CNG_MAX_ENV + 3 slots) and
+ * NULL-terminate it.
+ *
+ * The guest starts from a clean slate rather than inheriting ours: a host
+ * variable describes the host, not the rootfs — PATH, HOME, LD_*, XDG_*,
+ * TMPDIR, SHELL would every one of them send a guest looking at host paths for
+ * things the rootfs has its own copies of — and our own CNG_* knobs have no
+ * business in a guest's environment either. Only the terminal-appearance pair is
+ * inherited, because TERM/COLORTERM describe the tty both sides share; anything
+ * else the guest needs is spelled out with -E/--env.
+ *
+ * An -E entry wins over the inherited value. Emitting both as duplicates would
+ * not be enough: getenv() takes the first match and a shell re-exporting envp
+ * keeps the last, so the two would disagree about which -E took effect. */
+static void build_guest_env(char *const *env_set, int ne, char **host,
+                            char **out) {
+    static const char *const keep[] = {"TERM=", "COLORTERM="};
+    int n = 0;
+    for (int i = 0; i < ne; i++)
+        out[n++] = env_set[i];
+    for (unsigned k = 0; k < sizeof keep / sizeof *keep; k++) {
+        size_t kl = strlen(keep[k]);
+        int overridden = 0;
+        for (int i = 0; i < ne; i++)
+            if (!strncmp(env_set[i], keep[k], kl)) {
+                overridden = 1;
+                break;
+            }
+        if (overridden)
+            continue;
+        for (char **e = host; e && *e; e++)
+            if (!strncmp(*e, keep[k], kl)) {
+                out[n++] = *e;
+                break;
+            }
+    }
+    out[n] = 0;
+}
+
+/* AArch64 struct stat: the st_mode field, for the -w directory check below. */
+#define ST_MODE_OFF 16
+
+/* -w/--work-dir: make the guest path `wd` the initial cwd.
+ *
+ * `wd` is a guest path resolved through the rootfs and its binds like any other,
+ * following symlinks — an absolute one from the guest root, a relative one
+ * against the default cwd the caller has just set — so the guest lands exactly
+ * where chdir(wd) would have put it, and getcwd() reports the resolved name a
+ * real chdir leaves behind rather than the symlink that was typed.
+ *
+ * A path that does not name a directory is fatal instead of a quiet fallback to
+ * "/": the point of the option is to say where the guest starts, and a program
+ * started in the wrong directory misbehaves silently — a build in the wrong
+ * tree, a relative <program> resolved somewhere else.
+ *
+ * Returns 0, or -1 with a diagnostic. */
+static int set_workdir(struct cng_fs *fs, const char *wd) {
+    if (!*wd) {   /* "" would join to the cwd; chdir("") is ENOENT */
+        cng_dprintf(2, "chroot-ng: --work-dir: empty path\n");
+        return -1;
+    }
+    char host[CNG_PATH_MAX];
+    if (cng_resolve(wd, 1, host, sizeof host) != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': cannot resolve\n", wd);
+        return -1;
+    }
+    char st[128];   /* struct stat, aarch64 */
+    long r = cng_pin_fstatat(host, st, 0);
+    if (r == -ENOENT) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': not found\n", wd);
+        return -1;
+    }
+    if (r != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': cannot stat (errno %d)\n",
+                    wd, (int)-r);
+        return -1;
+    }
+    if ((*(unsigned *)(st + ST_MODE_OFF) & CNG_S_IFMT) != CNG_S_IFDIR) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': not a directory\n", wd);
+        return -1;
+    }
+    /* The guest-side name of what we resolved: absolute and symlink-free by
+     * construction. A host path outside the guest view has no such name — only
+     * possible for a resolution that left the map, e.g. through /proc/self/fd —
+     * so fall back to the lexical form there. */
+    char guest[CNG_PATH_MAX];
+    if (cng_fs_untranslate(fs, host, guest, sizeof guest) != 0 &&
+        cng_fs_abscanon(fs, wd, guest, sizeof guest) != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': path too long\n", wd);
+        return -1;
+    }
+    /* The real cwd first, and its failure is the whole answer: a relative path
+     * the monitor never sees — anything untrapped, and everything when no
+     * monitor installs at all — resolves against this one, so leaving it at the
+     * launch directory while telling the guest it is somewhere else resolves
+     * those names outside the guest view entirely. It can genuinely fail after
+     * the stat above: a directory with no search permission is EACCES, and
+     * under --fake-id the guest believes it is root while the kernel does not. */
+    long r2 = sys_chdir(host);
+    if (r2 != 0) {
+        cng_dprintf(2, "chroot-ng: --work-dir '%s': cannot enter (errno %d)\n",
+                    wd, (int)-r2);
+        return -1;
+    }
+    cng_fs_set_cwd(fs, guest);
+    return 0;
+}
+
+int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
+            const char *const *bind_g, const char *const *bind_h,
+            const int *bind_ro, int nb, char *const *env_set, int ne,
+            int gargc, char **gargv, char **envp, unsigned long *auxv) {
+    const char *prog_guest = gargv[0];
+
+    /* Capture host auxv (for emulated execve), the guest exe path (a placeholder
+     * for the /proc/self/exe fixups until the program is resolved below, which is
+     * what makes it absolute and symlink-resolved) and our own environment (for
+     * the CNG_* knobs and
+     * for env lookups after argv/envp are out of reach — procreg.c's
+     * shared_dir). This is the host environment throughout; the guest's is
+     * `genv` below. */
+    cng_host_auxv = auxv;
+    cng_g_exe_guest = prog_guest;
+    cng_g_host_envp = envp;
+    /* The break before any guest program has run: what an emulated execve winds
+     * the heap back to, since it cannot drop it with the address space. */
+    long brk0 = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+    if (brk0 > 0)
+        cng_g_brk0 = (unsigned long)brk0;
+
+    /* Key the System V shm namespace to this invocation (unless --shared-proc
+     * widens it to the rootfs). Seeded here, in the root process while we are
+     * still single-threaded, and fork-inherited — so one launch's whole process
+     * tree shares one namespace and separate launches stay isolated. */
+    cng_broker_seed_session();
+
+    /* And what the guest's /dev/shm is, which on a host that has none is a
+     * directory of ours under $TMPDIR rather than a name that does not resolve.
+     * Needs the host environment on record (just above) and has to be settled
+     * before anything asks the path layer, which the workdir and the program
+     * lookup below both do. */
+    cng_dev_shm_init();
+
+    /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging;
+     * CNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid
+     * for hosts whose filesystem allows real hardlinks). */
+    for (char **e = envp; e && *e; e++) {
+        /* An empty value is off, as it is for the two knobs below and for
+         * cng_broker_env, which every other CNG_* switch goes through. Without
+         * the test, `CNG_DEBUG= chroot-ng ...` — how a shell clears a variable
+         * for one command — turned verbose logging ON, onto the guest's own
+         * stderr, which is a stream package managers capture and log. */
+        if (!strncmp(*e, "CNG_DEBUG=", 10) && (*e)[10] != '\0' &&
+            (*e)[10] != '0')
+            cng_g_debug = 1;
+        if (!strncmp(*e, "CNG_L2S_FORCE=", 14) && (*e)[14] != '\0' &&
+            (*e)[14] != '0')
+            cng_g_l2s_force = 1;
+        /* CNG_PROCSTAT_SYNTH=1 forces the synthesized /proc/stat even where the
+         * host file is readable (Android denies it; test hosts do not). */
+        if (!strncmp(*e, "CNG_PROCSTAT_SYNTH=", 19) && (*e)[19] != '\0' &&
+            (*e)[19] != '0')
+            cng_g_procstat_synth = 1;
+        /* CNG_OVERFLOWID_SYNTH=1 does the same for /proc/sys/kernel/overflow{u,g}id. */
+        if (!strncmp(*e, "CNG_OVERFLOWID_SYNTH=", 21) && (*e)[21] != '\0' &&
+            (*e)[21] != '0')
+            cng_g_overflowid_synth = 1;
+        /* CNG_PROC_DENY_STAT=1 makes stat/access of a synthesized /proc name
+         * answer as the host does on Android, where SELinux refuses them. */
+        if (!strncmp(*e, "CNG_PROC_DENY_STAT=", 19) && (*e)[19] != '\0' &&
+            (*e)[19] != '0')
+            cng_g_proc_deny_stat = 1;
+        /* CNG_PROCFS_REOPEN_DENY=1 takes the memfd reopen that makes a
+         * synthesized view read-only as refused, as Android's policy does. */
+        if (!strncmp(*e, "CNG_PROCFS_REOPEN_DENY=", 23) && (*e)[23] != '\0' &&
+            (*e)[23] != '0')
+            cng_g_procfs_reopen_deny = 1;
+        /* CNG_TERMIOS2_DENY=1 refuses the termios2 ioctls with EACCES before
+         * the host is asked, as Android's SELinux policy does. */
+        if (!strncmp(*e, "CNG_TERMIOS2_DENY=", 18) && (*e)[18] != '\0' &&
+            (*e)[18] != '0')
+            cng_g_termios2_deny = 1;
+        /* CNG_TIOCGSID_DENY=1 does the same for TIOCGSID. */
+        if (!strncmp(*e, "CNG_TIOCGSID_DENY=", 18) && (*e)[18] != '\0' &&
+            (*e)[18] != '0')
+            cng_g_tiocgsid_deny = 1;
+        /* CNG_TCSETSF_DENY=1 does the same for TCSETSF. */
+        if (!strncmp(*e, "CNG_TCSETSF_DENY=", 17) && (*e)[17] != '\0' &&
+            (*e)[17] != '0')
+            cng_g_tcsetsf_deny = 1;
+        /* CNG_SETID_DENY=1 takes the uid and gid setters as refused by an
+         * ambient filter, as Android's refuses them (cred.c). */
+        if (!strncmp(*e, "CNG_SETID_DENY=", 15) && (*e)[15] != '\0' &&
+            (*e)[15] != '0')
+            cng_g_setid_deny = 1;
+        /* CNG_OPENAT2_DENY=1 does the same for openat2, which a guest then
+         * gets emulated. */
+        if (!strncmp(*e, "CNG_OPENAT2_DENY=", 17) && (*e)[17] != '\0' &&
+            (*e)[17] != '0')
+            cng_g_openat2_deny = 1;
+        /* CNG_MM_MAP_DENY=1 takes PR_SET_MM_MAP as refused, as Android's
+         * kernels refuse it, so cmdline/environ come from guest memory. */
+        if (!strncmp(*e, "CNG_MM_MAP_DENY=", 16) && (*e)[16] != '\0' &&
+            (*e)[16] != '0')
+            cng_g_mm_map_deny = 1;
+    }
+    /* Stamp the build: this tree is copied to test devices by hand, so a trace
+     * has to be able to say whether it came from the build you just made. */
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] chroot-ng %s (built %s %s)\n", CNG_VERSION,
+                    __DATE__, __TIME__);
+
+    /* The environment the guest will see, built from -E/--env plus TERM /
+     * COLORTERM — everything the knob scan above just read stays on our side of
+     * the line. It only has to outlive cng_build_stack, which copies the strings
+     * onto the guest stack. */
+    char *genv[CNG_MAX_ENV + 3];
+    build_guest_env(env_set, ne, envp, genv);
+
+    /* Fake identity (--fake-id): establish it from the real invoking ids (which
+     * are also the stat-remap source). See cng_cred_setup for the implied-vs-
+     * explicit identity default. */
+    if (cng_g_fake_id)
+        cng_cred_setup((unsigned)sys_getuid(), (unsigned)sys_getgid());
+
+    /* Filesystem view. A prefix that does not fit is refused, not shortened:
+     * every guest path is joined to it, so a truncated one would silently root
+     * the guest at an ancestor of the tree that was named — or, since the cut
+     * lands mid-component, at a path that is not a directory at all. */
+    if (cng_fs_init(&g_fs, rootfs) != 0) {
+        cng_dprintf(2, "chroot-ng: rootfs '%s': path too long (max %d)\n",
+                    rootfs, (int)sizeof g_fs.rootfs - 1);
+        return 2;
+    }
+    for (int j = 0; j < nb; j++)
+        if (cng_fs_add_bind(&g_fs, bind_g[j], bind_h[j], bind_ro[j]) != 0) {
+            cng_dprintf(2, "chroot-ng: --bind '%s:%s': path too long\n",
+                        bind_h[j], bind_g[j]);
+            return 2;
+        }
+    /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
+     * the fs view even if the seccomp monitor never installs (e.g. -R only) —
+     * and so does cng_resolve, which -w/--work-dir and the program lookup below
+     * both go through. */
+    cng_g_fs = &g_fs;
+
+    /* Initial guest cwd. With a real rootfs, default to "/" (never leak the host
+     * launch dir) and chdir the real process into the rootfs so untranslated
+     * relative access stays contained. With an identity rootfs, the host cwd is
+     * the guest cwd.
+     *
+     * The chdir's failure is the whole answer, as it is for --work-dir: a
+     * relative name the monitor never sees — anything untrapped, and under
+     * -R every site the rewriter did not reach — resolves against the real
+     * cwd, and one left at the launch directory while the guest is told it
+     * is at "/" resolves those names outside the guest view entirely. It
+     * used to be ignored, so a rootfs that was not there, or not enterable,
+     * ran the guest (from a bind, say) with its containment fallback
+     * missing and not a word said. */
+    if (strcmp(rootfs, "/") != 0) {
+        cng_fs_set_cwd(&g_fs, "/");
+        char rhost[CNG_PATH_MAX];
+        long r = cng_fs_translate(&g_fs, "/", rhost, sizeof rhost) == 0
+                     ? sys_chdir(rhost)
+                     : -ENAMETOOLONG;
+        if (r != 0) {
+            cng_dprintf(2, "chroot-ng: rootfs '%s': cannot enter (errno %d)\n",
+                        rootfs, (int)-r);
+            return 1;
+        }
+    } else {
+        char cwd[CNG_PATH_MAX];
+        if (sys_getcwd(cwd, sizeof cwd) > 0)
+            cng_fs_set_cwd(&g_fs, cwd);
+    }
+    /* -w/--work-dir overrides that default. It has to land here: <program> is
+     * resolved against the cwd just below, so a relative one follows -w, exactly
+     * as it would follow the cwd of a shell that ran the same command. */
+    if (workdir && set_workdir(&g_fs, workdir) < 0)
+        return 1;
+
+    if (cng_broker_env("CNG_NETLINK_FORCE_BLOCK"))
+        cng_nl_force_block = 1;
+    if (cng_broker_env("CNG_NETLINK_NO_RELAY")) {
+        cng_nl_force_block = 1;
+        cng_nl_no_relay = 1;
+    }
+    if (cng_broker_env("CNG_NETLINK_DENY_GETLINK")) {
+        cng_nl_force_block = 1;
+        cng_nl_deny_getlink = 1;
+    }
+    /* Stands alone: the audit refusal has nothing to do with the rtnetlink
+     * emulation, so forcing one must not force the other. */
+    if (cng_broker_env("CNG_NETLINK_DENY_AUDIT"))
+        cng_nl_deny_audit = 1;
+
+    /* No host here has a true noexec mount to offer, so the one path that only
+     * such a mount reaches has a knob of its own: take the anonymous route for
+     * every executable file mapping without asking the kernel first. */
+    if (cng_broker_env("CNG_MMAP_FORCE_ANON"))
+        cng_g_execmap_force = 1;
+
+    /* Resolve the program itself through the map (following symlinks) to find
+     * the host file. */
+    char host_prog[CNG_PATH_MAX];
+    if (cng_resolve(prog_guest, 1, host_prog, sizeof host_prog) != 0) {
+        cng_dprintf(2, "chroot-ng: cannot resolve %s\n", prog_guest);
+        return 1;
+    }
+    /* /proc/self/exe (and the comm derived from it) for the initial program. It
+     * was <program> verbatim, while a real kernel reports the absolute,
+     * symlink-resolved path of the image it actually loaded — and glibc does not
+     * merely tolerate that, it asserts the leading '/' in _dl_get_origin, so a
+     * relative <program> ("chroot-ng / build/tests/hello") aborted the guest
+     * before main. The host path we just resolved, untranslated back into the
+     * guest view, is absolute and symlink-resolved by construction, and it is the
+     * same derivation the emulated execve uses for every program after this one
+     * (execve.c) — so the first program in a session stops answering differently
+     * from its own children. */
+    static char exe_guest[CNG_PATH_MAX];
+    if (cng_fs_untranslate(&g_fs, host_prog, exe_guest, sizeof exe_guest) == 0 ||
+        cng_fs_abscanon(&g_fs, prog_guest, exe_guest, sizeof exe_guest) == 0)
+        cng_g_exe_guest = exe_guest;
+
+    /* setuid/setgid-on-exec for the initial program (e.g. running /bin/su
+     * directly), mirroring the emulated-execve path. */
+    cng_cred_exec(host_prog);
+
+    /* The view is complete: publish it. From here every reader sees it through
+     * the sequence protocol and every chdir/chroot replaces it whole rather
+     * than editing it under them (path.c). g_fs itself is not written again,
+     * which is what lets the l2s emulation keep it as the view the run was
+     * started with: a guest chroot narrows the published one, and a hardlink
+     * group made before it still has its data where this one put it. */
+    cng_g_fs = cng_fs_publish(&g_fs);
+    cng_l2s_home(&g_fs);
+
+    /* What the launcher handed down, judged against that view: a descriptor on
+     * a directory the guest has no name for is closed here rather than left
+     * for the guest to resolve names from — the one way to reach outside the
+     * view that no path translation can see (dispatch.c, cng_fd_admit). */
+    cng_fds_sanitize();
+
+    /* The floor: every mapping that exists at this moment is ours or the
+     * kernel's, because nothing of the guest has been mapped yet. An emulated
+     * execve gives back what is NOT in it (the sweep in execve.c), so where
+     * this stands is the whole of its accuracy — and it has to stand HERE,
+     * in front of the first program, not merely in front of the first guest
+     * instruction. Taken after the load, the floor would claim that program's
+     * image and its 64 MiB stack, and once those are given back the kernel
+     * hands the same addresses to the next generation's allocator, which the
+     * sweep would then read as ours and keep. Measured that way: the reclaim
+     * held on to 16 MB per generation and could not say why.
+     *
+     * Everything the monitor maps after this point records itself
+     * (cng_own_map); everything the loader maps is a generation range. */
+    cng_own_floor();
+
+    struct cng_loaded prog;
+    int rc = cng_load_elf(host_prog, 0, &prog);
+    if (rc != CNG_LOAD_OK) {
+        cng_dprintf(2, "chroot-ng: cannot load %s (%s): %s\n", prog_guest,
+                    host_prog, load_err(rc));
+        return 1;
+    }
+
+    unsigned long sp, entry;
+    struct cng_loaded interp;
+    if (prog.has_interp) {
+        char ipath[CNG_PATH_MAX];
+        const char *ip;
+        if (libprefix) {
+            ip = join2(ipath, sizeof ipath, libprefix, prog.interp);
+            if (!ip) {
+                cng_dprintf(2,
+                            "chroot-ng: interpreter path is too long: %s + %s\n",
+                            libprefix, prog.interp);
+                return 1;
+            }
+        } else if (cng_resolve(prog.interp, 1, ipath, sizeof ipath) == 0)
+            ip = ipath;
+        else
+            ip = prog.interp;
+
+        int rc2 = cng_load_elf(ip, 0, &interp);
+        if (rc2 != CNG_LOAD_OK) {
+            cng_dprintf(2, "chroot-ng: cannot load interpreter %s: %s\n", ip,
+                        load_err(rc2));
+            return 1;
+        }
+        sp = cng_build_stack(gargc, gargv, genv, auxv, &prog, &interp,
+                             prog_guest);
+        entry = interp.entry;
+    } else {
+        sp = cng_build_stack(gargc, gargv, genv, auxv, &prog, 0, prog_guest);
+        entry = prog.entry;
+    }
+    if (!sp) {
+        cng_dprintf(2, "chroot-ng: argument list too long\n");
+        return 1;
+    }
+    /* The first generation. Nothing is retired here — there is no program being
+     * replaced — but an exec has to have something to retire when it comes. */
+    cng_exec_generation(&prog, prog.has_interp ? &interp : 0, cng_g_stack_lo,
+                        cng_g_stack_len);
+    /* (svc rewriting + its pool are handled inside the loader, per object.) */
+
+    /* /proc emulation: bring up the PID registry and reserve the synthesized fd
+     * range (both must be settled before the seccomp filter is built, which
+     * bakes the range in), then publish this process's guest identity from the
+     * stack we just built. */
+    if (!cng_g_no_proc) {
+        cng_procfs_init();
+        cng_procfs_publish_stack(sp);
+    }
+
+    /* The ptrace link registry: one MAP_SHARED region that every guest process
+     * must inherit, so it has to exist before the guest can fork — and before
+     * the filter, whose install is the last thing that happens here. */
+    cng_pt_init();
+
+    /* Install the monitor last, after all of our own path syscalls are done.
+     * Only when it has something to do: an identity view needs no translation.
+     *
+     * Two options need a trap of ours whatever the view is, and were inert
+     * without this. --no-ptrace has to *refuse* ptrace(2), which takes the trap
+     * that would otherwise emulate it — left out, the guest's ptrace went
+     * straight to the host kernel and worked, which is the opposite of what was
+     * asked for. --shared-proc has to publish this invocation's processes into
+     * the shared registry as they fork, and that hook hangs off the trapped
+     * clone; without it a --shared-proc invocation over `/` published its root
+     * process and nothing else, so another invocation's `ps` saw one process
+     * where there were dozens.
+     *
+     * --no-proc, --no-dev and --share-abstract-sockets are the opposite case:
+     * each turns an emulation of ours off, and with no monitor installed there
+     * is none to turn off, so they are already honored by not being here. */
+    int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id ||
+                     cng_g_rewrite || cng_g_l2s || cng_g_no_ptrace ||
+                     cng_g_shared_proc;
+    if (want_xlate) {
+        int mrc = cng_install_monitor(cng_g_fs);
+        /* A monitor that could not be installed is not a warning to print on
+         * the way into the guest. Without one, nothing intercepts: a rootfs
+         * that is not `/` runs against the host's own paths, -u reports the
+         * real identity, -l makes no hardlink, --no-ptrace refuses nothing and
+         * --shared-proc publishes nothing — every one of them the thing the
+         * invocation asked for, and none of them delivered. That used to go
+         * ahead behind one line on stderr, which a launcher script never
+         * reads, and the guest wrote where the host keeps its files. It stops
+         * here instead, with the errno: EINVAL is qemu-user or a kernel
+         * before 3.5, EACCES a policy that forbids the filter (the probe says
+         * which).
+         *
+         * -R is the exception, and a deliberate one: a rewritten svc site
+         * calls the dispatcher directly and needs no filter, which is what
+         * makes it the interception tier for hosts that have none
+         * (docs/DESIGN.md). What it cannot reach — the svc sites in a library
+         * the guest's own ld.so maps from a mount that grants PROT_EXEC, and
+         * code no object carries — goes to the host untranslated, and the
+         * warning says exactly that, so a run that goes on does so knowing. */
+        if (mrc < 0 && !cng_g_rewrite) {
+            cng_dprintf(2,
+                        "chroot-ng: cannot install the seccomp monitor (errno %d)"
+                        " and nothing else would intercept the guest's syscalls:"
+                        " not entering it\n"
+                        "           (seccomp is inert under qemu-user and needs a"
+                        " kernel >= 3.5 that permits the filter; -R carries"
+                        " translation without it, for the svc sites it can"
+                        " reach)\n",
+                        -mrc);
+            return 1;
+        }
+        if (mrc < 0)
+            cng_dprintf(2,
+                        "chroot-ng: warning: could not install the seccomp"
+                        " monitor (errno %d); only the svc sites -R rewrote are"
+                        " intercepted\n"
+                        "           (code in a library the guest's ld.so maps"
+                        " from an exec-permitted mount, and any code no object"
+                        " carries, reaches the host untranslated)\n",
+                        -mrc);
+
+        /* A host with no /dev/shm whose temp directories all failed the
+         * stand-in's checks (cng_dev_shm_init) leaves the guest without one,
+         * which it can run without — but its shm_open and sem_open then fail
+         * ENOENT, nowhere near the cause, which is the launcher's: an Android
+         * app that hands over its 0771 files directory as $TMPDIR, say. So
+         * this says which candidates were passed over and why. Only here,
+         * with the monitor in: without it the guest has the host's /dev,
+         * which is what it would have had anyway. */
+        const char *shm_why = cng_dev_shm_missing();
+        if (shm_why)
+            cng_dprintf(2,
+                        "chroot-ng: warning: no temp directory can stand in for"
+                        " the /dev/shm this host lacks, so the guest has none"
+                        " (shm_open and sem_open fail)\n"
+                        "           %s%s\n"
+                        "           (point $TMPDIR at a directory nobody else"
+                        " can write: mode 0700, or sticky like 1777)\n",
+                        *shm_why ? "passed over: " : "no candidate is set",
+                        shm_why);
+    }
+
+    cng_enter(sp, entry);
+}

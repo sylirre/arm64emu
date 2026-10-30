@@ -1,0 +1,181 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Path virtualization core: map guest paths onto host paths using a rootfs plus
+ * bind mounts, exactly like proot but mechanism-independent (the SIGSYS monitor
+ * calls this; so does the `_xlate` debug command). Lexical `..` canonicalization
+ * keeps guest paths from escaping the rootfs.
+ */
+#ifndef CNG_PATH_H
+#define CNG_PATH_H
+
+#include <stddef.h>
+
+#define CNG_PATH_MAX  4096
+#define CNG_MAX_BINDS 64
+
+/* The lengths and the basename offset are kept with the strings because the
+ * view is walked on the hot paths — every relative name asks whether it could
+ * be a bind's basename, every mutating call whether the view has a :ro bind at
+ * all, every reverse lookup how long each host prefix is — and they are
+ * written only by cng_fs_add_bind and cng_fs_chroot, which keep them right. */
+struct cng_bind {
+    char guest[256];  /* canonical guest prefix */
+    char host[512];   /* host path, no trailing slash */
+    unsigned glen;    /* strlen(guest) */
+    unsigned hlen;    /* strlen(host) */
+    unsigned base;    /* guest + base is its last component ("" for "/") */
+    unsigned ro;      /* ":ro" mount: mutating syscalls under it get -EROFS */
+};
+
+struct cng_fs {
+    char rootfs[512]; /* host root, normalized: no trailing slash; "" == "/" */
+    unsigned rlen;    /* strlen(rootfs): 0 for the identity root */
+    struct cng_bind binds[CNG_MAX_BINDS];
+    int nbinds;
+    int has_ro;       /* any bind with ro set */
+    char cwd[CNG_PATH_MAX]; /* canonical guest cwd, default "/" */
+};
+
+/* --no-proc: disable the /proc passthrough and the synthesized /proc files, so
+ * the guest sees only whatever /proc its rootfs (or an explicit -b) provides. */
+extern int cng_g_no_proc;
+
+/* --no-dev: disable the /dev device-node passthrough, so /dev is served from the
+ * rootfs (or an explicit -b) only. */
+extern int cng_g_no_dev;
+
+/* The /dev passthrough whitelist, shared by the path zone and the getdents64
+ * synthesis so the two can never disagree about what /dev contains. `host` is
+ * what the name resolves to (usually itself; the std* aliases and fd point into
+ * /proc/self/fd), and is what gets lstat'ed for a real d_type when the entry is
+ * spliced into a listing.
+ *
+ * A name *under* an entry is joined to that host path, so what may be reached
+ * there is whatever the host node offers: an entry under pts/, shm/ or fd/ for
+ * the directory-valued ones, and for a device node the ENOTDIR the kernel gives
+ * for a path below a character device — "/dev/null/x" is ENOTDIR, not a lookup
+ * in the rootfs. No entry needs to say which kind it is: the host node already
+ * does, and it is the one asked. */
+struct cng_dev_node {
+    const char *name; /* basename under /dev */
+    const char *host; /* host path it resolves to */
+};
+extern const struct cng_dev_node cng_dev_nodes[];
+extern const int cng_dev_nnodes;
+
+/* Settle what the guest's /dev/shm is, and store the /dev directory nodes
+ * the way the kernel spells them. Called once from cng_run, before the guest
+ * runs and after the host environment is on record. */
+void cng_dev_shm_init(void);
+
+/* A directory of our own, "<stem>.<uid>" under the first usable temp
+ * directory ($TMPDIR, $XDG_RUNTIME_DIR, /data/local/tmp, /tmp): made 0700 if
+ * it is not there, and adopted only if it is ours, private, and in a parent
+ * nobody else can rename it out of. Its host path, as the kernel spells it,
+ * goes into `out`. 0, or -1 where no candidate will do, and then `why` (when
+ * not 0) holds why each one was passed over, "; "-separated, for a warning.
+ * CNG_TMP_ENV_ONLY=1 leaves out the two fixed candidates. The /dev/shm
+ * stand-in lives in one, and so do the read-only views of synthesized /proc
+ * files on a host that will not reopen a memfd (procfs.c). */
+int cng_private_tmp_dir(const char *stem, char *out, size_t sz, char *why,
+                        size_t whysz);
+
+/* 0 unless the host has no /dev/shm and no stand-in could be made for it, so
+ * the guest has none: then why each temp directory was passed over (as
+ * cng_private_tmp_dir's `why`, possibly empty), for cng_run's warning. */
+const char *cng_dev_shm_missing(void);
+
+/* Is there a /dev/shm for the guest at all? Asked by the /proc mount tables,
+ * which must not announce a tmpfs the guest cannot then open. */
+int cng_dev_shm_ok(void);
+
+/* 0, or -1 when the rootfs path does not fit fs->rootfs: it is refused rather
+ * than truncated, since a short prefix roots the guest somewhere else. */
+/* The published view (see path.c): cng_g_fs points at it. Readers take a
+ * sequence and the pointer, work, and re-check the sequence — a change means a
+ * writer swapped the view meanwhile and the work is redone. The path functions
+ * below do this themselves when handed the view; a caller reading fields of
+ * its own (a walk of the binds) does it like so:
+ *     const struct cng_fs *v;
+ *     do { unsigned s = cng_fs_read_begin(&v); ... v->binds ... }
+ *     while (cng_fs_read_retry(s));
+ * A private struct — one cng_fs_publish has not been given — is read and
+ * written in place. */
+unsigned cng_fs_read_begin(const struct cng_fs **fs);
+int cng_fs_read_retry(unsigned s);
+struct cng_fs *cng_fs_publish(const struct cng_fs *src);
+/* The cwd (never empty: "/" at least) and the rootfs of the view, copied out
+ * under the protocol above. Returns strlen of the source. */
+size_t cng_fs_cwd(char *out, size_t sz);
+size_t cng_fs_rootfs(char *out, size_t sz);
+
+int cng_fs_init(struct cng_fs *fs, const char *rootfs);
+int cng_fs_add_bind(struct cng_fs *fs, const char *guest, const char *host,
+                    int ro);
+void cng_fs_set_cwd(struct cng_fs *fs, const char *guest_cwd);
+
+/* 1 if `host` (an already-resolved host path) lies under a read-only bind, so a
+ * mutating syscall on it must answer -EROFS. Keyed on the host side — as the
+ * oracle's host_ro is — so a guest symlink that lands inside a :ro bind is
+ * covered too, however the path got there. */
+int cng_fs_host_ro(const struct cng_fs *fs, const char *host);
+
+/* Emulate chroot(2): make the guest directory `guest_root` (canonical, with
+ * `host_root` its already-translated host path) the new guest root. Bind
+ * mounts and the cwd are rebased onto it rather than dropped — a real chroot
+ * unmounts nothing (apk runs every package script under chroot(".")). */
+void cng_fs_chroot(struct cng_fs *fs, const char *guest_root,
+                   const char *host_root);
+
+/* Lexically canonicalize an absolute guest path (collapse //, ., ..). `..` at
+ * the root stays at the root. Returns 0 on success, -1 on overflow. */
+int cng_path_canon(const char *abs, char *out, size_t outsz);
+
+/* Does this spelling require its final component to resolve to a DIRECTORY?
+ *
+ * A trailing slash says so, and it is a statement about the file, not about the
+ * name: Linux answers ENOTDIR for "f/" where "f" is anything but a directory,
+ * follows the final symlink to find out however loudly O_NOFOLLOW or
+ * AT_SYMLINK_NOFOLLOW asked it not to, and turns an O_CREAT into EISDIR. A
+ * trailing "/." says the identical thing ("f/." is ENOTDIR too).
+ *
+ * cng_path_canon drops both, because what it produces is a name. So the
+ * question is asked of the spelling before it is canonicalized, and carried to
+ * the host path the kernel is finally handed. */
+int cng_path_wants_dir(const char *path);
+
+/* Resolve a guest path (absolute or relative to fs->cwd) to a canonical guest
+ * absolute path (no host rootfs applied). Returns 0/-1. */
+int cng_fs_abscanon(const struct cng_fs *fs, const char *path, char *out,
+                    size_t outsz);
+
+/* Which entry of the guest's mount table a path falls in — the identity
+ * RESOLVE_NO_XDEV is judged against, and the same table the synthesized
+ * /proc/self/mounts is built from. A bind is its own index; everything else is
+ * one of these. */
+#define CNG_MOUNT_ROOTFS (-1)
+#define CNG_MOUNT_PROC   (-2)
+#define CNG_MOUNT_DEV    (-3)
+
+/* Translate a guest path (absolute, or relative to fs->cwd) to a host path.
+ * Returns 0 on success, -1 on overflow. The _mnt form also reports which mount
+ * answered (see above); `mount_out` may be 0, which is what cng_fs_translate
+ * passes. */
+int cng_fs_translate(const struct cng_fs *fs, const char *path, char *out,
+                     size_t outsz);
+int cng_fs_translate_mnt(const struct cng_fs *fs, const char *path, char *out,
+                         size_t outsz, int *mount_out);
+
+/* The mount alone, for a path that is already canonical (an absolute guest
+ * path with no ".", ".." or doubled slashes: what the resolver's walk holds).
+ * The same verdict cng_fs_translate_mnt reports, without the host path being
+ * built — RESOLVE_NO_XDEV asks this of every component it walks. */
+int cng_fs_mount_of(const struct cng_fs *fs, const char *canon);
+
+/* Reverse translation: map a host path back to the guest path it represents
+ * (strip rootfs / reverse binds). Returns 0 on success, -1 if the host path is
+ * outside the guest view. Used to keep the virtual cwd in sync after fchdir. */
+int cng_fs_untranslate(const struct cng_fs *fs, const char *host, char *out,
+                       size_t outsz);
+
+#endif /* CNG_PATH_H */

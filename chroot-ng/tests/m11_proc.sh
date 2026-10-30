@@ -1,0 +1,727 @@
+# M11: /proc emulation (sourced by tests/run.sh).
+#
+# Two layers. First the dispatcher-level self-test (-t proctest), which needs no
+# seccomp and so runs anywhere. Then guest-shell scenarios under -R with a real
+# Alpine rootfs: those are the ones that would have caught a file describing
+# chroot-ng instead of the guest, since a shell reads them the way a real tool
+# does. Unlike M10 this is not differential against arm64chroot — the sibling
+# emulator synthesizes a plausibly different mount table (its own pseudo-mount
+# rows and mount IDs), so the assertions are structural instead.
+echo "== M11: /proc emulation =="
+
+M11_ALPINE="${M11_ALPINE:-$CNG_ALPINE}"
+
+# The bind source is a directory we make, not a host path like /usr: Android has
+# no /usr at all, and all proctest wants is a bind whose guest mount point must
+# then show up in the synthesized mount table.
+PT=$(mktemp -d); PTB=$(mktemp -d)
+out=$(run -t proctest -r "$PT" -b "$PTB":/usr 2>&1); rc=$?
+check "proctest overall" 0 "$rc"
+check_contains "the registry runs broker-backed (--shared-proc plumbing)" \
+    "proctest shared-proc backing: 3 -> OK" "$out"
+check_contains "/proc passes through, non-guest pids are hidden" \
+    "proctest passthrough+hidden -> OK" "$out"
+check_contains "a -b /proc:/proc bind does not reopen the host process list" \
+    "proctest bound-proc hidden -> OK" "$out"
+check_contains "a /proc listing drops host pids, keeps guest ones" \
+    "proctest listing: self=1 own_pid=1 host_pids=0 -> OK" "$out"
+# The hidden view keys on the resolved HOST path, and a /proc dirfd has no guest
+# path to resolve against — so a relative name under one went to the kernel
+# untouched and read the process the absolute spelling had just refused. Our own
+# entry must still be reachable both ways, or the fix would hide everything.
+# ...and the fd links, which are the sharp end of the same thing: they are
+# answered as HOST paths, so the kernel takes one straight to the open file
+# description it names. A hidden process's descriptors were readable by pid and
+# number — the host file itself, wherever on the filesystem it lived. ENOENT is
+# the required answer, not EACCES: that would mean we reached it and only DAC
+# turned us away.
+check_contains "a host pid stays hidden through a /proc dirfd and its fd links" \
+    "prochide: abs=-2 rel=-2 bare=-2 own=1 self=1 fdlink=-2 fdopen=-2 ownfd=1 -> OK" \
+    "$(run -t dtest -r "$PT" prochide / 2>&1)"
+check_contains "cmdline is the guest argv, not the chroot-ng invocation" \
+    "proctest cmdline: 24 bytes argv0=/bin/busybox -> OK" "$out"
+
+# ...and that has to hold when there is no registry at all. It is a shared table
+# and it can be missing (no memfd) or full; the fallback used to be the host
+# file, which for a guest process is the chroot-ng invocation that started it.
+# We are the process being described, so the live stack answers on its own.
+# CNG_PROCREG_NONE=1 is the only way to reach the degraded tier on a working
+# host (same convention as CNG_SHM_FORCE_FILE).
+sout=$(run -t selfproc 2>&1)
+check "selfproc with the registry" 0 $?
+check_contains "our own cmdline is the guest's argv" \
+    "selfproc /proc/self/cmdline: 22 bytes [/bin/guestprog] -> OK" "$sout"
+check_contains "our own environ is the guest's" \
+    "selfproc /proc/self/environ: 13 bytes [GUESTVAR=yes] -> OK" "$sout"
+sout=$(CNG_PROCREG_NONE=1 run -t selfproc 2>&1)
+check "selfproc with no registry at all" 0 $?
+check_contains "the registry really was unavailable" \
+    "selfproc registry=0: 0 failure(s)" "$sout"
+check_contains "cmdline still answers from the live stack" \
+    "selfproc /proc/self/cmdline: 22 bytes [/bin/guestprog] -> OK" "$sout"
+check_contains "environ still answers from the live stack" \
+    "selfproc /proc/self/environ: 13 bytes [GUESTVAR=yes] -> OK" "$sout"
+# That stack is the guest's own, and it is read long after it was built: argc,
+# the vectors and the strings they name are all the program's to rewrite
+# (setproctitle does exactly that), while the file is one the guest opens on
+# itself. The walk used to be raw — an unbounded `while (*p) p++` over the
+# environment and another over the auxv pairs — so a stack that ran off the end
+# of its mapping faulted inside the SIGSYS handler, where SIGSEGV is masked and
+# the process dies rather than answering. Three rewrites of one stack that ends
+# at the edge of a mapping: an unreadable string ends the cmdline (0 bytes,
+# environ and auxv intact), an unterminated environment empties the environ while
+# the cmdline still answers, and an unterminated auxv is dropped whole rather
+# than half-walked. What is never done is declining the snapshot and letting the
+# host file answer, since for a guest process that file is the chroot-ng
+# invocation — the one answer that is certainly wrong.
+check_contains "a stack the guest has since rewritten answers, never faults" \
+    "selfproc hostile-stack: bad-string=0,13,16 bad-envp=15,0,0 bad-auxv=15,13,0 -> OK" \
+    "$sout"
+check_contains "environ is the guest environment" \
+    "proctest environ: 30 bytes -> OK" "$out"
+check_contains "another guest process is described from the registry" \
+    "proctest other-pid: -> OK" "$out"
+check_contains "a child's exec outranks the fork publish; a dead pid stops answering" \
+    "proctest fork-guard+stale-pid: -> OK" "$out"
+# A child the scheduler runs ahead of its parent's publish registers itself, so
+# a process it forks in that gap is published too, rather than invisible for
+# good — refused by PTRACE_ATTACH and hidden from kill.
+check_contains "a child that forks before its parent publishes it is registered" \
+    "proctest fork before the parent publishes: y -> OK" "$out"
+check_contains "mounts describes the rootfs and binds" "proctest mounts:" "$out"
+check_contains "mountinfo carries the root device row" "proctest mountinfo:" "$out"
+check_contains "loadavg has the kernel's five fields" "proctest loadavg:" "$out"
+check_contains "a held loadavg fd refreshes on rewind (top's pattern)" \
+    "proctest loadavg refresh:" "$out"
+check_contains "the readv path takes the same refresh hook" \
+    "proctest loadavg readv refresh:" "$out"
+# The p-variants take it too, and there the offset is the caller's argument, not
+# the description's — which pread(2) is defined never to move. Measured: the
+# kernel leaves a held /proc/uptime fd at 8 across a pread of the whole file.
+check_contains "the refresh is keyed on device and inode, and a reused number is left alone" \
+    "proctest synth fd identity: dev+ino=1 reused number left alone=1 -> OK" "$out"
+check_contains "a pread that triggers the refresh leaves the offset alone" \
+    "proctest pread keeps the offset: 8 then 8 -> OK" "$out"
+# The entry a number carried is the one taken when another refreshable file is
+# opened onto it; left beside the new one, it was what the first read found
+# and retired, skipping that read's refresh.
+check_contains "a number reused by another refreshable file refreshes as it" \
+    "proctest synth fd reused by another kind: same=1 uptime=1 refreshed=1 -> OK" "$out"
+check_contains "uptime is synthesized" "proctest uptime:" "$out"
+# The description handed over is what the real file gives. memfd_create only
+# makes O_RDWR files, and that was what the guest got: a /proc file it could
+# write(), ftruncate() and mmap(MAP_SHARED|PROT_WRITE), reporting O_RDWR from
+# F_GETFL — all refused on the real file (EBADF, EINVAL, EACCES, O_RDONLY). The
+# status flags it did ask for (O_APPEND) still come back from F_GETFL.
+# The only way to a read-only description of a memfd is to reopen it through its
+# own /proc link, and Android's policy refuses that. There the view is a file of
+# ours instead, in a private directory under $TMPDIR, opened read-only for real
+# and unlinked: Chrome dup()s a child's /proc/<pid>/status and CHECKs that what
+# it hands on is read-only. Only with no such directory either does the fd stay
+# writable (documented at synth_seal), and the driver says so.
+case "$out" in
+*"proctest synth fd is read-only: unavailable"*)
+    skip "synthesized fds are read-only: this host refuses to reopen a memfd and has no private temp directory"
+    ;;
+*)
+    check_contains "a synthesized fd is read-only, with the guest's status flags" \
+        "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
+        "$out"
+    ;;
+esac
+# The same driver with that reopen taken as refused (CNG_PROCFS_REOPEN_DENY),
+# which is what reaches the files off a device: every check holds as it does
+# from a memfd — content, refresh, identity, the fd link's name — and nothing
+# is left in the directory once the views are closed.
+PTS=$(mktemp -d)
+out=$(TMPDIR="$PTS" CNG_PROCFS_REOPEN_DENY=1 run -t proctest -r "$PT" -b "$PTB":/usr 2>&1); rc=$?
+check "proctest overall, views from files of ours" 0 "$rc"
+check_contains "...read-only for real, with the guest's status flags" \
+    "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
+    "$out"
+check_contains "...refreshed through the file on a rewind" \
+    "proctest synth fd identity: dev+ino=1 reused number left alone=1 -> OK" "$out"
+check_contains "...and named by its link as the memfd is" \
+    "proctest overflowuid: 6 bytes -> OK" "$out"
+check "...and the directory holds nothing afterwards" "" \
+    "$(ls -A "$PTS/chroot-ng-proc.v1.$(id -u)" 2>&1)"
+rm -rf "$PTS"
+# ...and the open flags are judged as the kernel judges them on the real file,
+# in its order: O_TRUNC is write intent (EACCES on a 0444 file), O_CREAT|O_EXCL
+# is EEXIST on a name that exists, O_DIRECTORY is ENOTDIR, O_DIRECT EINVAL,
+# O_NOATIME the owner's, O_NOFOLLOW on the /proc/mounts symlink whatever the
+# host says for it (ELOOP on a kernel; qemu-user realpath()s the name), and
+# O_PATH hands over the real inode, which cannot be read. Each of these used to
+# synthesize as if nothing had been asked. (The noatime field is -1 unprivileged
+# and 0 as root, so the line is matched up to it and the overall rc covers it.)
+check_contains "synthesized /proc opens judge their flags as the kernel does" \
+    "proctest open flags: trunc=-13 creat_excl=-17 dir=-20 direct=-22 noatime=" \
+    "$out"
+# The fd described the memfd behind it: fstat, newfstatat/statx by fd and
+# fstatfs answered 0777, no links, the content's size and tmpfs where stat() of
+# the same path (host passthrough) says the real /proc file, and its fd link
+# read "/memfd:cng-proc (deleted)". Now the real file's — found again from the
+# memfd's name, so a dup'd fd and a stat through the link agree too, and a
+# held entry of a process that is gone still reads as a /proc regular file.
+# A host with no statx to issue cannot be asked the statx half (statx=-1).
+sfd_needle="proctest synth fd stat: fstat=1 statx=1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK"
+case "$out" in
+*"proctest synth fd stat: fstat=1 statx=-1 "*)
+    skip "synthesized fd statx: this host has no statx to issue (kernel or ambient filter)"
+    sfd_needle="proctest synth fd stat: fstat=1 statx=-1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK" ;;
+esac
+check_contains "a synthesized fd stats as the real /proc file, and outlives it" \
+    "$sfd_needle" "$out"
+check_contains "stat falls back to synthesis where the host denies it" \
+    "proctest stat:" "$out"
+check_contains "overflowuid is the kernel default, from a memfd, where forced" \
+    "proctest overflowuid: 6 bytes -> OK" "$out"
+check_contains "overflowgid is the kernel default, from a memfd, where forced" \
+    "proctest overflowgid: 6 bytes -> OK" "$out"
+check_contains "maps leaks no host path" "proctest maps:" "$out"
+check_contains "an fd link reports the guest path" \
+    "proctest fdlink: / -> OK" "$out"
+# ...and a buffer the value does not fit in cuts the guest spelling, rather than
+# being left as the kernel wrote it — which for a short buffer is the head of
+# the HOST path, and past the answer its tail.
+check_contains "a short readlink buffer truncates the guest path, not the host one" \
+    "proctest fdlink short: 1=/ 2=/r 3=/rl 4=/rl residue=0 -> OK" "$out"
+check_contains "a map_files link target is mapped into the guest view" \
+    "proctest map_files:" "$out"
+check_contains "status Uid/Gid remapped under --fake-id" \
+    "proctest status remap:" "$out"
+# ...and it has to be the LIVE set. The ids in cng_g_cred are what getresuid,
+# getresgid and getgroups answer, and every credential syscall writes them; the
+# status lines were remapped from the host's instead, so a guest that dropped
+# privilege was still described by the identity it started with, and its
+# supplementary groups were the invoking user's — groups getgroups() never
+# reported. One process, two answers, is a thing the kernel cannot do.
+check_contains "status carries the live credential set, not the startup one" \
+    "proctest status live: uid=11/12/13 gid=21/22/23 groups=3 -> OK" "$out"
+# capget names a task and the kernel looks it up: 0 and the caller's own tid
+# are the caller, any other pid is found — any thread, not only a leader — or
+# is ESRCH. The fake set used to be synthesized for every non-negative pid, so a
+# pid that named nothing was described as fully capable. Another guest process
+# is judged by the ids it publishes, a fake root's being the full set; a host
+# process is whatever the kernel says of it.
+check_contains "capget by pid: ourselves and a guest faked, the rest the kernel's" \
+    "proctest capget by pid: self=0/ffffffff tid=0/ffffffff guest=0/ffffffff dead=-3 host=0 neg=-22 none=-3 -> OK" \
+    "$out"
+# What a guest publishes of its ids, which is what a socket peer is told of it
+# (SO_PEERCRED, SCM_CREDENTIALS, SO_PEERGROUPS) and what its status file and
+# /proc directory say: a forked child that drops them is read by all eight
+# and its groups, and has no capabilities to capget; its claim is recorded
+# beside them, and the next change of its set drops the claim.
+check_contains "a guest's published ids follow its drop, and capget with them" \
+    "proctest ids by pid: dropped=1 fake=1 1234/1234/1235/1236:1234/1234/1237/1238 groups=2:7,8 claim=1 0:1234 capget=0/0 changed=1 claim=0 -> OK" \
+    "$out"
+check_contains "--no-proc disables passthrough and synthesis" \
+    "proctest no-proc -> OK" "$out"
+rm -rf "$PT" "$PTB"
+
+# --- maps lines longer than the line reader ---------------------------------
+# put_maps re-parses every chunk the line reader hands it, and a line longer
+# than that reader's buffer arrives in pieces. Only the first piece carries the
+# five fixed columns; the rest is bare path characters, which the five-field
+# scan runs straight past, so the "no pathname column" branch printed the raw
+# host tail — the one thing put_maps exists to prevent. Two legs, because the
+# fix has two halves: a buffer that fits any path the kernel can print, and a
+# refusal to re-parse a piece of a line when it does not.
+#
+# The length has to come from the guest side of a short rootfs: a bind's host
+# path is capped at 512 bytes, so it cannot supply one. The rootfs prefix is
+# then the only part of the host spelling the guest cannot also say, which makes
+# the mktemp directory's own name the marker to count.
+ML_DIR=$(mktemp -d)
+ML_MARK=$(basename "$ML_DIR")
+ML_ROOT="$ML_DIR/rootfs"
+mkdir -p "$ML_ROOT"
+if guest_xlate_ready "maps over-long-line legs" &&
+    guest_cc_report "$ML_ROOT/mapslong" tests/guests/mapslong.c; then
+    # (a) A host path long enough to have overrun the old 2 KiB line buffer,
+    # which is an ordinary deep tree: a nested node_modules, a Java class
+    # hierarchy. The mapping must still appear, under its guest name.
+    ml_deep=""
+    ml_i=0
+    while [ "$ml_i" -lt 50 ]; do
+        ml_deep="$ml_deep/cngdeepcngdeepcngdeepcngdeepcngdeepcngdeepcng"
+        ml_i=$((ml_i + 1))
+    done
+    if mkdir -p "$ML_ROOT$ml_deep" 2>/dev/null &&
+        printf 'x' > "$ML_ROOT$ml_deep/blob" 2>/dev/null; then
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $GUEST_BINDS "$ML_ROOT" /mapslong "$ml_deep/blob" \
+            "$ML_MARK" 2>&1)
+        check_contains "maps a long host path survives whole" \
+            "lines=1 hostleak=0 mapped=1 malformed=0" "$out"
+    else
+        skip "maps long-path leg: the host filesystem refused the path"
+    fi
+
+    # (b) Past any buffer, so the size alone cannot be the whole fix. The kernel
+    # escapes '\n' in the pathname column as the four bytes \012, so a path made
+    # of newlines prints four times its own length: measured, fourteen 251-byte
+    # components print as a 14155-byte line, and PATH_MAX bounds only the path.
+    # A guest can make such a directory inside its own rootfs. Nothing faithful
+    # can be emitted for that line — but half of it is not the answer either,
+    # and re-parsing the second half is what printed the raw host tail.
+    ml_nl=$(printf 'a'; printf '%0249d' 0 | tr '0' '\n'; printf 'b')
+    ml_wide=""
+    ml_i=0
+    while [ "$ml_i" -lt 14 ]; do
+        ml_wide="$ml_wide/$ml_nl"
+        ml_i=$((ml_i + 1))
+    done
+    if mkdir -p "$ML_ROOT$ml_wide" 2>/dev/null &&
+        printf 'x' > "$ML_ROOT$ml_wide/blob" 2>/dev/null; then
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $GUEST_BINDS "$ML_ROOT" /mapslong "$ml_wide/blob" \
+            "$ML_MARK" 2>&1)
+        # mapped=0 by construction: the guest names the path in raw bytes and
+        # maps prints it escaped, so the row cannot be found by that spelling.
+        check_contains "maps an unprintable-length path emits no half-line" \
+            "hostleak=0 mapped=0 malformed=0" "$out"
+    else
+        skip "maps escaped-path leg: the host filesystem refused the path"
+    fi
+fi
+rm -rf "$ML_DIR"
+
+# A refreshable file's tracking entry used to publish the descriptor before
+# its kind and identity, so a sibling thread reading the new number in that
+# interval judged it against the entry's previous identity, retired it, and
+# the file never refreshed again. Reader threads pread the whole reserved range
+# from offset 0 while the main thread opens batches of /proc/uptime into it and
+# checks that each rewind reads a clock that has moved. The window is a few
+# instructions wide, so the previous build loses a refresh in only some runs;
+# a lost one is never right.
+PR_ROOT=$(mktemp -d)
+if guest_xlate_ready "refresh-tracking race leg" &&
+    guest_cc "$PR_ROOT/procrace" tests/guests/procrace.c -pthread; then
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    out=$(run_t 120 -R $GUEST_BINDS "$PR_ROOT" /procrace 2>&1)
+    check_contains "a rewind refreshes however readers race the open" \
+        "procrace: samples>0=1 lost=0" "$out"
+else
+    skip "refresh-tracking race leg: could not build tests/guests/procrace.c with -pthread"
+fi
+rm -rf "$PR_ROOT"
+
+# The mount tables are emitted from one static snapshot of the view, held by
+# thread id. Under -R the dispatcher runs on the guest's signal mask, so a
+# handler that interrupted the emission and opened a mount table itself waited
+# for the snapshot its own thread held: the previous build hangs here in every
+# run. An interval timer interrupts a loop of mountinfo reads, and the handler
+# reads it too; every read must be the same table.
+MS_ROOT=$(mktemp -d)
+if guest_xlate_ready "mount table from a signal handler leg" &&
+    guest_cc_report "$MS_ROOT/mntsig" tests/guests/mntsig.c; then
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    out=$(run_t 60 -R $GUEST_BINDS "$MS_ROOT" /mntsig 2>&1)
+    check_contains "a mount table opened from a handler that interrupted another" \
+        "mntsig: handled>0=1 bad=0" "$out"
+fi
+rm -rf "$MS_ROOT"
+
+# A /proc number spelled with a leading zero is no name at all to procfs
+# (name_to_int), so "/proc/self/fd/05" and "/proc/0<pid>/exe" are ENOENT
+# whatever descriptor 5 and process <pid> are. Where the monitor answers such a
+# name itself — an exec through an fd link, exe/cwd, a synthesized cmdline — it
+# read the digits as the number, and the previous build ran the program and
+# read the files. Differential against the same guest with nothing in the way.
+PN_ROOT=$(mktemp -d)
+if guest_xlate_ready "leading-zero /proc name leg" &&
+    guest_cc_report "$PN_ROOT/procnum" tests/guests/procnum.c; then
+    pn_base=$(emu_t 60 "$PN_ROOT/procnum" 2>/dev/null)
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    pn_got=$(run_t 60 -R $GUEST_BINDS "$PN_ROOT" /procnum 2>/dev/null)
+    case "$pn_base" in
+    *"fd plain open: ok"*"exec pid-zero-exe: errno=2"*)
+        if [ "$pn_got" = "$pn_base" ]; then
+            pass=$((pass + 1))
+            echo "  ok   a /proc number with a leading zero names what the kernel's does"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL a /proc number with a leading zero names what the kernel's does"
+            printf '%s\n' "$pn_base" >"$CNG_TMP/pn.want"
+            printf '%s\n' "$pn_got" >"$CNG_TMP/pn.got"
+            diff "$CNG_TMP/pn.want" "$CNG_TMP/pn.got" | sed 's/^/    /'
+        fi
+        ;;
+    *)
+        skip "leading-zero /proc name leg: the unemulated guest did not run cleanly"
+        ;;
+    esac
+fi
+rm -rf "$PN_ROOT"
+
+# stat, statx, access and an O_PATH fstat on the synthesized global files
+# (version, loadavg, uptime, stat, sys/kernel/overflow{u,g}id). Android's SELinux
+# refuses an app every one of them, and the open was served from memory regardless, so `cat` worked where
+# `stat` and `test -r` of the same name failed. The guest checks the shape every
+# form must agree on, which holds wherever the host answers or refuses the call
+# itself: on a device the refusal is real, and elsewhere CNG_PROC_DENY_STAT=1
+# makes the second run take the same path (/proc/stat and the overflow{u,g}id
+# sysctls, readable here, join it with CNG_PROCSTAT_SYNTH and
+# CNG_OVERFLOWID_SYNTH). Where the host has no statx at all the guest leaves
+# that form out and says so on a last line, which is taken off and noted.
+PS_ROOT=$(mktemp -d)
+ps_nostatx() {
+    case "$ps_got" in
+    *"
+statx: none on this host")
+        ps_got=${ps_got%"
+statx: none on this host"}
+        [ -n "${ps_noted:-}" ] ||
+            skip "statx of a synthesized /proc file: this host has no statx to issue"
+        ps_noted=1 ;;
+    esac
+}
+if guest_xlate_ready "synthesized /proc stat leg" &&
+    guest_cc_report "$PS_ROOT/procstat" tests/guests/procstat.c; then
+    ps_want="/proc/version: ok
+/proc/loadavg: ok
+/proc/uptime: ok
+/proc/stat: ok
+/proc/sys/kernel/overflowuid: ok
+/proc/sys/kernel/overflowgid: ok"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    ps_got=$(run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    ps_nostatx
+    if [ "$ps_got" = "$ps_want" ]; then
+        pass=$((pass + 1))
+        echo "  ok   stat and access of a synthesized /proc file agree with the file it is served as"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL stat and access of a synthesized /proc file agree with the file it is served as"
+        printf '%s\n' "$ps_got" | sed 's/^/    /'
+    fi
+    # shellcheck disable=SC2086
+    ps_got=$(CNG_PROC_DENY_STAT=1 CNG_PROCSTAT_SYNTH=1 CNG_OVERFLOWID_SYNTH=1 \
+        run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    ps_nostatx
+    if [ "$ps_got" = "$ps_want" ]; then
+        pass=$((pass + 1))
+        echo "  ok   ...and with the host's own refusal of each call forced"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL ...and with the host's own refusal of each call forced"
+        printf '%s\n' "$ps_got" | sed 's/^/    /'
+    fi
+fi
+rm -rf "$PS_ROOT"
+
+# cmdline and environ are the process's memory, read when the file is: a title
+# written over argv is what `ps` prints from then on (node's process.title,
+# setproctitle, nginx's and postgres's status lines). They were the registry's
+# exec-time copies, so every one of those read back as the command line the
+# process started with. Now the kernel's own record is pointed at the guest's
+# strings where it takes PR_SET_MM_MAP (a desktop kernel: "record: kernel"),
+# and where it does not (Android, or CNG_MM_MAP_DENY=1) the ranges are read
+# out of the guest's memory under the kernel's rules — ours directly, a child's
+# with process_vm_readv. The guest checks its own files and a forked child's
+# against those rules, which a native host first confirms against the kernel
+# itself. qemu-user has no process_vm_readv for anyone, so on the cross host a
+# child's files are still the copies and only the guest's own are asserted.
+PT_ROOT=$(mktemp -d)
+pt_check() { # desc, want, got
+    if [ "$2" = "$3" ]; then
+        pass=$((pass + 1)); echo "  ok   $1"
+    else
+        fail=$((fail + 1)); echo "  FAIL $1"
+        printf '%s\n' "$2" >"$CNG_TMP/pt.want"
+        printf '%s\n' "$3" >"$CNG_TMP/pt.got"
+        diff "$CNG_TMP/pt.want" "$CNG_TMP/pt.got" | sed 's/^/    /'
+    fi
+}
+if guest_xlate_ready "live cmdline/environ leg" &&
+    guest_cc_report "$PT_ROOT/proctitle" tests/guests/proctitle.c; then
+    pt_legs="start: ok
+start environ: ok
+environ: ok
+kid cmdline: ok
+kid environ: ok
+title: ok
+overflow: ok
+overflow environ: ok"
+    pt_record=ours
+    if [ -n "$QEMU" ]; then
+        pt_legs=$(printf '%s\n' "$pt_legs" | grep -v '^kid ')
+        pt_cut() { grep -v -e '^kid ' -e '^mm_map: '; }
+        skip "a child's live cmdline/environ: qemu-user has no process_vm_readv"
+    else
+        pt_cut() { grep -v '^mm_map: '; }
+        pt_got=$(kref "$PT_ROOT/proctitle" 2>&1)
+        case "$pt_got" in
+        "mm_map: yes"*) pt_record=kernel ;;
+        esac
+        # A kernel before 4.18 ended a title run into the environment at its
+        # NUL and left the NUL out (Android 8's 3.18, measured): no reference
+        # for that leg, which the emulation answers as the 6.1 it advertises.
+        # The rest is still the kernel's to judge.
+        pt_kwant=$pt_legs
+        if printf '%s\n' "$pt_got" |
+            grep -q '^overflow: FAIL got [0-9]* \[\([^]]*\)\] want [0-9]* \[\1|\]$'; then
+            skip "the kernel's cmdline of an overflowing title: the host kernel predates its NUL (4.18), so it is no reference"
+            pt_kwant=$(printf '%s\n' "$pt_legs" | grep -v '^overflow: ')
+            pt_got=$(printf '%s\n' "$pt_got" | grep -v '^overflow: ')
+        fi
+        pt_check "the kernel's own cmdline and environ follow the rules the guest checks" \
+            "record: kernel
+$pt_kwant" "$(printf '%s\n' "$pt_got" | pt_cut)"
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    pt_got=$(run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle 2>/dev/null)
+    pt_check "cmdline and environ are the guest's live strings" \
+        "record: $pt_record
+$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+    # shellcheck disable=SC2086
+    pt_got=$(CNG_MM_MAP_DENY=1 run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle \
+        2>/dev/null)
+    pt_check "...and read out of guest memory where the kernel's record stays ours" \
+        "record: ours
+$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+fi
+rm -rf "$PT_ROOT"
+
+# --- guest-shell scenarios -------------------------------------------------
+m11_ready=0
+if [ -n "$M11_ALPINE" ] && [ -x "$M11_ALPINE/bin/busybox" ]; then
+    m11_ready=1
+else
+    skip "guest-shell /proc scenarios: no alpine rootfs"
+fi
+# Bound at the guest's /tmp so the mount table has a third row to find. The host
+# side is a directory of ours: /tmp is not a path Android has.
+M11TMP=$(mktemp -d)
+
+# m11_sh <desc> <expected> <script>: run the script in an Alpine guest under -R
+# and compare its (whitespace-trimmed) stdout. $M11BIND is the -b spec, so a leg
+# that needs a different mount point can set it around itself.
+M11BIND="$M11TMP:/tmp"
+m11_sh() {
+    got=$(run -R -b "$M11BIND" "$M11_ALPINE" /bin/busybox sh -c "$3" 2>/dev/null)
+    if [ "$got" = "$2" ]; then
+        pass=$((pass + 1)); echo "  ok   m11 $1"
+    else
+        fail=$((fail + 1)); echo "  FAIL m11 $1"
+        echo "    want: $2"
+        echo "    got:  $got"
+    fi
+}
+
+if [ "$m11_ready" -eq 1 ]; then
+    # The guest's own command line — the host file holds the chroot-ng argv.
+    m11_sh "cmdline is the guest's own argv" "cat|/proc/self/cmdline|" \
+        'cat /proc/self/cmdline | tr "\0" "|"'
+
+    # The mount table is the guest's: rootfs, /proc, and the -b bind.
+    m11_sh "mounts shows rootfs + proc + bind" "3" \
+        'grep -c -e "^/dev/root / " -e "^proc /proc proc " -e " /tmp " /proc/mounts'
+
+    # ...and it names a device as the source of every row, as a real one does.
+    # The directory a bind came from is a host path: `df`, `mount` and findmnt
+    # print that field, and it used to spell out where the rootfs lives on the
+    # device — in the one namespace whose whole point is that the guest cannot
+    # name a host path (the maps leg above is the same assertion one file over).
+    m11_sh "no mount table leaks the bind's source path" "0" \
+        "cat /proc/mounts /proc/self/mountinfo /proc/self/mountstats |
+         grep -c '$M11TMP'"
+    m11_sh "...and the bind is still a row of the guest's own device" "1" \
+        'grep -c "^/dev/root /tmp " /proc/mounts'
+
+    # A guest mount point with whitespace in it. Every one of these tables is
+    # whitespace-separated and everything that reads one splits on that —
+    # libmount, busybox df and mount, findmnt — so a real kernel escapes space,
+    # tab, newline and backslash as octal in every path and device name it
+    # prints (fs/proc_namespace.c). Printed raw, the row named "/tmp/my" and
+    # handed the field after it, the filesystem type, to "dir".
+    M11BIND="$M11TMP:/tmp/my dir"
+    m11_sh "a mount point with a space is escaped in all three tables" "3" \
+        "cat /proc/mounts /proc/self/mountinfo /proc/self/mountstats |
+         grep -cF '/tmp/my\040dir'"
+    m11_sh "...and appears raw in none of them" "0" \
+        "cat /proc/mounts /proc/self/mountinfo /proc/self/mountstats |
+         grep -cF '/tmp/my dir'"
+    # ...and it is still the mount point the guest can reach by that name.
+    m11_sh "...and the guest still finds it under that name" "ok" \
+        '[ -d "/tmp/my dir" ] && echo ok'
+    M11BIND="$M11TMP:/tmp"
+
+    # No host path may appear in the guest's view of its own mappings.
+    m11_sh "maps leaks no rootfs host path" "0" \
+        "grep -c '$M11_ALPINE' /proc/self/maps"
+
+    # Host processes are invisible; the guest's own are not.
+    m11_sh "a host pid is hidden" "hidden" \
+        '[ -e /proc/1/stat ] || echo hidden'
+    m11_sh "our own pid is visible" "visible" \
+        '[ -e /proc/$$/stat ] && echo visible'
+    m11_sh "ps sees only the guest's processes" "few" \
+        'n=$(ps | wc -l); [ "$n" -lt 10 ] && echo few'
+
+    # The magic links stay in guest terms.
+    m11_sh "exe link is the guest path" "/bin/busybox" 'readlink /proc/self/exe'
+    m11_sh "root link is the guest root" "/" 'readlink /proc/self/root'
+
+    # loadavg / uptime shape (Android denies the real files to apps).
+    m11_sh "loadavg has five fields" "5" 'wc -w < /proc/loadavg'
+    m11_sh "uptime has two fields" "2" 'wc -w < /proc/uptime'
+
+    # bubblewrap reads these two before it does anything else and dies where
+    # Android denies them. Forced here, the guest gets the kernel's default;
+    # unforced, a readable host file is the answer, and the debug trace shows
+    # which one served the open.
+    got=$(CNG_OVERFLOWID_SYNTH=1 CNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
+        'echo $(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)' 2>&1)
+    case $got in
+    *"procfs /proc/sys/kernel/overflowuid -> fd"*"procfs /proc/sys/kernel/overflowgid -> fd"*"65534 65534")
+        pass=$((pass + 1)); echo "  ok   m11 overflowuid and overflowgid are served from the fallback, 65534" ;;
+    *)
+        fail=$((fail + 1)); echo "  FAIL m11 overflowuid and overflowgid are served from the fallback, 65534"
+        printf '%s\n' "$got" | sed 's/^/    /' ;;
+    esac
+    if [ -r /proc/sys/kernel/overflowuid ] && [ -r /proc/sys/kernel/overflowgid ]; then
+        want="$(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)"
+        got=$(CNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
+            'echo $(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)' 2>&1)
+        case $got in
+        *"procfs /proc/sys/kernel/overflow"*)
+            fail=$((fail + 1)); echo "  FAIL m11 a readable host overflowuid/overflowgid is not shadowed"
+            printf '%s\n' "$got" | sed 's/^/    /' ;;
+        *"$want")
+            pass=$((pass + 1)); echo "  ok   m11 a readable host overflowuid/overflowgid is not shadowed" ;;
+        *)
+            fail=$((fail + 1)); echo "  FAIL m11 a readable host overflowuid/overflowgid is not shadowed"
+            echo "    want: $want"
+            printf '%s\n' "$got" | sed 's/^/    /' ;;
+        esac
+    else
+        skip "overflowuid/overflowgid passthrough: the host cannot read them"
+    fi
+
+    # comm is the guest program, not chroot-ng (PR_SET_NAME, not synthesis).
+    m11_sh "comm names the guest program" "busybox" 'cat /proc/self/comm'
+
+    # What a synthesized fd says about itself. The shell's redirection is the
+    # common way one reaches a program: the shell opens the file, dup2()s it
+    # onto 0 and closes the original, so the program's fstat(0) is of a dup'd
+    # fd. That used to describe the memfd behind it — 0777, no links, the
+    # content's size — where stat of the path says the real file; and the fd
+    # link read "/memfd:cng-proc (deleted)". busybox stat -L on the link is a
+    # stat through it, which lands on the same memfd. Every answer here is what
+    # the kernel gives for the real file, compared against the path form.
+    m11_sh "a redirected synthesized fd stats as the real file (mode links size)" \
+        "same" \
+        'a=$(stat -c "%f %h %s %d %i" /proc/$$/mounts);
+         b=$(stat -L -c "%f %h %s %d %i" /dev/stdin < /proc/$$/mounts);
+         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+    # The global files Android hides (loadavg, uptime, stat, version) answer
+    # their stat as the file they are served as: the host refuses it there, and
+    # the guest used to read /proc/version with cat and be told "Permission
+    # denied" by stat on the same name. The descriptor and the path agree.
+    m11_sh "...and for a root-owned global file" "same" \
+        'a=$(stat -c "%f %h %s %d %i %u" /proc/loadavg);
+         b=$(stat -L -c "%f %h %s %d %i %u" /dev/stdin < /proc/loadavg);
+         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+    m11_sh "stat of a global /proc file is a /proc regular file, as access says" \
+        "8124 1 0 0 readable" \
+        'a=$(stat -c "%f %h %s %u" /proc/version) || exit 1;
+         [ -r /proc/version ] && echo "$a readable" || echo "$a unreadable"'
+    m11_sh "the fd link of a synthesized file names the file" \
+        "/proc/loadavg" 'readlink /proc/self/fd/0 < /proc/loadavg'
+    m11_sh "...and a process entry by its number" "ok" \
+        'exec 3< /proc/self/status; [ "$(readlink /proc/self/fd/3)" = "/proc/$$/status" ] && echo ok || readlink /proc/self/fd/3'
+    m11_sh "the filesystem behind a synthesized fd is proc" "same" \
+        'a=$(stat -f -c "%t %T" /proc/$$/mounts);
+         b=$(stat -L -f -c "%t %T" /dev/stdin < /proc/$$/mounts);
+         [ "$a" = "$b" ] && echo same || echo "$a | $b"'
+
+    # Binding the host /proc at /proc is a common habit from proot; it must not
+    # hand the guest the host's process list back. The hidden view keys on where
+    # a path lands, not on which map rule put it there.
+    got=$(run -R -b /proc:/proc "$M11_ALPINE" /bin/busybox sh -c \
+        'ls /proc | grep -c "^[0-9]*$"' 2>/dev/null)
+    own=$(run -R "$M11_ALPINE" /bin/busybox sh -c \
+        'ls /proc | grep -c "^[0-9]*$"' 2>/dev/null)
+    if [ -n "$got" ] && [ "$got" = "$own" ]; then
+        pass=$((pass + 1)); echo "  ok   m11 -b /proc:/proc hides host pids like the default"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL m11 -b /proc:/proc hides host pids like the default"
+        echo "    bound: $got  default: $own"
+    fi
+    got=$(run -R -b /proc:/proc "$M11_ALPINE" /bin/busybox sh -c \
+        '[ -e /proc/1/stat ] || echo hidden' 2>/dev/null)
+    check_contains "a host pid stays unreachable under a /proc bind" \
+        "hidden" "$got"
+
+    # An explicit -b DIR:/proc pointing somewhere else is the user overriding
+    # the host view, and must outrank both the passthrough and the synthesis.
+    BP=$(mktemp -d); printf 'bound\n' > "$BP/loadavg"
+    got=$(run -R -b "$BP":/proc "$M11_ALPINE" /bin/busybox cat /proc/loadavg \
+        2>/dev/null)
+    check_contains "an explicit -b DIR:/proc outranks the synthesis" \
+        "bound" "$got"
+    rm -rf "$BP"
+
+    # --no-proc turns the whole thing off: the rootfs has no /proc of its own.
+    got=$(run -R --no-proc "$M11_ALPINE" /bin/busybox sh -c \
+        'cat /proc/loadavg 2>/dev/null || echo none' 2>/dev/null)
+    check_contains "--no-proc leaves the guest without /proc" "none" "$got"
+
+    # --shared-proc: two INDEPENDENT invocations over one rootfs share the
+    # process view through the per-rootfs broker — ps in the second lists the
+    # first's guest process, with the cmdline the sleeper published. Without
+    # the flag each invocation has its own registry and hides the other's
+    # processes (the pre-flag behavior, still the default).
+    run -R --shared-proc "$M11_ALPINE" /bin/busybox sleep 87.65 2>/dev/null &
+    m11_bg=$!
+    sleep 2
+    got=$(run -R --shared-proc "$M11_ALPINE" /bin/busybox ps 2>/dev/null)
+    case "$got" in
+    *"sleep 87.65"*)
+        pass=$((pass + 1))
+        echo "  ok   m11 --shared-proc: ps sees the other invocation's guest" ;;
+    *)
+        fail=$((fail + 1))
+        echo "  FAIL m11 --shared-proc: ps sees the other invocation's guest"
+        echo "    got: $got" ;;
+    esac
+    solo=$(run -R "$M11_ALPINE" /bin/busybox ps 2>/dev/null)
+    case "$solo" in
+    *"sleep 87.65"*)
+        fail=$((fail + 1))
+        echo "  FAIL m11 without --shared-proc the other invocation stays hidden" ;;
+    *)
+        pass=$((pass + 1))
+        echo "  ok   m11 without --shared-proc the other invocation stays hidden" ;;
+    esac
+    kill "$m11_bg" 2>/dev/null
+    wait "$m11_bg" 2>/dev/null
+fi
+rm -rf "$M11TMP"
+
+# The registry's named-file tier is the one object here whose name CANNOT be
+# random: separate --shared-proc invocations find each other by computing it, in
+# a directory (/dev/shm, /tmp) every user on the machine may write to. So it
+# proves the file is its own after opening it — O_NOFOLLOW, then a regular file,
+# owned by us, with no group or other permission — and declines anything else
+# rather than ftruncating it and mapping it shared. Driven through
+# CNG_PROCREG_FORCE_FILE, since that tier is otherwise reached only on a host
+# without memfd_create.
+SHT=$(mktemp -d)
+out=$(CNG_PROCREG_FORCE_FILE=1 run -t sharedtest "$SHT" 2>&1); rc=$?
+check "sharedtest overall" 0 "$rc"
+check_contains "a symlink on the registry name is declined, and its target kept" \
+    "sharedtest symlinked registry declined=1 victim_intact=1 -> OK" "$out"
+check_contains "so is a file with permission our own 0600 creation never gives" \
+    "sharedtest world-readable registry declined=1 -> OK" "$out"
+# ...and one exactly as our own creation leaves it, but naming another rootfs
+# in the record at the table's end: the name is a hash of the rootfs path,
+# and two rootfs of one user could share it; the record is the whole path.
+check_contains "so is a well-formed file of another rootfs, left as it was" \
+    "sharedtest another rootfs' registry declined=1 intact=1 -> OK" "$out"
+check_contains "...while an unplanted name is adopted, and joined, so those are refusals" \
+    "sharedtest an unplanted name is adopted=2 -> OK" "$out"
+rm -rf "$SHT"

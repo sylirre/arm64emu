@@ -1,0 +1,16 @@
+/build/
+# `bear -- make` output: absolute paths, so it belongs to one checkout only.
+# compile_flags.txt is the committed, portable equivalent.
+/compile_commands.json
+*.o
+*.d
+*.tmp
+tests/artifacts/
+
+# Rootfs images and their tarballs, provisioned by the test harness (tests/lib.sh).
+/tests/.cache/
+
+# Dev custom
+*.key
+TODO.txt
+TODO.md

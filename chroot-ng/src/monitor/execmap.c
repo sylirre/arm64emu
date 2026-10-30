@@ -1,0 +1,391 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* mmap(PROT_EXEC) of a file the host refuses to map executable — see
+ * include/cng/execmap.h for why this exists at all. */
+#include "cng/execmap.h"
+#include "cng/elf.h"
+#include "cng/loader.h"
+#include "cng/monitor.h"
+#include "cng/ownmap.h"
+#include "cng/rewrite.h"
+#include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/uapi.h"
+
+int cng_g_execmap_force = 0;
+
+/* MAP_TYPE: the low bits that say SHARED / PRIVATE / SHARED_VALIDATE. */
+#define MAP_TYPE_MASK 0x0f
+
+/* pread the whole of [off, off+len) that the file actually has. Returns the
+ * byte count (a short answer is EOF, which is normal: the mapping a linker
+ * asks for spans the object's bss too) or a negative errno. */
+static long fill_from_file(int fd, char *dst, unsigned long len,
+                           unsigned long off) {
+    unsigned long done = 0;
+    while (done < len) {
+        long r = sys_pread64(fd, dst + done, len - done, (long)(off + done));
+        if (r < 0) {
+            if (r == -EINTR)
+                continue;
+            return r;
+        }
+        if (r == 0)
+            break; /* EOF */
+        done += (unsigned long)r;
+    }
+    return (long)done;
+}
+
+/* One program header, read straight from the file rather than from the mapping
+ * (which may begin past them). Returns 0/-1. */
+static int read_phdr(int fd, const Elf64_Ehdr *eh, int i, Elf64_Phdr *ph) {
+    unsigned long at = eh->e_phoff + (unsigned long)i * sizeof *ph;
+    return fill_from_file(fd, (char *)ph, sizeof *ph, at) == (long)sizeof *ph
+               ? 0
+               : -1;
+}
+
+/* Rewrite the `svc` sites of this mapping, but only where the object says its
+ * code is. The M8 scan matches a bare 0xD4000001 word, and a PF_X PT_LOAD is
+ * not a code segment: a musl link puts the whole read-only image in it, and
+ * every link leaves the unwind tables there, where LSDA bytes really do equal
+ * `svc #0` (see cng_code_ranges). So the segments say which bytes this mapping
+ * carries and the section headers say which of them are instructions.
+ *
+ * The trampoline pool has to be within a `b`'s reach of the code. The loader
+ * gets that by over-allocating its own reservation; here the mapping belongs to
+ * the guest's linker, which has already reserved the object's whole span and
+ * MAP_FIXEDs the remaining segments into it, so the pool goes immediately
+ * outside that span instead — computed from the same headers. Both candidates
+ * are taken with MAP_FIXED_NOREPLACE, so a busy neighbourhood costs the
+ * rewriting and nothing else.
+ *
+ * Anything unexpected — not an ELF, a mapping matching no segment, nowhere to
+ * put the pool — simply means no rewriting: the SIGSYS floor still covers those
+ * sites and the mapping itself is already correct. Returns the number of sites
+ * rewritten. */
+static int rewrite_text(int fd, unsigned long map, unsigned long off,
+                        unsigned long got) {
+    Elf64_Ehdr eh;
+    if (fill_from_file(fd, (char *)&eh, sizeof eh, 0) != (long)sizeof eh)
+        return 0;
+    if (eh.e_ident[0] != ELF_MAG0 || eh.e_ident[1] != ELF_MAG1 ||
+        eh.e_ident[2] != ELF_MAG2 || eh.e_ident[3] != ELF_MAG3 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_machine != EM_AARCH64 ||
+        eh.e_phentsize != sizeof(Elf64_Phdr) || eh.e_phnum == 0 ||
+        eh.e_phnum > CNG_MAX_PHDR)
+        return 0;
+
+    /* Pass one: the object's own load span, and the bias this mapping implies.
+     * A linker maps a segment at bias + page_down(p_vaddr) from file offset
+     * page_down(p_offset) — glibc and musl both — so the segment whose rounded
+     * offset is this mapping's names the bias. */
+    unsigned long vlo = ~0UL, vhi = 0, bias = 0;
+    int have_bias = 0;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        Elf64_Phdr ph;
+        if (read_phdr(fd, &eh, i, &ph) != 0)
+            return 0;
+        if (ph.p_type != PT_LOAD)
+            continue;
+        /* A header whose end is not an address describes nothing — the sum
+         * wrapping, or rounding up to 0 from within a page of the top. */
+        unsigned long e;
+        if (cng_page_end(ph.p_vaddr, ph.p_memsz, &e) != 0)
+            return 0;
+        unsigned long s = cng_page_down(ph.p_vaddr);
+        if (s < vlo)
+            vlo = s;
+        if (e > vhi)
+            vhi = e;
+        if (!have_bias && cng_page_down(ph.p_offset) == off) {
+            bias = map - s;
+            have_bias = 1;
+        }
+    }
+    if (!have_bias || vhi <= vlo)
+        return 0;
+
+    /* Immediately above the object, then immediately below it, then wherever
+     * the kernel cares to put one: a library sits in a crowded neighbourhood
+     * (its neighbours were allocated from the same arena), so the two exact
+     * spots are often taken. The kernel's own choice comes out of that same
+     * arena and is normally within reach as well — and when it is not,
+     * cng_rewrite_seg rewrites nothing and the pool is handed straight back. */
+    unsigned long pool = cng_pool_at(bias + vhi, CNG_TRAMP_POOL);
+    if (!pool && bias + vlo >= CNG_TRAMP_POOL)
+        pool = cng_pool_at(bias + vlo - CNG_TRAMP_POOL, CNG_TRAMP_POOL);
+    if (!pool) {
+        void *any = sys_mmap(0, CNG_TRAMP_POOL,
+                             CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (!cng_is_err((long)any))
+            pool = (unsigned long)any;
+    }
+    if (!pool)
+        return 0;
+
+    /* Pass two: the executable segments, clipped to the bytes this mapping
+     * actually carries, and to the object's own code map. */
+    struct cng_code_ranges cr;
+    cng_code_ranges(fd, &cr);
+    unsigned long used = 0;
+    int sites = 0;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        Elf64_Phdr ph;
+        if (read_phdr(fd, &eh, i, &ph) != 0)
+            break;
+        if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X) || !ph.p_filesz)
+            continue;
+        unsigned long slo = ph.p_offset, shi = ph.p_offset + ph.p_filesz;
+        if (shi < slo)
+            continue;
+        if (slo < off)
+            slo = off;
+        if (shi > off + got)
+            shi = off + got;
+        if (shi <= slo)
+            continue;
+        sites += cng_rewrite_seg(map + (slo - off), map + (shi - off), slo,
+                                 &cr, pool, CNG_TRAMP_POOL, &used);
+    }
+    if (!used) {
+        sys_munmap((void *)pool, CNG_TRAMP_POOL); /* nothing was reachable */
+        return 0;
+    }
+    sys_mprotect((void *)pool, cng_page_up(used),
+                 CNG_PROT_READ | CNG_PROT_EXEC);
+    cng_flush_icache((void *)pool, (void *)(pool + used));
+    return sites;
+}
+
+long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
+                 long fd, unsigned long off) {
+    int mfd = (int)fd; /* int arg: the x-register's top half may be dirty */
+    long native = -EPERM;
+
+    /* Ask the kernel first: on an exec-permitted mount the real file mapping is
+     * strictly better than a copy, and it is what everything reading
+     * /proc/self/maps expects to find. Only the two refusals a noexec mount (or
+     * an SELinux file-execute denial) produces are worth answering. */
+    if (!cng_g_execmap_force) {
+        void *p = sys_mmap((void *)addr, len, (int)prot, (int)flags, mfd,
+                           (long)off);
+        if (!cng_is_err((long)p))
+            return (long)p;
+        native = (long)p;
+        if (native != -EPERM && native != -EACCES)
+            return native;
+    }
+
+    /* A copy has private semantics whatever the file says, so MAP_SHARED must
+     * keep the kernel's refusal: quietly handing back memory no other attacher
+     * would ever see is worse than the error. */
+    if ((flags & MAP_TYPE_MASK) != CNG_MAP_PRIVATE || mfd < 0)
+        return native;
+    unsigned long mlen = cng_page_up(len);
+    if (!len || mlen < len || (off & (cng_page_size - 1)))
+        return native;
+    /* The addresses that are never ours to take (see the threat-model note in
+     * docs/DESIGN.md): mapping over the monitor — its image, a scratch stack,
+     * a registry — would replace the code or the state serving the mapping.
+     * Only MAP_FIXED can reach them — a hint is a hint. */
+    if ((flags & CNG_MAP_FIXED) && cng_hits_monitor(addr, mlen))
+        return native;
+
+    void *p = sys_mmap((void *)addr, mlen, CNG_PROT_READ | CNG_PROT_WRITE,
+                       (int)flags | CNG_MAP_ANONYMOUS, -1, 0);
+    if (cng_is_err((long)p))
+        return native;
+
+    /* Fill it. The bytes of the partial page past end-of-file stay zero, which
+     * is what a file mapping reads there too; the pages wholly past it are
+     * dealt with below, once the copy is protected. */
+    long got = fill_from_file(mfd, (char *)p, mlen, off);
+    if (got < 0) {
+        sys_munmap(p, mlen);
+        return native;
+    }
+
+    int sites = 0;
+    if (cng_g_rewrite && (prot & CNG_PROT_EXEC))
+        sites = rewrite_text(mfd, (unsigned long)p, off, (unsigned long)got);
+
+    if (sys_mprotect(p, mlen, (int)prot) < 0) {
+        /* execmem denied as well: there is no in-process way to run this code,
+         * and the guest is owed the kernel's own answer for its request. */
+        sys_munmap(p, mlen);
+        return native;
+    }
+    if (prot & CNG_PROT_EXEC)
+        cng_flush_icache(p, (char *)p + mlen);
+
+    /* The pages wholly past end-of-file. A file mapping answers a fault on one
+     * of those with SIGBUS — the kernel checks the file's size at fault time,
+     * page by page, and only the partial last page reads as zeroes — so a
+     * truncated object dies at the first touch past its end. The copy read on
+     * with zeroes instead: a page of zero words is `udf #0`, so code ran to a
+     * SIGILL some way past the truncation, and data read as zero with no word
+     * said. The tail goes back under the file: a file mapping without
+     * PROT_EXEC is one no mount and no policy refuses for a file we could
+     * pread, and every page of it past EOF faults exactly as the kernel's would
+     * — and stops faulting if the file grows, as the kernel's would. Where even
+     * that is refused, PROT_NONE: SIGSEGV for SIGBUS, at the same place. A
+     * mapping that starts past EOF (got == 0) is the tail entire. */
+    unsigned long have = cng_page_up((unsigned long)got);
+    if (have < mlen) {
+        void *t = sys_mmap((char *)p + have, mlen - have,
+                           (int)prot & ~CNG_PROT_EXEC,
+                           CNG_MAP_PRIVATE | CNG_MAP_FIXED, mfd,
+                           (long)(off + have));
+        if (cng_is_err((long)t))
+            sys_mprotect((char *)p + have, mlen - have, CNG_PROT_NONE);
+    }
+    if (cng_g_debug)
+        cng_dprintf(2,
+                    "[cng] execmap fd=%d off=%lu len=%lu prot=%ld -> %p"
+                    " (anon copy of %ld bytes, %d svc sites, %lu past eof)\n",
+                    mfd, off, mlen, prot, p, got, sites,
+                    have < mlen ? mlen - have : 0);
+    return (long)p;
+}
+
+/* ---- the loader's copies under mremap(MREMAP_DONTUNMAP) -------------------
+ *
+ * The loader's anonymous strategy copies an image in where a kernel exec maps
+ * it from the file, and a mremap that moves pages away tells the two apart:
+ * MREMAP_DONTUNMAP leaves the old range mapped, and its next touch faults in
+ * what that mapping is backed by — the file's bytes for a file mapping, zeroes
+ * for an anonymous one. V8 moves its embedded builtins, which live in the text
+ * of the binary that embeds it, into its code range this way and CHECKs that
+ * the first word reads the same at both addresses; against a copy it read 0 at
+ * the old one, and every Chrome renderer died of the CHECK.
+ *
+ * So the move is the kernel's, and the old range gets back the bytes that
+ * moved: the content a file mapping leaves there. Written through
+ * /proc/self/mem, which takes the old range's own protection as it is — the
+ * same write a debugger's breakpoint makes, instruction-cache maintenance
+ * included — and answers a range that went away under us with an errno where
+ * a store of ours would fault in a handler that cannot take one. A page the
+ * guest had written reads back as written, where the kernel would refault the
+ * file's own bytes: the copy has no file under it to refault from, and the
+ * one difference that matters — -R's rewritten svc sites — is better kept.
+ *
+ * Not every kernel moves a file mapping this way: DONTUNMAP is 5.7, and until
+ * 5.13 it refused anything but private anonymous memory with EINVAL. There a
+ * copy would move as the anonymous memory it is, so the guest is told what the
+ * kernel tells it for the file mapping, before anything moves. That is
+ * also the answer where the write cannot be made: a range left zeroed is the
+ * very failure this exists for, and EINVAL is one every caller of a 5.12
+ * kernel already has a path for (V8's is to copy the builtins instead).
+ *
+ * Only the copies the running images were loaded as are known. A guest that
+ * unmaps part of its own image and maps something else there leaves a stale
+ * record behind (munmap is not trapped), and pages moved out of a copy are
+ * not one at their new address, so moving them on again moves them as the
+ * anonymous memory they are there. Neither is something a program does to
+ * its own text. */
+static struct cng_load_range g_copied[2 * CNG_LOAD_COPIED];
+static int g_ncopied;
+
+void cng_execmap_images(const struct cng_loaded *prog,
+                        const struct cng_loaded *interp) {
+    const struct cng_loaded *img[2] = {prog, interp};
+    int n = 0;
+    for (int k = 0; k < 2; k++)
+        for (int i = 0; img[k] && i < img[k]->ncopied; i++)
+            g_copied[n++] = img[k]->copied[i];
+    g_ncopied = n;
+}
+
+int cng_execmap_copied(unsigned long addr, unsigned long len) {
+    unsigned long end = addr + len;
+    if (end < addr)
+        end = ~0UL;
+    for (int i = 0; i < g_ncopied; i++)
+        if (addr < g_copied[i].hi && g_copied[i].lo < end)
+            return 1;
+    return 0;
+}
+
+/* Does this kernel move a private file mapping with MREMAP_DONTUNMAP, and can
+ * the old range then be written through /proc/self/mem? Asked of a one-page
+ * private mapping of a memfd — a file mapping like any other, to mremap — and
+ * of /proc/self/mem against the old range it leaves, which is read-only.
+ * 1 yes, -1 no; asked once. */
+static int g_dontunmap_files;
+
+static int dontunmap_probe(void) {
+    unsigned long pg = cng_page_size;
+    long mfd = sys_memfd_create("cng-dontunmap", 1 /*MFD_CLOEXEC*/);
+    if (mfd < 0)
+        return -1; /* no memfd: a kernel well before DONTUNMAP */
+    int ok = -1;
+    void *p = sys_ftruncate((int)mfd, (long)pg) == 0
+                  ? sys_mmap(0, pg, CNG_PROT_READ, CNG_MAP_PRIVATE, (int)mfd, 0)
+                  : CNG_MAP_FAILED;
+    if (!cng_is_err((long)p) && p != CNG_MAP_FAILED) {
+        long q = CNG_SYS(__NR_mremap, p, pg, pg,
+                         CNG_MREMAP_MAYMOVE | CNG_MREMAP_DONTUNMAP, 0, 0);
+        if (!cng_is_err(q)) {
+            long m = sys_openat(CNG_AT_FDCWD, "/proc/self/mem",
+                                CNG_O_RDWR | CNG_O_CLOEXEC, 0);
+            char one = 1;
+            if (m >= 0 && sys_pwrite64((int)m, &one, 1, (long)p) == 1 &&
+                *(volatile char *)p == 1)
+                ok = 1;
+            if (m >= 0)
+                sys_close((int)m);
+            sys_munmap((void *)q, pg);
+        }
+        sys_munmap(p, pg);
+    }
+    sys_close((int)mfd);
+    return ok;
+}
+
+long cng_execmap_dontunmap(unsigned long old, unsigned long len,
+                           unsigned long nlen, long flags,
+                           unsigned long naddr) {
+    int v = __atomic_load_n(&g_dontunmap_files, __ATOMIC_ACQUIRE);
+    if (!v) {
+        v = dontunmap_probe();
+        __atomic_store_n(&g_dontunmap_files, v, __ATOMIC_RELEASE);
+    }
+    long m = v > 0 ? sys_openat(CNG_AT_FDCWD, "/proc/self/mem",
+                                CNG_O_RDWR | CNG_O_CLOEXEC, 0)
+                   : -1;
+    if (m < 0) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] mremap %lx+%lu DONTUNMAP of a loader copy ->"
+                           " EINVAL (%s)\n",
+                        old, len, v > 0 ? "no /proc/self/mem" : "kernel");
+        return -EINVAL;
+    }
+    long r = CNG_SYS(__NR_mremap, old, len, nlen, flags, naddr, 0);
+    if (!cng_is_err(r)) {
+        for (int i = 0; i < g_ncopied; i++) {
+            unsigned long lo = g_copied[i].lo > old ? g_copied[i].lo : old;
+            unsigned long hi =
+                g_copied[i].hi < old + len ? g_copied[i].hi : old + len;
+            while (lo < hi) {
+                long w = sys_pwrite64((int)m, (void *)(r + (lo - old)), hi - lo,
+                                      (long)lo);
+                if (w <= 0) {
+                    if (cng_g_debug)
+                        cng_dprintf(2, "[cng] mremap DONTUNMAP: restoring"
+                                       " %lx-%lx failed (%ld)\n",
+                                    lo, hi, w);
+                    break;
+                }
+                lo += (unsigned long)w;
+            }
+        }
+    }
+    sys_close((int)m);
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] mremap %lx+%lu DONTUNMAP of a loader copy -> %lx\n",
+                    old, len, r);
+    return r;
+}

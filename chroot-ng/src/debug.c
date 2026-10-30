@@ -1,0 +1,11625 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Hidden debug subcommands for testing internals without a real kernel.
+ *   _xlate -r ROOT [-b GUEST:HOST]... [-C CWD] [-c CHROOT] PATH...
+ * prints guest->host path translations (-c first emulates a chroot to CHROOT).
+ * Used by the M5 unit tests (the path core is pure logic, fully exercisable
+ * under qemu).
+ */
+#include "cng/broker.h"
+#include "cng/elf.h"
+#include "cng/execmap.h"
+#include "cng/l2s.h"
+#include "cng/loader.h"
+#include "cng/monitor.h"
+#include "cng/netlink.h"
+#include "cng/path.h"
+#include "cng/pin.h"
+#include "cng/procfs.h"
+#include "cng/procreg.h"
+#include "cng/ptrace.h"
+#include "cng/rewrite.h"
+#include "cng/seccomp.h"
+#include "cng/shm.h"
+#include "cng/sysvipc.h"
+#include "cng/tab.h"
+#include "cng/ownmap.h"
+#include "cng/rt.h"
+#include "cng/syscall.h"
+#include "cng/uapi.h"
+#include "cng/ucontext.h"
+
+/* aarch64 struct stat accessors (for _l2stest). */
+#define ST_INO(b)   (*(unsigned long long *)((char *)(b) + 8))
+#define ST_MODE(b)  (*(unsigned *)((char *)(b) + 16))
+#define ST_NLINK(b) (*(unsigned *)((char *)(b) + 20))
+#define ST_MTIME(b) (*(long long *)((char *)(b) + 88))
+#define ST_ISREG(b) ((ST_MODE(b) & 0170000) == 0100000)
+/* struct statx accessors. */
+#define STX_MASK(b)  (*(unsigned *)(char *)(b))
+#define STX_NLINK(b) (*(unsigned *)((char *)(b) + 16))
+
+int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+
+    const char *rootfs = "/";
+    const char *cwd = 0;
+    const char *chroot_to = 0;
+    const char *bind_g[CNG_MAX_BINDS];
+    const char *bind_h[CNG_MAX_BINDS];
+    int bind_ro[CNG_MAX_BINDS];
+    int nb = 0;
+    const char *paths[256];
+    int np = 0, resolve = 0, deref_final = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc) {
+            rootfs = argv[++i];
+        } else if (!strcmp(argv[i], "-b") && i + 1 < argc) {
+            /* SRC:DST[:ro] — host first, same order as the -b CLI option. */
+            char *spec = argv[++i];
+            char *c = strchr(spec, ':');
+            if (c && nb < CNG_MAX_BINDS) {
+                *c = '\0';
+                char *dst = c + 1;
+                int ro = 0;
+                unsigned long dl = strlen(dst);
+                if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                    ro = 1;
+                    dst[dl - 3] = '\0';
+                }
+                bind_g[nb] = dst;
+                bind_h[nb] = spec;
+                bind_ro[nb] = ro;
+                nb++;
+            }
+        } else if (!strcmp(argv[i], "-C") && i + 1 < argc) {
+            cwd = argv[++i];
+        } else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
+            chroot_to = argv[++i];
+        } else if (!strcmp(argv[i], "-R")) {
+            resolve = 1; /* the real resolver: symlinks, physical ".." */
+        } else if (!strcmp(argv[i], "-n")) {
+            resolve = 1;
+            deref_final = 0;
+        } else if (np < 256) {
+            paths[np++] = argv[i];
+        }
+    }
+
+    struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    for (int i = 0; i < nb; i++)
+        cng_fs_add_bind(&fs, bind_g[i], bind_h[i], bind_ro[i]);
+    if (cwd)
+        cng_fs_set_cwd(&fs, cwd);
+    if (chroot_to) { /* what cng_dispatch does for chroot(2), minus the stat */
+        char canon[CNG_PATH_MAX], hp[CNG_PATH_MAX];
+        if (cng_fs_abscanon(&fs, chroot_to, canon, sizeof canon) == 0 &&
+            cng_fs_translate(&fs, canon, hp, sizeof hp) == 0)
+            cng_fs_chroot(&fs, canon, hp);
+    }
+
+    char out[CNG_PATH_MAX];
+    for (int i = 0; i < np; i++) {
+        if (resolve) {
+            /* cng_resolve reads the real filesystem (it readlinks each
+             * component), so this leg needs the tree to exist. */
+            cng_g_fs = &fs;
+            long r = cng_resolve(paths[i], deref_final, out, sizeof out);
+            if (r == 0)
+                cng_dprintf(1, "%s -> %s\n", paths[i], out);
+            else
+                cng_dprintf(1, "%s -> <errno %d>\n", paths[i], (int)-r);
+            continue;
+        }
+        if (cng_fs_translate(&fs, paths[i], out, sizeof out) == 0)
+            cng_dprintf(1, "%s -> %s\n", paths[i], out);
+        else
+            cng_dprintf(1, "%s -> <overflow>\n", paths[i]);
+    }
+    return 0;
+}
+
+/* _dtest -r ROOT (open|access) GUESTPATH
+ * Drives cng_dispatch directly (no seccomp) to verify translate+reissue: the
+ * real syscall must hit ROOT/GUESTPATH. Exercised under qemu. */
+int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *rootfs = "/";
+    const char *op = 0, *gpath = 0, *bind_spec = 0, *relpath = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            rootfs = argv[++i];
+        else if (!strcmp(argv[i], "-b") && i + 1 < argc)
+            bind_spec = argv[++i];
+        else if (!op)
+            op = argv[i];
+        else if (!gpath)
+            gpath = argv[i];
+        else if (!relpath)
+            relpath = argv[i];
+    }
+    if (!op || !gpath) {
+        cng_dprintf(2, "usage: _dtest -r ROOT [-b SRC:DST[:ro]] "
+                       "(open|access|dbgpath|robind|l2sro|rolink) GUESTPATH\n"
+                       "       _dtest -r ROOT atrel GUESTDIR RELPATH\n"
+                       "       _dtest -r ROOT outside HOSTDIR HOSTFILE\n");
+        return 2;
+    }
+
+    static struct cng_fs fs; /* referenced by dispatcher via cng_g_fs */
+    cng_fs_init(&fs, rootfs);
+    if (bind_spec) { /* SRC:DST[:ro] — host first, as the CLI spells it */
+        static char spec[512];
+        cng_strlcpy(spec, bind_spec, sizeof spec);
+        char *c = strchr(spec, ':');
+        if (c) {
+            *c = '\0';
+            char *dst = c + 1;
+            int ro = 0;
+            unsigned long dl = strlen(dst);
+            if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                ro = 1;
+                dst[dl - 3] = '\0';
+            }
+            cng_fs_add_bind(&fs, dst, spec, ro);
+        }
+    }
+    cng_g_fs = &fs;
+
+    if (!strcmp(op, "open")) {
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
+        if (fd < 0) {
+            cng_dprintf(1, "open: errno %d\n", (int)-fd);
+            return 1;
+        }
+        char buf[128];
+        long n = sys_read((int)fd, buf, sizeof buf - 1);
+        sys_close((int)fd);
+        if (n < 0) {
+            cng_dprintf(1, "read: errno %d\n", (int)-n);
+            return 1;
+        }
+        buf[n] = '\0';
+        cng_dprintf(1, "read: %s\n", buf);
+        return 0;
+    }
+    /* _dtest -r ROOT [-b SRC:DST] dents GUESTDIR BUFSZ — read a directory to
+     * the end through the dispatcher, one getdents64 of BUFSZ bytes at a time,
+     * and print every name. The entries that exist only as resolution overlays
+     * (a -b mount point, the /dev nodes) have no dirent of their own and are
+     * spliced in by the dispatcher, so a small BUFSZ is what asks whether they
+     * survive a directory whose real entries fill the guest's buffer — musl's
+     * readdir reads 2 KiB at a time where glibc's reads 32 KiB. */
+    if (!strcmp(op, "dents") && relpath) {
+        long bufsz = 0;
+        for (const char *q = relpath; *q >= '0' && *q <= '9'; q++)
+            bufsz = bufsz * 10 + (*q - '0');
+        if (bufsz < 32 || bufsz > 65536)
+            bufsz = 256;
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (fd < 0) {
+            cng_dprintf(1, "dents: open errno %d\n", (int)-fd);
+            return 1;
+        }
+        char buf[65536];
+        int batches = 0;
+        cng_dprintf(1, "dents:");
+        for (;;) {
+            long n = cng_dispatch(__NR_getdents64, fd, (long)buf, bufsz, 0, 0, 0,
+                                  0);
+            if (n <= 0 || ++batches > 4096)
+                break;
+            for (long o = 0; o + 19 <= n;) {
+                unsigned short rl;
+                memcpy(&rl, buf + o + 16, 2);
+                if (rl == 0 || o + rl > n)
+                    break;
+                cng_dprintf(1, " %s", buf + o + 19);
+                o += rl;
+            }
+        }
+        cng_dprintf(1, "\ndents: batches=%d\n", batches);
+        sys_close((int)fd);
+        return 0;
+    }
+    /* CNG_DEBUG error logging must never dereference a syscall arg that is a
+     * scalar rather than a path: truncate's length here is large enough to look
+     * like a pointer, and reading it killed the guest (SIGSEGV in the handler,
+     * with SIGSEGV masked). The dispatch must survive and report EISDIR. */
+    if (!strcmp(op, "dbgpath")) {
+        int save = cng_g_debug;
+        cng_g_debug = 1;
+        long r = cng_dispatch(__NR_truncate, (long)gpath, 0x7ffffff0, 0, 0, 0, 0,
+                              /*trapped=*/0);
+        cng_g_debug = save;
+        cng_dprintf(1, "dbgpath: survived rc=%d -> %s\n", (int)r,
+                    r == -EISDIR ? "OK" : "FAIL");
+        return r == -EISDIR ? 0 : 1;
+    }
+    /* A name resolved relative to a real dirfd must be contained exactly like an
+     * absolute one. It used to be handed to the kernel untouched, and the kernel
+     * has no rootfs: a ".." run climbed out of it and an absolute symlink target
+     * came from the HOST root. Opens GUESTDIR through the dispatcher, then reads
+     * RELPATH relative to that fd. */
+    if (!strcmp(op, "atrel") && relpath) {
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (dfd < 0) {
+            cng_dprintf(1, "atrel: dir errno %d\n", (int)-dfd);
+            return 1;
+        }
+        long fd = cng_dispatch(__NR_openat, dfd, (long)relpath, CNG_O_RDONLY, 0,
+                               0, 0, 0);
+        if (fd < 0) {
+            cng_dprintf(1, "atrel: errno %d\n", (int)-fd);
+            sys_close((int)dfd);
+            return 1;
+        }
+        char buf[128];
+        long n = sys_read((int)fd, buf, sizeof buf - 1);
+        sys_close((int)fd);
+        sys_close((int)dfd);
+        if (n < 0) {
+            cng_dprintf(1, "atrel: read errno %d\n", (int)-n);
+            return 1;
+        }
+        buf[n] = '\0';
+        cng_dprintf(1, "atrel: %s\n", buf);
+        return 0;
+    }
+    /* The xattr family was never trapped, so a guest's absolute path went to the
+     * HOST filesystem: getxattr answered existence questions about it and
+     * setxattr wrote it. Translation shows up as the errno: a name that exists
+     * inside the rootfs answers ENODATA/EOPNOTSUPP ("no such attribute"), while
+     * an untranslated path lands on a host name that is not there -> ENOENT. */
+    if (!strcmp(op, "getxa")) {
+        char val[64];
+        long r = cng_dispatch(__NR_getxattr, (long)gpath, (long)"user.cng.probe",
+                              (long)val, sizeof val, 0, 0, 0);
+        cng_dprintf(1, "getxa: errno %d\n", r < 0 ? (int)-r : 0);
+        /* The dirfd form (6.13) asks the same question of (dirfd, path), and
+         * was in no table at all: the build's headers ended before it. A host
+         * without it says ENOSYS, which the leg reads as "cannot be asked
+         * here" rather than as an answer. */
+        struct {
+            unsigned long value;
+            unsigned size, flags;
+        } xa = {(unsigned long)val, sizeof val, 0};
+        r = cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)gpath, 0,
+                         (long)"user.cng.probe", (long)&xa, sizeof xa, 0);
+        cng_dprintf(1, "getxaat: errno %d\n", r < 0 ? (int)-r : 0);
+        return 0;
+    }
+    /* The six path-bearing syscalls born after the old table's last entry
+     * (setxattrat, getxattrat, listxattrat, removexattrat; file_getattr,
+     * file_setattr), checked for what can be checked without a kernel that
+     * has them: the decisions the dispatcher takes on the guest's own spelling
+     * BEFORE the re-issue. A ".." walked through a file is ENOTDIR — which
+     * proves the path was read from a1 with the dirfd from a0 — and an empty
+     * name is ENOENT without AT_EMPTY_PATH and passes with it (the flag's own
+     * slot differs between the two families). `gpath` names a regular file. */
+    if (!strcmp(op, "newat")) {
+        char dd[CNG_PATH_MAX];
+        size_t gl = cng_strlcpy(dd, gpath, sizeof dd);
+        cng_strlcpy(dd + gl, "/../x", sizeof dd - gl);
+        char val[64];
+        struct {
+            unsigned long value;
+            unsigned size, flags;
+        } xa = {(unsigned long)val, sizeof val, 0};
+        unsigned long fa[3] = {0, 0, 0}; /* struct file_attr: 24 bytes */
+        struct {
+            const char *name;
+            long want;
+            long r;
+        } t[] = {
+            {"getxattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)"user.x", (long)&xa, sizeof xa, 0)},
+            {"setxattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_setxattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)"user.x", (long)&xa, sizeof xa, 0)},
+            {"listxattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_listxattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)val, sizeof val, 0, 0)},
+            {"removexattrat-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_removexattrat, CNG_AT_FDCWD, (long)dd, 0,
+                          (long)"user.x", 0, 0, 0)},
+            {"file_getattr-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_file_getattr, CNG_AT_FDCWD, (long)dd, (long)fa,
+                          sizeof fa, 0, 0, 0)},
+            {"file_setattr-dotdot", -ENOTDIR,
+             cng_dispatch(__NR_file_setattr, CNG_AT_FDCWD, (long)dd, (long)fa,
+                          sizeof fa, 0, 0, 0)},
+            {"getxattrat-empty", -ENOENT,
+             cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)"", 0,
+                          (long)"user.x", (long)&xa, sizeof xa, 0)},
+            {"file_getattr-empty", -ENOENT,
+             cng_dispatch(__NR_file_getattr, CNG_AT_FDCWD, (long)"", (long)fa,
+                          sizeof fa, 0, 0, 0)},
+        };
+        int fails = 0;
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int ok = t[i].r == t[i].want;
+            cng_dprintf(1, "newat %s: rc=%d -> %s\n", t[i].name, (int)t[i].r,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* With the flag, the empty name is the dirfd itself and goes over: any
+         * answer but the ENOENT of the check above says the flag was read from
+         * the right slot (a kernel without the call says ENOSYS, one with it
+         * answers for the cwd). */
+        long ge = cng_dispatch(__NR_getxattrat, CNG_AT_FDCWD, (long)"",
+                               CNG_AT_EMPTY_PATH, (long)"user.x", (long)&xa,
+                               sizeof xa, 0);
+        long fe = cng_dispatch(__NR_file_getattr, CNG_AT_FDCWD, (long)"",
+                               (long)fa, sizeof fa, CNG_AT_EMPTY_PATH, 0, 0);
+        int ok = ge != -ENOENT && fe != -ENOENT;
+        cng_dprintf(1, "newat empty-path-flag: getxattrat=%d file_getattr=%d"
+                       " -> %s\n",
+                    (int)ge, (int)fe, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_dprintf(1, "newat: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    /* inotify_add_watch was never trapped either, and its a0 is the inotify
+     * instance rather than a dirfd, so the guest's absolute path went to the
+     * HOST — the containment exactly inverted: a name inside the rootfs
+     * answered ENOENT while a host-only one armed the watch. The errno says
+     * which file the kernel found. */
+    /* The hidden-process view keys on the resolved HOST path, and a /proc dirfd
+     * has no guest path to resolve against — so a relative name under it went
+     * to the kernel untouched and `openat(dirfd("/proc"), "1/status")` read the
+     * host's init while "/proc/1/status" answered ENOENT. Both spellings of a
+     * foreign pid must be hidden, and both spellings of our own must not be. */
+    if (!strcmp(op, "prochide")) {
+        long d = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc",
+                              CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (d < 0) {
+            cng_dprintf(1, "prochide: /proc errno %d\n", (int)-d);
+            return 1;
+        }
+        char own[64];
+        cng_snprintf(own, sizeof own, "%ld/status", sys_getpid());
+        long a_for = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                  (long)"/proc/1/status", CNG_O_RDONLY, 0, 0, 0,
+                                  0);
+        long r_for = cng_dispatch(__NR_openat, d, (long)"1/status",
+                                  CNG_O_RDONLY, 0, 0, 0, 0);
+        long r_bare = cng_dispatch(__NR_newfstatat, d, (long)"1",
+                                   (long)(char[144]){0}, 0, 0, 0, 0);
+        long r_own = cng_dispatch(__NR_openat, d, (long)own, CNG_O_RDONLY, 0, 0,
+                                  0, 0);
+        long r_self = cng_dispatch(__NR_openat, d, (long)"self/status",
+                                   CNG_O_RDONLY, 0, 0, 0, 0);
+        /* The fd links are the sharp end: they are answered as HOST paths, so
+         * the kernel takes one straight to the open file description it names.
+         * A hidden process's must be ENOENT — not EACCES, which would mean we
+         * reached it and only DAC turned us away. pid 1 is never a guest
+         * process and always exists, so it is the honest thing to ask about. */
+        char lb[CNG_PATH_MAX];
+        long fd_for = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                   (long)"/proc/1/fd/0", (long)lb, sizeof lb, 0,
+                                   0, 0);
+        long fd_open = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                    (long)"/proc/1/fd/0", CNG_O_RDONLY, 0, 0, 0,
+                                    0);
+        long fd_own = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                   (long)"/proc/self/fd/1", (long)lb, sizeof lb,
+                                   0, 0, 0);
+        if (a_for >= 0)
+            sys_close((int)a_for);
+        if (r_for >= 0)
+            sys_close((int)r_for);
+        if (r_own >= 0)
+            sys_close((int)r_own);
+        if (r_self >= 0)
+            sys_close((int)r_self);
+        if (fd_open >= 0)
+            sys_close((int)fd_open);
+        sys_close((int)d);
+        int ok = a_for < 0 && r_for < 0 && r_bare < 0 && r_own >= 0 &&
+                 r_self >= 0 && fd_for == -ENOENT && fd_open == -ENOENT &&
+                 fd_own > 0;
+        cng_dprintf(1,
+                    "prochide: abs=%d rel=%d bare=%d own=%d self=%d "
+                    "fdlink=%d fdopen=%d ownfd=%d -> %s\n",
+                    (int)a_for, (int)r_for, (int)r_bare, r_own >= 0,
+                    r_self >= 0, (int)fd_for, (int)fd_open, fd_own > 0,
+                    ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+    if (!strcmp(op, "inotify")) {
+        long ifd = CNG_SYS(__NR_inotify_init1, 0, 0, 0, 0, 0, 0);
+        if (ifd < 0) {
+            cng_dprintf(1, "inotify: init errno %d\n", (int)-ifd);
+            return 1;
+        }
+        long w = cng_dispatch(__NR_inotify_add_watch, ifd, (long)gpath,
+                              2 /*IN_MODIFY*/, 0, 0, 0, /*trapped=*/0);
+        cng_dprintf(1, "inotify: errno %d\n", w < 0 ? (int)-w : 0);
+        sys_close((int)ifd);
+        return 0;
+    }
+    /* The -R trampoline tier runs with no seccomp filter at all, so the
+     * designed-ENOSYS refusals cannot come from the kernel there: the dispatcher
+     * has to answer them itself. bpftest covers the filter; this covers the
+     * other tier, and it is the only one testable under qemu-user. */
+    if (!strcmp(op, "denied")) {
+        struct {
+            const char *name;
+            long nr;
+        } d[] = {
+            {"io_uring_setup", __NR_io_uring_setup},
+            {"io_uring_enter", __NR_io_uring_enter},
+            {"io_uring_register", __NR_io_uring_register},
+            {"clone3", __NR_clone3},
+            {"statmount", __NR_statmount},
+            {"open_tree", __NR_open_tree},
+            {"mq_open", __NR_mq_open},
+            {"mq_timedsend", __NR_mq_timedsend},
+            {"mount", __NR_mount},
+            {"umount2", __NR_umount2},
+            {"pivot_root", __NR_pivot_root},
+            {"quotactl", __NR_quotactl},
+            {"swapon", __NR_swapon},
+            {"acct", __NR_acct},
+        };
+        int fails = 0;
+        for (unsigned i = 0; i < sizeof d / sizeof *d; i++) {
+            /* trapped=0: exactly how an -R trampoline calls in. */
+            long r = cng_dispatch(d[i].nr, 0, 0, 0, 0, 0, 0, 0);
+            int ok = (r == -ENOSYS);
+            cng_dprintf(1, "denied %s: rc=%d -> %s\n", d[i].name, (int)r,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* Control: an ordinary untranslated syscall still runs on this tier. */
+        long g = cng_dispatch(__NR_getpid, 0, 0, 0, 0, 0, 0, 0);
+        int ok = g > 0;
+        cng_dprintf(1, "denied control getpid: rc=%d -> %s\n", (int)g,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_dprintf(1, "denied: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    /* uname must report a fixed kernel identity, and /proc/version must repeat
+     * it word for word — while nodename stays the host's, which is what names
+     * the machine the guest is really on. */
+    if (!strcmp(op, "uname")) {
+        char host[390], guest[390];
+        memset(host, 0, sizeof host);
+        memset(guest, 0, sizeof guest);
+        sys_uname(host);
+        long r = cng_dispatch(__NR_uname, (long)guest, 0, 0, 0, 0, 0, 0);
+        /* A faked field is 65 bytes, and the kernel NUL-pads its own. Writing a
+         * shorter identity over a longer one left the host's tail readable past
+         * the terminator — which for release and version is the vendor string
+         * the fake exists to withhold. Every byte after it must be zero. */
+        int dirty = 0;
+        for (int f = 0; f < 5; f++) {
+            if (f == 1)
+                continue; /* nodename is deliberately the host's */
+            const char *p = guest + f * 65;
+            for (unsigned k = strlen(p) + 1; k < 65; k++)
+                dirty += p[k] != '\0';
+        }
+        cng_dprintf(1,
+                    "uname: rc=%d sys=%s rel=%s ver=%s mach=%s node_kept=%d "
+                    "tail_dirty=%d\n",
+                    (int)r, guest, guest + 2 * 65, guest + 3 * 65, guest + 4 * 65,
+                    !strcmp(host + 65, guest + 65), dirty);
+        return r == 0 ? 0 : 1;
+    }
+    /* chroot(2) is privileged: without CAP_SYS_CHROOT — for us, a fake identity
+     * whose effective uid is 0 — the kernel refuses it. Both answers in one run,
+     * since the gate is the whole point. */
+    if (!strcmp(op, "chroot")) {
+        cng_g_fake_id = 0;
+        long unpriv = cng_dispatch(__NR_chroot, (long)gpath, 0, 0, 0, 0, 0, 0);
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = cng_g_fake_gid = 0;
+        cng_cred_seed();
+        long priv = cng_dispatch(__NR_chroot, (long)gpath, 0, 0, 0, 0, 0, 0);
+        cng_dprintf(1, "chroot: unpriv=%d root=%d cwd=%s\n", (int)unpriv,
+                    (int)priv, cng_g_fs->cwd);
+        cng_g_fake_id = 0;
+        return 0;
+    }
+    if (!strcmp(op, "access")) {
+        long r = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 0, 0, 0,
+                              0, /*trapped=*/0);
+        cng_dprintf(1, "access: %s\n", r == 0 ? "ok" : "no");
+        return r == 0 ? 0 : 1;
+    }
+    /* faccessat2's AT_SYMLINK_NOFOLLOW asks about the link itself, so a
+     * dangling one exists (F_OK) where following it is ENOENT. Resolving the
+     * final component during translation answered for the target instead. */
+    if (!strcmp(op, "accessnf")) {
+        /* Android refuses faccessat2 outright (measured on Android 13), and
+         * dispatch then answers the ENOSYS an older kernel would have — there
+         * is no flag behaviour left to compare. Say so rather than reporting
+         * two ENOSYSes as if they were an answer. */
+        if (cng_blocked[__NR_faccessat2]) {
+            cng_dprintf(1, "accessnf: unavailable (faccessat2 refused here)\n");
+            return 0;
+        }
+        long f = cng_dispatch(__NR_faccessat2, CNG_AT_FDCWD, (long)gpath, 0,
+                              CNG_AT_SYMLINK_NOFOLLOW, 0, 0, /*trapped=*/0);
+        long d = cng_dispatch(__NR_faccessat2, CNG_AT_FDCWD, (long)gpath, 0, 0,
+                              0, 0, /*trapped=*/0);
+        cng_dprintf(1, "accessnf: nofollow=%d follow=%d\n", (int)f, (int)d);
+        return 0;
+    }
+    /* faccessat(2) takes three arguments — dirfd, path, mode — and has no flags
+     * word at all; only faccessat2 does. x3 is therefore whatever the caller
+     * happened to leave there, and no part of the answer may depend on it. The
+     * same call is made twice, with a clean x3 and with one carrying
+     * AT_SYMLINK_NOFOLLOW, and the two must agree.
+     *
+     * GUESTPATH names a non-executable file through a /proc fd link, which the
+     * resolver hands over as the magic link itself rather than dereferencing it.
+     * That is what makes the difference observable: under fake-root a denied
+     * X_OK is recovered from a stat, and a stray NOFOLLOW made that stat
+     * describe the link (mode 0700 — so X_OK is granted whatever the file is)
+     * instead of the file behind it. */
+    if (!strcmp(op, "accessgb")) {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = cng_g_fake_gid = 0;
+        cng_cred_seed();
+        long clean = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                  1 /*X_OK*/, 0, 0, 0, /*trapped=*/0);
+        long dirty = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                  1 /*X_OK*/, CNG_AT_SYMLINK_NOFOLLOW, 0, 0,
+                                  /*trapped=*/0);
+        cng_g_fake_id = 0;
+        cng_dprintf(1, "accessgb: clean=%d dirty=%d\n", (int)clean, (int)dirty);
+        return 0;
+    }
+    /* Root's DAC bypass covers a permission denial and nothing else. GUESTPATH
+     * names a file the invoking user cannot write (mode 0444, so the real check
+     * is EACCES and the bypass is what grants it) — or one on a genuinely
+     * read-only mount, where the kernel refuses MAY_WRITE with EROFS before the
+     * DAC check and root gets the same answer. The mode word is asked about too:
+     * bits outside R_OK|W_OK|X_OK are EINVAL for everyone. */
+    if (!strcmp(op, "accessfr")) {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = cng_g_fake_gid = 0;
+        cng_cred_seed();
+        long w = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                              2 /*W_OK*/, 0, 0, 0, /*trapped=*/0);
+        long rd = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                               4 /*R_OK*/, 0, 0, 0, /*trapped=*/0);
+        long bad = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath, 8, 0,
+                                0, 0, /*trapped=*/0);
+        long miss = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD,
+                                 (long)"/cng-no-such-file", 0, 0, 0, 0,
+                                 /*trapped=*/0);
+        cng_g_fake_id = 0;
+        cng_dprintf(1, "accessfr: w=%d r=%d badmode=%d missing=%d\n", (int)w,
+                    (int)rd, (int)bad, (int)miss);
+        return 0;
+    }
+    /* The one formatter the whole freestanding runtime shares, asked about the
+     * inputs it cannot get from a literal. A format ending in a bare '%' is the
+     * sharp one: stepping past the '%' is unconditional and every scan for
+     * flags, width and length stops at the terminator, so the conversion
+     * dispatch used to land on '\0' — emit it as a character, and let the
+     * loop's own increment walk off the end of the string and go on formatting
+     * whatever followed it in memory, consuming a va_arg per '%' found there.
+     * In .rodata that is an out-of-bounds read in code the SIGSYS handler runs,
+     * where a fault is an unblockable kill. Built here rather than written as a
+     * literal, so a compiler's own -Wformat cannot object and so the bytes
+     * after the terminator are known: the walk shows up as a length of 9 rather
+     * than 2, having appended "Z4242Z" from past the end. */
+    if (!strcmp(op, "fmt")) {
+        static char pct[8] = {'a', '%', 0, 'Z', '%', 'd', 'Z', 0};
+        static char pctw[12] = {'b', '%', '0', '8', 'l', 0, 'Z', '%', 'd', 0};
+        char out[64];
+        memset(out, 'Q', sizeof out);
+        size_t n = cng_snprintf(out, sizeof out, pct, 4242);
+        int clean = n == 2 && out[0] == 'a' && out[1] == '%' && out[2] == 0;
+        char out2[64];
+        memset(out2, 'Q', sizeof out2);
+        size_t n2 = cng_snprintf(out2, sizeof out2, pctw, 4242);
+        int clean2 = n2 == 2 && out2[0] == 'b' && out2[1] == '%' && out2[2] == 0;
+        /* ...and an ordinary format still works, so the guard is not a stop. */
+        char out3[64];
+        size_t n3 = cng_snprintf(out3, sizeof out3, "x%03d%%y", 7);
+        int ok3 = n3 == 6 && !strcmp(out3, "x007%y");
+        cng_dprintf(1, "fmt: bare=%d,%lu wide=%d,%lu normal=%d,%lu [%s]\n",
+                    clean, (unsigned long)n, clean2, (unsigned long)n2, ok3,
+                    (unsigned long)n3, out3);
+        return 0;
+    }
+    /* A ":ro" bind must answer -EROFS for every mutating path syscall while
+     * still serving reads, the way a real read-only mount does. GUESTPATH names
+     * an existing file inside the bind. Without ":ro" on the -b spec the same
+     * calls must NOT report EROFS — that is the negative control the test
+     * drives, so a blanket refusal cannot pass. */
+    /* _dtest -r ROOT outside HOSTDIR HOSTFILE — descriptors the guest has no
+     * name for. HOSTDIR and HOSTFILE are host paths outside ROOT; the driver
+     * opens both itself (it runs without the startup sanitization that keeps
+     * such a dirfd out of a real guest's table, which is what makes the
+     * refusals observable here) and asks the dispatcher what a guest holding
+     * them may do. The directory: nothing that resolves a name from it — a walk
+     * (a name with a slash or ".."), fchdir, a reopen or a name through its
+     * magic link — is EACCES, and a copy of it that arrives over a socket or
+     * from pidfd_getfd is closed on arrival. The file keeps the kernel's own
+     * answers: ENOTDIR for a name below it, a reopen through its magic link,
+     * and it survives both imports — the I/O it carries is what an inherited
+     * descriptor is for. (A plain single-component name against the directory
+     * is not asked about: that is the walk-free path whose safety rests on the
+     * sanitization this driver skips.) */
+    if (!strcmp(op, "outside")) {
+        const char *hostfile = relpath;
+        if (!hostfile) {
+            cng_dprintf(2, "outside: HOSTFILE missing\n");
+            return 2;
+        }
+        long od = sys_openat(CNG_AT_FDCWD, gpath, CNG_O_RDONLY | CNG_O_DIRECTORY, 0);
+        long of = sys_openat(CNG_AT_FDCWD, hostfile, CNG_O_RDONLY, 0);
+        if (od < 0 || of < 0) {
+            cng_dprintf(2, "outside: cannot open %s / %s\n", gpath, hostfile);
+            return 2;
+        }
+        char link[40], sub[64], st[144];
+        int fails = 0;
+        struct {
+            const char *name;
+            long want; /* -errno, or 0 for "succeeds" */
+            long r;
+        } t[16];
+        int n = 0;
+#define OUT_LEG(nm, w, call)                                                   \
+        do {                                                                   \
+            t[n].name = nm;                                                    \
+            t[n].want = w;                                                     \
+            t[n].r = call;                                                     \
+            n++;                                                               \
+        } while (0)
+        OUT_LEG("dir-walk", -EACCES,
+                cng_dispatch(__NR_openat, od, (long)"a/b", CNG_O_RDONLY, 0, 0, 0, 0));
+        OUT_LEG("dir-dotdot", -EACCES,
+                cng_dispatch(__NR_openat, od, (long)"..", CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0));
+        OUT_LEG("dir-stat-walk", -EACCES,
+                cng_dispatch(__NR_newfstatat, od, (long)"x/y", (long)st, 0, 0, 0, 0));
+        OUT_LEG("dir-fchdir", -EACCES,
+                cng_dispatch(__NR_fchdir, od, 0, 0, 0, 0, 0, 0));
+        cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)od);
+        OUT_LEG("dir-magic", -EACCES,
+                cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)link, CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0));
+        cng_snprintf(sub, sizeof sub, "/proc/self/fd/%d/file", (int)od);
+        OUT_LEG("dir-magic-below", -EACCES,
+                cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)sub, CNG_O_RDONLY, 0, 0, 0, 0));
+        OUT_LEG("file-walk", -ENOTDIR,
+                cng_dispatch(__NR_openat, of, (long)"a/b", CNG_O_RDONLY, 0, 0, 0, 0));
+        cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)of);
+        OUT_LEG("file-magic", 0,
+                cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)link, CNG_O_RDONLY, 0, 0, 0, 0));
+        /* Over a socket, through the dispatcher's recvmsg. */
+        int sv[2] = {-1, -1};
+        long spr = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, sv, 0, 0);
+        for (int k = 0; k < 2; k++) {
+            int send = k == 0 ? (int)od : (int)of;
+            long got = -1;
+            if (spr == 0 && cng_broker_send(sv[0], "x", 1, send) == 0) {
+                char data;
+                struct cng_iovec iov = {&data, 1};
+                struct {
+                    struct cng_cmsghdr h;
+                    int fd;
+                    int pad;
+                } cm;
+                memset(&cm, 0, sizeof cm);
+                struct cng_msghdr msg;
+                memset(&msg, 0, sizeof msg);
+                msg.iov = &iov;
+                msg.iovlen = 1;
+                msg.control = &cm;
+                msg.controllen = sizeof cm;
+                long rr = cng_dispatch(__NR_recvmsg, sv[1], (long)&msg, 0, 0, 0, 0, 0);
+                if (rr >= 0 && cm.h.type == CNG_SCM_RIGHTS)
+                    got = sys_fcntl(cm.fd, CNG_F_GETFD, 0) < 0 ? -EBADF : cm.fd;
+                else
+                    got = rr < 0 ? rr : -EIO;
+            }
+            OUT_LEG(k == 0 ? "dir-scm" : "file-scm", k == 0 ? -EBADF : 0, got);
+        }
+        /* Out of another table: our own, through pidfd_getfd. Having
+         * pidfd_open does not mean having pidfd_getfd: Android's 4.19 kernels
+         * carry a backport of the first (for lmkd) and not the second, which
+         * answers ENOSYS there. A descriptor that is no pidfd tells the two
+         * apart — EBADF where the call exists. An older filter traps both
+         * (Android 8), which this driver, with no handler, would die of. */
+        long pfd = cng_blocked[__NR_pidfd_open]
+                       ? -ENOSYS
+                       : CNG_SYS(__NR_pidfd_open, sys_getpid(), 0, 0, 0, 0, 0);
+        if (pfd >= 0 &&
+            cng_dispatch(__NR_pidfd_getfd, -1, 0, 0, 0, 0, 0, 0) == -ENOSYS) {
+            sys_close((int)pfd);
+            pfd = -ENOSYS;
+        }
+        if (pfd >= 0) {
+            OUT_LEG("dir-pidfd_getfd", -EPERM,
+                    cng_dispatch(__NR_pidfd_getfd, pfd, od, 0, 0, 0, 0, 0));
+            OUT_LEG("file-pidfd_getfd", 0,
+                    cng_dispatch(__NR_pidfd_getfd, pfd, of, 0, 0, 0, 0, 0));
+        } else {
+            cng_dprintf(1, "outside pidfd: unavailable (errno %d)\n", (int)-pfd);
+        }
+#undef OUT_LEG
+        for (int i = 0; i < n; i++) {
+            int ok = t[i].want == 0 ? t[i].r >= 0 : t[i].r == t[i].want;
+            cng_dprintf(1, "outside %s: rc=%d -> %s\n", t[i].name, (int)t[i].r,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        cng_dprintf(1, "outside: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    if (!strcmp(op, "robind")) {
+        int ro = fs.nbinds > 0 && fs.binds[0].ro;
+        char sib[CNG_PATH_MAX];
+        size_t gl = cng_strlcpy(sib, gpath, sizeof sib);
+        cng_strlcpy(sib + gl, ".x", sizeof sib - gl);
+        int fails = 0;
+
+        /* Names that are NOT there. A real read-only mount refuses at the point
+         * the kernel reaches it, and for the calls that must operate on an
+         * existing name that is *after* the path has resolved — so a missing
+         * name is ENOENT, the same answer a writable mount gives, and the one
+         * `[ -e f ] || : >f` needs to take the right branch. The create-and-
+         * remove family orders it the other way, taking write access on the
+         * parent first, and is EROFS even for a name that is not there. Both
+         * halves measured against a squashfs mount. Each leg gets a name of its
+         * own so no leg's answer depends on another having created something in
+         * the rw control run. */
+        char miss[CNG_PATH_MAX];
+        size_t ml = cng_strlcpy(miss, gpath, sizeof miss);
+        cng_strlcpy(miss + ml, ".absent", sizeof miss - ml);
+        char missc[CNG_PATH_MAX], missd[CNG_PATH_MAX];
+        cng_strlcpy(missc, miss, sizeof missc);
+        cng_strlcpy(missc + ml + 7, "c", sizeof missc - ml - 7);
+        cng_strlcpy(missd, miss, sizeof missd);
+        cng_strlcpy(missd + ml + 7, "d", sizeof missd - ml - 7);
+        struct {
+            const char *name;
+            long want;
+            long r;
+        } m[] = {
+            {"miss-open-w", -ENOENT,
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)miss, CNG_O_WRONLY, 0,
+                          0, 0, 0)},
+            {"miss-open-trunc", -ENOENT,
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)miss,
+                          CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0, 0)},
+            {"miss-truncate", -ENOENT,
+             cng_dispatch(__NR_truncate, (long)miss, 0, 0, 0, 0, 0, 0)},
+            {"miss-chmod", -ENOENT,
+             cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)miss, 0600, 0, 0, 0,
+                          0)},
+            {"miss-chown", -ENOENT,
+             cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)miss, 0, 0, 0, 0,
+                          0)},
+            {"miss-utimensat", -ENOENT,
+             cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)miss, 0, 0, 0, 0,
+                          0)},
+            /* ...and the family the kernel refuses before it looks. */
+            {"miss-open-creat", -EROFS,
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)missc,
+                          CNG_O_WRONLY | CNG_O_CREAT, 0644, 0, 0, 0)},
+            {"miss-mkdir", -EROFS,
+             cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)missd, 0755, 0, 0, 0,
+                          0)},
+            {"miss-unlink", -EROFS,
+             cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)miss, 0, 0, 0, 0,
+                          0)},
+        };
+        for (unsigned i = 0; i < sizeof m / sizeof *m; i++) {
+            int ok = ro ? m[i].r == m[i].want : m[i].r != -EROFS;
+            if (m[i].r >= 0)
+                sys_close((int)m[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        m[i].name, (int)m[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+
+        /* First, the same calls made *relative to a directory fd* inside the
+         * bind, which is how rm -rf, find -delete, tar and git all work. The
+         * refusal keys on the resolved HOST path, and a plain relative name used
+         * to be handed to the kernel without ever acquiring one — so these went
+         * straight through and the unlink really removed the file. Run before
+         * the absolute set below, which in the rw control leg deletes it. */
+        long rofd = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                 (long)(fs.nbinds > 0 ? fs.binds[0].guest : "/"),
+                                 CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        const char *base = strrchr(gpath, '/');
+        base = base ? base + 1 : gpath;
+        /* The unlink leg gets a name of its own: in the rw control run it really
+         * removes what it names, and the absolute set below still needs the
+         * original. Creating it is itself one of the calls under test. */
+        char atsib[128];
+        size_t bl = cng_strlcpy(atsib, base, sizeof atsib);
+        cng_strlcpy(atsib + bl, ".at", sizeof atsib - bl);
+        struct {
+            const char *name;
+            long r;
+        } at[] = {
+            {"at-read", cng_dispatch(__NR_openat, rofd, (long)base,
+                                     CNG_O_RDONLY, 0, 0, 0, 0)},
+            {"at-open-w", cng_dispatch(__NR_openat, rofd, (long)base,
+                                       CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"at-creat", cng_dispatch(__NR_openat, rofd, (long)atsib,
+                                      CNG_O_WRONLY | CNG_O_CREAT, 0644, 0, 0,
+                                      0)},
+            {"at-unlink", cng_dispatch(__NR_unlinkat, rofd, (long)atsib, 0, 0, 0,
+                                       0, 0)},
+        };
+        if (rofd >= 0)
+            sys_close((int)rofd);
+        for (unsigned i = 0; i < sizeof at / sizeof *at; i++) {
+            int is_read = !strcmp(at[i].name, "at-read");
+            int ok = is_read ? at[i].r >= 0
+                             : (ro ? at[i].r == -EROFS : at[i].r != -EROFS);
+            if (at[i].r >= 0 && strcmp(at[i].name, "at-unlink"))
+                sys_close((int)at[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        at[i].name, (int)at[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+
+        /* Then through the fd magic link of a descriptor opened read-only (and
+         * one opened O_PATH) under the bind: the link resolves to a host path
+         * that names no bind, and a write-open of it used to go straight
+         * through — the file was written, and O_TRUNC emptied it. A real
+         * read-only mount answers EROFS, the description having been opened
+         * through it. Both spellings, since /dev/fd is the same link. The
+         * read-only reopen is the control: the description is reachable, and
+         * only the write intent is refused. */
+        long rfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        long pfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_PATH, 0, 0, 0, 0);
+        char fl[48], dl[48], pl[48];
+        cng_snprintf(fl, sizeof fl, "/proc/self/fd/%d", (int)rfd);
+        cng_snprintf(dl, sizeof dl, "/dev/fd/%d", (int)rfd);
+        cng_snprintf(pl, sizeof pl, "/proc/self/fd/%d", (int)pfd);
+        struct {
+            const char *name;
+            long r;
+        } fdl[] = {
+            {"fdlink-read", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                                         CNG_O_RDONLY, 0, 0, 0, 0)},
+            {"fdlink-open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                                           CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"fdlink-open-trunc",
+             cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                          CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0, 0)},
+            {"devfd-open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)dl,
+                                          CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"pathfd-open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)pl,
+                                           CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"fdlink-truncate",
+             cng_dispatch(__NR_truncate, (long)fl, 0, 0, 0, 0, 0, 0)},
+            {"fdlink-chmod", cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)fl,
+                                          0644, 0, 0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof fdl / sizeof *fdl; i++) {
+            int is_read = !strcmp(fdl[i].name, "fdlink-read");
+            int ok = is_read ? fdl[i].r >= 0
+                             : (ro ? fdl[i].r == -EROFS : fdl[i].r != -EROFS);
+            if (fdl[i].r >= 0 && strncmp(fdl[i].name, "fdlink-truncate", 15) &&
+                strncmp(fdl[i].name, "fdlink-chmod", 12))
+                sys_close((int)fdl[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        fdl[i].name, (int)fdl[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* And by descriptor alone: the calls that carry no path for the
+         * refusal to key on. A read-only descriptor under the bind is what
+         * the bind hands out, and fchmod, fchown, futimens, the fd xattr
+         * setters, the AT_EMPTY_PATH spellings of the path forms and the
+         * mount-writing ioctls all went to the kernel with nothing in the
+         * way — mnt_want_write_file() refuses every one of them on a real
+         * read-only mount. FIDEDUPERANGE names its target in the argument:
+         * the descriptor is the source (a rw name of the same file, so the
+         * source is never the refusal), and the destination under the bind
+         * has to come back with EROFS in its own status. Where the kernel
+         * has no dedupe at all (tmpfs, qemu-user) the call fails whole and
+         * says nothing about the mount; that is reported and not judged. */
+        long mfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (dfd < 0) /* gpath is a file: its directory is the bind itself */
+            dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                               (long)(fs.nbinds > 0 ? fs.binds[0].guest : "/"),
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long ioflags = 0;
+        unsigned char fsx[28] = {0};
+        struct {
+            const char *name;
+            long r;
+        } fdm[] = {
+            {"fchmod", cng_dispatch(__NR_fchmod, mfd, 0644, 0, 0, 0, 0, 0)},
+            {"fchown", cng_dispatch(__NR_fchown, mfd, -1, -1, 0, 0, 0, 0)},
+            {"fchmod-dir", cng_dispatch(__NR_fchmod, dfd, 0755, 0, 0, 0, 0, 0)},
+            {"futimens",
+             cng_dispatch(__NR_utimensat, mfd, 0, 0, 0, 0, 0, 0)},
+            {"fsetxattr",
+             cng_dispatch(__NR_fsetxattr, mfd, (long)"user.cng", (long)"1", 1,
+                          0, 0, 0)},
+            {"fremovexattr",
+             cng_dispatch(__NR_fremovexattr, mfd, (long)"user.cng", 0, 0, 0, 0,
+                          0)},
+            {"fchownat-empty",
+             cng_dispatch(__NR_fchownat, mfd, (long)"", -1, -1,
+                          CNG_AT_EMPTY_PATH, 0, 0)},
+            {"fchmodat2-empty",
+             cng_dispatch(__NR_fchmodat2, mfd, (long)"", 0644,
+                          CNG_AT_EMPTY_PATH, 0, 0, 0)},
+            {"setxattrat-empty",
+             cng_dispatch(__NR_setxattrat, mfd, (long)"", CNG_AT_EMPTY_PATH,
+                          (long)"user.cng", 0, 0, 0)},
+            {"file_setattr-empty",
+             cng_dispatch(__NR_file_setattr, mfd, (long)"", (long)fsx, 24,
+                          CNG_AT_EMPTY_PATH, 0, 0)},
+            {"ioctl-setflags",
+             cng_dispatch(__NR_ioctl, mfd, CNG_FS_IOC_SETFLAGS, (long)&ioflags,
+                          0, 0, 0, 0)},
+            {"ioctl-fssetxattr",
+             cng_dispatch(__NR_ioctl, mfd, CNG_FS_IOC_FSSETXATTR, (long)fsx, 0,
+                          0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof fdm / sizeof *fdm; i++) {
+            int ok = ro ? fdm[i].r == -EROFS : fdm[i].r != -EROFS;
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        fdm[i].name, (int)fdm[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* AT_EMPTY_PATH with AT_FDCWD names the working directory, which the
+         * translation spells out and the descriptor question cannot ask. */
+        {
+            cng_fs_set_cwd(&fs, fs.nbinds > 0 ? fs.binds[0].guest : "/");
+            long r = cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"", -1,
+                                  -1, CNG_AT_EMPTY_PATH, 0, 0);
+            cng_fs_set_cwd(&fs, "/");
+            int ok = ro ? r == -EROFS : r != -EROFS;
+            cng_dprintf(1, "robind %s cwd-empty: rc=%d -> %s\n",
+                        ro ? "ro" : "rw", (int)r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        {
+            /* The source is the file by its host path, so it is never under
+             * the bind; the destination is the guest's read-only descriptor. */
+            char hostp[CNG_PATH_MAX];
+            long sfd = cng_fs_translate(&fs, gpath, hostp, sizeof hostp) == 0
+                           ? sys_openat(CNG_AT_FDCWD, hostp, CNG_O_RDONLY, 0)
+                           : -1;
+            unsigned char dd[CNG_DEDUPE_HDR + CNG_DEDUPE_INFO];
+            memset(dd, 0, sizeof dd);
+            unsigned short one = 1;
+            memcpy(dd + CNG_DEDUPE_COUNT_OFF, &one, sizeof one);
+            long dest = mfd;
+            memcpy(dd + CNG_DEDUPE_HDR, &dest, sizeof dest);
+            long r = cng_dispatch(__NR_ioctl, sfd, CNG_FIDEDUPERANGE, (long)dd,
+                                  0, 0, 0, 0);
+            int st = 0;
+            memcpy(&st, dd + CNG_DEDUPE_HDR + CNG_DEDUPE_STATUS_OFF, sizeof st);
+            int judged = r >= 0;
+            int ok = !judged || (ro ? st == -EROFS : st != -EROFS);
+            cng_dprintf(1, "robind %s dedupe: rc=%d status=%d -> %s\n",
+                        ro ? "ro" : "rw", (int)r, st,
+                        !judged ? "UNSUPPORTED" : ok ? "OK" : "FAIL");
+            fails += !ok;
+            if (sfd >= 0)
+                sys_close((int)sfd);
+        }
+        if (mfd >= 0)
+            sys_close((int)mfd);
+        if (dfd >= 0)
+            sys_close((int)dfd);
+        if (rfd >= 0)
+            sys_close((int)rfd);
+        if (pfd >= 0)
+            sys_close((int)pfd);
+
+        struct {
+            const char *name;
+            long r;
+        } t[] = {
+            {"read", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                  CNG_O_RDONLY, 0, 0, 0, 0)},
+            /* access(W_OK) reports a read-only mount, so `test -w` agrees with
+             * what the write would actually do rather than with the host
+             * file's own mode. R_OK on the same name must still succeed. */
+            {"access-r", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      4 /*R_OK*/, 0, 0, 0, 0)},
+            {"access-w", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      2 /*W_OK*/, 0, 0, 0, 0)},
+            {"open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                    CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"open-creat", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)sib,
+                                        CNG_O_RDONLY | CNG_O_CREAT, 0644, 0, 0,
+                                        0)},
+            {"mkdirat", cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)sib, 0755,
+                                     0, 0, 0, 0)},
+            {"unlinkat", cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gpath, 0,
+                                      0, 0, 0, 0)},
+            {"fchmodat", cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)gpath,
+                                      0600, 0, 0, 0, 0)},
+            {"truncate",
+             cng_dispatch(__NR_truncate, (long)gpath, 0, 0, 0, 0, 0, 0)},
+            {"symlinkat", cng_dispatch(__NR_symlinkat, (long)"/t", CNG_AT_FDCWD,
+                                       (long)sib, 0, 0, 0, 0)},
+            {"renameat", cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)gpath,
+                                      CNG_AT_FDCWD, (long)sib, 0, 0, 0)},
+            {"utimensat", cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)gpath,
+                                       0, 0, 0, 0, 0)},
+            {"fchownat", cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)gpath, 0,
+                                      0, 0, 0, 0)},
+            /* The 6.13/6.17 dirfd forms: setters, so EROFS under :ro. */
+            {"setxattrat",
+             cng_dispatch(__NR_setxattrat, CNG_AT_FDCWD, (long)gpath, 0,
+                          (long)"user.cng", 0, 0, 0)},
+            {"file_setattr",
+             cng_dispatch(__NR_file_setattr, CNG_AT_FDCWD, (long)gpath, 0, 24, 0,
+                          0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int is_read = !strcmp(t[i].name, "read") ||
+                          !strcmp(t[i].name, "access-r");
+            /* reads always succeed; mutators are EROFS exactly when ro */
+            int ok = is_read ? t[i].r >= 0
+                             : (ro ? t[i].r == -EROFS : t[i].r != -EROFS);
+            if (!strcmp(t[i].name, "read") && t[i].r >= 0)
+                sys_close((int)t[i].r);
+            cng_dprintf(1, "robind %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        t[i].name, (int)t[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        cng_dprintf(1, "robind: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    /* _dtest -r ROOT -b SRC:DST[:ro] l2sro GUESTPATH — the link2symlink
+     * emulation inside a read-only bind. A group's data file lives in the
+     * store under the rootfs, which no bind covers, so a mutator that reached
+     * it through the emulation's symlink found a perfectly writable file and
+     * went through: the :ro mount the guest's own name sits under was lost on
+     * the way (see ro_denied_l2s in dispatch.c). To the guest that name is a
+     * regular file, so the mount over the NAME is the one that governs it.
+     *
+     * The group is made here through the l2s API, on host paths, because the
+     * bind refuses the linkat that would otherwise make one — which is also
+     * how such a tree comes about in practice: linked while writable (or by
+     * arm64chroot), bound read-only afterwards.
+     *
+     * The rw run is the negative control: the same calls must NOT report EROFS
+     * there, so a blanket refusal cannot pass both legs. */
+    if (!strcmp(op, "l2sro")) {
+        int ro = fs.nbinds > 0 && fs.binds[0].ro;
+        cng_g_l2s = 1;
+        char host[CNG_PATH_MAX], sib[CNG_PATH_MAX], data[CNG_PATH_MAX];
+        char gsib[CNG_PATH_MAX];
+        if (cng_fs_translate(&fs, gpath, host, sizeof host) != 0) {
+            cng_dprintf(1, "l2sro: %s does not translate\n", gpath);
+            return 1;
+        }
+        size_t hl = cng_strlcpy(sib, host, sizeof sib);
+        cng_strlcpy(sib + hl, ".l2", sizeof sib - hl);
+        size_t gl = cng_strlcpy(gsib, gpath, sizeof gsib);
+        cng_strlcpy(gsib + gl, ".l2", sizeof gsib - gl);
+        int lrc = cng_l2s_link(host, sib);
+        int isgrp = cng_l2s_resolve(host, data, sizeof data, 0) == 1;
+        /* The point of the leg is the data file living OUTSIDE the bind: that
+         * is the central-store layout, and it is what takes the name's mount
+         * out of the picture. A same-directory (legacy) group keeps the data
+         * inside the bind, where the old keying refuses it anyway — so say so
+         * rather than pass on a case that proves nothing. */
+        const char *bh = fs.nbinds > 0 ? fs.binds[0].host : "";
+        size_t bl = strlen(bh);
+        int outside = isgrp && !(bl && !strncmp(data, bh, bl) &&
+                                 (data[bl] == '/' || data[bl] == '\0'));
+        cng_dprintf(1, "l2sro group: link=%d group=%d data-outside-bind=%d\n",
+                    lrc, isgrp, outside);
+        if (!isgrp || !outside)
+            return 1;
+
+        int fails = 0;
+        /* Reads first: they must work whatever the mount says, and the
+         * mutators below really do mutate in the rw control run. */
+        struct {
+            const char *name;
+            long r;
+        } rd[] = {
+            {"read", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                  CNG_O_RDONLY, 0, 0, 0, 0)},
+            {"access-r", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      4 /*R_OK*/, 0, 0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof rd / sizeof *rd; i++) {
+            int ok = rd[i].r >= 0;
+            if (rd[i].r >= 0 && !strcmp(rd[i].name, "read"))
+                sys_close((int)rd[i].r);
+            cng_dprintf(1, "l2sro %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        rd[i].name, (int)rd[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+
+        /* The mutators. Every one of them names the l2s link, and every one
+         * of them used to be answered by the store's own (writable) mount.
+         * The unlink takes the group's second name so the first survives for
+         * the rest whatever order these are evaluated in. */
+        struct {
+            const char *name;
+            long r;
+        } t[] = {
+            {"open-w", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                    CNG_O_WRONLY, 0, 0, 0, 0)},
+            {"open-trunc", cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                        CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0,
+                                        0)},
+            {"access-w", cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)gpath,
+                                      2 /*W_OK*/, 0, 0, 0, 0)},
+            {"truncate",
+             cng_dispatch(__NR_truncate, (long)gpath, 0, 0, 0, 0, 0, 0)},
+            {"fchmodat", cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)gpath,
+                                      0600, 0, 0, 0, 0)},
+            {"fchownat", cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)gpath, 0,
+                                      0, 0, 0, 0)},
+            {"utimensat", cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)gpath,
+                                       0, 0, 0, 0, 0)},
+            {"setxattr",
+             cng_dispatch(__NR_setxattr, (long)gpath, (long)"user.cng",
+                          (long)"1", 1, 0, 0, 0)},
+            {"setxattrat",
+             cng_dispatch(__NR_setxattrat, CNG_AT_FDCWD, (long)gpath,
+                          CNG_AT_SYMLINK_NOFOLLOW, (long)"user.cng", 0, 0, 0)},
+            {"file_setattr",
+             cng_dispatch(__NR_file_setattr, CNG_AT_FDCWD, (long)gpath, 0, 24,
+                          0, 0, 0)},
+            {"unlinkat", cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gsib, 0,
+                                      0, 0, 0, 0)},
+        };
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int ok = ro ? t[i].r == -EROFS : t[i].r != -EROFS;
+            if (t[i].r >= 0 && !strcmp(t[i].name, "open-w"))
+                sys_close((int)t[i].r);
+            if (t[i].r >= 0 && !strcmp(t[i].name, "open-trunc"))
+                sys_close((int)t[i].r);
+            cng_dprintf(1, "l2sro %s %s: rc=%d -> %s\n", ro ? "ro" : "rw",
+                        t[i].name, (int)t[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* The fd magic link of a descriptor opened read-only through the
+         * name: it is on the data file, which no bind covers, and which name
+         * it came through is not something a description remembers. Its
+         * access mode is: read-only, it is judged as the :ro name's while the
+         * view has a :ro bind (fd_link_ro in dispatch.c); the rw control has
+         * none, and reopens. */
+        long rfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        char fl[48];
+        cng_snprintf(fl, sizeof fl, "/proc/self/fd/%d", (int)rfd);
+        long rw = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)fl,
+                               CNG_O_WRONLY, 0, 0, 0, 0);
+        int okw = ro ? rw == -EROFS : rw >= 0;
+        if (rw >= 0)
+            sys_close((int)rw);
+        if (rfd >= 0)
+            sys_close((int)rfd);
+        cng_dprintf(1, "l2sro %s fdlink-open-w: rc=%d -> %s\n", ro ? "ro" : "rw",
+                    (int)rw, okw ? "OK" : "FAIL");
+        fails += !okw;
+        cng_dprintf(1, "l2sro: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    if (!strcmp(op, "rolink")) {
+        /* A link out of a :ro bind into the (writable) rootfs. A real one is
+         * EXDEV — a link cannot span mounts, and the bind is a mount — after
+         * the new name's own verdict; made anyway, the new name was a
+         * writable way into the :ro file, and under -l the fallback moved
+         * the file into the store. The rw bind is the control: every link
+         * there is the host's to make, so what it must answer is the host's
+         * own verdict on the same link, asked raw — 0 where the filesystem
+         * allows a hardlink, its errno where it does not (Android's SELinux
+         * policy refuses every one with EACCES) — and dispatch adds nothing
+         * to it. */
+        int ro = fs.nbinds > 0 && fs.binds[0].ro;
+        const char *rs = ro ? "ro" : "rw";
+        char host[CNG_PATH_MAX], st0[144], st1[144];
+        if (cng_fs_translate(&fs, gpath, host, sizeof host) != 0 ||
+            CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st0,
+                    CNG_AT_SYMLINK_NOFOLLOW, 0, 0) != 0) {
+            cng_dprintf(1, "rolink: %s is not there\n", gpath);
+            return 1;
+        }
+        long xdev = ro ? -EXDEV : 0;
+        long lnk = xdev;
+        if (!ro) {
+            char hl[CNG_PATH_MAX];
+            cng_snprintf(hl, sizeof hl, "%s/rolink.host", rootfs);
+            lnk = CNG_SYS(__NR_linkat, CNG_AT_FDCWD, host, CNG_AT_FDCWD, hl, 0,
+                          0);
+            if (lnk == 0)
+                CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, hl, 0, 0, 0, 0);
+        }
+        cng_dispatch(__NR_symlinkat, (long)gpath, CNG_AT_FDCWD,
+                     (long)"/rolink.sym", 0, 0, 0, 0);
+        long tf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/rolink.taken",
+                               CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (tf >= 0)
+            sys_close((int)tf);
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                               CNG_O_RDONLY, 0, 0, 0, 0);
+        /* What the kernel says of this descriptor as a link source, asked the
+         * way dispatch asks it: "/" is a new name filename_create refuses
+         * with EEXIST once the source has passed, so nothing is created. */
+        long probe = fd >= 0 ? CNG_SYS(__NR_linkat, fd, (long)"", CNG_AT_FDCWD,
+                                       (long)"/", CNG_AT_EMPTY_PATH, 0)
+                             : -EBADF;
+        long byfd = probe == -EEXIST ? lnk : probe;
+        struct {
+            const char *name;
+            long want, r;
+        } t[] = {
+            {"name", lnk,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath, CNG_AT_FDCWD,
+                          (long)"/rolink.a", 0, 0, 0)},
+            {"followed", lnk,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/rolink.sym",
+                          CNG_AT_FDCWD, (long)"/rolink.b",
+                          CNG_AT_SYMLINK_FOLLOW, 0, 0)},
+            {"dst-taken", -EEXIST,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath, CNG_AT_FDCWD,
+                          (long)"/rolink.taken", 0, 0, 0)},
+            {"dst-nodir", -ENOENT,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath, CNG_AT_FDCWD,
+                          (long)"/rolink.none/x", 0, 0, 0)},
+            {"by-fd", byfd,
+             cng_dispatch(__NR_linkat, fd, (long)"", CNG_AT_FDCWD,
+                          (long)"/rolink.e", CNG_AT_EMPTY_PATH, 0, 0)},
+        };
+        int fails = 0;
+        for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+            int ok = t[i].r == t[i].want;
+            cng_dprintf(1, "rolink %s %s: rc=%d -> %s\n", rs, t[i].name,
+                        (int)t[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        /* Under -l, with the host's link refused so the fallback is what
+         * would answer: the refusal comes first, and the fallback never runs
+         * on a :ro source. (The rw control's fallback links for real, moving
+         * the bind's file into the store — last, since it changes the file.) */
+        if (ro) {
+            cng_g_l2s = 1;
+            cng_blocked[__NR_linkat] = 1;
+            long lf = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gpath,
+                                   CNG_AT_FDCWD, (long)"/rolink.f", 0, 0, 0);
+            long lg = cng_dispatch(__NR_linkat, fd, (long)"", CNG_AT_FDCWD,
+                                   (long)"/rolink.g", CNG_AT_EMPTY_PATH, 0, 0);
+            cng_blocked[__NR_linkat] = 0;
+            cng_g_l2s = 0;
+            int ok = lf == -EXDEV && lg == -EXDEV;
+            cng_dprintf(1, "rolink ro l2s-fallback: rc=%d/%d -> %s\n", (int)lf,
+                        (int)lg, ok ? "OK" : "FAIL");
+            fails += !ok;
+            /* ...and the bind's file is as it was: the same regular file,
+             * with the one name it had. */
+            int kept = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, host, st1,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                       ST_ISREG(st1) && ST_INO(st1) == ST_INO(st0) &&
+                       ST_NLINK(st1) == 1;
+            cng_dprintf(1, "rolink ro file-kept: %d -> %s\n", kept,
+                        kept ? "OK" : "FAIL");
+            fails += !kept;
+        }
+        if (fd >= 0)
+            sys_close((int)fd);
+
+        /* A group a link out of the bind already made: data under the bind,
+         * a writable name in the rootfs pointing at it. The file lives on the
+         * :ro mount, so it is read-only through that name too, the name's
+         * unlink leaves the count on the :ro mount alone, and a link from the
+         * name is a link out of the bind. Planted as the old fallback would
+         * have left it (a legacy group inside the bind, joined from outside
+         * by an absolute target). */
+        const char *bh = fs.binds[0].host;
+        char pd[CNG_PATH_MAX], pm[CNG_PATH_MAX], pn[CNG_PATH_MAX];
+        cng_snprintf(pd, sizeof pd, "%s/.l2s.4242", bh);
+        cng_snprintf(pm, sizeof pm, "%s/.l2s.4242.0002", bh);
+        cng_snprintf(pn, sizeof pn, "%s/rolink.pair", rootfs);
+        long pf = sys_openat(CNG_AT_FDCWD, pd, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+        if (pf >= 0) {
+            sys_write((int)pf, "PAIR", 4);
+            sys_close((int)pf);
+        }
+        pf = sys_openat(CNG_AT_FDCWD, pm, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+        if (pf >= 0)
+            sys_close((int)pf);
+        CNG_SYS(__NR_symlinkat, pd, CNG_AT_FDCWD, pn, 0, 0, 0);
+        cng_g_l2s = 1;
+        long rofs = ro ? -EROFS : 0;
+        long pt[4] = {1234, 0, 1234, 0};
+        long po = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                               CNG_O_WRONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        struct {
+            const char *name;
+            long want, r;
+        } p[] = {
+            {"pair-utimensat", rofs,
+             cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                          (long)pt, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0)},
+            {"pair-fchownat", rofs,
+             cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                          -1, -1, CNG_AT_SYMLINK_NOFOLLOW, 0, 0)},
+            {"pair-open-w", rofs, po >= 0 ? 0 : po},
+            {"pair-link", xdev,
+             cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/rolink.pair",
+                          CNG_AT_FDCWD, (long)"/rolink.pair2", 0, 0, 0)},
+            {"pair-unlink", 0,
+             cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/rolink.pair", 0,
+                          0, 0, 0, 0)},
+        };
+        if (po >= 0)
+            sys_close((int)po);
+        cng_g_l2s = 0;
+        for (unsigned i = 0; i < sizeof p / sizeof *p; i++) {
+            int ok = p[i].r == p[i].want;
+            cng_dprintf(1, "rolink %s %s: rc=%d -> %s\n", rs, p[i].name,
+                        (int)p[i].r, ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        if (ro) {
+            int kept = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pm, st1,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                       CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pd, st1,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                       ST_MTIME(st1) != 1234;
+            cng_dprintf(1, "rolink ro pair-count-kept: %d -> %s\n", kept,
+                        kept ? "OK" : "FAIL");
+            fails += !kept;
+        }
+        cng_dprintf(1, "rolink: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
+    cng_dprintf(2, "_dtest: unknown op %s\n", op);
+    return 2;
+}
+
+/* _sigtest — install a SIGUSR1 handler with our restorer, self-signal, and
+ * confirm the handler ran and the AArch64 ucontext was readable (validates the
+ * signal round-trip and sigcontext offsets that the SIGSYS path relies on). */
+static volatile int g_sig_ran;
+static volatile unsigned long g_sig_pc;
+
+static void sigtest_handler(int s, cng_siginfo_t *si, void *ucv) {
+    (void)s;
+    (void)si;
+    struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
+    g_sig_pc = (unsigned long)uc->uc_mcontext.pc;
+    g_sig_ran = 1;
+}
+
+int cng_cmd_sigtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    if (cng_sig_install(CNG_SIGUSR1, sigtest_handler) < 0) {
+        cng_dprintf(1, "sigtest: sigaction failed\n");
+        return 1;
+    }
+    long pid = sys_getpid();
+    long tid = sys_gettid();
+    cng_syscall6(pid, tid, CNG_SIGUSR1, 0, 0, 0, __NR_tgkill);
+    if (g_sig_ran && g_sig_pc > 0x1000) {
+        cng_dprintf(1, "sigtest: handler ran, pc=0x%lx\n", g_sig_pc);
+        return 0;
+    }
+    cng_dprintf(1, "sigtest: handler did not run cleanly\n");
+    return 1;
+}
+
+/* _jmptest — validate the ucontext-redirect that M6's execve emulation relies
+ * on: a handler rewrites uc->pc so sigreturn resumes at a different function.
+ * If the redirect works we land in jmptest_landing and exit 7. */
+static void jmptest_landing(void) {
+    cng_dprintf(1, "jmptest: landed in redirected context\n");
+    sys_exit_group(7);
+}
+
+static void jmptest_handler(int s, cng_siginfo_t *si, void *ucv) {
+    (void)s;
+    (void)si;
+    struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
+    uc->uc_mcontext.pc = (unsigned long long)(unsigned long)(void *)jmptest_landing;
+}
+
+int cng_cmd_jmptest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    if (cng_sig_install(CNG_SIGUSR1, jmptest_handler) < 0) {
+        cng_dprintf(1, "jmptest: sigaction failed\n");
+        return 1;
+    }
+    cng_syscall6(sys_getpid(), sys_gettid(), CNG_SIGUSR1, 0, 0, 0,
+                 __NR_tgkill);
+    /* Reached only if the redirect did NOT take effect. */
+    cng_dprintf(1, "jmptest: fell through (redirect failed)\n");
+    return 1;
+}
+
+/* _faketest -r ROOT FILE — exercise the M7 fidelity fixups through the
+ * dispatcher: credential faking, stat ownership rewrite, /proc/self/exe. */
+int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *rootfs = "/";
+    const char *file = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            rootfs = argv[++i];
+        else if (!file)
+            file = argv[i];
+    }
+    if (!file) {
+        cng_dprintf(2, "usage: _faketest -r ROOT FILE\n");
+        return 2;
+    }
+
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    cng_g_fs = &fs;
+    cng_g_fake_id = 1;
+    cng_g_fake_uid = 0;
+    cng_g_fake_gid = 0;
+    /* The remap source is the real owner of the test file (this process). */
+    cng_g_host_uid = (unsigned)sys_getuid();
+    cng_g_host_gid = (unsigned)sys_getgid();
+    cng_cred_seed();
+    cng_g_exe_guest = "/bin/sh";
+
+    cng_dprintf(1, "getuid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 0));
+    cng_dprintf(1, "geteuid=%d\n",
+                (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0, 0));
+    /* fchown a real fd (stdout) to root: the unprivileged host can't, so
+     * fake-root must turn the denial into success. fchmod on the same fd is the
+     * mirror image — a guest that opens a file and chmods the descriptor (tar,
+     * cp -p, install) never goes near the fchmodat branch. */
+    cng_dprintf(1, "fchown=%d\n",
+                (int)cng_dispatch(__NR_fchown, 1, 0, 0, 0, 0, 0, 1));
+    cng_dprintf(1, "fchmod=%d\n",
+                (int)cng_dispatch(__NR_fchmod, 1, 0644, 0, 0, 0, 0, 1));
+
+    /* stat and fstat must agree about who owns the same file: an installer
+     * compares them before deciding to chown, and the remap used to be applied
+     * only on the path form (fstat was trapped only under -l). */
+    {
+        char fs1[128], fs2[128];
+        long pr = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file,
+                               (long)fs1, 0, 0, 0, /*trapped=*/0);
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)file,
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
+        long fr = fd < 0 ? -1
+                         : cng_dispatch(__NR_fstat, fd, (long)fs2, 0, 0, 0, 0,
+                                        /*trapped=*/0);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "stat_vs_fstat stat=%u:%u fstat=%u:%u -> %s\n",
+                    pr == 0 ? *(unsigned *)(fs1 + 24) : 0xffffffffu,
+                    pr == 0 ? *(unsigned *)(fs1 + 28) : 0xffffffffu,
+                    fr == 0 ? *(unsigned *)(fs2 + 24) : 0xffffffffu,
+                    fr == 0 ? *(unsigned *)(fs2 + 28) : 0xffffffffu,
+                    (pr == 0 && fr == 0 &&
+                     *(unsigned *)(fs1 + 24) == *(unsigned *)(fs2 + 24) &&
+                     *(unsigned *)(fs1 + 28) == *(unsigned *)(fs2 + 28))
+                        ? "OK"
+                        : "FAIL");
+    }
+
+    char sb[256];
+    long r = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)file, (long)sb,
+                          0, 0, 0, /*trapped=*/0);
+    if (r == 0)
+        cng_dprintf(1, "st_uid=%u st_gid=%u\n", *(unsigned *)(sb + 24),
+                    *(unsigned *)(sb + 28));
+    else
+        cng_dprintf(1, "stat errno %d\n", (int)-r);
+
+    char lb[256];
+    long n = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                          (long)"/proc/self/exe", (long)lb, sizeof lb, 0, 0,
+                          /*trapped=*/0);
+    if (n > 0) {
+        lb[n] = '\0';
+        cng_dprintf(1, "exe=%s\n", lb);
+    }
+
+    /* Fake-root reads what real root could. apk hands its package scripts to
+     * the shebang interpreter as "/proc/self/fd/N", and their inode grants
+     * execute but not read — real root reopens it anyway, we get EACCES. Take
+     * the read bits off the test file and the reopen must still succeed, with
+     * the file's mode put back exactly as it was. */
+    {
+        char hp[CNG_PATH_MAX], pfd[40];
+        long ffd = -1, ofd = -1;
+        int mode_kept = 0;
+        if (cng_fs_translate(&fs, file, hp, sizeof hp) == 0)
+            ffd = sys_openat(CNG_AT_FDCWD, hp, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        if (ffd >= 0) {
+            CNG_SYS(__NR_fchmod, (int)ffd, 0111, 0, 0, 0, 0);
+            size_t k = cng_strlcpy(pfd, "/proc/self/fd/", sizeof pfd);
+            char d[8];
+            int di = 0;
+            for (long v = ffd; di < 7; v /= 10) {
+                d[di++] = (char)('0' + v % 10);
+                if (v < 10)
+                    break;
+            }
+            while (di > 0 && k + 1 < sizeof pfd)
+                pfd[k++] = d[--di];
+            pfd[k] = '\0';
+            ofd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)pfd,
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
+            char st[128];
+            mode_kept = (CNG_SYS(__NR_fstat, (int)ffd, st, 0, 0, 0, 0) == 0 &&
+                         (ST_MODE(st) & 07777) == 0111);
+            CNG_SYS(__NR_fchmod, (int)ffd, 0644, 0, 0, 0, 0);
+            if (ofd >= 0)
+                sys_close((int)ofd);
+            sys_close((int)ffd);
+        }
+        cng_dprintf(1, "fakeroot_reopen: opened=%d mode_kept=%d -> %s\n",
+                    ofd >= 0, mode_kept,
+                    (ofd >= 0 && mode_kept) ? "OK" : "FAIL");
+    }
+
+    /* The other refusal kind, which no DAC change can fix: the inode grants
+     * the access and the open is still denied (on Android, SELinux on the
+     * tmpfs inode behind a memfd — where apk 3 keeps package scripts, and
+     * where Chrome keeps every shared-memory region). The refusal cannot be
+     * provoked on a devbox, so drive cng_fd_reopen directly with a memfd and a
+     * simulated EACCES. A duplicate is handed back, rewound to the start even
+     * though ours sits at EOF, only where it is the description that was asked
+     * for: the same access mode, or the script a #! exec ran from this fd
+     * opened O_RDONLY by its interpreter. A read-only open of any other O_RDWR
+     * memfd keeps the refusal — the duplicate would report O_RDWR from
+     * F_GETFL, which Chrome CHECKs — and so does the script's number once it
+     * names another file. */
+    {
+        long mfd = sys_memfd_create("cng-fdreopen", 1 /*MFD_CLOEXEC*/);
+        long narrower = 1, reused = 1;
+        int script = 0, content = 0, exact = 0;
+        if (mfd >= 0) {
+            sys_write((int)mfd, "SCRIPT", 6); /* our offset is now at EOF */
+            char pfd[40];
+            cng_snprintf(pfd, sizeof pfd, "/proc/self/fd/%d", (int)mfd);
+            narrower = cng_fd_reopen(pfd, CNG_O_RDONLY, 0, -EACCES);
+            if (narrower >= 0)
+                sys_close((int)narrower);
+            cng_fd_reopen_script((int)mfd);
+            long nfd = cng_fd_reopen(pfd, CNG_O_RDONLY, 0, -EACCES);
+            if (nfd >= 0) {
+                script = 1;
+                char b[8];
+                long n = sys_read((int)nfd, b, sizeof b);
+                content = (n == 6 && b[0] == 'S' && b[5] == 'T');
+                sys_close((int)nfd);
+            }
+            cng_fd_reopen_script(-1);
+            nfd = cng_fd_reopen(pfd, CNG_O_RDWR, 0, -EACCES);
+            if (nfd >= 0) {
+                exact = 1;
+                sys_close((int)nfd);
+            }
+            /* The record outlives the file: the number handed to another. */
+            cng_fd_reopen_script((int)mfd);
+            sys_close((int)mfd);
+            long other = sys_memfd_create("cng-fdreopen2", 1 /*MFD_CLOEXEC*/);
+            if (other == mfd) {
+                reused = cng_fd_reopen(pfd, CNG_O_RDONLY, 0, -EACCES);
+                if (reused >= 0)
+                    sys_close((int)reused);
+            }
+            if (other >= 0)
+                sys_close((int)other);
+            cng_fd_reopen_script(-1);
+        }
+        cng_dprintf(1, "fd_reopen: narrower=%ld script=%d content=%d exact=%d"
+                       " reused=%ld -> %s\n",
+                    narrower, script, content, exact, reused,
+                    (narrower == -EACCES && script && content && exact &&
+                     reused == -EACCES)
+                        ? "OK"
+                        : "FAIL");
+    }
+
+    /* fchmodat2 answered ENOSYS — by a kernel predating it (Linux < 6.6), or by
+     * Android's filter, which reissue answers the same way — is what glibc's
+     * fchmodat and systemd fall back on. Fake-root is for denials, and faking
+     * this one to 0 left the mode silently unchanged. The blocked form gives
+     * the same ENOSYS on any host, so it stands in for the old kernel. */
+    {
+        cng_blocked[__NR_fchmodat2] = 1;
+        long r = cng_dispatch(__NR_fchmodat2, CNG_AT_FDCWD, (long)file, 0640,
+                              0, 0, 0, /*trapped=*/1);
+        cng_blocked[__NR_fchmodat2] = 0;
+        cng_dprintf(1, "fchmodat2_enosys=%d want=%d -> %s\n", (int)r,
+                    (int)-ENOSYS, r == -ENOSYS ? "OK" : "FAIL");
+    }
+
+    /* Full credential model. Supplementary groups start empty; capabilities are
+     * the full set while fake-root (euid still 0 at this point). */
+    cng_dprintf(1, "ngroups=%d\n",
+                (int)cng_dispatch(__NR_getgroups, 0, 0, 0, 0, 0, 0, 1));
+    /* ...and the set holds a realistic list, not a token one. initgroups(3) in
+     * a directory-service environment hands over more than a handful, and a
+     * limit it trips is an EINVAL that takes `su` and `login` with it. Round
+     * trip a list past the old ceiling, then put the set back. */
+    {
+        static unsigned gsend[200], gback[200];
+        for (unsigned i = 0; i < 200; i++)
+            gsend[i] = 3000 + i;
+        long sg = cng_dispatch(__NR_setgroups, 200, (long)gsend, 0, 0, 0, 0, 1);
+        long gg = cng_dispatch(__NR_getgroups, 200, (long)gback, 0, 0, 0, 0, 1);
+        int same = (gg == 200);
+        for (int i = 0; same && i < 200; i++)
+            same = gback[i] == gsend[i];
+        /* One past the ceiling is still EINVAL, as it is in the kernel past
+         * its own. */
+        long over = cng_dispatch(__NR_setgroups, CNG_NGROUPS_MAX + 1,
+                                 (long)gsend, 0, 0, 0, 0, 1);
+        cng_dispatch(__NR_setgroups, 0, 0, 0, 0, 0, 0, 1);
+        cng_dprintf(1, "groups set=%d got=%d same=%d over=%d\n", (int)sg,
+                    (int)gg, same, (int)over);
+    }
+    unsigned caphdr[2] = { 0x20080522u, 0 };   /* _LINUX_CAPABILITY_VERSION_3 */
+    unsigned capdata[6] = { 0 };               /* two {eff,perm,inh} blocks */
+    cng_dispatch(__NR_capget, (long)caphdr, (long)capdata, 0, 0, 0, 0, 1);
+    cng_dprintf(1, "cap_eff=%x\n", capdata[0]);
+    /* The header version is negotiated, not assumed: an unrecognised one is
+     * answered with the version the kernel does speak, and only a data-less
+     * probe of it counts as a success. Calling it supported instead handed a v1
+     * caller two blocks of data for its one-block buffer. */
+    unsigned probe[2] = { 0, 0 };
+    long cpn = cng_dispatch(__NR_capget, (long)probe, 0, 0, 0, 0, 0, 1);
+    unsigned negotiated = probe[0];
+    probe[0] = 0;
+    long cbad = cng_dispatch(__NR_capget, (long)probe, (long)capdata, 0, 0, 0, 0,
+                             1);
+    unsigned v1hdr[2] = { 0x19980330u, 0 };    /* v1: one block, and only one */
+    unsigned v1data[6];
+    memset(v1data, 0xee, sizeof v1data);
+    long cv1 = cng_dispatch(__NR_capget, (long)v1hdr, (long)v1data, 0, 0, 0, 0,
+                            1);
+    cng_dprintf(1, "cap_ver probe=%d got=%x bad=%d v1=%d v1_spill=%d\n",
+                (int)cpn, negotiated, (int)cbad, (int)cv1,
+                v1data[3] != 0xeeeeeeeeu);
+
+    /* (uid_t)-1 is not an id: setuid and setgid refuse it with EINVAL before
+     * any privilege question — even for root, which is what we are here — and
+     * a setgroups list carrying it is EINVAL with the set left alone. The -1
+     * that means "leave unchanged" belongs to setre*id/setres*id (which must
+     * still take it) and to setfsuid, which reports the current id for it.
+     * The blind install left 4294967295 as every id. */
+    {
+        long eu = cng_dispatch(__NR_setuid, -1L, 0, 0, 0, 0, 0, 1);
+        long eg = cng_dispatch(__NR_setgid, -1L, 0, 0, 0, 0, 0, 1);
+        unsigned bad[2] = {5, (unsigned)-1};
+        long es = cng_dispatch(__NR_setgroups, 2, (long)bad, 0, 0, 0, 0, 1);
+        long ng = cng_dispatch(__NR_getgroups, 0, 0, 0, 0, 0, 0, 1);
+        long kr = cng_dispatch(__NR_setreuid, -1L, -1L, 0, 0, 0, 0, 1);
+        long ks = cng_dispatch(__NR_setresgid, -1L, -1L, -1L, 0, 0, 0, 1);
+        long kf = cng_dispatch(__NR_setfsuid, -1L, 0, 0, 0, 0, 0, 1);
+        long u = cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1);
+        long g = cng_dispatch(__NR_getgid, 0, 0, 0, 0, 0, 0, 1);
+        int ok = eu == -EINVAL && eg == -EINVAL && es == -EINVAL && ng == 0 &&
+                 kr == 0 && ks == 0 && kf == 0 && u == 0 && g == 0;
+        cng_dprintf(1,
+                    "invalid_id setuid=%d setgid=%d setgroups=%d ngroups=%d "
+                    "keep=%d/%d/%d uid=%d gid=%d -> %s\n",
+                    (int)eu, (int)eg, (int)es, (int)ng, (int)kr, (int)ks,
+                    (int)kf, (int)u, (int)g, ok ? "OK" : "FAIL");
+    }
+
+    /* A privilege drop is real and, for the resulting non-root id, irreversible:
+     * setuid(1000) succeeds, getuid then reports 1000, and setuid(0) is EPERM. */
+    long su = cng_dispatch(__NR_setuid, 1000, 0, 0, 0, 0, 0, 1);
+    long u2 = cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1);
+    long re = cng_dispatch(__NR_setuid, 0, 0, 0, 0, 0, 0, 1);
+    cng_dprintf(1, "setuid_drop rc=%d uid=%d regain=%d\n", (int)su, (int)u2,
+                (int)re);
+
+    /* --setuid-root / --setgid-root: as a non-root fake id (1000), a setuid+
+     * setgid executable ("/suid", mode 6755) is shown as owned by root:root, and
+     * exec of it elevates euid/egid to 0 while ruid stays 1000 — after which the
+     * guest's own setuid(0) is privileged and sticks. This is the `su` chain. */
+    cng_g_fake_uid = 1000;
+    cng_g_fake_gid = 1000;
+    cng_cred_seed();
+    cng_g_setuid_root = 1;
+    cng_g_setgid_root = 1;
+
+    char sub[256];
+    long sr = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/suid",
+                           (long)sub, 0, 0, 0, /*trapped=*/0);
+    if (sr == 0)
+        cng_dprintf(1, "suid_stat st_uid=%u st_gid=%u\n",
+                    *(unsigned *)(sub + 24), *(unsigned *)(sub + 28));
+    else
+        cng_dprintf(1, "suid_stat errno %d\n", (int)-sr);
+
+    char suidhost[CNG_PATH_MAX];
+    if (cng_fs_translate(&fs, "/suid", suidhost, sizeof suidhost) == 0)
+        cng_cred_exec(suidhost);
+    cng_dprintf(1, "suid_exec ruid=%d euid=%d egid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_geteuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_getegid, 0, 0, 0, 0, 0, 0, 1));
+    long root = cng_dispatch(__NR_setuid, 0, 0, 0, 0, 0, 0, 1);
+    cng_dprintf(1, "su_to_root rc=%d uid=%d\n", (int)root,
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1));
+
+    /* An exec resets the saved set-user-ID to the effective one, which is the
+     * rule that makes a privilege drop permanent. Start from the elevated state
+     * the setuid exec produces (ruid 1000, euid 0, suid 0) and drop the
+     * EFFECTIVE id only: POSIX keeps suid at 0, so root is still regainable —
+     * asserted, so the setup is not passing for free. Then exec something with
+     * no set-id bits. The kernel sets suid = euid = 1000 there and the second
+     * regain must fail; without the reset it stayed 0 and every later program
+     * in the chain could take root back. */
+    cng_g_fake_uid = 1000;
+    cng_g_fake_gid = 1000;
+    cng_cred_seed();
+    if (cng_fs_translate(&fs, "/suid", suidhost, sizeof suidhost) == 0)
+        cng_cred_exec(suidhost);
+    cng_dispatch(__NR_setresuid, -1L, 1000, -1L, 0, 0, 0, 1);
+    long regain_pre = cng_dispatch(__NR_setresuid, -1L, 0, -1L, 0, 0, 0, 1);
+    cng_dispatch(__NR_setresuid, -1L, 1000, -1L, 0, 0, 0, 1);
+    cng_g_setuid_root = 0; /* an ordinary exec: no set-id bit applies */
+    cng_g_setgid_root = 0;
+    char plainhost[CNG_PATH_MAX];
+    if (cng_fs_translate(&fs, "/f", plainhost, sizeof plainhost) == 0)
+        cng_cred_exec(plainhost);
+    long regain_post = cng_dispatch(__NR_setresuid, -1L, 0, -1L, 0, 0, 0, 1);
+    cng_dprintf(1, "exec_clears_saved before=%d after=%d -> %s\n",
+                (int)regain_pre, (int)regain_post,
+                (regain_pre == 0 && regain_post == -EPERM) ? "OK" : "FAIL");
+    cng_g_setuid_root = 1;
+    cng_g_setgid_root = 1;
+
+    /* Identity resolution (cng_cred_setup): an id only implied by --setuid-root
+     * (explicit=0) defaults to the real invoking id, so those flags alone don't
+     * turn the guest into root; an explicit -u/--fake-id (explicit=1) wins. */
+    cng_g_setuid_root = 0;
+    cng_g_setgid_root = 0;
+    cng_g_fake_id_explicit = 0;
+    cng_g_fake_uid = 0;
+    cng_g_fake_gid = 0; /* CLI defaults before the run seeds the identity */
+    cng_cred_setup(4321, 8765);
+    cng_dprintf(1, "implied_id uid=%d gid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_getgid, 0, 0, 0, 0, 0, 0, 1));
+    cng_g_fake_id_explicit = 1;
+    cng_g_fake_uid = 1000;
+    cng_g_fake_gid = 1000;
+    cng_cred_setup(4321, 8765);
+    cng_dprintf(1, "explicit_id uid=%d gid=%d\n",
+                (int)cng_dispatch(__NR_getuid, 0, 0, 0, 0, 0, 0, 1),
+                (int)cng_dispatch(__NR_getgid, 0, 0, 0, 0, 0, 0, 1));
+    return 0;
+}
+
+/* _rwtest — copy a self-checking function containing an `svc #0`, rewrite the
+ * svc to a trampoline, run it, and confirm it returns the real pid with all
+ * caller registers preserved (validates M8's trampoline: x30/x18/args survive
+ * the C dispatch call). No seccomp involved. */
+extern char cng_rwtest_fn[];
+extern char cng_rwtest_fn_end[];
+extern char cng_rwtest_gen_fn[];
+extern char cng_rwtest_gen_fn_end[];
+extern char cng_svc_tramp_tpl[];
+extern char cng_svc_tramp_disp[];
+
+/* Stand-in for cng_tramp_dispatch, patched into one emitted trampoline below: a
+ * dispatcher that hands back a moved pc. That is what a tracer's SETREGSET does
+ * at a syscall stop, and it is the only thing that takes the trampoline's
+ * general exit — so it is the only way to run those instructions here. */
+static void rw_move_pc(struct cng_uregs *r) {
+    cng_tramp_dispatch(r);
+    r->pc += 4;
+}
+
+/* rwtest's "object" is two templates memcpy'd into anonymous memory, so every
+ * byte of it is code: an explicit whole-range map, rather than the headerless
+ * fallback, which would put the syscall-context filter in the way of a test
+ * that is about the trampoline. */
+static const struct cng_code_ranges rw_all = {1, {0}, {~0UL}};
+
+/* --- what the scan is allowed to touch ------------------------------------
+ *
+ * The trampoline checks below run over code this binary wrote itself. These
+ * run over the other half of the M8 problem: a scan matching a bare 0xD4000001
+ * word cannot tell an instruction from a data word that equals one, and stock
+ * aarch64 rootfs images do contain the latter — every one found so far in
+ * .gcc_except_table, whose uleb128 call-site records emit the byte string
+ * `01 00 00 d4` (a landing pad and an action of zero, then the next entry)
+ * often enough to be a matter of when, not whether. Rewriting one corrupts the
+ * LSDA the C++ personality routine later reads, and nothing between the store
+ * and the wrong landing pad reports a thing.
+ *
+ * Two independent things have to hold: an object's section headers keep the
+ * scan out of its data, and where an object has none the syscall-context
+ * filter rejects a word nothing set x8 for. */
+
+/* Verbatim from Debian trixie's libstdc++.so.6.0.33 at file offset 0x249b8c:
+ * the .gcc_except_table word that equals `svc #0`, behind the eight words
+ * before it — exactly as far back as the filter looks. */
+static const unsigned char rw_lsda[44] = {
+    0x00, 0xff, 0xff, 0x01, 0x1d, 0x38, 0xe4, 0x01, 0x00, 0x00, 0xe0,
+    0x06, 0xe4, 0x05, 0xc4, 0x14, 0x00, 0xdc, 0x0d, 0x48, 0x00, 0x00,
+    0xc4, 0x10, 0xd0, 0x02, 0xc4, 0x14, 0x00, 0xd8, 0x14, 0x04, 0x00,
+    0x00, 0xff, 0xff, 0x01, 0x1d, 0x38, 0xe4, 0x01, 0x00, 0x00, 0xd4,
+};
+
+/* `movz x8, #93; svc #0; ret; nop` — a syscall site of the shape every libc
+ * writes, and what the filter has to keep saying yes to. */
+static const unsigned rw_site[4] = {0xD2800BA8u, 0xD4000001u, 0xD65F03C0u,
+                                    0xD503201Fu};
+
+#define RW_FOFF     0x1000UL /* the file offset the image stands for */
+#define RW_SITE_OFF 4        /* the real svc, in bytes into the image */
+#define RW_DATA_OFF 56       /* the LSDA word that collides with it */
+
+/* Lay the two out the way an object does — code, then the data behind it — and
+ * scan with the map the caller passes (0 for the headerless fallback). Reports
+ * the two words afterwards, because a count alone does not say which one was
+ * taken. */
+static int rw_scan_probe(unsigned long region, const struct cng_code_ranges *cr,
+                         int data_only, unsigned *site_out, unsigned *data_out) {
+    unsigned char *img = (unsigned char *)region;
+    unsigned long len;
+    unsigned long used = 0;
+    if (data_only) {
+        memcpy(img, rw_lsda, sizeof rw_lsda);
+        len = sizeof rw_lsda;
+    } else {
+        memcpy(img, rw_site, sizeof rw_site);
+        memcpy(img + sizeof rw_site, rw_lsda, sizeof rw_lsda);
+        len = sizeof rw_site + sizeof rw_lsda;
+    }
+    int n = cng_rewrite_seg(region, region + len, RW_FOFF, cr, region + 4096,
+                            CNG_TRAMP_POOL, &used);
+    if (site_out)
+        *site_out = data_only ? 0 : *(unsigned *)(region + RW_SITE_OFF);
+    if (data_out)
+        *data_out = *(unsigned *)(region + (data_only ? 40 : RW_DATA_OFF));
+    return n;
+}
+
+/* An ELF header and a section table, and nothing else — all cng_code_ranges
+ * reads. `with_shdrs` 0 leaves e_shoff at zero: an object that kept none. */
+static long rw_shdr_memfd(int with_shdrs) {
+    long fd = sys_memfd_create("cng-shdr-elf", 0);
+    if (fd < 0)
+        return fd;
+    Elf64_Ehdr eh;
+    Elf64_Shdr sh[6];
+    memset(&eh, 0, sizeof eh);
+    memset(sh, 0, sizeof sh);
+    eh.e_ident[0] = ELF_MAG0;
+    eh.e_ident[1] = ELF_MAG1;
+    eh.e_ident[2] = ELF_MAG2;
+    eh.e_ident[3] = ELF_MAG3;
+    eh.e_ident[EI_CLASS] = ELFCLASS64;
+    eh.e_ident[EI_DATA] = ELFDATA2LSB;
+    eh.e_type = ET_DYN;
+    eh.e_machine = EM_AARCH64;
+    eh.e_version = 1;
+    eh.e_ehsize = sizeof eh;
+    if (with_shdrs) {
+        eh.e_shoff = sizeof eh;
+        eh.e_shentsize = sizeof(Elf64_Shdr);
+        eh.e_shnum = 6;
+    }
+    /* [1] code; [2] the section abutting it, which must merge into it; [3]
+     * allocated but not executable; [4] executable with no bytes in the file;
+     * [5] code standing apart. */
+    sh[1].sh_type = SHT_PROGBITS;
+    sh[1].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    sh[1].sh_offset = 0x1000;
+    sh[1].sh_size = 0x100;
+    sh[2] = sh[1];
+    sh[2].sh_offset = 0x1100;
+    sh[2].sh_size = 0x80;
+    sh[3] = sh[1];
+    sh[3].sh_flags = SHF_ALLOC;
+    sh[3].sh_offset = 0x2000;
+    sh[3].sh_size = 0x40;
+    sh[4] = sh[1];
+    sh[4].sh_type = SHT_NOBITS;
+    sh[4].sh_offset = 0x2100;
+    sh[4].sh_size = 0x40;
+    sh[5] = sh[1];
+    sh[5].sh_offset = 0x3000;
+    sh[5].sh_size = 0x40;
+    if (cng_write_all((int)fd, &eh, sizeof eh) != (long)sizeof eh ||
+        cng_write_all((int)fd, sh, sizeof sh) != (long)sizeof sh) {
+        sys_close((int)fd);
+        return -EIO;
+    }
+    return fd;
+}
+
+/* The code map an object's headers produce, and the four scan decisions that
+ * follow from having one, from having one that covers the data too (the
+ * control: the word really is taken when nothing says not to), and from having
+ * none at all. Returns the number of failures. */
+static int rw_scan_checks(void) {
+    int fails = 0;
+
+    struct cng_code_ranges cr, headerless;
+    int n = -1, hn = -1;
+    long fd = rw_shdr_memfd(1);
+    if (fd >= 0) {
+        n = cng_code_ranges((int)fd, &cr);
+        sys_close((int)fd);
+    }
+    long hfd = rw_shdr_memfd(0);
+    if (hfd >= 0) {
+        hn = cng_code_ranges((int)hfd, &headerless);
+        sys_close((int)hfd);
+    }
+    if (fd < 0 || hfd < 0) {
+        /* No memfd, no synthetic object: say so rather than fail a host for
+         * something the scan itself has nothing to do with. */
+        cng_dprintf(1, "rwtest codemap: unavailable (memfd=%d) -> SKIP\n",
+                    (int)(fd < 0 ? fd : hfd));
+    } else {
+        int cok = (n == 2 && cr.lo[0] == 0x1000 && cr.hi[0] == 0x1180 &&
+                   cr.lo[1] == 0x3000 && cr.hi[1] == 0x3040 && hn == 0);
+        cng_dprintf(1,
+                    "rwtest codemap: ranges=%d [%lx,%lx) [%lx,%lx)"
+                    " headerless=%d -> %s\n",
+                    n, n > 0 ? cr.lo[0] : 0UL, n > 0 ? cr.hi[0] : 0UL,
+                    n > 1 ? cr.lo[1] : 0UL, n > 1 ? cr.hi[1] : 0UL, hn,
+                    cok ? "OK" : "FAIL");
+        fails += !cok;
+    }
+
+    /* [image | pool], so the pool is within a `b`'s reach of every site — the
+     * same reason the loader over-allocates. Nothing here is executed: what is
+     * under test is the decision to rewrite, not the trampoline. */
+    unsigned long total = 4096 + CNG_TRAMP_POOL;
+    void *region = sys_mmap(0, total, CNG_PROT_READ | CNG_PROT_WRITE,
+                            CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (region == CNG_MAP_FAILED || cng_is_err((long)region)) {
+        cng_dprintf(1, "rwtest scan: mmap failed -> FAIL\n");
+        return fails + 1;
+    }
+    unsigned long rg = (unsigned long)region;
+
+    struct cng_code_ranges code_only = {1, {RW_FOFF}, {RW_FOFF + 16}};
+    struct cng_code_ranges whole = {1, {RW_FOFF}, {RW_FOFF + 60}};
+    unsigned site = 0, data = 0;
+    int mapped = rw_scan_probe(rg, &code_only, 0, &site, &data);
+    int mok = (mapped == 1 && site != 0xD4000001u && data == 0xD4000001u);
+    int control = rw_scan_probe(rg, &whole, 0, &site, &data);
+    int nok = (control == 2 && site != 0xD4000001u && data != 0xD4000001u);
+    int filtered = rw_scan_probe(rg, 0, 0, &site, &data);
+    int fok = (filtered == 1 && site != 0xD4000001u && data == 0xD4000001u);
+    int dataonly = rw_scan_probe(rg, 0, 1, 0, &data);
+    int dok = (dataonly == 0 && data == 0xD4000001u);
+    sys_munmap(region, total);
+
+    int sok = mok && nok && fok && dok;
+    cng_dprintf(1,
+                "rwtest scan: mapped=%d unmapped=%d filtered=%d dataonly=%d"
+                " -> %s\n",
+                mapped, control, filtered, dataonly, sok ? "OK" : "FAIL");
+    fails += !sok;
+    return fails;
+}
+
+/* The sentinels cng_rwtest_fn leaves in res[0..7]: the FP registers and the
+ * IP0/IP1 pair, none of which a syscall may spend. Shared by the two drivers
+ * that run that function — through an ahead-of-time rewrite and through a lazy
+ * one — because what must survive is the same either way. */
+static int rw_regs_ok(const unsigned long *res) {
+    static const unsigned long want[8] = {0xfd00UL,     0xfd01UL,  0xfd08UL,
+                                          0xfd10UL,     0xfd1fUL,  0x400000UL,
+                                          0xdead1616UL, 0xbeef1717UL};
+    static const char *const nm[8] = {"d0",   "d1",   "d8",  "d16",
+                                      "d31",  "fpcr", "x16", "x17"};
+    int ok = 1;
+    for (int i = 0; i < 8; i++)
+        if (res[i] != want[i]) {
+            ok = 0;
+            cng_dprintf(1, "rwtest: %s clobbered: %lx want %lx\n", nm[i], res[i],
+                        want[i]);
+        }
+    return ok;
+}
+
+/* The lazy tier, which no filter on this host will ever fire: hand the patcher
+ * the address a SIGSYS would have handed it. Everything the trap itself does
+ * not do is what this exercises — finding the mapping in /proc/self/maps,
+ * putting a pool within a branch's reach of it, and writing a word into
+ * read-only text with the page executable throughout — and then that the code
+ * still runs, through the same trampoline the ahead-of-time pass emits.
+ *
+ * The copy is mapped r-xp on purpose. The ahead-of-time pass only ever writes
+ * into a mapping it made itself and has not protected yet; a site that arrives
+ * here is in text that has been read-only for as long as it has existed. */
+static int rw_lazy_checks(void) {
+    size_t fsz = (size_t)(cng_rwtest_fn_end - cng_rwtest_fn);
+    unsigned long total = cng_page_up(fsz);
+    void *code = sys_mmap(0, total, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (code == CNG_MAP_FAILED || cng_is_err((long)code)) {
+        cng_dprintf(1, "rwtest lazy: mmap failed -> FAIL\n");
+        return 1;
+    }
+    memcpy(code, cng_rwtest_fn, fsz);
+    if (sys_mprotect(code, total, CNG_PROT_READ | CNG_PROT_EXEC) < 0) {
+        /* No anonymous executable memory to be had (PR_SET_MDWE, or Android's
+         * execmem revoked): there is no lazy tier here to test. */
+        sys_munmap(code, total);
+        cng_dprintf(1, "rwtest lazy: no executable memory -> SKIP\n");
+        return 0;
+    }
+    cng_flush_icache(code, (char *)code + fsz);
+
+    unsigned long lo = (unsigned long)code, first = 0;
+    int sites = 0, patched = 0;
+    for (unsigned long a = lo; a + 4 <= lo + fsz; a += 4) {
+        if (*(uint32_t *)a != 0xD4000001u)
+            continue;
+        sites++;
+        if (!first)
+            first = a;
+        patched += cng_rewrite_site(a);
+    }
+    /* A site that is already a branch, and a word that was never an `svc`:
+     * both have to be declined, since what makes this tier exact is that it
+     * only ever patches a word it has been told the CPU executed. */
+    int repeat = first ? cng_rewrite_site(first) : 1;
+    int nonsvc = cng_rewrite_site(lo);
+
+    unsigned long res[9];
+    memset(res, 0, sizeof res);
+    cng_g_procstat_synth = 1;
+    long (*fn)(void *, const char *) = (long (*)(void *, const char *))code;
+    long got = fn(res, "/proc/stat");
+    if ((long)res[8] >= 0)
+        sys_close((int)res[8]);
+    long real = sys_getpid();
+
+    int ok = (sites >= 2 && patched == sites && !repeat && !nonsvc &&
+              got == real && (long)res[8] >= 0 && rw_regs_ok(res));
+    cng_dprintf(1,
+                "rwtest lazy: sites=%d patched=%d repeat=%d nonsvc=%d pid=%s"
+                " openat=%s -> %s\n",
+                sites, patched, repeat, nonsvc, got == real ? "ok" : "wrong",
+                (long)res[8] >= 0 ? "ok" : "failed", ok ? "OK" : "FAIL");
+
+    cng_rewrite_lazy_reset(); /* and the pool it took goes back */
+    sys_munmap(code, total);
+    return !ok;
+}
+
+int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+
+    size_t fsz = (size_t)(cng_rwtest_fn_end - cng_rwtest_fn);
+    size_t gsz = (size_t)(cng_rwtest_gen_fn_end - cng_rwtest_gen_fn);
+    /* One mapping: [code page | trampoline pool], so the pool is adjacent and
+     * within a `b`'s reach (same reason the loader over-allocates). */
+    unsigned long total = 4096 + CNG_TRAMP_POOL;
+    void *region = sys_mmap(0, total, CNG_PROT_READ | CNG_PROT_WRITE,
+                            CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (region == CNG_MAP_FAILED || cng_is_err((long)region)) {
+        cng_dprintf(1, "rwtest: mmap failed\n");
+        return 1;
+    }
+    void *buf = region;
+    memcpy(buf, cng_rwtest_fn, fsz);
+    void *gbuf = (char *)region + ((fsz + 15) & ~(size_t)15);
+    memcpy(gbuf, cng_rwtest_gen_fn, gsz);
+    unsigned long pool = (unsigned long)region + 4096;
+    unsigned long used = 0;
+
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    cng_g_rewrite = 1;
+
+    int n = cng_rewrite_seg((unsigned long)buf, (unsigned long)buf + fsz, 0,
+                            &rw_all, pool, CNG_TRAMP_POOL, &used);
+    /* The general-exit copy's own trampoline is the next one out of the pool, so
+     * its dispatcher literal is at a known offset. */
+    unsigned long gslot = pool + used;
+    int gn = cng_rewrite_seg((unsigned long)gbuf, (unsigned long)gbuf + gsz, 0,
+                             &rw_all, pool, CNG_TRAMP_POOL, &used);
+    *(unsigned long *)(gslot + (cng_svc_tramp_disp - cng_svc_tramp_tpl)) =
+        (unsigned long)&rw_move_pc;
+    sys_mprotect(region, total, CNG_PROT_READ | CNG_PROT_EXEC);
+    cng_flush_icache(buf, (char *)buf + fsz);
+    cng_flush_icache((void *)pool, (void *)(pool + used));
+
+    long real = sys_getpid();
+    unsigned long res[9];
+    memset(res, 0, sizeof res);
+    /* The openat below goes to a synthesized /proc/stat, forced here the way the
+     * --proc-stat-synth flag forces it: that path counts the CPUs in the
+     * affinity mask with __builtin_popcountl, which gcc compiles to `cnt v0.8b`.
+     * The dispatcher reaching for a vector register is not hypothetical. */
+    cng_g_procstat_synth = 1;
+    long (*fn)(void *, const char *) = (long (*)(void *, const char *))buf;
+    long got = fn(res, "/proc/stat");
+    if ((long)res[8] >= 0)
+        sys_close((int)res[8]);
+
+    /* The FP register file is the guest's across a syscall — the kernel does
+     * not touch it — so the C dispatcher a rewritten site calls must not spend
+     * any of it. Nothing puts it back; the monitor is built to never generate an
+     * FP instruction in the first place (-mgeneral-regs-only). x16/x17 are the
+     * same claim about IP0/IP1, which the trampoline used to keep for itself. */
+    int regs_ok = rw_regs_ok(res);
+
+    int ok = (n >= 2 && got == real && (long)res[8] >= 0 && regs_ok);
+    /* The descriptor number itself is the host's to choose — 3 where the three
+     * standard ones are all that is open, 4 under an emulator that keeps one of
+     * its own — so report whether the call succeeded, and say what went wrong
+     * on its own line when it did not. A test pinned to a literal fd passes on
+     * one host and fails on the other for no reason of ours. */
+    if ((long)res[8] < 0)
+        cng_dprintf(1, "rwtest: openat failed: %ld\n", (long)res[8]);
+    cng_dprintf(1,
+                "rwtest: rewrote %d site(s); real_pid=%d fn_pid=%d openat=%s "
+                "-> %s\n",
+                n, (int)real, (int)got, (long)res[8] >= 0 ? "ok" : "failed",
+                ok ? "OK" : "FAIL");
+
+    /* The general exit: a pc the guest did not arrive with has to be entered,
+     * and everything but the two registers that exit spends has to be back. */
+    unsigned long g[3];
+    memset(g, 0, sizeof g);
+    long (*gfn)(void *) = (long (*)(void *))gbuf;
+    gfn(g);
+    int gok = (gn == 1 && (long)g[0] == real && g[1] == 0x9a9a && g[2] == 0x0c0c);
+    cng_dprintf(1, "rwtest general exit: pid=%ld marker=%lx x12=%lx -> %s\n",
+                (long)g[0], g[1], g[2], gok ? "OK" : "FAIL");
+
+    int sfails = rw_scan_checks() + rw_lazy_checks();
+
+    return (ok && gok && !sfails) ? 0 : 1;
+}
+
+/* _blocktest — validate that a syscall marked blocked (as cng_probe_blocked
+ * would on Android) is emulated to ENOSYS by the dispatcher instead of being
+ * re-issued, while an unblocked one still runs. */
+int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    cng_blocked[__NR_fchownat] = 1; /* pretend Android blocks chown */
+    long r = cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"/x", 0, 0, 0, 0,
+                          /*trapped=*/1);
+    int ok1 = (r == -ENOSYS);
+    cng_dprintf(1, "blocktest fchownat(blocked)=%d want=%d -> %s\n", (int)r,
+                (int)-ENOSYS, ok1 ? "OK" : "FAIL");
+    fails += !ok1;
+
+    cng_blocked[__NR_faccessat] = 0; /* allowed -> still re-issued */
+    long r2 = cng_dispatch(__NR_faccessat, CNG_AT_FDCWD, (long)"/", 0, 0, 0, 0,
+                           /*trapped=*/1);
+    int ok2 = (r2 == 0);
+    cng_dprintf(1, "blocktest faccessat(allowed)=%d -> %s\n", (int)r2,
+                ok2 ? "OK" : "FAIL");
+    fails += !ok2;
+
+    cng_blocked[__NR_fchownat] = 0; /* reset */
+
+    /* accept(2) where only accept4(2) is allowed — Android's filter, and the
+     * call every glibc and musl server makes on AArch64. The same call with no
+     * flags, so it has to be made, with and without an address to fill; and
+     * when accept4 is refused too the answer is ENOSYS again, while accept4
+     * itself is untouched. A listening abstract socket, two clients queued
+     * for the first pair and one for the last. */
+    {
+        struct cng_sockaddr_un sa;
+        memset(&sa, 0, sizeof sa);
+        sa.family = CNG_AF_UNIX;
+        cng_snprintf(sa.path + 1, sizeof sa.path - 1, "cng-blocktest-accept.%d",
+                     (int)sys_getpid());
+        unsigned alen = 2 + 1 + (unsigned)strlen(sa.path + 1);
+        long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+        long cl[3] = {-1, -1, -1};
+        int up = ls >= 0 &&
+                 CNG_SYS(__NR_bind, ls, (long)&sa, alen, 0, 0, 0) == 0 &&
+                 CNG_SYS(__NR_listen, ls, 8, 0, 0, 0, 0) == 0;
+        for (int i = 0; up && i < 3; i++) {
+            cl[i] = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+            up &= cl[i] >= 0 &&
+                  CNG_SYS(__NR_connect, cl[i], (long)&sa, alen, 0, 0, 0) == 0;
+        }
+        long a1 = -1, a2 = -1, a3 = -1, a4 = -1;
+        unsigned plen = sizeof sa;
+        struct cng_sockaddr_un peer;
+        if (up) {
+            cng_blocked[__NR_accept] = 1;
+            cng_blocked[__NR_accept4] = 0;
+            a1 = cng_dispatch(__NR_accept, ls, 0, 0, 0, 0, 0, /*trapped=*/1);
+            a2 = cng_dispatch(__NR_accept, ls, (long)&peer, (long)&plen, 0, 0, 0,
+                              1);
+            cng_blocked[__NR_accept4] = 1;
+            a3 = cng_dispatch(__NR_accept, ls, 0, 0, 0, 0, 0, 1);
+            cng_blocked[__NR_accept4] = 0;
+            a4 = cng_dispatch(__NR_accept4, ls, 0, 0, 0, 0, 0, 1);
+            cng_blocked[__NR_accept] = 0;
+        }
+        int ok3 = up && a1 >= 0 && a2 >= 0 && plen >= 2 && plen <= sizeof peer &&
+                  peer.family == CNG_AF_UNIX && a3 == -ENOSYS && a4 >= 0;
+        cng_dprintf(1,
+                    "blocktest accept(blocked, accept4 allowed)=%d addr=%d "
+                    "len=%u both blocked=%d accept4=%d -> %s\n",
+                    (int)a1, (int)a2, plen, (int)a3, (int)a4,
+                    ok3 ? "OK" : "FAIL");
+        fails += !ok3;
+        long got[3] = {a1, a2, a4};
+        for (int i = 0; i < 3; i++)
+            if (got[i] >= 0)
+                sys_close((int)got[i]);
+        for (int i = 0; i < 3; i++)
+            if (cl[i] >= 0)
+                sys_close((int)cl[i]);
+        if (ls >= 0)
+            sys_close((int)ls);
+    }
+
+    /* The uid and gid setters without --fake-id. Android's app filter refuses
+     * all of them but setresuid, and every one was answered ENOSYS — from a
+     * trap of that filter, and from -R on any host, where nothing refuses
+     * them. Each row is what the kernel answers a process with no capability
+     * and one uid and one gid (an app's process; measured on the host, whose
+     * setgroups is EPERM ahead of a bad size or pointer). Taken as Android
+     * takes them, through the trap and through an -R trampoline, and then as
+     * this host has them, where they are re-issued — but for the two rows
+     * qemu-user answers itself, checking setgroups' arguments first. A
+     * process that is not like that is answered differently, and skipped. */
+    {
+        unsigned ru[3] = {0}, rg[3] = {0}, hdr[2] = {0x20080522u, 0};
+        unsigned cd[6] = {0};
+        int plain =
+            CNG_SYS(__NR_getresuid, &ru[0], &ru[1], &ru[2], 0, 0, 0) == 0 &&
+            CNG_SYS(__NR_getresgid, &rg[0], &rg[1], &rg[2], 0, 0, 0) == 0 &&
+            CNG_SYS(__NR_capget, hdr, cd, 0, 0, 0, 0) == 0 &&
+            !(cd[0] & 0xc0) /* CAP_SETGID, CAP_SETUID */ && ru[0] == ru[1] &&
+            ru[1] == ru[2] && rg[0] == rg[1] && rg[1] == rg[2];
+        long U = ru[0], G = rg[0];
+        const struct {
+            const char *what;
+            long nr, a0, a1, a2, want;
+            int refused_only;
+        } t[] = {
+            {"setuid self", __NR_setuid, U, 0, 0, 0, 0},
+            {"setuid other", __NR_setuid, U + 1, 0, 0, -EPERM, 0},
+            {"setuid -1", __NR_setuid, -1, 0, 0, -EINVAL, 0},
+            {"setgid self", __NR_setgid, G, 0, 0, 0, 0},
+            {"setgid other", __NR_setgid, G + 1, 0, 0, -EPERM, 0},
+            {"setreuid keep", __NR_setreuid, -1, -1, 0, 0, 0},
+            {"setreuid other", __NR_setreuid, -1, U + 1, 0, -EPERM, 0},
+            {"setregid self", __NR_setregid, G, G, 0, 0, 0},
+            {"setresuid keep", __NR_setresuid, -1, -1, -1, 0, 0},
+            {"setresgid self", __NR_setresgid, G, -1, G, 0, 0},
+            {"setresgid other", __NR_setresgid, -1, -1, G + 1, -EPERM, 0},
+            {"setfsuid other", __NR_setfsuid, U + 1, 0, 0, U, 0},
+            {"setfsuid -1", __NR_setfsuid, -1, 0, 0, U, 0},
+            {"setfsgid other", __NR_setfsgid, G + 1, 0, 0, G, 0},
+            {"setgroups none", __NR_setgroups, 0, 0, 0, -EPERM, 0},
+            {"setgroups huge", __NR_setgroups, -1, 0, 0, -EPERM, 1},
+            {"setgroups fault", __NR_setgroups, 1, 8, 0, -EPERM, 1},
+        };
+        const int nt = (int)(sizeof t / sizeof t[0]);
+        if (!plain) {
+            cng_dprintf(1, "blocktest setid: SKIP (privileged, or ids that "
+                           "differ)\n");
+        } else {
+            unsigned char was[CNG_NR_MAX];
+            memcpy(was, cng_blocked, sizeof was);
+            int asked[2] = {0, 0}, right[2] = {0, 0};
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass == 0)
+                    for (int i = 0; i < cng_setid_deny_n; i++)
+                        cng_blocked[cng_setid_deny_nrs[i]] = 1;
+                else
+                    memcpy(cng_blocked, was, sizeof was);
+                for (int i = 0; i < nt; i++)
+                    for (int trapped = 1; trapped >= 0; trapped--) {
+                        if (pass == 1 && t[i].refused_only)
+                            continue;
+                        long r = cng_dispatch(t[i].nr, t[i].a0, t[i].a1,
+                                              t[i].a2, 0, 0, 0, trapped);
+                        asked[pass]++;
+                        if (r == t[i].want) {
+                            right[pass]++;
+                            continue;
+                        }
+                        cng_dprintf(1,
+                                    "blocktest setid: %s (%s, %s) = %ld, "
+                                    "want %ld\n",
+                                    t[i].what, pass ? "as measured" : "refused",
+                                    trapped ? "trap" : "-R", r, t[i].want);
+                    }
+            }
+            unsigned ru2[3] = {0}, rg2[3] = {0};
+            CNG_SYS(__NR_getresuid, &ru2[0], &ru2[1], &ru2[2], 0, 0, 0);
+            CNG_SYS(__NR_getresgid, &rg2[0], &rg2[1], &rg2[2], 0, 0, 0);
+            int kept = !memcmp(ru, ru2, sizeof ru) && !memcmp(rg, rg2, sizeof rg);
+            int ok4 = right[0] == asked[0] && right[1] == asked[1] && kept;
+            cng_dprintf(1,
+                        "blocktest setid: refused %d/%d, as measured %d/%d "
+                        "as the kernel answers, ids kept=%d -> %s\n",
+                        right[0], asked[0], right[1], asked[1], kept,
+                        ok4 ? "OK" : "FAIL");
+            fails += !ok4;
+        }
+    }
+    return fails ? 1 : 0;
+}
+
+/* _faulttest — a guest pointer the handler dereferences itself must answer
+ * -EFAULT, not kill the guest.
+ *
+ * These syscalls are emulated rather than re-issued, so the kernel never gets to
+ * validate their pointers for us; and the handler runs with SIGSEGV masked, so a
+ * fault there is unblockable and fatal. Every case below passes a wild (non-NULL,
+ * unmapped) pointer through the dispatcher: a pass means the run survived AND the
+ * errno is right, so the test failing to print at all is itself the diagnosis. */
+/* How many POSIX timers /proc/self/timers lists for this process ("ID: <n>"
+ * lines), or -1 where the file cannot be read. Under qemu-user the file is the
+ * emulator's own, listing the host timers it created for the guest's — which
+ * is the count that matters for the leg below, since those are the ones a
+ * failed create has to have deleted again. */
+static int dbg_count_timers(void) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/timers",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char buf[4096];
+    int n = 0, at_bol = 1;
+    long k;
+    while ((k = sys_read((int)fd, buf, sizeof buf)) > 0) {
+        for (long i = 0; i < k; i++) {
+            if (at_bol && i + 3 < k && !memcmp(buf + i, "ID: ", 4))
+                n++;
+            at_bol = buf[i] == '\n';
+        }
+    }
+    sys_close((int)fd);
+    return n;
+}
+
+int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    /* CNG_UACCESS_MEMFD is read through cng_broker_env, which walks this — so
+     * without it the knob that forces the descriptor-backed probe is silently
+     * inert, and the forced run measures whatever the host would have picked
+     * anyway. That went unnoticed because the host it runs on most is qemu,
+     * where process_vm_readv is absent and the fallback is the only tier. */
+    cng_g_host_envp = envp;
+
+    void *bad = (void *)0x10; /* non-NULL, and no mapping starts that low */
+    char *badv[2] = {(char *)0x10, 0}; /* a readable vector of unreadable strings */
+    char good[128];
+    int fails = 0;
+
+    /* The probe needs a memfd; where it cannot be had the helpers answer
+     * "accessible" and the dereferences below would really fault. */
+    if (cng_user_readable(bad, 8) || cng_user_writable(bad, 8)) {
+        cng_dprintf(1, "faulttest: memory probe unavailable here -> SKIP\n");
+        return 0;
+    }
+    int okg = cng_user_readable(good, sizeof good) &&
+              cng_user_writable(good, sizeof good);
+    cng_dprintf(1, "faulttest probe good=%d bad=0 mech=%s -> %s\n", okg,
+                cng_uaccess_probe_setup() ? "process_vm" : "memfd",
+                okg ? "OK" : "FAIL");
+    fails += !okg;
+
+    cng_g_fake_id = 1;
+    cng_g_fake_uid = cng_g_fake_gid = 0;
+    cng_cred_seed();
+
+    struct {
+        const char *name;
+        long r;
+    } t[] = {
+        {"rt_sigaction",
+         cng_dispatch(__NR_rt_sigaction, CNG_SIGUSR1, (long)bad, 0, 8, 0, 0, 1)},
+        {"rt_sigprocmask",
+         cng_dispatch(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, (long)bad, 0, 8, 0,
+                      0, 1)},
+        {"getcwd", cng_dispatch(__NR_getcwd, (long)bad, 4096, 0, 0, 0, 0, 1)},
+        {"getresuid",
+         cng_dispatch(__NR_getresuid, (long)bad, (long)bad, (long)bad, 0, 0, 0,
+                      1)},
+        {"getresgid",
+         cng_dispatch(__NR_getresgid, (long)bad, (long)bad, (long)bad, 0, 0, 0,
+                      1)},
+        {"setgroups", cng_dispatch(__NR_setgroups, 4, (long)bad, 0, 0, 0, 0, 1)},
+        {"capget", cng_dispatch(__NR_capget, (long)bad, 0, 0, 0, 0, 0, 1)},
+        {"shmctl",
+         cng_dispatch(__NR_shmctl, 0, CNG_IPC_SET, (long)bad, 0, 0, 0, 1)},
+        {"sendmsg", cng_dispatch(__NR_sendmsg, 0, (long)bad, 0, 0, 0, 0, 1)},
+        /* uname is re-issued, but into a buffer of ours — the identity fields
+         * are faked there and the struct is handed over afterwards, so the
+         * guest's pointer is one we write to ourselves. */
+        {"uname", cng_dispatch(__NR_uname, (long)bad, 0, 0, 0, 0, 0, 1)},
+        /* A /proc magic link is answered from our own bookkeeping, so this
+         * buffer is one the kernel never validates either. */
+        {"readlinkat",
+         cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/proc/self/cwd",
+                      (long)bad, 4096, 0, 0, 1)},
+        /* And the path argument of an ordinary path syscall: the resolver
+         * copies up to 4 KiB out of it long before the kernel sees it. */
+        {"openat path",
+         cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)bad, CNG_O_RDONLY, 0, 0,
+                      0, 1)},
+        {"renameat path2",
+         cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/tmp",
+                      CNG_AT_FDCWD, (long)bad, 0, 0, 1)},
+        /* execve walks argv/envp itself — the kernel never sees them — so both
+         * the vector and the strings it points at have to be validated. */
+        {"execve path",
+         cng_dispatch(__NR_execve, (long)bad, 0, 0, 0, 0, 0, 1)},
+        {"execve argv",
+         cng_dispatch(__NR_execve, (long)"/bin/sh", (long)bad, 0, 0, 0, 0, 1)},
+        {"execve argv string",
+         cng_dispatch(__NR_execve, (long)"/bin/sh", (long)badv, 0, 0, 0, 0, 1)},
+    };
+    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
+        int ok = (t[i].r == -EFAULT);
+        cng_dprintf(1, "faulttest %s=%d want=%d -> %s\n", t[i].name, (int)t[i].r,
+                    (int)-EFAULT, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* And the same case with the trace on. CNG_DEBUG must never change what the
+     * guest gets, but execve's entry line printed the guest's own path pointer
+     * with %s — so the wild path right above, which answers -EFAULT with the
+     * log off, walked unmapped memory inside the handler the moment the log was
+     * on, and there SIGSEGV is masked and the walk is fatal. Reaching the print
+     * below at all is the pass; the errno has to be the same one either way. */
+    {
+        int save = cng_g_debug;
+        cng_g_debug = 1;
+        long rd = cng_dispatch(__NR_execve, (long)bad, 0, 0, 0, 0, 0, 1);
+        cng_g_debug = save;
+        int ok = rd == -EFAULT;
+        cng_dprintf(1, "faulttest execve path (CNG_DEBUG)=%d want=%d -> %s\n",
+                    (int)rd, (int)-EFAULT, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* timer_create's id is taken in a word of ours and handed over afterwards,
+     * so a bad pointer is -EFAULT — and the timer the kernel had already
+     * created is deleted again, as do_timer_create() deletes its own when the
+     * put fails: the count in /proc/self/timers must not move. A good pointer
+     * still gets its id, and that one is deleted here to leave the count where
+     * it was. Where the file cannot be read (-1) only the errno is asserted. */
+    {
+        int before = dbg_count_timers();
+        long rt = cng_dispatch(__NR_timer_create, 0, 0, (long)bad, 0, 0, 0, 1);
+        int after = dbg_count_timers();
+        int id = -1;
+        long rg = cng_dispatch(__NR_timer_create, 0, 0, (long)&id, 0, 0, 0, 1);
+        int with = dbg_count_timers();
+        if (rg == 0)
+            cng_dispatch(__NR_timer_delete, id, 0, 0, 0, 0, 0, 1);
+        int ok = rt == -EFAULT && rg == 0 && id >= 0 &&
+                 (before < 0 || (after == before && with == before + 1));
+        cng_dprintf(1,
+                    "faulttest timer_create bad=%d good=%d timers=%d/%d/%d "
+                    "-> %s\n",
+                    (int)rt, (int)rg, before, after, with, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* getdents64 of /proc is answered out of a batch buffer of ours (the
+     * hidden-process view has records to drop from it), so a bad buffer is
+     * -EFAULT from us — and the stream is put back where it was, the way the
+     * kernel leaves it at the record it could not copy: the read after it is
+     * the first batch again, "." at its head, rather than the second or the
+     * end of the directory. */
+    {
+        long dfd = sys_openat(CNG_AT_FDCWD, "/proc",
+                              CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+        long rb = cng_dispatch(__NR_getdents64, dfd, (long)bad, 4096, 0, 0, 0, 1);
+        char db[4096];
+        long ra = cng_dispatch(__NR_getdents64, dfd, (long)db, sizeof db, 0, 0,
+                               0, 1);
+        int dot = ra > 20 && db[19] == '.' && db[20] == '\0';
+        int ok = dfd >= 0 && rb == -EFAULT && dot;
+        cng_dprintf(1, "faulttest getdents64 bad=%d again=%d first=%d -> %s\n",
+                    (int)rb, (int)ra, dot, ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (dfd >= 0)
+            sys_close((int)dfd);
+    }
+
+    /* The copy-in pair, which is how execve's second pass takes argv/envp now.
+     * A probe followed by a memcpy is two acts with a gap, and another thread of
+     * the exec'ing guest is free to unmap the strings inside it — the memcpy
+     * then faults in the handler, which is the death the probes exist to
+     * prevent. That race cannot be scheduled from a test, so what is driven here
+     * is the property that makes the second pass safe whatever the race does:
+     * a range that will not come across whole is -EFAULT, and the walk stops at
+     * the grain boundary rather than reading into the hole past it.
+     *
+     * Two pages with the second one unmapped is the whole apparatus: a string
+     * ending inside the first must still arrive, one running up to the boundary
+     * must not. */
+    {
+        unsigned long pg = cng_page_size;
+        char *m = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                           CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (m == CNG_MAP_FAILED || cng_is_err((long)m)) {
+            cng_dprintf(1, "faulttest copyin: no mapping -> SKIP\n");
+        } else {
+            sys_munmap(m + pg, pg);
+            char *str = m + pg - 8; /* "abc" and its NUL, near the edge */
+            memcpy(str, "abc", 4);
+            char *nonul = m + pg - 4; /* four bytes, then the hole */
+            memset(nonul, 'x', 4);
+            char dst[64];
+            long whole = cng_user_strcopyin(dst, str, sizeof dst);
+            int wok = whole == 3 && !strcmp(dst, "abc");
+            long over = cng_user_strcopyin(dst, nonul, sizeof dst);
+            long cap = cng_user_strcopyin(dst, str, 2);
+            long half = cng_user_copyin(dst, nonul, 8);
+            long fits = cng_user_copyin(dst, str, 4);
+            long none = cng_user_copyin(dst, bad, 8);
+            int ok = wok && over == -EFAULT && cap == -E2BIG &&
+                     half == -EFAULT && fits == 0 && none == -EFAULT &&
+                     !strcmp(dst, "abc");
+            cng_dprintf(1,
+                        "faulttest copyin: str=%d over=%d cap=%d half=%d "
+                        "fits=%d bad=%d -> %s\n",
+                        (int)whole, (int)over, (int)cap, (int)half, (int)fits,
+                        (int)none, ok ? "OK" : "FAIL");
+            fails += !ok;
+
+            /* The two measurements, on the same apparatus. They answer about a
+             * copy now rather than about the guest's own bytes — a probe
+             * followed by a walk had the gap this whole file is about, and the
+             * walk is the half that faults. What is asserted is the property
+             * that survives whatever a racing thread does: a string or a vector
+             * that ends inside the live page is measured, and one that runs
+             * into the hole is -EFAULT rather than an over-read. */
+            long slen = cng_user_strlen(str, 64);
+            long sover = cng_user_strlen(nonul, 64);
+            long scap = cng_user_strlen(str, 2);
+            char **vec = (char **)(m + pg - 16); /* one entry, then the NUL */
+            vec[0] = str;
+            vec[1] = 0;
+            long vlen = cng_user_veclen(vec, 8);
+            char **vover = (char **)(m + pg - 8); /* one entry, then the hole */
+            vover[0] = str;
+            long vover_r = cng_user_veclen(vover, 8);
+            int mok = slen == 3 && sover == -EFAULT && scap == -E2BIG &&
+                      vlen == 1 && vover_r == -EFAULT;
+            cng_dprintf(1,
+                        "faulttest measure: str=%d over=%d cap=%d vec=%d "
+                        "vecover=%d -> %s\n",
+                        (int)slen, (int)sover, (int)scap, (int)vlen,
+                        (int)vover_r, mok ? "OK" : "FAIL");
+            fails += !mok;
+
+            /* And the write direction. cng_user_writable followed by a store
+             * has the same gap as a probe followed by a memcpy, and the store
+             * is the half that cannot be taken back. */
+            char src[8];
+            memset(src, 'z', sizeof src);
+            long wfits = cng_user_copyout(m + pg - 8, src, 8);
+            long wover = cng_user_copyout(m + pg - 4, src, 8);
+            long wnone = cng_user_copyout(bad, src, 8);
+            int ook = wfits == 0 && wover == -EFAULT && wnone == -EFAULT &&
+                      m[pg - 8] == 'z' && m[pg - 1] == 'z';
+            cng_dprintf(1,
+                        "faulttest copyout: fits=%d over=%d bad=%d -> %s\n",
+                        (int)wfits, (int)wover, (int)wnone, ook ? "OK" : "FAIL");
+            fails += !ook;
+            sys_munmap(m, pg);
+        }
+    }
+
+    /* Two processes must not stage their copies through the same descriptor.
+     *
+     * fork brings the descriptor across with the address space, and the file
+     * behind it: parent and child would go on writing into the same bytes of
+     * the same memfd and reading each other's back. The probes never cared —
+     * nothing is ever read back out of their regions — so it only became a
+     * question once the descriptor started carrying data, and then it showed
+     * up as a guest command failing with EFAULT about one run in thirty (a
+     * shell pipeline forks two children, and both translate a path at once).
+     *
+     * Driven rather than raced: each side copies a pattern of its own in a
+     * tight loop and checks what comes back. One shared staging area fails
+     * that within a few hundred iterations; a descriptor per process cannot
+     * fail at all. Only the memfd tier stages anything, so where
+     * process_vm_readv exists this passes for free — which is the other reason
+     * the suite runs the whole set again with CNG_UACCESS_MEMFD=1. */
+    {
+        /* The identity is what is asserted, not a race won: the child reports
+         * whether the descriptor it stages through is a different file from
+         * the one its parent had, which it knows because `pino` came across
+         * the fork with the rest of the stack. Racing the two and waiting for
+         * corruption catches this only when their two ring positions happen to
+         * meet — one run in three, measured, which is no way to hold a fix
+         * down. */
+        unsigned long pino = cng_uaccess_scratch_ino();
+        char csrc[256], cdst[256];
+        long kid = sys_fork();
+        if (kid == 0) {
+            unsigned long cino = cng_uaccess_scratch_ino();
+            if (!pino || !cino || cino == pino)
+                sys_exit_group(1);
+            /* ...and both sides go on copying at once, which is the thing the
+             * separation is for. */
+            memset(csrc, 0x5a, sizeof csrc);
+            for (int i = 0; i < 500; i++) {
+                memset(cdst, 0, sizeof cdst);
+                if (cng_user_copyin(cdst, csrc, sizeof csrc) != 0 ||
+                    memcmp(cdst, csrc, sizeof csrc) != 0)
+                    sys_exit_group(2);
+            }
+            sys_exit_group(0);
+        }
+        int mine = 1;
+        memset(csrc, 0xa5, sizeof csrc);
+        for (int i = 0; i < 500; i++) {
+            memset(cdst, 0, sizeof cdst);
+            if (cng_user_copyin(cdst, csrc, sizeof csrc) != 0 ||
+                memcmp(cdst, csrc, sizeof csrc) != 0) {
+                mine = 0;
+                break;
+            }
+        }
+        int st = 0;
+        if (kid > 0)
+            sys_wait4((int)kid, &st, 0, 0);
+        int child = kid > 0 && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+        int ok = kid > 0 && mine && child;
+        cng_dprintf(1, "faulttest fork: parent=%d child=%d -> %s\n", mine,
+                    child, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* getgroups writes only what it has: with no supplementary groups the bad
+     * pointer is never touched, so seed one and ask again. */
+    {
+        struct cng_cred_write w;
+        struct cng_cred *c = cng_cred_write_begin(&w);
+        c->ngroups = 1;
+        c->groups[0] = 42;
+        cng_cred_write_end(&w, 1);
+    }
+    long rg = cng_dispatch(__NR_getgroups, 4, (long)bad, 0, 0, 0, 0, 1);
+    int okgg = (rg == -EFAULT);
+    cng_dprintf(1, "faulttest getgroups=%d want=%d -> %s\n", (int)rg,
+                (int)-EFAULT, okgg ? "OK" : "FAIL");
+    fails += !okgg;
+
+    /* Socket addresses are the other thing read ahead of the kernel: cng_sun_in
+     * copies sun_path before any call that would have validated the pointer, and
+     * the mmsg array forms walk a whole vector of guest msghdrs the same way. The
+     * fd here is not a socket, so the kernel's own refusal arrives before it ever
+     * looks at the address — which is the point. What is being asserted is that
+     * an answer arrives at all, rather than the handler dying on the pointer; the
+     * specific errno is the host's to choose. */
+    long rb = cng_dispatch(__NR_bind, 0, (long)bad, 110, 0, 0, 0, 1);
+    long rsm = cng_dispatch(__NR_sendmmsg, 0, (long)bad, 2, 0, 0, 0, 1);
+    long rrm = cng_dispatch(__NR_recvmmsg, 0, (long)bad, 2, 0, 0, 0, 1);
+    int oksa = (rb < 0 && rsm < 0 && rrm < 0);
+    cng_dprintf(1,
+                "faulttest socket-addr bind=%d sendmmsg=%d recvmmsg=%d -> %s\n",
+                (int)rb, (int)rsm, (int)rrm, oksa ? "OK" : "FAIL");
+    fails += !oksa;
+
+    /* A send on an emulated netlink socket is the one send that never reaches
+     * the kernel at all: the request is parsed here and answered from the
+     * stand-in pair, so nothing else was ever going to look at the pointer.
+     * Both spellings a netlink library uses are driven — sendto's buffer and
+     * sendmsg's first iovec base, which was probed one level short. */
+    cng_nl_force_block = 1;
+    long nlfd = cng_dispatch(__NR_socket, 16 /*AF_NETLINK*/, 3 /*SOCK_RAW*/,
+                             0 /*NETLINK_ROUTE*/, 0, 0, 0, 1);
+    if (nlfd >= 0) {
+        struct cng_iovec biov = {bad, 32};
+        char mh[56];
+        memset(mh, 0, sizeof mh);
+        *(struct cng_iovec **)(mh + 16) = &biov;
+        *(unsigned long *)(mh + 24) = 1;
+        long rst = cng_dispatch(__NR_sendto, nlfd, (long)bad, 32, 0, 0, 0, 1);
+        long rsg = cng_dispatch(__NR_sendmsg, nlfd, (long)mh, 0, 0, 0, 0, 1);
+        int oknl = (rst == -EFAULT && rsg == -EFAULT);
+        cng_dprintf(1, "faulttest netlink sendto=%d sendmsg=%d want=%d -> %s\n",
+                    (int)rst, (int)rsg, (int)-EFAULT, oknl ? "OK" : "FAIL");
+        fails += !oknl;
+        sys_close((int)nlfd);
+    } else {
+        cng_dprintf(1, "faulttest netlink unavailable (%d) -> SKIP\n",
+                    (int)nlfd);
+    }
+    cng_nl_force_block = 0;
+
+    /* Not every bad pointer means "nothing was written". getres*id fills its
+     * three out pointers in order, one store each, and stops at the first that
+     * will not take one — so a bad second pointer answers -EFAULT with the real
+     * id already sitting in the first (measured against the host). Validating
+     * all three up front reported the same errno and got the memory wrong: the
+     * write probe validates a range by ZEROING it, so the good pointer came
+     * back 0 where the kernel would have left an id. A non-zero fake uid is
+     * what makes the two outcomes tell apart. */
+    unsigned idbuf[3];
+    unsigned uid_was = cng_g_fake_uid;
+    cng_g_fake_uid = 4242;
+    cng_cred_seed();
+    idbuf[0] = 0xa5a5a5a5u;
+    long rpw = cng_dispatch(__NR_getresuid, (long)&idbuf[0], (long)bad,
+                            (long)bad, 0, 0, 0, 1);
+    int okpw = (rpw == -EFAULT && idbuf[0] == 4242u);
+    cng_dprintf(1, "faulttest getresuid partial=%d ruid=%u want=%d/4242 -> %s\n",
+                (int)rpw, idbuf[0], (int)-EFAULT, okpw ? "OK" : "FAIL");
+    fails += !okpw;
+    cng_g_fake_uid = uid_was;
+    cng_cred_seed();
+
+    /* And the same calls with real memory still work. */
+    long rr = cng_dispatch(__NR_getresuid, (long)good, (long)(good + 8),
+                           (long)(good + 16), 0, 0, 0, 1);
+    long rc = cng_dispatch(__NR_getcwd, (long)good, sizeof good, 0, 0, 0, 0, 1);
+    int okv = (rr == 0 && rc > 0);
+    cng_dprintf(1, "faulttest valid getresuid=%d getcwd=%d -> %s\n", (int)rr,
+                (int)rc, okv ? "OK" : "FAIL");
+    fails += !okv;
+
+    /* readlinkat's bufsiz is an int, and the kernel refuses a non-positive one
+     * outright. The magic links are answered from our bookkeeping, so the clamp
+     * is ours to apply — and applying it to the raw register instead made a
+     * negative bufsiz a buffer of ~2^64 bytes, i.e. no clamp at all. */
+    long rn = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                           (long)"/proc/self/cwd", (long)good, -1, 0, 0, 1);
+    memset(good, '#', sizeof good);
+    long rs = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                           (long)"/proc/self/cwd", (long)good, 1, 0, 0, 1);
+    int okrl = (rn == -EINVAL && rs == 1 && good[1] == '#');
+    cng_dprintf(1, "faulttest readlink-bufsiz neg=%d short=%d -> %s\n", (int)rn,
+                (int)rs, okrl ? "OK" : "FAIL");
+    fails += !okrl;
+
+    cng_g_fake_id = 0;
+    return fails ? 1 : 0;
+}
+
+/* _prctltest — the confinement ops prctl must not answer honestly.
+ *
+ * We install a seccomp filter and set no_new_privs to do it, and both are
+ * visible through prctl: PR_GET_SECCOMP would report mode 2 and
+ * PR_GET_NO_NEW_PRIVS would report 1, neither of which the guest asked for. The
+ * test sets the real bit first, so "the guest sees 0" is an assertion about the
+ * virtualization rather than about an untouched process. */
+int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    /* As cng_install_seccomp does, before the guest ever runs. */
+    sys_prctl(CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    long host_nnp = sys_prctl(CNG_PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+
+    struct {
+        const char *name;
+        long r, want;
+    } t[] = {
+        {"GET_SECCOMP",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_SECCOMP, 0, 0, 0, 0, 0, 1), 0},
+        {"GET_NO_NEW_PRIVS (host bit hidden)",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, 1), 0},
+        {"SET_SECCOMP refused",
+         cng_dispatch(__NR_prctl, CNG_PR_SET_SECCOMP, CNG_SECCOMP_MODE_FILTER,
+                      0, 0, 0, 0, 1),
+         -EACCES},
+        {"SET_NO_NEW_PRIVS 0 is EINVAL",
+         cng_dispatch(__NR_prctl, CNG_PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, 1),
+         -EINVAL},
+        {"SET_NO_NEW_PRIVS 1",
+         cng_dispatch(__NR_prctl, CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0, 1), 0},
+        {"GET_NO_NEW_PRIVS after the guest set it",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, 1), 1},
+        /* The getter takes no arguments, and the kernel refuses a call that
+         * supplies any — the same check the setter beside it already made. */
+        {"GET_NO_NEW_PRIVS with a stray argument is EINVAL",
+         cng_dispatch(__NR_prctl, CNG_PR_GET_NO_NEW_PRIVS, 0, 1, 0, 0, 0, 1),
+         -EINVAL},
+        {"seccomp(2) refused",
+         cng_dispatch(__NR_seccomp, CNG_SECCOMP_SET_MODE_FILTER, 0, 0, 0, 0, 0,
+                      1),
+         -ENOSYS},
+    };
+    cng_dprintf(1, "prctltest host no_new_privs=%d\n", (int)host_nnp);
+    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
+        int ok = (t[i].r == t[i].want);
+        cng_dprintf(1, "prctltest %s=%d want=%d -> %s\n", t[i].name, (int)t[i].r,
+                    (int)t[i].want, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* An op we do not own still reaches the kernel. */
+    char nm[16] = "cngprctl";
+    long sr = cng_dispatch(__NR_prctl, CNG_PR_SET_NAME, (long)nm, 0, 0, 0, 0, 1);
+    char back[16] = {0};
+    sys_prctl(16 /*PR_GET_NAME*/, (unsigned long)back, 0, 0, 0);
+    int okn = (sr == 0 && !strcmp(back, nm));
+    cng_dprintf(1, "prctltest SET_NAME passthrough rc=%d comm=%s -> %s\n",
+                (int)sr, back, okn ? "OK" : "FAIL");
+    fails += !okn;
+
+    cng_dprintf(1, "prctltest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _selfproc — our own /proc/self/{cmdline,environ} must describe the GUEST.
+ *
+ * The registry is where another process's identity comes from, but for our own
+ * it is a convenience: when it is unavailable (never mapped, or full) the old
+ * fallback was the host file, which for a guest process is the chroot-ng
+ * invocation that started it — `/proc/self/cmdline` read back "chroot-ng -u
+ * /rootfs /bin/sh". Run with CNG_PROCREG_NONE=1 the registry is gone and the
+ * answer must still be the guest's own argv, out of the live stack.
+ *
+ * The stack below is the layout cng_build_stack hands a guest: argc, argv,
+ * NULL, envp, NULL, then auxv pairs terminated by AT_NULL. */
+int cng_cmd_selfproc(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    cng_g_host_envp = envp;
+    cng_g_exe_guest = "/bin/guestprog";
+
+    static char *gargv[] = {"/bin/guestprog", "--flag", 0};
+    static char *genvp[] = {"GUESTVAR=yes", 0};
+    static unsigned long stk[16];
+    int i = 0;
+    stk[i++] = 2; /* argc */
+    stk[i++] = (unsigned long)gargv[0];
+    stk[i++] = (unsigned long)gargv[1];
+    stk[i++] = 0;
+    stk[i++] = (unsigned long)genvp[0];
+    stk[i++] = 0;
+    stk[i++] = 0; /* AT_NULL */
+    stk[i++] = 0;
+
+    cng_procfs_init();
+    cng_procfs_publish_stack((unsigned long)stk);
+
+    char buf[512];
+    struct {
+        const char *name, *want;
+        int len;
+    } t[] = {
+        {"/proc/self/cmdline", "/bin/guestprog\0--flag", 22},
+        {"/proc/self/environ", "GUESTVAR=yes", 13},
+    };
+    int fails = 0;
+    for (unsigned k = 0; k < sizeof t / sizeof t[0]; k++) {
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)t[k].name,
+                               CNG_O_RDONLY, 0, 0, 0, /*trapped=*/0);
+        long n = fd < 0 ? -1 : sys_read((int)fd, buf, sizeof buf);
+        if (fd >= 0)
+            sys_close((int)fd);
+        int ok = (n == t[k].len && !memcmp(buf, t[k].want, (size_t)n));
+        cng_dprintf(1, "selfproc %s: %ld bytes [%s] -> %s\n", t[k].name, n,
+                    n > 0 ? buf : "", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* A guest stack that no longer describes a stack.
+     *
+     * The legs above read the stack we built, in the moment after we built it.
+     * This one reads it the way every later question does: after the program
+     * living on it has had its way with it. argc, the vectors and the strings
+     * they point at are all the guest's to rewrite (setproctitle does exactly
+     * that), and the file being answered is one the guest opens on itself — so a
+     * walk that runs off the mapping faults inside the SIGSYS handler, where
+     * SIGSEGV is masked and the process simply dies.
+     *
+     * One well-formed stack ending exactly at the edge of a mapping whose next
+     * page is unmapped, published while it is still well-formed — publishing is
+     * the one moment the stack is certainly ours — and then rewritten under
+     * three shapes, each of which used to walk off the end:
+     *
+     *   A  a string pointer into the hole: that entry ends the cmdline, and
+     *      environ/auxv are untouched;
+     *   B  an environment with no terminator before the hole (the old
+     *      `while (*p) p++`): an empty environ, while the cmdline — which does
+     *      not depend on it — still answers, rather than the whole snapshot
+     *      being declined and the host file (chroot-ng's own argv) taking the
+     *      question;
+     *   C  an auxv with no AT_NULL before the hole (the old `while (end[0])`):
+     *      cmdline still answers and the auxv is dropped whole, never handed
+     *      over half-walked.
+     *
+     * Only with no registry: with one, /proc/<self> is answered from the table
+     * and the live stack is never read at all. */
+    if (cng_g_procreg_backing != CNG_PROCREG_B_NONE) {
+        cng_dprintf(1, "selfproc hostile-stack: registry answers instead"
+                       " -> SKIP\n");
+    } else {
+        unsigned long pg = cng_page_size;
+        char *m = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                           CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (m == CNG_MAP_FAILED || cng_is_err((long)m)) {
+            cng_dprintf(1, "selfproc hostile-stack: no mapping -> SKIP\n");
+        } else {
+            sys_munmap(m + pg, pg);
+            unsigned long hole = (unsigned long)(m + pg); /* unmapped */
+            unsigned long *sp = (unsigned long *)(m + pg) - 7;
+            sp[0] = 1;                          /* argc */
+            sp[1] = (unsigned long)gargv[0];    /* argv[0] */
+            sp[2] = 0;                          /* argv terminator */
+            sp[3] = (unsigned long)genvp[0];    /* envp[0] */
+            sp[4] = 0;                          /* envp terminator */
+            sp[5] = 0;                          /* auxv: AT_NULL... */
+            sp[6] = 0;                          /* ...and its value */
+            cng_procfs_publish_stack((unsigned long)sp);
+
+            static const char *const names[] = {"/proc/self/cmdline",
+                                                "/proc/self/environ",
+                                                "/proc/self/auxv"};
+            long n[9];
+            for (int layout = 0, k = 0; layout < 3; layout++) {
+                if (layout == 0) {
+                    sp[1] = hole; /* a string nobody can read */
+                } else if (layout == 1) {
+                    sp[1] = (unsigned long)gargv[0];
+                    sp[4] = sp[5] = sp[6] = (unsigned long)genvp[0];
+                } else {
+                    sp[4] = 0;
+                    sp[5] = 3; /* an auxv pair, and then the hole */
+                    sp[6] = 7;
+                }
+                for (unsigned f = 0; f < 3; f++, k++) {
+                    long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                           (long)names[f], CNG_O_RDONLY, 0, 0, 0,
+                                           /*trapped=*/0);
+                    n[k] = fd < 0 ? -1 : sys_read((int)fd, buf, sizeof buf);
+                    if (fd >= 0)
+                        sys_close((int)fd);
+                }
+            }
+            int a = n[0] == 0 && n[1] == 13 && n[2] == 16;
+            int b = n[3] == 15 && n[4] == 0 && n[5] == 0;
+            int c = n[6] == 15 && n[7] == 13 && n[8] == 0;
+            int ok = a && b && c;
+            cng_dprintf(1,
+                        "selfproc hostile-stack: bad-string=%ld,%ld,%ld"
+                        " bad-envp=%ld,%ld,%ld bad-auxv=%ld,%ld,%ld -> %s\n",
+                        n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8],
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+            sys_munmap(m, pg);
+            cng_procfs_publish_stack((unsigned long)stk); /* put it back */
+        }
+    }
+
+    cng_dprintf(1, "selfproc registry=%d: %d failure(s)\n",
+                cng_g_procreg_backing, fails);
+    return fails ? 1 : 0;
+}
+
+/* _loadtwice PATH — load the same ELF twice into this address space (as execve
+ * emulation does, without tearing down the first) to surface re-load failures. */
+int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    if (argc < 2) {
+        cng_dprintf(2, "usage: _loadtwice PATH\n");
+        return 2;
+    }
+    struct cng_loaded p1, p2;
+    int rc1 = cng_load_elf(argv[1], 0, &p1);
+    int rc2 = cng_load_elf(argv[1], 0, &p2);
+    cng_dprintf(1, "load1 rc=%d base=%lx; load2 rc=%d base=%lx\n", rc1,
+                p1.base, rc2, p2.base);
+    return (rc1 == 0 && rc2 == 0) ? 0 : 1;
+}
+
+/* _exectest -r ROOT [-b SRC:DST[:ro]]... [-D DIR] [-e] [-N] [-B] [-l]
+ * [-L SRC:DST] PROG [args] — drive cng_emulate_execve (incl. shebang) and, on
+ * success, enter the loaded program. Exercises execve emulation under qemu
+ * where neither the SIGSYS nor trampoline route reaches it.
+ *
+ * The execveat form is reachable through the option flags, which is the only way
+ * to test what its flags word means now that it is read at all:
+ *   -D DIR  resolve PROG against an open fd for DIR (a real dirfd)
+ *   -e      AT_EMPTY_PATH: open PROG and execute the fd, with an empty path
+ *   -N      AT_SYMLINK_NOFOLLOW
+ *   -B      set an undefined flag bit, which the kernel refuses with EINVAL
+ *   -l      enable link2symlink, forced (every linkat goes through it)
+ *   -L S:D  linkat(S, D) through the dispatcher first — with -l, an l2s link
+ *           for -N to exec, which must run it rather than ELOOP
+ *
+ * The binds matter for a dynamically linked guest: its ELF interpreter is named
+ * by an absolute guest path, and a synthetic rootfs holding only the test binary
+ * has no interpreter of its own. On a host whose toolchain cannot link static
+ * (Termux/bionic), the harness exposes the platform linker's directories here. */
+int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    const char *rootfs = "/";
+    const char *bind_g[CNG_MAX_BINDS];
+    const char *bind_h[CNG_MAX_BINDS];
+    int bind_ro[CNG_MAX_BINDS];
+    const char *dirpath = 0;
+    char *linkspec = 0;
+    int nb = 0, xflags = 0, empty = 0, probe_reset = 0, l2s = 0;
+    int i = 1;
+    while (i < argc) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc) {
+            rootfs = argv[i + 1];
+            i += 2;
+        } else if (!strcmp(argv[i], "-l")) {
+            l2s = 1;
+            i++;
+        } else if (!strcmp(argv[i], "-L") && i + 1 < argc) {
+            linkspec = argv[i + 1];
+            i += 2;
+        } else if (!strcmp(argv[i], "-D") && i + 1 < argc) {
+            dirpath = argv[i + 1];
+            i += 2;
+        } else if (!strcmp(argv[i], "-e")) {
+            empty = 1;
+            i++;
+        } else if (!strcmp(argv[i], "-N")) {
+            xflags |= CNG_AT_SYMLINK_NOFOLLOW;
+            i++;
+        } else if (!strcmp(argv[i], "-B")) {
+            xflags |= CNG_AT_NO_AUTOMOUNT; /* not a valid execveat flag */
+            i++;
+        } else if (!strcmp(argv[i], "-R")) {
+            probe_reset = 1;
+            i++;
+        } else if (!strcmp(argv[i], "-b") && i + 1 < argc) {
+            /* SRC:DST[:ro] — host first, same order as the -b CLI option. Split
+             * in place: argv is writable and outlives the fs view. */
+            char *spec = argv[i + 1];
+            char *c = strchr(spec, ':');
+            if (c && nb < CNG_MAX_BINDS) {
+                *c = '\0';
+                char *dst = c + 1;
+                int ro = 0;
+                unsigned long dl = strlen(dst);
+                if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                    ro = 1;
+                    dst[dl - 3] = '\0';
+                }
+                bind_g[nb] = dst;
+                bind_h[nb] = spec;
+                bind_ro[nb] = ro;
+                nb++;
+            }
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    if (i >= argc) {
+        cng_dprintf(2, "usage: _exectest -r ROOT [-b SRC:DST[:ro]]... "
+                       "[-D DIR] [-e] [-N] [-B] [-l] [-L SRC:DST] PROG [args]\n");
+        return 2;
+    }
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    for (int b = 0; b < nb; b++)
+        cng_fs_add_bind(&fs, bind_g[b], bind_h[b], bind_ro[b]);
+    cng_g_fs = &fs;
+    cng_host_auxv = auxv;
+    cng_g_host_envp = envp;
+    if (l2s)
+        cng_g_l2s = cng_g_l2s_force = 1;
+    if (linkspec) {
+        char *c = strchr(linkspec, ':');
+        if (!c) {
+            cng_dprintf(2, "exectest: -L wants SRC:DST\n");
+            return 2;
+        }
+        *c = '\0';
+        long r = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)linkspec,
+                              CNG_AT_FDCWD, (long)(c + 1), 0, 0, 1);
+        if (r != 0) {
+            cng_dprintf(2, "exectest: linkat %s -> %s failed %ld\n", linkspec,
+                        c + 1, r);
+            return 1;
+        }
+    }
+
+    char **gargv = argv + i;
+    const char *gpath = gargv[0];
+    int dirfd = CNG_AT_FDCWD;
+    /* Both fds are opened through the dispatcher, so they are the translated
+     * ones a guest would have. */
+    if (dirpath) {
+        long d = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)dirpath,
+                              CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 1);
+        if (d < 0) {
+            cng_dprintf(2, "exectest: open dir %s failed %ld\n", dirpath, d);
+            return 1;
+        }
+        dirfd = (int)d;
+    }
+    if (empty) {
+        /* O_CLOEXEC, because that is how the real callers open it: apk runs a
+         * package script from a descriptor it opened close-on-exec, and every
+         * memfd-based exec does the same. It also makes the fd disappear at the
+         * commit point, which is where anything still needing it has to have
+         * asked already. */
+        long f = cng_dispatch(__NR_openat, dirfd, (long)gpath,
+                              CNG_O_RDONLY | CNG_O_CLOEXEC, 0, 0, 0, 1);
+        if (f < 0) {
+            cng_dprintf(2, "exectest: open %s failed %ld\n", gpath, f);
+            return 1;
+        }
+        dirfd = (int)f;
+        gpath = "";
+        xflags |= CNG_AT_EMPTY_PATH;
+    }
+    /* -R: the state a real execve drops with the address space. Grow the heap,
+     * arm a POSIX timer and register an rseq area the way a running program
+     * would, then report whether the emulation undid all three — the reset
+     * happens at the commit point, so it is only observable from here, before
+     * we enter the new program. */
+    /* Timers: a hundred through the dispatcher — past the 64 the old record
+     * held — and one raw, which the emulation never saw handed out and which
+     * only the kernel's own list (/proc/self/timers) can find. Under qemu-user
+     * the ids in that list are not the ones a guest holds, and the emulator
+     * allows a process 32 timers in all, so the count actually armed is
+     * reported and the full hundred, like the raw one, is asserted on a
+     * native host (tests/m6_execve.sh). */
+    enum { NTIMERS = 100 };
+    int tid[NTIMERS], tid_raw = 0, ntimers = 0, have_raw = 0, have_rseq = 0;
+    int rseq_enosys = 0;
+    /* struct rseq: 32 bytes, 32-aligned; the signature is any word. */
+    static struct {
+        unsigned int cpu_id_start, cpu_id;
+        unsigned long long rseq_cs;
+        unsigned int flags;
+    } __attribute__((aligned(32))) rs_old, rs_new;
+    if (probe_reset) {
+        long b = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+        if (b > 0) {
+            cng_g_brk0 = (unsigned long)b;
+            CNG_SYS(__NR_brk, b + (1 << 20), 0, 0, 0, 0, 0);
+        }
+        /* ...and one raw first: a timer the emulation never saw. */
+        have_raw = CNG_SYS(__NR_timer_create, 0, 0, (long)&tid_raw, 0, 0, 0) == 0;
+        /* Through the dispatcher, which is where the id gets recorded. */
+        while (ntimers < NTIMERS &&
+               cng_dispatch(__NR_timer_create, 0 /*CLOCK_REALTIME*/, 0,
+                            (long)&tid[ntimers], 0, 0, 0, 1) == 0)
+            ntimers++;
+        /* Likewise the rseq area, which is recorded the same way. A kernel or
+         * emulator without rseq (qemu-user answers ENOSYS) leaves nothing to
+         * drop, and that is not a failure — nor is a host whose ambient filter
+         * refuses it (Android 15's does, and the dispatcher answers the ENOSYS
+         * a kernel without it would). The two are told apart from a refusal
+         * for any other reason, which is: rseq_enosys says which this was. */
+        long rr = cng_dispatch(__NR_rseq, (long)&rs_old, 32, 0, 0x53053053, 0,
+                               0, 1);
+        have_rseq = rr == 0;
+        rseq_enosys = rr == -ENOSYS;
+    }
+
+    static struct cng_ucontext uc;
+    memset(&uc, 0, sizeof uc);
+    cng_emulate_execve(&uc, dirfd, gpath, gargv, envp, xflags);
+    if (probe_reset) {
+        long b = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+        /* A timer is gone when deleting it again is refused. Counting
+         * /proc/self/timers would answer a different question under an emulator,
+         * which keeps its own timer table. */
+        int gone = ntimers > 0;
+        for (int i = 0; i < ntimers; i++)
+            gone &= CNG_SYS(__NR_timer_delete, tid[i], 0, 0, 0, 0, 0) < 0;
+        int raw_gone = have_raw &&
+                       CNG_SYS(__NR_timer_delete, tid_raw, 0, 0, 0, 0, 0) < 0;
+        /* The registration is gone when a fresh area can be registered: the
+         * kernel refuses a second registration (EINVAL for another area, EBUSY
+         * for the same) for as long as the first stands. */
+        int rseq_gone = have_rseq &&
+                        CNG_SYS(__NR_rseq, (long)&rs_new, 32, 0, 0x53053053,
+                                0, 0) == 0;
+        int brk_back = ((unsigned long)b == cng_g_brk0);
+        int ok = brk_back && gone && (!have_rseq || rseq_gone);
+        cng_dprintf(1,
+                    "execreset: brk_back=%d timers_created=%d timers_gone=%d "
+                    "unseen_timer_gone=%d rseq_enosys=%d rseq_registered=%d "
+                    "rseq_gone=%d -> %s\n",
+                    brk_back, ntimers, gone, raw_gone, rseq_enosys, have_rseq,
+                    rseq_gone, ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+    unsigned long entry = (unsigned long)uc.uc_mcontext.pc;
+    unsigned long sp = (unsigned long)uc.uc_mcontext.sp;
+    if (entry == 0) {
+        cng_dprintf(2, "exectest: emulate_execve failed x0=%ld\n",
+                    (long)uc.uc_mcontext.regs[0]);
+        return 1;
+    }
+    /* /proc/self/exe fixup tracks the exec'd program (symlinks resolved). */
+    cng_dprintf(2, "exectest: exe=%s\n", cng_g_exe_guest);
+    cng_enter(sp, entry); /* never returns */
+}
+
+/* Host-path builder for the l2s store checks: "<a><b>" plus, when with_ino,
+ * the decimal of `ino` appended. */
+static void dbg_mkpath(char *out, size_t sz, const char *a, const char *b,
+                       unsigned long long ino, int with_ino) {
+    size_t n = cng_strlcpy(out, a, sz);
+    if (b && n < sz)
+        n += cng_strlcpy(out + n, b, sz - n);
+    if (with_ino) {
+        char tmp[24];
+        int t = 0;
+        do {
+            tmp[t++] = (char)('0' + (ino % 10));
+            ino /= 10;
+        } while (ino);
+        while (t > 0 && n + 1 < sz)
+            out[n++] = tmp[--t];
+        if (n < sz)
+            out[n] = '\0';
+    }
+}
+
+/* 1 if the host directory contains any ".l2s.*" entry, 0 if none, -1 on open
+ * failure. Raw getdents64 walk (linux_dirent64: reclen @16, name @19). */
+static int dbg_has_l2s(const char *dir) {
+    long fd = sys_openat(CNG_AT_FDCWD, dir,
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char buf[4096];
+    int found = 0;
+    long n;
+    while (!found &&
+           (n = CNG_SYS(__NR_getdents64, (int)fd, buf, sizeof buf, 0, 0, 0)) >
+               0) {
+        long o = 0;
+        while (o + 19 <= n) {
+            unsigned short rl;
+            memcpy(&rl, buf + o + 16, 2);
+            if (rl == 0 || o + rl > n)
+                break;
+            if (!strncmp(buf + o + 19, ".l2s.", 5)) {
+                found = 1;
+                break;
+            }
+            o += rl;
+        }
+    }
+    sys_close((int)fd);
+    return found;
+}
+
+/* _l2stest ROOT — exercise link2symlink (target must be a guest/relative path,
+ * not a host path) and fchdir cwd tracking. ROOT must contain a dir "w". The
+ * emulation is opt-in on the command line, so the test drives cng_g_l2s itself:
+ * first off (the refusal must pass through), then on for the rest. */
+int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *rootfs = argc > 1 ? argv[1] : "/";
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    /* link2symlink backing-file scheme. Force the fallback (tmpfs allows real
+     * hardlinks) by marking linkat blocked. The emulated "hardlink" must present
+     * as a regular file: shared inode, st_nlink counted, readlink refused. */
+    cng_blocked[__NR_linkat] = 1;
+    long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/a",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fd >= 0) {
+        sys_write((int)fd, "hi", 2);
+        sys_close((int)fd);
+    }
+
+    /* The emulation is opt-in (-l/--link2symlink), so with the flag still off
+     * the host's refusal must reach the guest verbatim and no name appear. */
+    long loff = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a",
+                             CNG_AT_FDCWD, (long)"/w/z", 0, 0, 0);
+    char sz[144];
+    long rz = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/z",
+                           (long)sz, 0, 0, 0, 0);
+    int ok_off = (loff == -ENOSYS && rz == -ENOENT);
+    cng_dprintf(1, "l2s-off: rc=%d created=%d -> %s\n", (int)loff, rz == 0,
+                ok_off ? "OK" : "FAIL");
+    fails += !ok_off;
+
+    cng_g_l2s = 1; /* everything below exercises the enabled emulation */
+    long lr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a", CNG_AT_FDCWD,
+                           (long)"/w/b", 0, 0, 0);
+    /* linking onto an existing name must fail with EEXIST, like real link(2) */
+    long lr2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a",
+                            CNG_AT_FDCWD, (long)"/w/b", 0, 0, 0);
+
+    char sa[144], sb[144];
+    long ra = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                           (long)sa, 0, 0, 0, 0);
+    long rb = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/b",
+                           (long)sb, 0, 0, 0, 0);
+    int reg = (ra == 0 && rb == 0 && ST_ISREG(sa) && ST_ISREG(sb));
+    int nlink = (reg && ST_NLINK(sa) == 2 && ST_NLINK(sb) == 2);
+    int sameino = (reg && ST_INO(sa) == ST_INO(sb));
+
+    char lb[256]; /* readlink must be transparent (EINVAL), never leak backing */
+    long rl = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/b",
+                           (long)lb, sizeof lb - 1, 0, 0, 0);
+    int noleak = (rl == -EINVAL);
+
+    char cbuf[8]; /* contents are shared through the backing file */
+    long bf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/b",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    long rd = -1;
+    if (bf >= 0) {
+        rd = sys_read((int)bf, cbuf, sizeof cbuf);
+        sys_close((int)bf);
+    }
+    int content = (rd == 2 && cbuf[0] == 'h' && cbuf[1] == 'i');
+
+    int ok_l2s = (lr == 0 && lr2 == -EEXIST && reg && nlink && sameino &&
+                  noleak && content);
+    cng_dprintf(1,
+                "l2s: rc=%d eexist=%d reg=%d nlink2=%d sameino=%d noleak=%d "
+                "content=%d -> %s\n",
+                (int)lr, lr2 == -EEXIST, reg, nlink, sameino, noleak, content,
+                ok_l2s ? "OK" : "FAIL");
+    fails += !ok_l2s;
+
+    /* Central store: the backing pair lives in "<root>/.l2s" (data keeping the
+     * original inode, marker at count 2), and nothing appears beside the
+     * names in /w. */
+    char hdata[CNG_PATH_MAX], hmark[CNG_PATH_MAX], hw[CNG_PATH_MAX];
+    dbg_mkpath(hdata, sizeof hdata, rootfs, "/.l2s/.l2s.", ST_INO(sa), 1);
+    dbg_mkpath(hmark, sizeof hmark, rootfs, "/.l2s/.l2s.", ST_INO(sa), 1);
+    size_t hml = strlen(hmark);
+    cng_strlcpy(hmark + hml, ".0002", sizeof hmark - hml);
+    dbg_mkpath(hw, sizeof hw, rootfs, "/w", 0, 0);
+    char sd[144];
+    long rsd = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hdata, sd,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    long rsm = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hmark, sd,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    int store_ok = (rsd == 0 && rsm == 0);
+    int user_clean = (dbg_has_l2s(hw) == 0);
+    int ok_store = (store_ok && user_clean);
+    cng_dprintf(1, "l2s-store: store=%d user_clean=%d -> %s\n", store_ok,
+                user_clean, ok_store ? "OK" : "FAIL");
+    fails += !ok_store;
+
+    /* fd-based stat: fstat and the AT_EMPTY_PATH forms must report the
+     * emulated st_nlink too (tar/rsync/coreutils stat open fds), and statx
+     * must pass the guest's mask through while advertising STATX_NLINK —
+     * where there is a statx to issue (-1 where there is not: a kernel before
+     * 4.11, or a filter that predates it, answers ENOSYS). */
+    int f_nlink = 0, ep_nlink = 0, epx = 0, xmask = 0;
+    long bf2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/b",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (bf2 >= 0) {
+        char sfd[144];
+        long r1 = cng_dispatch(__NR_fstat, bf2, (long)sfd, 0, 0, 0, 0, 0);
+        f_nlink = (r1 == 0 && ST_NLINK(sfd) == 2);
+        long r2 = cng_dispatch(__NR_newfstatat, bf2, (long)"", (long)sfd,
+                               CNG_AT_EMPTY_PATH, 0, 0, 0);
+        ep_nlink = (r2 == 0 && ST_NLINK(sfd) == 2);
+        char sxb[256];
+        long r3 = cng_dispatch(__NR_statx, bf2, (long)"", CNG_AT_EMPTY_PATH,
+                               CNG_STATX_BASIC_STATS, (long)sxb, 0, 0);
+        epx = r3 == -ENOSYS ? -1
+                            : (r3 == 0 && STX_NLINK(sxb) == 2 &&
+                               (STX_MASK(sxb) & CNG_STATX_NLINK));
+        sys_close((int)bf2);
+    }
+    char sxp[256];
+    long rxp = cng_dispatch(__NR_statx, CNG_AT_FDCWD, (long)"/w/b", 0,
+                            CNG_STATX_NLINK, (long)sxp, 0, 0);
+    xmask = rxp == -ENOSYS ? -1
+                           : (rxp == 0 && STX_NLINK(sxp) == 2 &&
+                              (STX_MASK(sxp) & CNG_STATX_NLINK));
+    int ok_fd = (f_nlink && ep_nlink && epx && xmask);
+    cng_dprintf(1, "l2s-fstat: fd=%d empty=%d emptyx=%d mask=%d -> %s\n",
+                f_nlink, ep_nlink, epx, xmask, ok_fd ? "OK" : "FAIL");
+    fails += !ok_fd;
+
+    /* readlink through a real dirfd must also refuse (the emulated link is a
+     * regular file to the guest, wherever the name comes from). */
+    int rlrel = 0;
+    long wfd0 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY, 0, 0, 0, 0);
+    if (wfd0 >= 0) {
+        char rb[64];
+        long rr = cng_dispatch(__NR_readlinkat, wfd0, (long)"b", (long)rb,
+                               sizeof rb, 0, 0, 0);
+        rlrel = (rr == -EINVAL);
+        sys_close((int)wfd0);
+    }
+    cng_dprintf(1, "l2s-dirfd-readlink: einval=%d -> %s\n", rlrel,
+                rlrel ? "OK" : "FAIL");
+    fails += !rlrel;
+
+    /* mtime preserve (apk's scenario): set an explicit mtime on one name, read
+     * it back through the other — must land on the shared backing file. */
+    long times[4] = {0x11223344, 0, 0x11223344, 0}; /* atime, mtime = T */
+    long um = cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/w/b",
+                           (long)times, 0, 0, 0, 0);
+    char sm[144];
+    long rm = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                           (long)sm, 0, 0, 0, 0);
+    int mtime_ok = (um == 0 && rm == 0 && ST_MTIME(sm) == 0x11223344);
+    cng_dprintf(1, "l2s-mtime: set=%d mtime=%lld -> %s\n", (int)um,
+                rm == 0 ? ST_MTIME(sm) : -1, mtime_ok ? "OK" : "FAIL");
+    fails += !mtime_ok;
+
+    /* dirfd-relative link (as apk does): open /w, linkat(fd,"d",fd,"e"). */
+    long df = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/d",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (df >= 0) {
+        sys_write((int)df, "x", 1);
+        sys_close((int)df);
+    }
+    long wfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w", CNG_O_RDONLY,
+                            0, 0, 0, 0);
+    long lr3 = -1;
+    int dreg = 0;
+    if (wfd >= 0) {
+        lr3 = cng_dispatch(__NR_linkat, wfd, (long)"d", wfd, (long)"e", 0, 0, 0);
+        char se[144];
+        long re = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/e",
+                               (long)se, 0, 0, 0, 0);
+        dreg = (re == 0 && ST_ISREG(se) && ST_NLINK(se) == 2);
+        sys_close((int)wfd);
+    }
+    int ok_dirfd = (lr3 == 0 && dreg);
+    cng_dprintf(1, "l2s-dirfd: rc=%d reg2=%d -> %s\n", (int)lr3, dreg,
+                ok_dirfd ? "OK" : "FAIL");
+    fails += !ok_dirfd;
+
+    /* decref: removing one name drops st_nlink; removing the last reclaims the
+     * backing file (the name then no longer exists). */
+    long ub = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/b", 0, 0, 0,
+                           0, 0);
+    char sa2[144];
+    long ra2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                            (long)sa2, 0, 0, 0, 0);
+    int after1 = (ub == 0 && ra2 == 0 && ST_NLINK(sa2) == 1);
+    long ua = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/a", 0, 0, 0,
+                           0, 0);
+    long ra3 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                            (long)sa2, 0, 0, 0, 0);
+    int gone = (ua == 0 && ra3 == -ENOENT);
+    int ok_dec = (after1 && gone);
+    cng_dprintf(1, "l2s-decref: nlink_after1=%d gone=%d -> %s\n", after1, gone,
+                ok_dec ? "OK" : "FAIL");
+    fails += !ok_dec;
+
+    /* Cross-directory hardlink via the central store: shared inode and count,
+     * content reachable both through the guest resolver (absolute path walks
+     * the store target) and through the host kernel (dirfd-relative open
+     * follows the absolute target natively). */
+    long ff = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/f",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (ff >= 0) {
+        sys_write((int)ff, "yo", 2);
+        sys_close((int)ff);
+    }
+    cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)"/w/sub", 0755, 0, 0, 0, 0);
+    long xg = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/f",
+                           CNG_AT_FDCWD, (long)"/w/g", 0, 0, 0);
+    long xr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/f",
+                           CNG_AT_FDCWD, (long)"/w/sub/x", 0, 0, 0);
+    char sf[144], sx[144];
+    long rf = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/f",
+                           (long)sf, 0, 0, 0, 0);
+    long rx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sub/x",
+                           (long)sx, 0, 0, 0, 0);
+    int x_ino = (rf == 0 && rx == 0 && ST_INO(sf) == ST_INO(sx));
+    int x_nlink = (rf == 0 && rx == 0 && ST_NLINK(sf) == 3 &&
+                   ST_NLINK(sx) == 3);
+    char xb[8];
+    long xrd = -1;
+    long xf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sub/x",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (xf >= 0) {
+        xrd = sys_read((int)xf, xb, sizeof xb);
+        sys_close((int)xf);
+    }
+    int x_abs = (xrd == 2 && xb[0] == 'y' && xb[1] == 'o');
+    long wfd2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY, 0, 0, 0, 0);
+    int x_rel = 0;
+    if (wfd2 >= 0) {
+        long xf2 = cng_dispatch(__NR_openat, wfd2, (long)"sub/x", CNG_O_RDONLY,
+                                0, 0, 0, 0);
+        if (xf2 >= 0) {
+            xrd = sys_read((int)xf2, xb, sizeof xb);
+            x_rel = (xrd == 2 && xb[0] == 'y' && xb[1] == 'o');
+            sys_close((int)xf2);
+        }
+        sys_close((int)wfd2);
+    }
+    int ok_xdir = (xg == 0 && xr == 0 && x_ino && x_nlink && x_abs && x_rel);
+    cng_dprintf(1, "l2s-xdir: rc=%d ino=%d nlink3=%d abs=%d rel=%d -> %s\n",
+                (int)xr, x_ino, x_nlink, x_abs, x_rel, ok_xdir ? "OK" : "FAIL");
+    fails += !ok_xdir;
+
+    /* Directory hiding: the ".l2s" store entry never shows in the root
+     * listing (while real entries do). */
+    int root_clean = 1, have_w = 0;
+    long rfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                            CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (rfd >= 0) {
+        char db[4096];
+        long dn;
+        while ((dn = cng_dispatch(__NR_getdents64, rfd, (long)db, sizeof db, 0,
+                                  0, 0, 0)) > 0) {
+            long o = 0;
+            while (o + 19 <= dn) {
+                unsigned short rl;
+                memcpy(&rl, db + o + 16, 2);
+                if (rl == 0 || o + rl > dn)
+                    break;
+                const char *nm = db + o + 19;
+                if (!strncmp(nm, ".l2s", 4))
+                    root_clean = 0;
+                if (!strcmp(nm, "w"))
+                    have_w = 1;
+                o += rl;
+            }
+        }
+        sys_close((int)rfd);
+    }
+    int ok_hide = (root_clean && have_w);
+    cng_dprintf(1, "l2s-hide: root_clean=%d have_w=%d -> %s\n", root_clean,
+                have_w, ok_hide ? "OK" : "FAIL");
+    fails += !ok_hide;
+
+    /* The links' own records: the kernel lists an emulated hardlink as the
+     * symlink it is (DT_LNK, the link's inode), and a guest trusting
+     * d_type/d_ino — GNU ls -F, find -type f, ls -i — saw through it. A fresh
+     * group /w/dl1 + /w/dl2, listed through the dispatcher, must read DT_REG
+     * with the inode stat() reports for them; a real symlink beside them stays
+     * DT_LNK with its own. */
+    int de_1 = 0, de_2 = 0, de_sym = 0, de_seen = 0;
+    long delf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/dl1",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (delf >= 0)
+        sys_close((int)delf);
+    long delr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/dl1",
+                            CNG_AT_FDCWD, (long)"/w/dl2", 0, 0, 0);
+    cng_dispatch(__NR_symlinkat, (long)"dl1", CNG_AT_FDCWD, (long)"/w/dsym", 0,
+                 0, 0, 0);
+    char sd1[144], sd2[144], ssy[144];
+    long rd1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/dl1",
+                            (long)sd1, 0, 0, 0, 0);
+    long rd2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/dl2",
+                            (long)sd2, 0, 0, 0, 0);
+    long rsy = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/dsym",
+                            (long)ssy, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long dwfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (dwfd >= 0) {
+        char db[4096];
+        long dn;
+        while ((dn = cng_dispatch(__NR_getdents64, dwfd, (long)db, sizeof db,
+                                  0, 0, 0, 0)) > 0) {
+            long o = 0;
+            while (o + 19 <= dn) {
+                unsigned short rl;
+                memcpy(&rl, db + o + 16, 2);
+                if (rl == 0 || o + rl > dn)
+                    break;
+                unsigned long long dino;
+                memcpy(&dino, db + o, 8);
+                unsigned char dt = (unsigned char)db[o + 18];
+                const char *nm = db + o + 19;
+                if (!strcmp(nm, "dl1"))
+                    de_1 = dt == CNG_DT_REG && rd1 == 0 && dino == ST_INO(sd1);
+                else if (!strcmp(nm, "dl2"))
+                    de_2 = dt == CNG_DT_REG && rd2 == 0 && dino == ST_INO(sd2);
+                else if (!strcmp(nm, "dsym"))
+                    de_sym = dt == CNG_DT_LNK && rsy == 0 && dino == ST_INO(ssy);
+                de_seen++;
+                o += rl;
+            }
+        }
+        sys_close((int)dwfd);
+    }
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/dsym", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/dl2", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/dl1", 0, 0, 0, 0, 0);
+    int ok_dent = (delr == 0 && de_1 && de_2 && de_sym && de_seen > 3);
+    cng_dprintf(1, "l2s-dirent: rc=%d dl1_reg_ino=%d dl2_reg_ino=%d sym_lnk=%d "
+                   "-> %s\n",
+                (int)delr, de_1, de_2, de_sym, ok_dent ? "OK" : "FAIL");
+    fails += !ok_dent;
+
+    /* Handcraft a dir holding only legacy hidden files (raw host syscalls
+     * bypass the guard), then list it through the dispatcher with a buffer so
+     * small each batch holds one record: every batch filters away and the
+     * listing must still terminate (the re-read loop, not a fake EOF). */
+    char hh[CNG_PATH_MAX], hf1[CNG_PATH_MAX], hf2[CNG_PATH_MAX];
+    dbg_mkpath(hh, sizeof hh, rootfs, "/w/h", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, hh, 0755, 0, 0, 0);
+    dbg_mkpath(hf1, sizeof hf1, rootfs, "/w/h/.l2s.7", 0, 0);
+    dbg_mkpath(hf2, sizeof hf2, rootfs, "/w/h/.l2s.7.0002", 0, 0);
+    long tf = sys_openat(CNG_AT_FDCWD, hf1, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (tf >= 0)
+        sys_close((int)tf);
+    tf = sys_openat(CNG_AT_FDCWD, hf2, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (tf >= 0)
+        sys_close((int)tf);
+    int hb_clean = 1, hb_eof = 0;
+    long hfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/h",
+                            CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (hfd >= 0) {
+        char sb[48];
+        for (int it = 0; it < 64; it++) {
+            long dn = cng_dispatch(__NR_getdents64, hfd, (long)sb, sizeof sb,
+                                   0, 0, 0, 0);
+            if (dn == 0) {
+                hb_eof = 1;
+                break;
+            }
+            if (dn < 0)
+                break;
+            long o = 0;
+            while (o + 19 <= dn) {
+                unsigned short rl;
+                memcpy(&rl, sb + o + 16, 2);
+                if (rl == 0 || o + rl > dn)
+                    break;
+                const char *nm = sb + o + 19;
+                if (strcmp(nm, ".") && strcmp(nm, ".."))
+                    hb_clean = 0;
+                o += rl;
+            }
+        }
+        sys_close((int)hfd);
+    }
+    int ok_hb = (hb_clean && hb_eof);
+    cng_dprintf(1, "l2s-hide-batch: clean=%d eof=%d -> %s\n", hb_clean, hb_eof,
+                ok_hb ? "OK" : "FAIL");
+    fails += !ok_hb;
+
+    /* The machinery must appear nonexistent by name: creating a grammar-
+     * matching file, statting the real data file, opening or chdir'ing into
+     * the store — all ENOENT. */
+    long dcr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/.l2s.999",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    char gd[CNG_PATH_MAX];
+    dbg_mkpath(gd, sizeof gd, "/.l2s/.l2s.", 0, ST_INO(sf), 1);
+    char sdn[144];
+    long dstt = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)gd,
+                             (long)sdn, 0, 0, 0, 0);
+    long dop = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/.l2s",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    long dch = cng_dispatch(__NR_chdir, (long)"/.l2s", 0, 0, 0, 0, 0, 0);
+    int ok_deny = (dcr == -ENOENT && dstt == -ENOENT && dop == -ENOENT &&
+                   dch == -ENOENT);
+    cng_dprintf(1, "l2s-deny: create=%d data=%d store=%d chdir=%d -> %s\n",
+                dcr == -ENOENT, dstt == -ENOENT, dop == -ENOENT,
+                dch == -ENOENT, ok_deny ? "OK" : "FAIL");
+    fails += !ok_deny;
+
+    /* NOFOLLOW chown must land on the backing file: give the file setuid via
+     * chmod (follows to the data), then chown with NOFOLLOW — the kernel
+     * clears setuid on whichever inode it really chowned. */
+    cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)"/w/g", 04755, 0, 0, 0, 0);
+    long cr = cng_dispatch(__NR_fchownat, CNG_AT_FDCWD, (long)"/w/g",
+                           (long)sys_getuid(), (long)sys_getgid(),
+                           CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    char sg[144];
+    long rg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/g",
+                           (long)sg, 0, 0, 0, 0);
+    int suid_cleared = (cr == 0 && rg == 0 && !(ST_MODE(sg) & 04000));
+    cng_dprintf(1, "l2s-chown: suid_cleared=%d -> %s\n", suid_cleared,
+                suid_cleared ? "OK" : "FAIL");
+    fails += !suid_cleared;
+
+    /* renameat2 flags: NOREPLACE refuses to clobber a link name (no decref);
+     * EXCHANGE swaps the names without touching the count. */
+    long pf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/p",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (pf >= 0) {
+        sys_write((int)pf, "pp", 2);
+        sys_close((int)pf);
+    }
+    long nrr = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/p",
+                            CNG_AT_FDCWD, (long)"/w/g", CNG_RENAME_NOREPLACE,
+                            0, 0);
+    char snr[144];
+    long rnr = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/f",
+                            (long)snr, 0, 0, 0, 0);
+    int nr_ok = (nrr == -EEXIST && rnr == 0 && ST_NLINK(snr) == 3);
+    cng_dprintf(1, "l2s-noreplace: eexist=%d nlink=%d -> %s\n", nrr == -EEXIST,
+                rnr == 0 && ST_NLINK(snr) == 3, nr_ok ? "OK" : "FAIL");
+    fails += !nr_ok;
+
+    long exr = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/p",
+                            CNG_AT_FDCWD, (long)"/w/g", CNG_RENAME_EXCHANGE, 0,
+                            0);
+    char sp1[144], sf3[144];
+    long rp1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/p",
+                            (long)sp1, 0, 0, 0, 0);
+    long rf3 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/f",
+                            (long)sf3, 0, 0, 0, 0);
+    int swapped = (rp1 == 0 && rf3 == 0 && ST_INO(sp1) == ST_INO(sf3));
+    int ex_nlink = (rf3 == 0 && ST_NLINK(sf3) == 3);
+    int ex_ok = (exr == 0 && swapped && ex_nlink);
+    cng_dprintf(1, "l2s-exchange: rc=%d swapped=%d nlink3=%d -> %s\n",
+                (int)exr, swapped, ex_nlink, ex_ok ? "OK" : "FAIL");
+    fails += !ex_ok;
+
+    /* Legacy (bare-basename) group: mv one name to another directory — the
+     * dispatcher must repoint it at the unmoved data file. */
+    char ofdir[CNG_PATH_MAX], od[CNG_PATH_MAX], om[CNG_PATH_MAX],
+        ox[CNG_PATH_MAX], oy[CNG_PATH_MAX];
+    dbg_mkpath(ofdir, sizeof ofdir, rootfs, "/w/of", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, ofdir, 0755, 0, 0, 0);
+    dbg_mkpath(od, sizeof od, rootfs, "/w/of/.l2s.11", 0, 0);
+    dbg_mkpath(om, sizeof om, rootfs, "/w/of/.l2s.11.0002", 0, 0);
+    dbg_mkpath(ox, sizeof ox, rootfs, "/w/of/x", 0, 0);
+    dbg_mkpath(oy, sizeof oy, rootfs, "/w/of/y", 0, 0);
+    long odf = sys_openat(CNG_AT_FDCWD, od, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "zz", 2);
+        sys_close((int)odf);
+    }
+    odf = sys_openat(CNG_AT_FDCWD, om, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0)
+        sys_close((int)odf);
+    CNG_SYS(__NR_symlinkat, ".l2s.11", CNG_AT_FDCWD, ox, 0, 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.11", CNG_AT_FDCWD, oy, 0, 0, 0);
+    long mvr = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/of/x",
+                            CNG_AT_FDCWD, (long)"/w/mvx", 0, 0, 0);
+    char smx[144];
+    long rmx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/mvx",
+                            (long)smx, 0, 0, 0, 0);
+    int mv_reg = (mvr == 0 && rmx == 0 && ST_ISREG(smx));
+    int mv_nlink = (rmx == 0 && ST_NLINK(smx) == 2);
+    char mb[8];
+    long mrd = -1;
+    long mf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/mvx",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (mf >= 0) {
+        mrd = sys_read((int)mf, mb, sizeof mb);
+        sys_close((int)mf);
+    }
+    int mv_content = (mrd == 2 && mb[0] == 'z' && mb[1] == 'z');
+    int ok_mv = (mv_reg && mv_nlink && mv_content);
+    cng_dprintf(1, "l2s-mvfix: reg=%d nlink2=%d content=%d -> %s\n", mv_reg,
+                mv_nlink, mv_content, ok_mv ? "OK" : "FAIL");
+    fails += !ok_mv;
+
+    /* O_TMPFILE + linkat(fd, "", ..., AT_EMPTY_PATH): the anonymous file is
+     * published (by content copy — nothing to symlink to). */
+    long tmf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                            CNG_O_TMPFILE | CNG_O_RDWR, 0644, 0, 0, 0);
+    long tlr = -1;
+    int t_reg = 0, t_content = 0, t_mode = 0;
+    if (tmf >= 0) {
+        sys_write((int)tmf, "tt", 2);
+        tlr = cng_dispatch(__NR_linkat, tmf, (long)"", CNG_AT_FDCWD,
+                           (long)"/w/t", CNG_AT_EMPTY_PATH, 0, 0);
+        sys_close((int)tmf);
+        char stt[144];
+        long rt = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/t",
+                               (long)stt, 0, 0, 0, 0);
+        t_reg = (rt == 0 && ST_ISREG(stt));
+        /* a real link shares the inode's mode, so the copy must keep 0644 */
+        t_mode = (rt == 0 && (ST_MODE(stt) & 07777) == 0644);
+        char tb[8];
+        long trd = -1;
+        long tf2 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/t",
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+        if (tf2 >= 0) {
+            trd = sys_read((int)tf2, tb, sizeof tb);
+            sys_close((int)tf2);
+        }
+        t_content = (trd == 2 && tb[0] == 't' && tb[1] == 't');
+    }
+    int ok_tmp = (tlr == 0 && t_reg && t_content && t_mode);
+    cng_dprintf(1, "l2s-tmpfile: rc=%d reg=%d content=%d mode=%d -> %s\n",
+                (int)tlr, t_reg, t_content, t_mode, ok_tmp ? "OK" : "FAIL");
+    fails += !ok_tmp;
+
+    /* linkat by fd on a live group member bumps that group. */
+    long lff = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/f",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    long flr = -1;
+    int fd_nl = 0;
+    if (lff >= 0) {
+        flr = cng_dispatch(__NR_linkat, lff, (long)"", CNG_AT_FDCWD,
+                           (long)"/w/j", CNG_AT_EMPTY_PATH, 0, 0);
+        sys_close((int)lff);
+        char sj[144];
+        long rj = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/j",
+                               (long)sj, 0, 0, 0, 0);
+        fd_nl = (rj == 0 && ST_NLINK(sj) == 4 && ST_INO(sj) == ST_INO(sf));
+    }
+    int ok_fdl = (flr == 0 && fd_nl);
+    cng_dprintf(1, "l2s-fdlink: rc=%d nlink4=%d -> %s\n", (int)flr, fd_nl,
+                ok_fdl ? "OK" : "FAIL");
+    fails += !ok_fdl;
+
+    /* O_NOFOLLOW: opening a link name through a dirfd succeeds on the backing
+     * file, while a real guest symlink still draws ELOOP. */
+    int nf_open = 0, nf_content = 0, nf_sym = 0;
+    long wfd3 = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                             CNG_O_RDONLY, 0, 0, 0, 0);
+    if (wfd3 >= 0) {
+        long nff = cng_dispatch(__NR_openat, wfd3, (long)"f",
+                                CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        if (nff >= 0) {
+            nf_open = 1;
+            char nb[8];
+            long nrd = sys_read((int)nff, nb, sizeof nb);
+            nf_content = (nrd == 2 && nb[0] == 'y' && nb[1] == 'o');
+            sys_close((int)nff);
+        }
+        cng_dispatch(__NR_symlinkat, (long)"f", wfd3, (long)"sym", 0, 0, 0, 0);
+        long nfs = cng_dispatch(__NR_openat, wfd3, (long)"sym",
+                                CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        nf_sym = (nfs == -ELOOP);
+        if (nfs >= 0)
+            sys_close((int)nfs);
+        sys_close((int)wfd3);
+    }
+    int ok_nf = (nf_open && nf_content && nf_sym);
+    cng_dprintf(1, "l2s-nofollow: open=%d content=%d sym_eloop=%d -> %s\n",
+                nf_open, nf_content, nf_sym, ok_nf ? "OK" : "FAIL");
+    fails += !ok_nf;
+
+    /* Every other call that declines to follow the final component has to land
+     * on the backing file the same way — handed the name, the kernel operated
+     * on the emulation's own symlink, and the guest saw a symlink where it has
+     * a file. O_PATH|O_NOFOLLOW handed over an fd whose fstat said S_IFLNK
+     * (glibc's fchmodat emulation goes this way and then refuses with ENOTSUP);
+     * name_to_handle_at encoded a handle to the link; the l-xattr calls worked
+     * on the link (EPERM to set user.* on a symlink); an IN_DONT_FOLLOW watch
+     * armed on the link never fired for the data; fchmodat2(AT_SYMLINK_NOFOLLOW)
+     * was EOPNOTSUPP; openat2 drew ELOOP from O_NOFOLLOW, and from
+     * RESOLVE_NO_SYMLINKS in our own walk. Each lands on the data now, shown
+     * through ANOTHER name of the group where the call has an effect to show.
+     * Legs the host cannot issue (no openat2 under qemu-user, a kernel that
+     * predates fchmodat2, a filesystem without user xattrs or file handles)
+     * report themselves skipped rather than failed. */
+    {
+        int opath_reg = 0, handle_same = -1, xattr = -1, watch = 0, chmod2 = -1,
+            o2_nofollow = -1, o2_nosym = -1;
+        /* (a) O_PATH|O_NOFOLLOW: the real inode of the group, a regular file */
+        long pfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/f",
+                                CNG_O_PATH | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        if (pfd >= 0) {
+            char sp[144];
+            if (sys_fstat((int)pfd, sp) == 0)
+                opath_reg = (ST_MODE(sp) & 0170000) == 0100000 &&
+                            ST_INO(sp) == ST_INO(sf);
+            sys_close((int)pfd);
+        }
+        /* (b) name_to_handle_at without AT_SYMLINK_FOLLOW: the same handle a
+         *     following call returns */
+        struct {
+            unsigned bytes, type;
+            unsigned char h[128];
+        } h1 = {128, 0, {0}}, h2 = {128, 0, {0}};
+        int mid1 = 0, mid2 = 0;
+        long hr1 = cng_dispatch(__NR_name_to_handle_at, CNG_AT_FDCWD,
+                                (long)"/w/f", (long)&h1, (long)&mid1, 0, 0, 0);
+        long hr2 = cng_dispatch(__NR_name_to_handle_at, CNG_AT_FDCWD,
+                                (long)"/w/j", (long)&h2, (long)&mid2,
+                                CNG_AT_SYMLINK_FOLLOW, 0, 0);
+        if (hr1 == 0 && hr2 == 0)
+            handle_same = h1.bytes == h2.bytes && h1.type == h2.type &&
+                          !memcmp(h1.h, h2.h, h1.bytes);
+        else if (hr1 != -EOPNOTSUPP && hr2 != -EOPNOTSUPP && hr1 != -ENOSYS &&
+                 hr2 != -ENOSYS)
+            handle_same = 0;
+        /* (c) l-xattr: set through one name, read back through another, listed,
+         *     removed, gone */
+        long xs = cng_dispatch(__NR_lsetxattr, (long)"/w/f", (long)"user.cng",
+                               (long)"v", 1, 0, 0, 0);
+        if (xs == 0) {
+            char xv[8], xl[64];
+            long xg = cng_dispatch(__NR_lgetxattr, (long)"/w/j", (long)"user.cng",
+                                   (long)xv, sizeof xv, 0, 0, 0);
+            long xls = cng_dispatch(__NR_llistxattr, (long)"/w/f", (long)xl,
+                                    sizeof xl, 0, 0, 0, 0);
+            int listed = 0;
+            for (long i = 0; xls > 0 && i < xls; i += (long)strlen(xl + i) + 1)
+                listed |= !strcmp(xl + i, "user.cng");
+            long xr = cng_dispatch(__NR_lremovexattr, (long)"/w/f",
+                                   (long)"user.cng", 0, 0, 0, 0, 0);
+            long xg2 = cng_dispatch(__NR_lgetxattr, (long)"/w/j", (long)"user.cng",
+                                    (long)xv, sizeof xv, 0, 0, 0);
+            xattr = xg == 1 && xv[0] == 'v' && listed && xr == 0 &&
+                    xg2 == -ENODATA;
+        } else if (xs != -EOPNOTSUPP) {
+            xattr = 0;
+        }
+        /* (d) IN_DONT_FOLLOW: the watch is on the data, so a change made
+         *     through another name of the group fires it */
+        long ifd = CNG_SYS(__NR_inotify_init1, CNG_O_NONBLOCK | CNG_O_CLOEXEC, 0,
+                           0, 0, 0, 0);
+        if (ifd >= 0) {
+            long wd = cng_dispatch(__NR_inotify_add_watch, ifd, (long)"/w/f",
+                                   0x4 /*IN_ATTRIB*/ | CNG_IN_DONT_FOLLOW, 0, 0,
+                                   0, 0);
+            cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/w/j", 0, 0, 0,
+                         0, 0);
+            char ev[64];
+            long n = sys_read((int)ifd, ev, sizeof ev);
+            watch = wd >= 0 && n >= 16 && *(int *)ev == (int)wd;
+            sys_close((int)ifd);
+        }
+        /* (e) fchmodat2(AT_SYMLINK_NOFOLLOW): the mode lands on the data */
+        long cm = cng_dispatch(__NR_fchmodat2, CNG_AT_FDCWD, (long)"/w/f", 0640,
+                               CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+        if (cm == 0) {
+            char sc[144];
+            chmod2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/j",
+                                  (long)sc, 0, 0, 0, 0) == 0 &&
+                     (ST_MODE(sc) & 07777) == 0640;
+            cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)"/w/f", 0644, 0, 0,
+                         0, 0);
+        } else if (cm != -ENOSYS) {
+            chmod2 = 0;
+        }
+        /* (f) openat2: O_NOFOLLOW in the how, and RESOLVE_NO_SYMLINKS */
+        struct cng_open_how how = {CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0};
+        long o2 = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/f",
+                               (long)&how, sizeof how, 0, 0, 0);
+        if (o2 >= 0) {
+            char nb[8];
+            long nrd = sys_read((int)o2, nb, sizeof nb);
+            o2_nofollow = nrd == 2 && nb[0] == 'y' && nb[1] == 'o';
+            sys_close((int)o2);
+        } else if (o2 != -ENOSYS) {
+            o2_nofollow = 0;
+        }
+        how.flags = CNG_O_RDONLY;
+        how.resolve = CNG_RESOLVE_NO_SYMLINKS;
+        o2 = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/f", (long)&how,
+                          sizeof how, 0, 0, 0);
+        if (o2 >= 0) {
+            char nb[8];
+            long nrd = sys_read((int)o2, nb, sizeof nb);
+            o2_nosym = nrd == 2 && nb[0] == 'y' && nb[1] == 'o';
+            sys_close((int)o2);
+        } else if (o2 != -ENOSYS) {
+            o2_nosym = 0;
+        }
+        int ok = opath_reg && handle_same != 0 && xattr != 0 && watch &&
+                 chmod2 != 0 && o2_nofollow != 0 && o2_nosym != 0;
+        cng_dprintf(1,
+                    "l2s-nofollow-rest: opath_reg=%d handle=%d xattr=%d watch=%d "
+                    "fchmodat2=%d openat2_nofollow=%d openat2_nosymlinks=%d "
+                    "-> %s (-1 = not issuable here)\n",
+                    opath_reg, handle_same, xattr, watch, chmod2, o2_nofollow,
+                    o2_nosym, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* Legacy per-dir format end to end (what arm64chroot writes, and what a
+     * pre-store chroot-ng left behind): stat, same-dir bump keeping the
+     * legacy look, cross-dir join via absolute target, decref, readlink. */
+    char ogdir[CNG_PATH_MAX], od2[CNG_PATH_MAX], om2[CNG_PATH_MAX],
+        ou[CNG_PATH_MAX], ov[CNG_PATH_MAX], om3[CNG_PATH_MAX];
+    dbg_mkpath(ogdir, sizeof ogdir, rootfs, "/w/og", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, ogdir, 0755, 0, 0, 0);
+    dbg_mkpath(od2, sizeof od2, rootfs, "/w/og/.l2s.13", 0, 0);
+    dbg_mkpath(om2, sizeof om2, rootfs, "/w/og/.l2s.13.0002", 0, 0);
+    dbg_mkpath(om3, sizeof om3, rootfs, "/w/og/.l2s.13.0003", 0, 0);
+    dbg_mkpath(ou, sizeof ou, rootfs, "/w/og/u", 0, 0);
+    dbg_mkpath(ov, sizeof ov, rootfs, "/w/og/v", 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, od2, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "qq", 2);
+        sys_close((int)odf);
+    }
+    odf = sys_openat(CNG_AT_FDCWD, om2, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0)
+        sys_close((int)odf);
+    CNG_SYS(__NR_symlinkat, ".l2s.13", CNG_AT_FDCWD, ou, 0, 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.13", CNG_AT_FDCWD, ov, 0, 0, 0);
+    char sdn2[144], su[144];
+    long rdn2 = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, od2, sdn2,
+                        CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    long ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/og/u",
+                           (long)su, 0, 0, 0, 0);
+    int old_reg = (ru == 0 && ST_ISREG(su) && ST_NLINK(su) == 2);
+    int old_same = (rdn2 == 0 && ru == 0 && ST_INO(su) == ST_INO(sdn2));
+    long ol1 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/og/u",
+                            CNG_AT_FDCWD, (long)"/w/og/z", 0, 0, 0);
+    char smk[144];
+    long rm3 = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, om3, smk,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/og/z",
+                      (long)su, 0, 0, 0, 0);
+    int old_bump = (ol1 == 0 && rm3 == 0 && ru == 0 && ST_NLINK(su) == 3);
+    long ol2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/og/u",
+                            CNG_AT_FDCWD, (long)"/w/z2", 0, 0, 0);
+    ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/z2", (long)su,
+                      0, 0, 0, 0);
+    int old_xdir = (ol2 == 0 && ru == 0 && ST_NLINK(su) == 4 &&
+                    rdn2 == 0 && ST_INO(su) == ST_INO(sdn2));
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/z2", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/og/z", 0, 0, 0, 0, 0);
+    ru = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/og/u",
+                      (long)su, 0, 0, 0, 0);
+    int old_back = (ru == 0 && ST_NLINK(su) == 2);
+    char orb[64];
+    long orl = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/og/u",
+                            (long)orb, sizeof orb, 0, 0, 0);
+    int old_einval = (orl == -EINVAL);
+    int ok_old = (old_reg && old_same && old_bump && old_xdir && old_back &&
+                  old_einval);
+    cng_dprintf(1,
+                "l2s-old: reg=%d same=%d bump3=%d xdir4=%d back2=%d "
+                "einval=%d -> %s\n",
+                old_reg, old_same, old_bump, old_xdir, old_back, old_einval,
+                ok_old ? "OK" : "FAIL");
+    fails += !ok_old;
+
+    /* Store unusable (a plain file squats on "<root>/.l2s"): first links fall
+     * back to the per-dir scheme beside the source. Exercised under a second
+     * rootfs so the real store stays live. */
+    char fbroot[CNG_PATH_MAX], fbsq[CNG_PATH_MAX], fbw[CNG_PATH_MAX];
+    dbg_mkpath(fbroot, sizeof fbroot, rootfs, "/fb", 0, 0);
+    dbg_mkpath(fbsq, sizeof fbsq, rootfs, "/fb/.l2s", 0, 0);
+    dbg_mkpath(fbw, sizeof fbw, rootfs, "/fb/w", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, fbroot, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, fbw, 0755, 0, 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, fbsq, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0)
+        sys_close((int)odf);
+    static struct cng_fs fs2;
+    cng_fs_init(&fs2, fbroot);
+    cng_g_fs = &fs2;
+    long fbf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/a",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fbf >= 0) {
+        sys_write((int)fbf, "ff", 2);
+        sys_close((int)fbf);
+    }
+    long fbl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/a",
+                            CNG_AT_FDCWD, (long)"/w/b", 0, 0, 0);
+    char sfa[144], sfb[144];
+    long rfa = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/a",
+                            (long)sfa, 0, 0, 0, 0);
+    long rfb = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/b",
+                            (long)sfb, 0, 0, 0, 0);
+    int fb_reg = (fbl == 0 && rfa == 0 && rfb == 0 && ST_ISREG(sfa) &&
+                  ST_NLINK(sfa) == 2 && ST_NLINK(sfb) == 2);
+    int fb_same = (rfa == 0 && rfb == 0 && ST_INO(sfa) == ST_INO(sfb));
+    int fb_beside = (dbg_has_l2s(fbw) == 1);
+    cng_g_fs = &fs;
+    int ok_fb = (fb_reg && fb_same && fb_beside);
+    cng_dprintf(1, "l2s-storefail: rc=%d reg=%d sameino=%d beside=%d -> %s\n",
+                (int)fbl, fb_reg, fb_same, fb_beside, ok_fb ? "OK" : "FAIL");
+    fails += !ok_fb;
+
+    /* glibc passes int args (dirfds) in w-registers and may leave the
+     * x-register's top half dirty; the monitor must truncate before
+     * comparing (Debian `ln a b` regression: AT_FDCWD arrived garbage-topped
+     * and source resolution failed with ENOENT). */
+    long dirty = (long)0xdeadbeef00000000ULL | (unsigned)CNG_AT_FDCWD;
+    cng_dispatch(__NR_chdir, (long)"/w", 0, 0, 0, 0, 0, 0);
+    long dcf = cng_dispatch(__NR_openat, dirty, (long)"da",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (dcf >= 0) {
+        sys_write((int)dcf, "dd", 2);
+        sys_close((int)dcf);
+    }
+    long dlr = cng_dispatch(__NR_linkat, dirty, (long)"da", dirty, (long)"db",
+                            0, 0, 0);
+    char sdd[144];
+    long drr = cng_dispatch(__NR_newfstatat, dirty, (long)"da", (long)sdd, 0,
+                            0, 0, 0);
+    int dirty_ok = (dlr == 0 && drr == 0 && ST_NLINK(sdd) == 2);
+    cng_dprintf(1, "l2s-dirtyfd: rc=%d nlink2=%d -> %s\n", (int)dlr,
+                drr == 0 && ST_NLINK(sdd) == 2, dirty_ok ? "OK" : "FAIL");
+    fails += !dirty_ok;
+    cng_dispatch(__NR_chdir, (long)"/", 0, 0, 0, 0, 0, 0);
+
+    /* A link is the emulation's by its target, and a target is text. One
+     * naming a data-shaped file outside the view — planted here with raw
+     * syscalls, as the host or a tool could have, since the guest itself
+     * may no longer write one — is an ordinary symlink: lstat says so, a
+     * no-follow call lands on the link, and unlink removes the link and
+     * nothing else. The guest's own attempt at such a link, or at one
+     * naming a marker, is refused with ENOENT, as the names are. */
+    char spr[CNG_PATH_MAX], spin[CNG_PATH_MAX], spw[CNG_PATH_MAX],
+        spout[CNG_PATH_MAX], spf[CNG_PATH_MAX], spx[CNG_PATH_MAX],
+        spp[CNG_PATH_MAX];
+    dbg_mkpath(spr, sizeof spr, rootfs, "/sp", 0, 0);
+    dbg_mkpath(spin, sizeof spin, rootfs, "/sp/in", 0, 0);
+    dbg_mkpath(spw, sizeof spw, rootfs, "/sp/in/w", 0, 0);
+    dbg_mkpath(spout, sizeof spout, rootfs, "/sp/out", 0, 0);
+    dbg_mkpath(spf, sizeof spf, rootfs, "/sp/out/.l2s.77", 0, 0);
+    dbg_mkpath(spx, sizeof spx, rootfs, "/sp/in/w/x", 0, 0);
+    dbg_mkpath(spp, sizeof spp, rootfs, "/sp/out/plain", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spr, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spin, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spw, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, spout, 0755, 0, 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, spf, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0) {
+        sys_write((int)odf, "zz", 2);
+        sys_close((int)odf);
+    }
+    CNG_SYS(__NR_symlinkat, spf, CNG_AT_FDCWD, spx, 0, 0, 0);
+    static struct cng_fs fs3;
+    cng_fs_init(&fs3, spin);
+    cng_g_fs = &fs3;
+    char ssx[144];
+    long rsx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/x",
+                            (long)ssx, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int sp_lnk = (rsx == 0 && (ST_MODE(ssx) & 0170000) == 0120000);
+    int sp_follow = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/x",
+                                 (long)ssx, 0, 0, 0, 0) == -ENOENT;
+    long spt[4] = {1234, 0, 1234, 0};
+    long sut = cng_dispatch(__NR_utimensat, CNG_AT_FDCWD, (long)"/w/x",
+                            (long)spt, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long sop = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/x",
+                            CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+    if (sop >= 0)
+        sys_close((int)sop);
+    long sul = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/x", 0, 0,
+                            0, 0, 0);
+    char ssf[144];
+    long rsf = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, spf, ssf,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    int sp_kept = (sut == 0 && sop == -ELOOP && sul == 0 && rsf == 0 &&
+                   ST_ISREG(ssf) && ST_MTIME(ssf) != 1234);
+    long sg1 = cng_dispatch(__NR_symlinkat, (long)spf, CNG_AT_FDCWD,
+                            (long)"/w/y", 0, 0, 0, 0);
+    long sg2 = cng_dispatch(__NR_symlinkat, (long)".l2s.5.0002", CNG_AT_FDCWD,
+                            (long)"/w/y", 0, 0, 0, 0);
+    long sg3 = cng_dispatch(__NR_symlinkat, (long)".l2s", CNG_AT_FDCWD,
+                            (long)"/w/y", 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/y", 0, 0, 0, 0, 0);
+    int sp_guard = (sg1 == -ENOENT && sg2 == -ENOENT && sg3 == 0);
+
+    /* A descriptor on a file outside the view, linked by AT_EMPTY_PATH: the
+     * contents are copied through it, and the file stays where it is — the
+     * emulation used to rename it into the store and leave a symlink in a
+     * directory no name of the guest's reaches. */
+    odf = sys_openat(CNG_AT_FDCWD, spp, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "pp", 2);
+        sys_close((int)odf);
+    }
+    long spd = sys_openat(CNG_AT_FDCWD, spp, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long spl = -1;
+    if (spd >= 0) {
+        spl = cng_dispatch(__NR_linkat, spd, (long)"", CNG_AT_FDCWD,
+                           (long)"/w/pl", CNG_AT_EMPTY_PATH, 0, 0);
+        sys_close((int)spd);
+    }
+    char spb[4] = {0};
+    long spo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/pl",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (spo >= 0) {
+        sys_read((int)spo, spb, 2);
+        sys_close((int)spo);
+    }
+    char ssp[144];
+    long rsp = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, spp, ssp,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    int sp_fd = (spl == 0 && spb[0] == 'p' && spb[1] == 'p' && rsp == 0 &&
+                 ST_ISREG(ssp));
+    cng_g_fs = &fs;
+    int ok_sp = (sp_lnk && sp_follow && sp_kept && sp_guard && sp_fd);
+    cng_dprintf(1,
+                "l2s-spoof: lnk=%d follow=%d kept=%d guard=%d fdcopy=%d "
+                "-> %s\n",
+                sp_lnk, sp_follow, sp_kept, sp_guard, sp_fd,
+                ok_sp ? "OK" : "FAIL");
+    fails += !ok_sp;
+
+    /* A rootfs copied with its links (cp -a) keeps their text, which names
+     * the ORIGINAL's store — present, so it was taken as it stood, and the
+     * copy's unlinks decref'd and deleted the original's data under names
+     * the copy never had. Planted as the copy would be: the names carry the
+     * original's store path, the copy's store its own data under the same
+     * name. The copy answers from its own data and reclaims it; the original
+     * keeps its group whole. */
+    long cgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (cgf >= 0) {
+        sys_write((int)cgf, "og", 2);
+        sys_close((int)cgf);
+    }
+    long cgl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            CNG_AT_FDCWD, (long)"/w/cg2", 0, 0, 0);
+    char scg[144];
+    long rcg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            (long)scg, 0, 0, 0, 0);
+    char cgt[CNG_PATH_MAX], cph[CNG_PATH_MAX], cpw[CNG_PATH_MAX],
+        cps[CNG_PATH_MAX], cpd[CNG_PATH_MAX], cpm[CNG_PATH_MAX],
+        cpn[CNG_PATH_MAX];
+    dbg_mkpath(cgt, sizeof cgt, rootfs, "/.l2s/.l2s.", ST_INO(scg), 1);
+    dbg_mkpath(cph, sizeof cph, rootfs, "/cp", 0, 0);
+    dbg_mkpath(cpw, sizeof cpw, rootfs, "/cp/w", 0, 0);
+    dbg_mkpath(cps, sizeof cps, rootfs, "/cp/.l2s", 0, 0);
+    dbg_mkpath(cpd, sizeof cpd, rootfs, "/cp/.l2s/.l2s.", ST_INO(scg), 1);
+    dbg_mkpath(cpm, sizeof cpm, cpd, ".0002", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, cph, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, cpw, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, cps, 0700, 0, 0, 0);
+    odf = sys_openat(CNG_AT_FDCWD, cpd, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (odf >= 0) {
+        sys_write((int)odf, "cp", 2);
+        sys_close((int)odf);
+    }
+    odf = sys_openat(CNG_AT_FDCWD, cpm, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (odf >= 0)
+        sys_close((int)odf);
+    dbg_mkpath(cpn, sizeof cpn, rootfs, "/cp/w/cg1", 0, 0);
+    CNG_SYS(__NR_symlinkat, cgt, CNG_AT_FDCWD, cpn, 0, 0, 0);
+    dbg_mkpath(cpn, sizeof cpn, rootfs, "/cp/w/cg2", 0, 0);
+    CNG_SYS(__NR_symlinkat, cgt, CNG_AT_FDCWD, cpn, 0, 0, 0);
+    char scd[144];
+    long rcd = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, cpd, scd,
+                       CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+    static struct cng_fs fs4;
+    cng_fs_init(&fs4, cph);
+    cng_g_fs = &fs4;
+    char scc[144];
+    long rcc = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cg1",
+                            (long)scc, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int cp_own = (rcc == 0 && rcd == 0 && ST_ISREG(scc) &&
+                  ST_INO(scc) == ST_INO(scd) && ST_NLINK(scc) == 2);
+    long cu1 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/cg1", 0, 0,
+                            0, 0, 0);
+    long cu2 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/cg2", 0, 0,
+                            0, 0, 0);
+    int cp_gone = (cu1 == 0 && cu2 == 0 && dbg_has_l2s(cps) == 0);
+    cng_g_fs = &fs;
+    rcg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cg2", (long)scg,
+                       0, 0, 0, 0);
+    char cgb[4] = {0};
+    long cgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/cg2",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (cgo >= 0) {
+        sys_read((int)cgo, cgb, 2);
+        sys_close((int)cgo);
+    }
+    int cp_orig = (cgl == 0 && rcg == 0 && ST_NLINK(scg) == 2 &&
+                   cgb[0] == 'o' && cgb[1] == 'g');
+    int ok_cp = (cp_own && cp_gone && cp_orig);
+    cng_dprintf(1, "l2s-copied: own=%d reclaimed=%d orig_kept=%d -> %s\n",
+                cp_own, cp_gone, cp_orig, ok_cp ? "OK" : "FAIL");
+    fails += !ok_cp;
+
+    /* A guest chroot narrows the view, and the store with it; a group linked
+     * before it keeps its data in the store of the view the run started
+     * with. Those links are still the emulation's (cng_l2s_home), as they
+     * were before the recognition was confined to the guest's own places. */
+    long hgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/hs",
+                            CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+    if (hgf < 0)
+        cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)"/w/hs", 0755, 0, 0, 0,
+                     0);
+    else
+        sys_close((int)hgf);
+    hgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/hs/h1",
+                       CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (hgf >= 0)
+        sys_close((int)hgf);
+    long hgl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/hs/h1",
+                            CNG_AT_FDCWD, (long)"/w/hs/h2", 0, 0, 0);
+    char hsr[CNG_PATH_MAX];
+    dbg_mkpath(hsr, sizeof hsr, rootfs, "/w/hs", 0, 0);
+    static struct cng_fs fs5;
+    cng_fs_init(&fs5, hsr);
+    cng_l2s_home(&fs);
+    cng_g_fs = &fs5;
+    char sh1[144];
+    long rh1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/h1",
+                            (long)sh1, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int home_reg = (hgl == 0 && rh1 == 0 && ST_ISREG(sh1) &&
+                    ST_NLINK(sh1) == 2);
+    long hu2 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/h2", 0, 0, 0,
+                            0, 0);
+    rh1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/h1", (long)sh1,
+                       0, 0, 0, 0);
+    int home_dec = (hu2 == 0 && rh1 == 0 && ST_NLINK(sh1) == 1);
+    cng_g_fs = &fs;
+    cng_l2s_home(0);
+    int ok_home = (home_reg && home_dec);
+    cng_dprintf(1, "l2s-home: reg=%d decref=%d -> %s\n", home_reg, home_dec,
+                ok_home ? "OK" : "FAIL");
+    fails += !ok_home;
+
+    /* A link of the emulation's own file where the host permits hardlinks
+     * (linkat unblocked: the harness's tmpfs does). By name, the host linked
+     * the emulation's symlink — a name the count never had, whose group's
+     * last counted unlink deleted the data under it; followed, or through a
+     * descriptor opened by the name, it linked the backing file, which then
+     * counted apart from the group. Each has to join the group. A descriptor
+     * is a link source only as far as the kernel says (before 6.10 the flag
+     * takes CAP_DAC_READ_SEARCH), so that leg expects the kernel's answer. */
+    long qf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/q1",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (qf >= 0) {
+        sys_write((int)qf, "qq", 2);
+        sys_close((int)qf);
+    }
+    long ql2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/q1",
+                            CNG_AT_FDCWD, (long)"/w/q2", 0, 0, 0);
+    cng_blocked[__NR_linkat] = 0;
+    long ql3 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/q1",
+                            CNG_AT_FDCWD, (long)"/w/q3", 0, 0, 0);
+    long ql4 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/q1",
+                            CNG_AT_FDCWD, (long)"/w/q4", CNG_AT_SYMLINK_FOLLOW,
+                            0, 0);
+    long qd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/q1",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    long qprobe = qd >= 0 ? CNG_SYS(__NR_linkat, qd, (long)"", CNG_AT_FDCWD,
+                                    (long)"/", CNG_AT_EMPTY_PATH, 0)
+                          : -EBADF;
+    long ql5 = qd >= 0 ? cng_dispatch(__NR_linkat, qd, (long)"", CNG_AT_FDCWD,
+                                      (long)"/w/q5", CNG_AT_EMPTY_PATH, 0, 0)
+                       : -EBADF;
+    if (qd >= 0)
+        sys_close((int)qd);
+    cng_blocked[__NR_linkat] = 1;
+    int q5_made = qprobe == -EEXIST;
+    char sq1[144], sqx[144];
+    long rq1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/q1",
+                            (long)sq1, 0, 0, 0, 0);
+    int q_join = (ql2 == 0 && ql3 == 0 && ql4 == 0 &&
+                  ql5 == (q5_made ? 0 : qprobe) && rq1 == 0 &&
+                  ST_NLINK(sq1) == (unsigned)(q5_made ? 5 : 4));
+    const char *qn[] = {"/w/q3", "/w/q4", "/w/q5"};
+    for (int i = 0; i < 2 + q5_made; i++) {
+        long rx = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)qn[i],
+                               (long)sqx, 0, 0, 0, 0);
+        q_join &= rx == 0 && ST_ISREG(sqx) && ST_INO(sqx) == ST_INO(sq1);
+    }
+    const char *qu[] = {"/w/q1", "/w/q2", "/w/q3"};
+    for (int i = 0; i < 3; i++)
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)qu[i], 0, 0, 0, 0, 0);
+    char qb[4] = {0};
+    long qo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/q4",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (qo >= 0) {
+        sys_read((int)qo, qb, 2);
+        sys_close((int)qo);
+    }
+    rq1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/q4", (long)sq1,
+                       0, 0, 0, 0);
+    int q_kept = (qb[0] == 'q' && qb[1] == 'q' && rq1 == 0 &&
+                  ST_NLINK(sq1) == (unsigned)(q5_made ? 2 : 1));
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/q4", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/q5", 0, 0, 0, 0, 0);
+    int ok_q = (q_join && q_kept);
+    cng_dprintf(1, "l2s-hostlink: joined=%d kept=%d -> %s\n", q_join, q_kept,
+                ok_q ? "OK" : "FAIL");
+    fails += !ok_q;
+
+    /* A group's count is its one marker, spelled as build_name spells it.
+     * Names of the same grammar that no marker of ours ever had — the inode
+     * plus 2^64 (the parse wrapped it back onto the inode), an unpadded
+     * count, a leading-zero inode — were read as that marker whenever the
+     * directory listed them first, which a tmpfs does for the newest entries:
+     * planted after the group's marker, as a tree from elsewhere could carry
+     * them. With the real marker gone every one of them is all there is,
+     * which settles the order whatever the filesystem: the count they claim
+     * (9) must not become the group's, and nothing done to the group may
+     * touch them. */
+    long mgf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/m1",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (mgf >= 0) {
+        sys_write((int)mgf, "mm", 2);
+        sys_close((int)mgf);
+    }
+    char smf[144];
+    unsigned long long mino = 0;
+    if (cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m1", (long)smf,
+                     0, 0, 0, 0) == 0)
+        mino = ST_INO(smf);
+    /* ino + 2^64 in decimal, added digit by digit onto 2^64's digits. */
+    char wide[32] = "18446744073709551616";
+    unsigned long long carry = mino;
+    for (int k = 19; k >= 0; k--) {
+        carry += (unsigned long long)(wide[k] - '0');
+        wide[k] = (char)('0' + carry % 10);
+        carry /= 10;
+    }
+    char mstray[3][CNG_PATH_MAX], mcanon[CNG_PATH_MAX], mlost[CNG_PATH_MAX],
+        mdata[CNG_PATH_MAX], mdir[CNG_PATH_MAX];
+    dbg_mkpath(mdir, sizeof mdir, rootfs, "/.l2s", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, mdir, 0700, 0, 0, 0);
+    dbg_mkpath(mstray[0], CNG_PATH_MAX, rootfs, "/.l2s/.l2s.", 0, 0);
+    cng_strlcpy(mstray[0] + strlen(mstray[0]), wide,
+                CNG_PATH_MAX - strlen(mstray[0]));
+    cng_strlcpy(mstray[0] + strlen(mstray[0]), ".0009",
+                CNG_PATH_MAX - strlen(mstray[0]));
+    dbg_mkpath(mstray[1], CNG_PATH_MAX, rootfs, "/.l2s/.l2s.", mino, 1);
+    cng_strlcpy(mstray[1] + strlen(mstray[1]), ".9",
+                CNG_PATH_MAX - strlen(mstray[1]));
+    dbg_mkpath(mstray[2], CNG_PATH_MAX, rootfs, "/.l2s/.l2s.0", mino, 1);
+    cng_strlcpy(mstray[2] + strlen(mstray[2]), ".0009",
+                CNG_PATH_MAX - strlen(mstray[2]));
+    dbg_mkpath(mdata, sizeof mdata, rootfs, "/.l2s/.l2s.", mino, 1);
+    dbg_mkpath(mcanon, sizeof mcanon, rootfs, "/.l2s/.l2s.", mino, 1);
+    size_t mcl = strlen(mcanon);
+    dbg_mkpath(mlost, sizeof mlost, rootfs, "/.l2s/lost-marker", 0, 0);
+    long ml2 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/m1",
+                            CNG_AT_FDCWD, (long)"/w/m2", 0, 0, 0);
+    for (int k = 0; k < 3; k++) {
+        long sf = sys_openat(CNG_AT_FDCWD, mstray[k],
+                             CNG_O_CREAT | CNG_O_WRONLY | CNG_O_CLOEXEC, 0600);
+        if (sf >= 0)
+            sys_close((int)sf);
+    }
+    long rm1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m1",
+                            (long)smf, 0, 0, 0, 0);
+    int m_two = ml2 == 0 && rm1 == 0 && ST_NLINK(smf) == 2;
+    /* The real marker gone, as a crash between two renames could leave it:
+     * the count is unknown (1), not the strays' 9. */
+    cng_strlcpy(mcanon + mcl, ".0002", sizeof mcanon - mcl);
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, mcanon, CNG_AT_FDCWD, mlost, 0, 0);
+    rm1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m1", (long)smf,
+                       0, 0, 0, 0);
+    int m_lost = rm1 == 0 && ST_NLINK(smf) == 1;
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, mlost, CNG_AT_FDCWD, mcanon, 0, 0);
+    long ml3 = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/m1",
+                            CNG_AT_FDCWD, (long)"/w/m3", 0, 0, 0);
+    rm1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/m3", (long)smf,
+                       0, 0, 0, 0);
+    cng_strlcpy(mcanon + mcl, ".0003", sizeof mcanon - mcl);
+    char msk[144];
+    int m_three = ml3 == 0 && rm1 == 0 && ST_NLINK(smf) == 3 &&
+                  CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mcanon, msk,
+                          CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+    const char *mu[] = {"/w/m1", "/w/m2", "/w/m3"};
+    for (int k = 0; k < 3; k++)
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)mu[k], 0, 0, 0, 0, 0);
+    int m_gone = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mdata, msk,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mcanon, msk,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT;
+    int m_strays = 1;
+    for (int k = 0; k < 3; k++) {
+        m_strays &= CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, mstray[k], msk,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+        CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, mstray[k], 0, 0, 0, 0);
+    }
+    int ok_m = mino && m_two && m_lost && m_three && m_gone && m_strays;
+    cng_dprintf(1,
+                "l2s-marker: two=%d lost=%d three=%d gone=%d strays=%d -> %s\n",
+                m_two, m_lost, m_three, m_gone, m_strays, ok_m ? "OK" : "FAIL");
+    fails += !ok_m;
+
+    /* A first link moves the file into the store and leaves a symlink in its
+     * name, by exchanging the two names in one renameat2 (no instant where
+     * the name is missing); where renameat2 cannot be issued, by a rename
+     * and then the symlink. Each way: a link whose new name cannot be made
+     * (no such directory) puts the file back under its name, a plain file
+     * again with nothing left in the store; a link that can be made leaves
+     * the name a symlink to the data file, which keeps the file's inode. */
+    int sw_ok[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        cng_blocked[__NR_renameat2] = (unsigned char)k;
+        char gs[16], gd[16], hs[CNG_PATH_MAX], hdat[CNG_PATH_MAX];
+        char shs[144], shd[144], sgd[144];
+        cng_strlcpy(gs, "/w/s0", sizeof gs);
+        gs[4] = (char)('0' + k);
+        cng_strlcpy(gd, gs, sizeof gd);
+        cng_strlcpy(gd + 5, "l", sizeof gd - 5);
+        long sf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gs,
+                               CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (sf >= 0) {
+            sys_write((int)sf, "sw", 2);
+            sys_close((int)sf);
+        }
+        dbg_mkpath(hs, sizeof hs, rootfs, gs, 0, 0);
+        unsigned long long sino = 0;
+        if (CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hs, shs,
+                    CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0)
+            sino = ST_INO(shs);
+        dbg_mkpath(hdat, sizeof hdat, rootfs, "/.l2s/.l2s.", sino, 1);
+        long nodir = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gs,
+                                  CNG_AT_FDCWD, (long)"/w/nodir/x", 0, 0, 0);
+        int back = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hs, shs,
+                           CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                   ST_ISREG(shs) && ST_INO(shs) == sino &&
+                   CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hdat, shd,
+                           CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT;
+        long sl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)gs,
+                               CNG_AT_FDCWD, (long)gd, 0, 0, 0);
+        int moved = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hs, shs,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                    (ST_MODE(shs) & 0170000) == 0120000 &&
+                    CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, hdat, shd,
+                            CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+                    ST_ISREG(shd) && ST_INO(shd) == sino;
+        int grp = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)gd,
+                               (long)sgd, 0, 0, 0, 0) == 0 &&
+                  ST_NLINK(sgd) == 2 && ST_INO(sgd) == sino;
+        sw_ok[k] = sino && nodir == -ENOENT && back && sl == 0 && moved && grp;
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gs, 0, 0, 0, 0, 0);
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)gd, 0, 0, 0, 0, 0);
+    }
+    cng_blocked[__NR_renameat2] = 0;
+    cng_dprintf(1, "l2s-swap: exchange=%d two_steps=%d -> %s\n", sw_ok[0],
+                sw_ok[1], sw_ok[0] && sw_ok[1] ? "OK" : "FAIL");
+    fails += !(sw_ok[0] && sw_ok[1]);
+
+    /* A link of a symlink, not followed, links the symlink: the new name
+     * reads the same text and carries the same times. The fallback used to
+     * open the source to copy it, which the pin refused with ELOOP. A text in
+     * the ".l2s." grammar is not copied (it could be taken for a name of a
+     * group beside it), and the source is never followed either way. */
+    char hsym[CNG_PATH_MAX], ssl[144], ssl2[144], rlk[16];
+    cng_dispatch(__NR_symlinkat, (long)"a", CNG_AT_FDCWD, (long)"/w/lsym", 0, 0,
+                 0, 0);
+    long ts_sym[4] = {1234567890, 0, 1234567890, 0};
+    dbg_mkpath(hsym, sizeof hsym, rootfs, "/w/lsym", 0, 0);
+    CNG_SYS(__NR_utimensat, CNG_AT_FDCWD, hsym, ts_sym, CNG_AT_SYMLINK_NOFOLLOW,
+            0, 0);
+    long syl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/lsym",
+                            CNG_AT_FDCWD, (long)"/w/lsym2", 0, 0, 0);
+    long syr = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/lsym2",
+                            (long)rlk, sizeof rlk, 0, 0, 0);
+    long sy1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lsym",
+                            (long)ssl, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long sy2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lsym2",
+                            (long)ssl2, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int sy_lnk = sy1 == 0 && sy2 == 0 && (ST_MODE(ssl2) & 0170000) == 0120000;
+    int sy_text = (syr == 1 && rlk[0] == 'a');
+    int sy_time = sy_lnk && ST_MTIME(ssl2) == 1234567890 &&
+                  ST_MTIME(ssl) == 1234567890;
+    dbg_mkpath(hsym, sizeof hsym, rootfs, "/w/lsym9", 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.9", CNG_AT_FDCWD, hsym, 0, 0, 0);
+    long syg = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/lsym9",
+                            CNG_AT_FDCWD, (long)"/w/lsym9b", 0, 0, 0);
+    long sy9 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lsym9b",
+                            (long)ssl2, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int sy_guard = syg == -EPERM && sy9 == -ENOENT;
+    int sy_ok = syl == 0 && sy_lnk && sy_text && sy_time && sy_guard;
+    cng_dprintf(1,
+                "l2s-symlink: rc=%d lnk=%d text=%d times=%d guard=%d -> %s\n",
+                (int)syl, sy_lnk, sy_text, sy_time, sy_guard,
+                sy_ok ? "OK" : "FAIL");
+    fails += !sy_ok;
+
+    /* A rename between two names of one group does nothing and answers 0,
+     * as the kernel's does for two names of one inode — under EXCHANGE too.
+     * The host moved one symlink over the other: the source name was gone
+     * and the count one short. NOREPLACE is still EEXIST. And under
+     * EXCHANGE both names move, so a legacy (bare-target) link that lands in
+     * another directory is repointed at its data like a renamed one is. */
+    char ssm[144];
+    long smfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sma",
+                            CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (smfd >= 0)
+        sys_close((int)smfd);
+    cng_dispatch(__NR_mkdirat, CNG_AT_FDCWD, (long)"/w/smd", 0755, 0, 0, 0, 0);
+    cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/sma", CNG_AT_FDCWD,
+                 (long)"/w/smb", 0, 0, 0);
+    cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/sma", CNG_AT_FDCWD,
+                 (long)"/w/smd/smc", 0, 0, 0);
+    static const char *const smn[3] = {"/w/sma", "/w/smb", "/w/smd/smc"};
+    long smr = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)smn[0],
+                            CNG_AT_FDCWD, (long)smn[1], 0, 0, 0);
+    long smxr = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)smn[1],
+                            CNG_AT_FDCWD, (long)smn[2], CNG_RENAME_EXCHANGE, 0,
+                            0);
+    long smo = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)smn[0],
+                            CNG_AT_FDCWD, (long)smn[1], CNG_RENAME_NOREPLACE,
+                            0, 0);
+    int sm_kept = 1;
+    for (int k = 0; k < 3; k++)
+        sm_kept &= cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)smn[k],
+                                (long)ssm, 0, 0, 0, 0) == 0 &&
+                   ST_ISREG(ssm) && ST_NLINK(ssm) == 3;
+    char lgd[CNG_PATH_MAX], lgf[CNG_PATH_MAX];
+    dbg_mkpath(lgd, sizeof lgd, rootfs, "/w/lg", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, lgd, 0755, 0, 0, 0);
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/.l2s.21", 0, 0);
+    long lgo = sys_openat(CNG_AT_FDCWD, lgf, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (lgo >= 0) {
+        sys_write((int)lgo, "lg", 2);
+        sys_close((int)lgo);
+    }
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/.l2s.21.0002", 0, 0);
+    lgo = sys_openat(CNG_AT_FDCWD, lgf, CNG_O_CREAT | CNG_O_WRONLY, 0600);
+    if (lgo >= 0)
+        sys_close((int)lgo);
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/u", 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.21", CNG_AT_FDCWD, lgf, 0, 0, 0);
+    dbg_mkpath(lgf, sizeof lgf, rootfs, "/w/lg/v", 0, 0);
+    CNG_SYS(__NR_symlinkat, ".l2s.21", CNG_AT_FDCWD, lgf, 0, 0, 0);
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lq",
+                       CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (lgo >= 0)
+        sys_close((int)lgo);
+    long lgx = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/lg/u",
+                            CNG_AT_FDCWD, (long)"/w/lq", CNG_RENAME_EXCHANGE,
+                            0, 0);
+    char lgb[4];
+    long lgr = -1;
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lq", CNG_O_RDONLY,
+                       0, 0, 0, 0);
+    if (lgo >= 0) {
+        lgr = sys_read((int)lgo, lgb, sizeof lgb);
+        sys_close((int)lgo);
+    }
+    int lg_ok = lgx == 0 && lgr == 2 && lgb[0] == 'l' &&
+                cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lq",
+                             (long)ssm, 0, 0, 0, 0) == 0 &&
+                ST_NLINK(ssm) == 2;
+    /* ...and the other way round: the legacy link is the destination. */
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lr",
+                       CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (lgo >= 0)
+        sys_close((int)lgo);
+    lgx = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/lr",
+                       CNG_AT_FDCWD, (long)"/w/lg/v", CNG_RENAME_EXCHANGE, 0,
+                       0);
+    lgr = -1;
+    lgo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/lr", CNG_O_RDONLY,
+                       0, 0, 0, 0);
+    if (lgo >= 0) {
+        lgr = sys_read((int)lgo, lgb, sizeof lgb);
+        sys_close((int)lgo);
+    }
+    lg_ok = lg_ok && lgx == 0 && lgr == 2 && lgb[0] == 'l' &&
+            cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/lr",
+                         (long)ssm, 0, 0, 0, 0) == 0 &&
+            ST_NLINK(ssm) == 2;
+    int sm_ok = smr == 0 && smxr == 0 && smo == -EEXIST && sm_kept && lg_ok;
+    cng_dprintf(1,
+                "l2s-samefile: mv=%d exch=%d noreplace=%d kept=%d "
+                "legacy_exch=%d -> %s\n",
+                (int)smr, (int)smxr, smo == -EEXIST, sm_kept, lg_ok,
+                sm_ok ? "OK" : "FAIL");
+    fails += !sm_ok;
+
+    /* A FIFO and a socket join a group as a regular file does: the node moves
+     * into the store, so both names are one pipe and one socket — a write
+     * end opened by one name finds the reader opened by the other (O_NONBLOCK
+     * opens of a FIFO with no reader are ENXIO), and a connect through the
+     * new name reaches the listener bound at the old one. The copy path
+     * opened the FIFO to read it and blocked until a writer came. */
+    char snd1[144], snd2[144], nb = 0;
+    long nmk = cng_dispatch(__NR_mknodat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            0010644, 0, 0, 0, 0);
+    long nfl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            CNG_AT_FDCWD, (long)"/w/nfifo2", 0, 0, 0);
+    long ns1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            (long)snd1, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long ns2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/nfifo2",
+                            (long)snd2, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    int nd_fifo = nmk == 0 && nfl == 0 && ns1 == 0 && ns2 == 0 &&
+                  (ST_MODE(snd2) & 0170000) == 0010000 &&
+                  ST_NLINK(snd1) == 2 && ST_NLINK(snd2) == 2 &&
+                  ST_INO(snd1) == ST_INO(snd2);
+    long nrd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/nfifo2",
+                            CNG_O_RDONLY | CNG_O_NONBLOCK, 0, 0, 0, 0);
+    long nwr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/nfifo",
+                            CNG_O_WRONLY | CNG_O_NONBLOCK, 0, 0, 0, 0);
+    int nd_pipe = nrd >= 0 && nwr >= 0 && sys_write((int)nwr, "p", 1) == 1 &&
+                  sys_read((int)nrd, &nb, 1) == 1 && nb == 'p';
+    if (nrd >= 0)
+        sys_close((int)nrd);
+    if (nwr >= 0)
+        sys_close((int)nwr);
+    struct cng_sockaddr_un nsa;
+    memset(&nsa, 0, sizeof nsa);
+    nsa.family = CNG_AF_UNIX;
+    cng_strlcpy(nsa.path, "/w/nsock", sizeof nsa.path);
+    unsigned nal = 2 + (unsigned)strlen(nsa.path) + 1;
+    long nls = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+    long ncs = CNG_SYS(__NR_socket, CNG_AF_UNIX, CNG_SOCK_STREAM, 0, 0, 0, 0);
+    int nd_sock = nls >= 0 && ncs >= 0 &&
+                  cng_dispatch(__NR_bind, nls, (long)&nsa, nal, 0, 0, 0, 0) ==
+                      0 &&
+                  CNG_SYS(__NR_listen, nls, 1, 0, 0, 0, 0) == 0 &&
+                  cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/nsock",
+                               CNG_AT_FDCWD, (long)"/w/nsock2", 0, 0, 0) == 0;
+    cng_strlcpy(nsa.path, "/w/nsock2", sizeof nsa.path);
+    nal = 2 + (unsigned)strlen(nsa.path) + 1;
+    nd_sock = nd_sock && cng_dispatch(__NR_connect, ncs, (long)&nsa, nal, 0, 0,
+                                      0, 0) == 0;
+    if (nls >= 0)
+        sys_close((int)nls);
+    if (ncs >= 0)
+        sys_close((int)ncs);
+    int nd_ok = nd_fifo && nd_pipe && nd_sock;
+    cng_dprintf(1, "l2s-node: fifo=%d pipe=%d socket=%d -> %s\n", nd_fifo,
+                nd_pipe, nd_sock, nd_ok ? "OK" : "FAIL");
+    fails += !nd_ok;
+
+    /* proot's groups, laid down by hand as proot-distro's proot writes them:
+     * members are symlinks holding the indirection's absolute host path, the
+     * indirection names "<itself>.<CCCC>" beside it, CCCC the count. Read as
+     * the one regular file a hardlink is, and kept with proot's bookkeeping:
+     * a link renames the data to the next count and repoints the indirection,
+     * an unlink the other way, the last one removes both. A moved tree (an
+     * old rootfs prefix in both texts) is read from this rootfs's store and
+     * healed; a chain that leaves the rootfs, or whose indirection names data
+     * in another directory, is an ordinary symlink. */
+    char pst[CNG_PATH_MAX], pind[CNG_PATH_MAX], pdat[CNG_PATH_MAX];
+    char ph[CNG_PATH_MAX], prt[CNG_PATH_MAX], psa[144], psb[144];
+    dbg_mkpath(pst, sizeof pst, rootfs, "/.l2s", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, pst, 0700, 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0002", 0, 0);
+    long pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0) {
+        sys_write((int)pfd, "pr", 2);
+        sys_close((int)pfd);
+    }
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.pa0001", 0, 0);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pa", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pb", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    /* Presented: lstat and stat say a regular file of two links, one inode
+     * for both names; readlink is EINVAL; the contents are the data's. */
+    long pr1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pa",
+                            (long)psa, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+    long pr2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pb",
+                            (long)psb, 0, 0, 0, 0);
+    long prl = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)"/w/pa",
+                            (long)prt, sizeof prt, 0, 0, 0);
+    char pb[4];
+    long prd = -1;
+    char psf[144];
+    long psr = -1;
+    long po = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/pb",
+                           CNG_O_RDONLY, 0, 0, 0, 0);
+    if (po >= 0) {
+        prd = sys_read((int)po, pb, sizeof pb);
+        psr = cng_dispatch(__NR_fstat, po, (long)psf, 0, 0, 0, 0, 0);
+        sys_close((int)po);
+    }
+    int pr_read = pr1 == 0 && pr2 == 0 && ST_ISREG(psa) && ST_ISREG(psb) &&
+                  ST_NLINK(psa) == 2 && ST_NLINK(psb) == 2 &&
+                  ST_INO(psa) == ST_INO(psb) && prl == -EINVAL && prd == 2 &&
+                  pb[0] == 'p' && psr == 0 && ST_NLINK(psf) == 2;
+    /* A link: the data is at .0003, the indirection names it, the new
+     * member carries the indirection's path, every name counts three. */
+    long prk = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pa",
+                            CNG_AT_FDCWD, (long)"/w/pc", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0003", 0, 0);
+    long pn = sys_readlinkat(CNG_AT_FDCWD, pind, prt, sizeof prt - 1);
+    int pr_ind3 = pn > 0 && (prt[pn] = '\0', strcmp(prt, pdat) == 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pc", 0, 0);
+    pn = sys_readlinkat(CNG_AT_FDCWD, ph, prt, sizeof prt - 1);
+    int pr_mem = pn > 0 && (prt[pn] = '\0', strcmp(prt, pind) == 0);
+    int pr_three = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pb",
+                                (long)psb, 0, 0, 0, 0) == 0 &&
+                   ST_NLINK(psb) == 3 && ST_INO(psb) == ST_INO(psa);
+    /* A followed link reaches the data file, and joins the group too. */
+    long prf = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pb",
+                            CNG_AT_FDCWD, (long)"/w/pd", CNG_AT_SYMLINK_FOLLOW,
+                            0, 0);
+    int pr_follow = prf == 0 &&
+                    cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pd",
+                                 (long)psb, CNG_AT_SYMLINK_NOFOLLOW, 0, 0,
+                                 0) == 0 &&
+                    ST_NLINK(psb) == 4 && ST_INO(psb) == ST_INO(psa);
+    /* An unlink, a rename over a name, a rename between two names (nothing
+     * happens), then the rest: the data and the indirection go with the
+     * last. */
+    long pu1 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/pd", 0, 0,
+                            0, 0, 0);
+    long pmv = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/pa",
+                            CNG_AT_FDCWD, (long)"/w/pb", 0, 0, 0);
+    po = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/pn",
+                      CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (po >= 0)
+        sys_close((int)po);
+    long pov = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/pn",
+                            CNG_AT_FDCWD, (long)"/w/pc", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0002", 0, 0);
+    int pr_two = pu1 == 0 && pmv == 0 && pov == 0 &&
+                 cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pa",
+                              (long)psb, 0, 0, 0, 0) == 0 &&
+                 ST_NLINK(psb) == 2 &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pdat, psb,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+    long pu2 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/pa", 0, 0,
+                            0, 0, 0);
+    long pu3 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/pb", 0, 0,
+                            0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pa0001.0001", 0, 0);
+    int pr_gone = pu2 == 0 && pu3 == 0 &&
+                  CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pind, psb,
+                          CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT &&
+                  CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pdat, psb,
+                          CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT;
+    /* A moved tree: both texts carry an old rootfs path. Read from this
+     * rootfs's store; the member is repointed at once, the indirection by
+     * the next change of the count. */
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pm0001.0002", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.pm0001", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/nonexistent-old-root/.l2s/.l2s.pm0001.0002",
+            CNG_AT_FDCWD, pind, 0, 0, 0);
+    char pm1[CNG_PATH_MAX];
+    dbg_mkpath(pm1, sizeof pm1, rootfs, "/w/pm1", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/nonexistent-old-root/.l2s/.l2s.pm0001",
+            CNG_AT_FDCWD, pm1, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pm2", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/nonexistent-old-root/.l2s/.l2s.pm0001",
+            CNG_AT_FDCWD, ph, 0, 0, 0);
+    int pr_moved = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pm1",
+                                (long)psa, CNG_AT_SYMLINK_NOFOLLOW, 0, 0,
+                                0) == 0 &&
+                   ST_ISREG(psa) && ST_NLINK(psa) == 2;
+    pn = sys_readlinkat(CNG_AT_FDCWD, pm1, prt, sizeof prt - 1);
+    long pmk = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pm2",
+                            CNG_AT_FDCWD, (long)"/w/pm3", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pm0001.0003", 0, 0);
+    long pn2 = sys_readlinkat(CNG_AT_FDCWD, pind, ph, sizeof ph - 1);
+    pr_moved = pr_moved && pn > 0 && (prt[pn] = '\0', !strcmp(prt, pind)) &&
+               pmk == 0 && pn2 > 0 && (ph[pn2] = '\0', !strcmp(ph, pdat));
+    /* proot without PROOT_L2S_DIR: the indirection and the data beside the
+     * first name, a member elsewhere naming them by host path. */
+    char pdd[CNG_PATH_MAX];
+    dbg_mkpath(pdd, sizeof pdd, rootfs, "/w/pdir", 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, pdd, 0755, 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/w/pdir/.l2s.f0001.0002", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/w/pdir/.l2s.f0001", 0, 0);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pdir/f", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pdf", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    int pr_beside = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                 (long)"/w/pdf", (long)psa, 0, 0, 0, 0) == 0 &&
+                    cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                 (long)"/w/pdir/f", (long)psb,
+                                 CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0) == 0 &&
+                    ST_ISREG(psa) && ST_NLINK(psa) == 2 &&
+                    ST_INO(psa) == ST_INO(psb);
+    /* A listing says what the stat says: the member's record is a regular
+     * file with the data's inode. */
+    unsigned long long pdi = 0;
+    unsigned pdt = 0;
+    long pdfd = sys_openat(CNG_AT_FDCWD, pdd, CNG_O_RDONLY | CNG_O_DIRECTORY, 0);
+    pr_beside = pr_beside && pdfd >= 0 &&
+                cng_l2s_dirent(pdfd, "f", &pdi, &pdt) == 1 && pdt == 8 &&
+                pdi == ST_INO(psa);
+    if (pdfd >= 0)
+        sys_close((int)pdfd);
+    /* The indirection is in plain sight here, and its text is a host path:
+     * readlink says the guest's own name for the data file. */
+    long pdr = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                            (long)"/w/pdir/.l2s.f0001", (long)prt,
+                            sizeof prt - 1, 0, 0, 0);
+    pr_beside = pr_beside && pdr == 23 &&
+                !strncmp(prt, "/w/pdir/.l2s.f0001.0002", 23);
+    /* A chain a killed process left cut (the data renamed to .0003, the
+     * indirection still naming .0002): a stat fails as for the dangling
+     * symlink proot shows, and the next change of the group mends it. */
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pc0001.0003", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.pc0001", 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pc0001.0002", 0, 0);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pc1", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/pc2", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    long pcs = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pc1",
+                            (long)psa, 0, 0, 0, 0);
+    long pcl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/pc1",
+                            CNG_AT_FDCWD, (long)"/w/pc3", 0, 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/.l2s/.l2s.pc0001.0004", 0, 0);
+    int pr_cut = pcs == -ENOENT && pcl == 0 &&
+                 cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/pc2",
+                              (long)psa, 0, 0, 0, 0) == 0 &&
+                 ST_ISREG(psa) && ST_NLINK(psa) == 4 &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, pdat, psb,
+                         CNG_AT_SYMLINK_NOFOLLOW, 0, 0) == 0;
+    /* Not groups: an indirection outside the rootfs (its text a host path
+     * the view does not name), and one that names data in another
+     * directory. Both stay symlinks to lstat. */
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/px1", 0, 0);
+    CNG_SYS(__NR_symlinkat, "/etc/.l2s.passwd0001", CNG_AT_FDCWD, ph, 0, 0, 0);
+    dbg_mkpath(pind, sizeof pind, rootfs, "/.l2s/.l2s.px0001", 0, 0);
+    dbg_mkpath(pdat, sizeof pdat, rootfs, "/w/pdir/.l2s.px0001.0002", 0, 0);
+    pfd = sys_openat(CNG_AT_FDCWD, pdat, CNG_O_CREAT | CNG_O_WRONLY, 0644);
+    if (pfd >= 0)
+        sys_close((int)pfd);
+    CNG_SYS(__NR_symlinkat, pdat, CNG_AT_FDCWD, pind, 0, 0, 0);
+    dbg_mkpath(ph, sizeof ph, rootfs, "/w/px2", 0, 0);
+    CNG_SYS(__NR_symlinkat, pind, CNG_AT_FDCWD, ph, 0, 0, 0);
+    int pr_hostile =
+        cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/px1", (long)psa,
+                     CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0) == 0 &&
+        (ST_MODE(psa) & 0170000) == 0120000 &&
+        cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/px2", (long)psb,
+                     CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0) == 0 &&
+        (ST_MODE(psb) & 0170000) == 0120000;
+    int pr_ok = pr_read && prk == 0 && pr_ind3 && pr_mem && pr_three &&
+                pr_follow && pr_two && pr_gone && pr_moved && pr_beside &&
+                pr_cut && pr_hostile;
+    cng_dprintf(1,
+                "l2s-proot: read=%d link=%d ind3=%d member=%d three=%d "
+                "follow=%d two=%d gone=%d moved=%d beside=%d cut=%d "
+                "hostile=%d -> %s\n",
+                pr_read, (int)prk, pr_ind3, pr_mem, pr_three, pr_follow, pr_two,
+                pr_gone, pr_moved, pr_beside, pr_cut, pr_hostile,
+                pr_ok ? "OK" : "FAIL");
+    fails += !pr_ok;
+
+    cng_blocked[__NR_linkat] = 0;
+    cng_g_l2s = 0;
+
+    /* fchdir cwd tracking. */
+    long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                            CNG_O_RDONLY, 0, 0, 0, 0);
+    if (dfd >= 0) {
+        cng_dispatch(__NR_fchdir, dfd, 0, 0, 0, 0, 0, 0);
+        sys_close((int)dfd);
+    }
+    int ok_cwd = (strcmp(cng_g_fs->cwd, "/w") == 0);
+    cng_dprintf(1, "fchdir: cwd=%s -> %s\n", cng_g_fs->cwd,
+                ok_cwd ? "OK" : "FAIL");
+    fails += !ok_cwd;
+
+    /* chdir through a symlink records where it LANDED, as the kernel's cwd is
+     * the directory itself — so getcwd reports the symlink-free name and a
+     * later ".." backs out of the real parent, not the link's. */
+    cng_dispatch(__NR_symlinkat, (long)"/w", CNG_AT_FDCWD, (long)"/wlink", 0, 0,
+                 0, 0);
+    long lch = cng_dispatch(__NR_chdir, (long)"/wlink", 0, 0, 0, 0, 0, 0);
+    int ok_link = (lch == 0 && strcmp(cng_g_fs->cwd, "/w") == 0);
+    cng_dprintf(1, "chdir-symlink: rc=%d cwd=%s -> %s\n", (int)lch,
+                cng_g_fs->cwd, ok_link ? "OK" : "FAIL");
+    fails += !ok_link;
+    cng_dispatch(__NR_chdir, (long)"/", 0, 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/wlink", 0, 0, 0, 0, 0);
+    return fails ? 1 : 0;
+}
+
+/* _cloexectest — emulated execve must close FD_CLOEXEC fds like a real execve
+ * (else fork/exec launchers' O_CLOEXEC notify pipes never close and the parent
+ * hangs — the git-clone symptom). Open one CLOEXEC and one plain fd, run the
+ * close pass, and check only the CLOEXEC one went away. */
+int cng_cmd_cloexectest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    long ce = sys_openat(CNG_AT_FDCWD, "/dev/null",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long pl = sys_openat(CNG_AT_FDCWD, "/dev/null", CNG_O_RDONLY, 0);
+    cng_close_cloexec();
+    long ce_fl = CNG_SYS(__NR_fcntl, (int)ce, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    long pl_fl = CNG_SYS(__NR_fcntl, (int)pl, 1 /*F_GETFD*/, 0, 0, 0, 0);
+    int ok = (ce >= 0 && pl >= 0 && ce_fl == -EBADF && pl_fl >= 0);
+    cng_dprintf(1, "cloexec: cloexec_closed=%d plain_open=%d -> %s\n",
+                ce_fl == -EBADF, pl_fl >= 0, ok ? "OK" : "FAIL");
+    if (pl >= 0)
+        sys_close((int)pl);
+    int fails = !ok;
+
+    /* The same pass with no /proc/self/fd to read. The pass opens that
+     * directory, and a descriptor table that is full refuses it — EMFILE, from
+     * exactly the program with the most descriptors to lose, and the launcher
+     * waiting on one of them. It used to return quietly then, and every
+     * close-on-exec descriptor survived the exec. Reproduced the way it
+     * happens: the soft limit is brought down to the table's current top,
+     * /dev/null is opened until EMFILE, and the pass is run — the CLOEXEC ones
+     * (one below the fill, one at the very top of it) have to go and the plain
+     * ones have to stay, exactly as before. The limit is restored afterwards. */
+    struct cng_rlimit save, low;
+    int fb_ce_gone = -1, fb_top_gone = -1, fb_pl_kept = -1, fb_full = 0;
+    if (sys_prlimit64(0, CNG_RLIMIT_NOFILE, 0, &save) == 0) {
+        long ce2 = sys_openat(CNG_AT_FDCWD, "/dev/null",
+                              CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        long pl2 = sys_openat(CNG_AT_FDCWD, "/dev/null", CNG_O_RDONLY, 0);
+        low.cur = (unsigned long)(pl2 > ce2 ? pl2 : ce2) + 8;
+        low.max = save.max;
+        int fill[8];
+        int nfill = 0;
+        long top = -1;
+        if (ce2 >= 0 && pl2 >= 0 && sys_prlimit64(0, CNG_RLIMIT_NOFILE, &low, 0) == 0) {
+            for (;;) {
+                long f = sys_openat(CNG_AT_FDCWD, "/dev/null",
+                                    CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+                if (f < 0) {
+                    fb_full = f == -EMFILE;
+                    break;
+                }
+                if (nfill < 8)
+                    fill[nfill++] = (int)f;
+                top = f;
+            }
+            long chk = sys_openat(CNG_AT_FDCWD, "/proc/self/fd",
+                                  CNG_O_RDONLY | CNG_O_DIRECTORY, 0);
+            if (chk >= 0) { /* the table was not full after all: no test */
+                sys_close((int)chk);
+                fb_full = 0;
+            }
+            if (fb_full) {
+                cng_close_cloexec();
+                fb_ce_gone = CNG_SYS(__NR_fcntl, (int)ce2, 1, 0, 0, 0, 0) ==
+                             -EBADF;
+                fb_top_gone = CNG_SYS(__NR_fcntl, (int)top, 1, 0, 0, 0, 0) ==
+                              -EBADF;
+                fb_pl_kept = CNG_SYS(__NR_fcntl, (int)pl2, 1, 0, 0, 0, 0) >= 0;
+            }
+            sys_prlimit64(0, CNG_RLIMIT_NOFILE, &save, 0);
+        }
+        for (int i = 0; i < nfill; i++)
+            sys_close(fill[i]);
+        if (ce2 >= 0)
+            sys_close((int)ce2);
+        if (pl2 >= 0)
+            sys_close((int)pl2);
+    }
+    int fb_ok = fb_full && fb_ce_gone == 1 && fb_top_gone == 1 &&
+                fb_pl_kept == 1;
+    cng_dprintf(1,
+                "cloexec no-proc: table_full=%d cloexec_closed=%d top_closed=%d"
+                " plain_open=%d -> %s\n",
+                fb_full, fb_ce_gone, fb_top_gone, fb_pl_kept,
+                fb_ok ? "OK" : "FAIL");
+    fails += !fb_ok;
+    return fails ? 1 : 0;
+}
+
+/* _stackswtest — validate the handler's stack switch (cng_run_on_stack): the
+ * callee must run on the scratch stack, its result must propagate, and the
+ * caller's stack must be intact afterward. */
+extern long cng_run_on_stack(void *newsp, void *fn, void *a0, void *a1);
+
+static long sp_probe(void *lo, void *hi) {
+    unsigned long sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    /* return 1 iff we are running on the [lo,hi] scratch region */
+    return (sp > (unsigned long)lo && sp <= (unsigned long)hi) ? 0xC0DE : sp;
+}
+
+static void lz_perms(unsigned long addr, char perm[5]);
+
+int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long marker = 0xA5A5A5A5;
+    void *base = sys_mmap(0, 256 * 1024, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    int mapped = !(base == CNG_MAP_FAILED || cng_is_err((long)base));
+    unsigned long top = mapped ? (((unsigned long)base + 256 * 1024) & ~15UL) : 0;
+    long r = mapped ? cng_run_on_stack((void *)top, (void *)sp_probe, base,
+                                       (void *)top)
+                    : -1;
+    /* If SP was corrupted by the switch, `marker` on our frame would be clobbered
+     * and subsequent use would crash; check it survived. */
+    int ok = (mapped && r == 0xC0DE && marker == 0xA5A5A5A5);
+    cng_dprintf(1, "stacksw: ran_on_scratch=%d ret=0x%lx caller_ok=%d -> %s\n",
+                r == 0xC0DE, (unsigned long)r, marker == 0xA5A5A5A5,
+                ok ? "OK" : "FAIL");
+    int fails = !ok;
+
+    /* The table those stacks come out of is keyed by TID, and a TID that has
+     * exited is not coming back for its slot. A runtime that spawns short-lived
+     * threads gets through hundreds, and once every slot was spoken for the
+     * dispatcher ran on the guest's own stack instead — where its frame is
+     * bigger than a guard page, so it walks over the guard into guest memory
+     * without faulting. Fill the table with TIDs that are not threads of this
+     * process and check a live one is still served; then check the one live
+     * entry that IS ours was never the slot taken.
+     *
+     * The TIDs are past pid_max on any kernel, so nothing can collide with a
+     * real one and every one of them reads as exited. */
+    {
+        long mine = sys_gettid();
+        unsigned long hi_mine = 0, hi_new = 0;
+        int slot_mine = cng_scratch_slot_for(mine, &hi_mine);
+        int filled = 0, mapped_all = 1;
+#define CNG_SCR_TEST_N 300 /* more than the table holds, so it must recover */
+        for (long t = 0x40000000L; t < 0x40000000L + CNG_SCR_TEST_N; t++) {
+            unsigned long hi = 0;
+            if (cng_scratch_slot_for(t, &hi) < 0)
+                break;
+            filled++;
+            mapped_all &= (hi != 0);
+        }
+        /* One more, with the table now full of exited TIDs. */
+        int slot_new = cng_scratch_slot_for(0x50000000L, &hi_new);
+        int again = cng_scratch_slot_for(mine, &hi_mine);
+        int gok = slot_mine >= 0 && filled == CNG_SCR_TEST_N && mapped_all &&
+                  slot_new >= 0 && hi_new != 0 && again == slot_mine;
+        cng_dprintf(1,
+                    "stacksw reclaim: filled=%d/%d then=%d mapped=%d "
+                    "mine_kept=%d -> %s\n",
+                    filled, CNG_SCR_TEST_N, slot_new, hi_new != 0,
+                    slot_mine >= 0 && again == slot_mine, gok ? "OK" : "FAIL");
+        fails += !gok;
+    }
+
+    /* The stack is a VMA of its own: an inaccessible page on each side, so no
+     * read-write neighbour of the guest's can ever be merged with it. A VMA
+     * that held our stack pointer made every mprotect(PROT_EXEC) on any page
+     * of it an attempt to make a stack executable, which SELinux refuses an
+     * Android app (the JVM's startup probe, issued from the handler). The
+     * permissions of the page on either side of each end are what the merge
+     * rule reads, so they are what is asserted. */
+    {
+        unsigned long hi = 0;
+        int s = cng_scratch_slot_for(sys_gettid(), &hi);
+        unsigned long lo = hi - 256 * 1024;
+        char below[5] = "", first[5] = "", last[5] = "", above[5] = "";
+        if (s >= 0 && hi) {
+            lz_perms(lo - 1, below);
+            lz_perms(lo, first);
+            lz_perms(hi - 1, last);
+            lz_perms(hi, above);
+        }
+        int bok = s >= 0 && hi && !strcmp(below, "---p") &&
+                  !strcmp(first, "rw-p") && !strcmp(last, "rw-p") &&
+                  !strcmp(above, "---p");
+        cng_dprintf(1,
+                    "stacksw guards: below=%s first=%s last=%s above=%s -> %s\n",
+                    below, first, last, above, bok ? "OK" : "FAIL");
+        fails += !bok;
+    }
+    return fails ? 1 : 0;
+}
+
+/* _sigsystest — the guest's view of SIGSYS, whose real disposition is the
+ * monitor's for the life of the process.
+ *
+ * rt_sigaction(SIGSYS) is answered from ptsig.c's mirror with the kernel's own
+ * argument checks — it used to be a bare 0: sigsetsize unchecked, a bad
+ * pointer never EFAULT, and a query that never showed the handler the guest had
+ * just installed — and the real handler must be untouched by any of it. A
+ * SIGSYS that is not a seccomp trap (tgkill here) then goes to that mirrored
+ * disposition, where it used to be consumed by our handler and nothing
+ * happened: the default action kills the process (core-dump class, so the
+ * parent sees WIFSIGNALED with SIGSYS — and the same wait status a plain
+ * SIG_DFL death gets on this host, which a sibling child measures, since the
+ * core-dumped bit in it is host policy), SIG_IGN drops it, a handler runs with
+ * the guest's siginfo, under sa_mask (SIGSYS itself is the one bit that cannot
+ * be added: a masked seccomp SIGSYS force-kills), and SA_RESETHAND puts the
+ * default back before the handler runs, so the second one kills. Each delivery
+ * runs in a child, since two of the four outcomes are the child's death. Every
+ * answer here is the host kernel's for the same calls on an unmonitored process
+ * (measured). */
+struct dbg_ksigaction {
+    void *handler;
+    unsigned long flags;
+    void *restorer;
+    unsigned long mask;
+};
+
+static volatile int *g_sst_page; /* MAP_SHARED: what a child's handler saw */
+
+static void sst_handler(int sig, cng_siginfo_t *si, void *uc) {
+    (void)uc;
+    unsigned long cur = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &cur, sizeof cur, 0, 0);
+    g_sst_page[0]++;
+    g_sst_page[1] = sig;
+    g_sst_page[2] = si->si_code;
+    g_sst_page[3] = (cur & (1UL << (CNG_SIGUSR1 - 1))) != 0; /* sa_mask applied */
+    g_sst_page[4] = (cur & (1UL << (CNG_SIGSYS - 1))) != 0;  /* never blocked */
+}
+
+static long sst_sigaction(int sig, const struct dbg_ksigaction *a,
+                          struct dbg_ksigaction *o, long sz) {
+    return cng_dispatch(__NR_rt_sigaction, sig, (long)a, (long)o, sz, 0, 0, 1);
+}
+
+/* Run `fn` in a child with the SIGSYS handler installed; returns the wait
+ * status, or -1. */
+static int sst_child(void (*fn)(void)) {
+    long kid = sys_fork();
+    if (kid == 0) {
+        fn();
+        sys_exit_group(99);
+    }
+    if (kid < 0)
+        return -1;
+    int st = -1;
+    sys_wait4((int)kid, &st, 0, 0);
+    return st;
+}
+
+static void sst_raise(void) {
+    CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSYS, 0, 0, 0);
+}
+static void sst_dfl(void) { sst_raise(); }
+/* The host's own answer for the default action: the real disposition put back
+ * to SIG_DFL, then the same tgkill. Death by SIGSYS is a core-dump class exit,
+ * and whether a core is actually written — which the wait status reports in
+ * its 0x80 bit — is the host's policy, not ours: a pipe core_pattern (Ubuntu's
+ * apport, as on a hosted CI runner) dumps with RLIMIT_CORE at 0 and answers
+ * 0x9f where a `core` file pattern under the same limit answers 0x1f. The
+ * emulated default action is a re-raise under SIG_DFL, so it must come out
+ * bit for bit as this does. */
+static void sst_kernel_dfl(void) {
+    struct dbg_ksigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    CNG_SYS(__NR_rt_sigaction, CNG_SIGSYS, &dfl, 0, 8, 0, 0);
+    sst_raise();
+}
+static void sst_ign(void) {
+    struct dbg_ksigaction a = {(void *)1, 0, 0, 0};
+    sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+    sst_raise();
+    sys_exit_group(42);
+}
+static void sst_handled(void) {
+    struct dbg_ksigaction a = {(void *)sst_handler, CNG_SA_SIGINFO, 0,
+                               1UL << (CNG_SIGUSR1 - 1)};
+    sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+    sst_raise();
+    /* back from the handler: the mask is the guest's own again */
+    unsigned long cur = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0, 0, &cur, sizeof cur, 0, 0);
+    g_sst_page[5] = (cur & (1UL << (CNG_SIGUSR1 - 1))) == 0;
+    sys_exit_group(43);
+}
+static void sst_resethand(void) {
+    struct dbg_ksigaction a = {(void *)sst_handler, CNG_SA_SIGINFO | CNG_SA_RESETHAND,
+                               0, 0};
+    sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+    sst_raise(); /* runs the handler, and resets */
+    struct dbg_ksigaction o;
+    memset(&o, 0xee, sizeof o);
+    sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+    g_sst_page[6] = o.handler == 0 && o.flags == 0; /* SIG_DFL now */
+    sst_raise(); /* kills */
+    sys_exit_group(44);
+}
+
+int cng_cmd_sigsystest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    if (cng_sigsys_install_only() < 0) {
+        cng_dprintf(1, "sigsys: setup failed -> FAIL\n");
+        return 1;
+    }
+    struct dbg_ksigaction real_before, real_after, o;
+    CNG_SYS(__NR_rt_sigaction, CNG_SIGSYS, 0, &real_before, 8, 0, 0);
+
+    /* 1) the sigaction answers, in the kernel's order: sigsetsize first (even
+     *    with bad pointers), then act's EFAULT, then oact's. */
+    {
+        struct dbg_ksigaction a = {(void *)1, 0, 0, 0};
+        long sz = sst_sigaction(CNG_SIGSYS, (void *)1, (void *)1, 4);
+        long ef_act = sst_sigaction(CNG_SIGSYS, (void *)1, 0, 8);
+        long ef_old = sst_sigaction(CNG_SIGSYS, 0, (void *)1, 8);
+        memset(&o, 0xee, sizeof o);
+        long q0 = sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int dfl0 = o.handler == 0 && o.flags == 0 && o.mask == 0;
+        long s1 = sst_sigaction(CNG_SIGSYS, &a, &o, 8); /* old = DFL */
+        int old_dfl = o.handler == 0;
+        memset(&o, 0xee, sizeof o);
+        long q1 = sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int ign1 = o.handler == (void *)1;
+        struct dbg_ksigaction h = {(void *)sst_handler,
+                                   CNG_SA_SIGINFO | CNG_SA_RESTART, 0, 0x55};
+        long s2 = sst_sigaction(CNG_SIGSYS, &h, &o, 8); /* old = IGN */
+        int old_ign = o.handler == (void *)1;
+        memset(&o, 0xee, sizeof o);
+        long q2 = sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int h2 = o.handler == (void *)sst_handler &&
+                 o.flags == (CNG_SA_SIGINFO | CNG_SA_RESTART) && o.mask == 0x55;
+        /* the real disposition is still ours, whatever the guest asked */
+        CNG_SYS(__NR_rt_sigaction, CNG_SIGSYS, 0, &real_after, 8, 0, 0);
+        int kept = real_after.handler == real_before.handler &&
+                   real_after.handler != (void *)sst_handler &&
+                   real_after.handler != 0;
+        int ok = sz == -EINVAL && ef_act == -EFAULT && ef_old == -EFAULT &&
+                 q0 == 0 && dfl0 && s1 == 0 && old_dfl && q1 == 0 && ign1 &&
+                 s2 == 0 && old_ign && q2 == 0 && h2 && kept;
+        cng_dprintf(1,
+                    "sigsys sigaction: size=%ld act=%ld oact=%ld dfl=%d "
+                    "ign=%d handler=%d real_kept=%d -> %s\n",
+                    sz, ef_act, ef_old, q0 == 0 && dfl0 && old_dfl,
+                    q1 == 0 && ign1 && old_ign, q2 == 0 && h2, kept,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) the exec reset: a handler goes back to default, SIG_IGN stays but
+     *    loses its flags and mask — flush_signal_handlers' rule. */
+    {
+        struct dbg_ksigaction a = {(void *)1, CNG_SA_RESTART, 0, 0x7};
+        sst_sigaction(CNG_SIGSYS, &a, 0, 8);
+        cng_pt_sig_exec_reset();
+        memset(&o, 0xee, sizeof o);
+        sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int ign_bare = o.handler == (void *)1 && o.flags == 0 && o.mask == 0;
+        struct dbg_ksigaction h = {(void *)sst_handler, CNG_SA_SIGINFO, 0, 0};
+        sst_sigaction(CNG_SIGSYS, &h, 0, 8);
+        cng_pt_sig_exec_reset();
+        memset(&o, 0xee, sizeof o);
+        sst_sigaction(CNG_SIGSYS, 0, &o, 8);
+        int dfl = o.handler == 0 && o.flags == 0 && o.mask == 0;
+        int ok = ign_bare && dfl;
+        cng_dprintf(1, "sigsys exec reset: ign_bare=%d handler_dfl=%d -> %s\n",
+                    ign_bare, dfl, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3) delivery of a tgkill'd SIGSYS, per disposition. */
+    g_sst_page = sys_mmap(0, 4096, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_SHARED | CNG_MAP_ANONYMOUS, -1, 0);
+    if (g_sst_page == CNG_MAP_FAILED || cng_is_err((long)g_sst_page)) {
+        cng_dprintf(1, "sigsys: no shared page -> FAIL\n");
+        return 1;
+    }
+    {
+        int ref = sst_child(sst_kernel_dfl);
+        int st = sst_child(sst_dfl);
+        int killed = st >= 0 && (st & 0x7f) == CNG_SIGSYS;
+        int as_kernel = st == ref;
+        cng_dprintf(1,
+                    "sigsys default action: killed_by_sigsys=%d as_kernel=%d "
+                    "(status=0x%x kernel=0x%x) -> %s\n",
+                    killed, as_kernel, st, ref,
+                    killed && as_kernel ? "OK" : "FAIL");
+        fails += !(killed && as_kernel);
+
+        st = sst_child(sst_ign);
+        int ignored = st >= 0 && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 42;
+        cng_dprintf(1, "sigsys ignored: status=0x%x survived=%d -> %s\n", st,
+                    ignored, ignored ? "OK" : "FAIL");
+        fails += !ignored;
+
+        memset((void *)g_sst_page, 0, 4096);
+        st = sst_child(sst_handled);
+        int ran = g_sst_page[0] == 1 && g_sst_page[1] == CNG_SIGSYS &&
+                  g_sst_page[2] == -6 /* SI_TKILL */ && g_sst_page[3] == 1 &&
+                  g_sst_page[4] == 0 && g_sst_page[5] == 1;
+        int ok = st >= 0 && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 43 && ran;
+        cng_dprintf(1,
+                    "sigsys handled: status=0x%x runs=%d sig=%d code=%d "
+                    "sa_mask=%d sigsys_unblocked=%d mask_back=%d -> %s\n",
+                    st, g_sst_page[0], g_sst_page[1], g_sst_page[2],
+                    g_sst_page[3], !g_sst_page[4], g_sst_page[5],
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        memset((void *)g_sst_page, 0, 4096);
+        st = sst_child(sst_resethand);
+        ok = st >= 0 && (st & 0x7f) == CNG_SIGSYS && st == ref &&
+             g_sst_page[0] == 1 && g_sst_page[6] == 1;
+        cng_dprintf(1,
+                    "sigsys resethand: runs=%d reset=%d second_kills=%d "
+                    "as_kernel=%d (status=0x%x) -> %s\n",
+                    g_sst_page[0], g_sst_page[6],
+                    st >= 0 && (st & 0x7f) == CNG_SIGSYS, st == ref, st,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    return fails ? 1 : 0;
+}
+
+/* _nesttest — a SIGSYS arriving while the handler already runs on the scratch
+ * stack must not land on the frame of the one that put it there.
+ *
+ * The kernel picks a frame's address with sigsp(): SA_ONSTACK and an SP that is
+ * not on the alt-stack means the alt-stack top. Having moved SP to the scratch
+ * stack, the handler satisfies that for a second time, so a nested SIGSYS — kept
+ * deliverable by SA_NODEFER, for the gate-net — was written at the same address
+ * as the outer frame. Measured on this host and under qemu with a plain C
+ * repro: delta from the outer frame, exactly 0.
+ *
+ * It runs in a child, because the failure mode is not a wrong answer. The outer
+ * frame becomes the nested one, so the sigreturn that reads it resumes a context
+ * from inside our own re-issue, and the handler re-enters itself for ever with
+ * every signal but SIGSYS masked — not even SIGTERM ends it. So: bounded wait,
+ * then SIGKILL. */
+#define NEST_ALT_SZ (64 * 1024)
+
+int cng_cmd_nesttest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+
+    void *alt = sys_mmap(0, NEST_ALT_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
+                         CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (alt == CNG_MAP_FAILED || cng_is_err((long)alt)) {
+        cng_dprintf(1, "nest: no alt stack -> FAIL\n");
+        return 1;
+    }
+    /* Without a registered alt-stack there is nowhere for two frames to
+     * collide — this is the guest that has one: Go, a JVM, anything that wants
+     * to survive its own stack overflow. */
+    cng_stack_t ss = {alt, 0, NEST_ALT_SZ};
+    if (CNG_SYS(__NR_sigaltstack, (long)&ss, 0, 0, 0, 0, 0) != 0 ||
+        cng_sigsys_install_only() < 0) {
+        cng_dprintf(1, "nest: setup failed -> FAIL\n");
+        return 1;
+    }
+
+    long kid = sys_fork();
+    if (kid == 0) {
+        cng_g_sigsys_nest = 1;
+        /* A seccomp-looking SIGSYS, not a tgkill'd one: a guest-directed SIGSYS
+         * is now delivered to the guest's disposition before the handler
+         * switches stacks, and the stack switch is the thing under test. */
+        cng_sigsys_fabricate();
+        /* Reaching this line at all means the outer frame was still the outer
+         * frame when its sigreturn read it. */
+        unsigned long o = cng_g_sigsys_frame[0], n = cng_g_sigsys_frame[1];
+        unsigned long lo = (unsigned long)alt, hi = lo + NEST_ALT_SZ;
+        int ok = o && n && n != o && !(n >= lo && n < hi);
+        cng_dprintf(1, "nest: outer=%s nested=%s same=%d -> %s\n",
+                    o >= lo && o < hi ? "altstack" : "elsewhere",
+                    n >= lo && n < hi ? "altstack" : "elsewhere", n == o,
+                    ok ? "OK" : "FAIL");
+        sys_exit_group(ok ? 0 : 1);
+    }
+    if (kid < 0) {
+        cng_dprintf(1, "nest: fork failed -> FAIL\n");
+        return 1;
+    }
+    int st = 0;
+    long r = 0;
+    for (int i = 0; i < 300; i++) { /* ~3s, then it is not coming back */
+        r = sys_wait4((int)kid, &st, 1 /*WNOHANG*/, 0);
+        if (r == kid)
+            break;
+        struct cng_timespec nap = {0, 10 * 1000 * 1000};
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+    }
+    if (r != kid) {
+        CNG_SYS(__NR_tgkill, kid, kid, 9 /*SIGKILL*/, 0, 0, 0);
+        sys_wait4((int)kid, &st, 0, 0);
+        cng_dprintf(1, "nest: the handler never came back -> FAIL\n");
+        return 1;
+    }
+    int ok = (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+    cng_dprintf(1, "nest: child status %d -> %s\n", st, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* _argvtest — building a guest stack must not cost the *caller's* stack in
+ * proportion to argc.
+ *
+ * The emulated execve runs on the SIGSYS handler's 256 KiB scratch stack, while
+ * accepting a quarter of RLIMIT_STACK worth of arguments — megabytes. The
+ * address of each pushed argv string used to be collected in a VLA, so an exec
+ * the kernel takes without complaint (`rm *` in a directory of fifty thousand
+ * files) overflowed the handler's stack; inside the handler, where every signal
+ * but SIGSYS is masked, that is the death of the guest rather than a fault.
+ *
+ * So build one on a stack of exactly that size and check the vector that comes
+ * back. Before the fix this does not print at all: it dies on the switch. */
+#define ARGVTEST_N 50000
+
+static struct cng_loaded argvtest_prog;
+static char **argvtest_argv;
+static char *argvtest_env[2] = {(char *)"ARGVTEST=1", 0};
+
+static long argvtest_body(void *a0, void *a1) {
+    (void)a0;
+    (void)a1;
+    return (long)cng_build_stack(ARGVTEST_N, argvtest_argv, argvtest_env, 0,
+                                 &argvtest_prog, 0, "argvtest");
+}
+
+int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long vsz = cng_page_up((ARGVTEST_N + 1) * sizeof(char *));
+    argvtest_argv = sys_mmap(0, vsz, CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    void *base = sys_mmap(0, 256 * 1024, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (cng_is_err((long)argvtest_argv) || cng_is_err((long)base)) {
+        cng_dprintf(1, "argv: mmap failed -> FAIL\n");
+        return 1;
+    }
+    for (int i = 0; i < ARGVTEST_N; i++)
+        argvtest_argv[i] = (char *)"arg";
+    argvtest_argv[ARGVTEST_N] = 0;
+
+    unsigned long top = ((unsigned long)base + 256 * 1024) & ~15UL;
+    unsigned long marker = 0xA5A5A5A5;
+    long sp = cng_run_on_stack((void *)top, (void *)argvtest_body, 0, 0);
+
+    unsigned long *w = (unsigned long *)sp;
+    int shape = sp > 0 && (sp & 15) == 0 && w[0] == ARGVTEST_N &&
+                w[ARGVTEST_N + 1] == 0;
+    /* Every slot really points at its own copy of the string, so a vector that
+     * was written short (or over its own end) does not read as intact. */
+    int strings = shape;
+    for (int i = 1; strings && i <= ARGVTEST_N; i++)
+        strings = w[i] && !strcmp((const char *)w[i], "arg");
+    int env_ok = shape && w[ARGVTEST_N + 2] &&
+                 !strcmp((const char *)w[ARGVTEST_N + 2], "ARGVTEST=1");
+    int ok = shape && strings && env_ok && marker == 0xA5A5A5A5;
+    cng_dprintf(1, "argv: n=%d shape=%d strings=%d env=%d caller_ok=%d -> %s\n",
+                ARGVTEST_N, shape, strings, env_ok, marker == 0xA5A5A5A5,
+                ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* _stackguardtest — the guest stack has a guard under it.
+ *
+ * A real main stack has stack_guard_gap (256 pages) of nothing beneath it and
+ * faults when it grows into that; the stack cng_build_stack maps was one RW
+ * region with whatever the kernel had placed below, so a recursion that ran off
+ * its end wrote into the next mapping down — a library, a scratch stack of ours
+ * — and kept going. Now the lowest 256 pages of the region are PROT_NONE.
+ *
+ * Checked from a child, since the check is a fault: a store one word below the
+ * usable bottom must die with SIGSEGV, a store at the usable bottom must not
+ * (the argv address scratch lives there while the stack is built, so it has to
+ * be writable), the sp handed back must lie above both, and the extent that
+ * the exec reclaim is told covers the guard as well as the stack. */
+static int stackguard_child(unsigned long addr) {
+    *(volatile unsigned long *)addr = 0x600d;
+    return 0;
+}
+
+static int stackguard_probe(unsigned long addr) {
+    long p = sys_fork();
+    if (p == 0)
+        sys_exit_group(stackguard_child(addr));
+    if (p < 0)
+        return -1;
+    int st = 0;
+    sys_wait4((int)p, &st, 0, 0);
+    if ((st & 0x7f) == 11) /* SIGSEGV */
+        return 1;
+    if ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0)
+        return 0;
+    return -1;
+}
+
+int cng_cmd_stackguardtest(int argc, char **argv, char **envp,
+                           unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_loaded prog;
+    char *av[2] = {(char *)"guard", 0};
+    char *ev[1] = {0};
+    unsigned long sp = cng_build_stack(1, av, ev, 0, &prog, 0, "guard");
+    unsigned long guard = 256 * cng_page_size;
+    unsigned long lo = cng_g_stack_lo, len = cng_g_stack_len;
+    int extent = sp && lo && len == CNG_GUEST_STACK_SIZE + guard;
+    int sp_in = extent && sp > lo + guard && sp < lo + len;
+    int below = extent ? stackguard_probe(lo + guard - sizeof(long)) : -1;
+    int bottom = extent ? stackguard_probe(lo + guard) : -1;
+    int deep = extent ? stackguard_probe(lo) : -1; /* the guard's own bottom */
+    int ok = extent && sp_in && below == 1 && bottom == 0 && deep == 1;
+    cng_dprintf(1,
+                "stackguard: extent=%d sp_in=%d below_faults=%d bottom_writes=%d"
+                " guard_base_faults=%d -> %s\n",
+                extent, sp_in, below, bottom == 0, deep, ok ? "OK" : "FAIL");
+    if (lo && len)
+        sys_munmap((void *)lo, len);
+    return ok ? 0 : 1;
+}
+
+/* _execmaptest — the mmap hook's anonymous copy, past the end of the file.
+ *
+ * A file mapping longer than its file answers a fault on any page wholly past
+ * EOF with SIGBUS (the kernel checks i_size at fault time, page by page) and
+ * reads the partial last page as zeroes past the end. The copy cng_execmap
+ * makes pread what the file had and left the rest zero, so a truncated object
+ * read on where the kernel's mapping would have died. Differential: the same
+ * three-page mapping of a one-and-a-bit-page file, once from the hook (forced
+ * onto the anonymous route) and once as the kernel's own PROT_READ mapping,
+ * probed page by page from a child — the signal, or none, must agree; and a
+ * mapping that begins past EOF, which is the tail entire. */
+static int execmap_probe(unsigned long addr) {
+    long p = sys_fork();
+    if (p == 0) {
+        volatile unsigned char *b = (volatile unsigned char *)addr;
+        sys_exit_group(b[0] == 0x5a ? 1 : 2);
+    }
+    if (p < 0)
+        return -1;
+    int st = 0;
+    sys_wait4((int)p, &st, 0, 0);
+    if (st & 0x7f)
+        return 100 + (st & 0x7f); /* 107 SIGBUS, 111 SIGSEGV */
+    return (st >> 8) & 0xff;      /* 1: the marker, 2: something else */
+}
+
+int cng_cmd_execmaptest(int argc, char **argv, char **envp,
+                        unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long pg = cng_page_size;
+    long fd = sys_memfd_create("cng-execmap-eof", 0);
+    if (fd < 0) {
+        cng_dprintf(1, "execmap: memfd_create errno=%d -> SKIP\n", (int)-fd);
+        return 0;
+    }
+    /* One page and 100 bytes of 0x5a. */
+    unsigned char buf[256];
+    memset(buf, 0x5a, sizeof buf);
+    for (unsigned long w = 0; w < pg + 100;) {
+        unsigned long n = pg + 100 - w;
+        if (n > sizeof buf)
+            n = sizeof buf;
+        if (sys_write((int)fd, buf, n) != (long)n) {
+            cng_dprintf(1, "execmap: write failed -> FAIL\n");
+            return 1;
+        }
+        w += n;
+    }
+
+    cng_g_execmap_force = 1;
+    long ours = cng_execmap(0, 3 * pg, CNG_PROT_READ | CNG_PROT_EXEC,
+                            CNG_MAP_PRIVATE, fd, 0);
+    long tail = cng_execmap(0, pg, CNG_PROT_READ | CNG_PROT_EXEC,
+                            CNG_MAP_PRIVATE, fd, 4 * pg);
+    cng_g_execmap_force = 0;
+    void *ref = sys_mmap(0, 3 * pg, CNG_PROT_READ, CNG_MAP_PRIVATE, (int)fd, 0);
+    void *rtail = sys_mmap(0, pg, CNG_PROT_READ, CNG_MAP_PRIVATE, (int)fd,
+                           (long)(4 * pg));
+    int fails = 0;
+    if (cng_is_err(ours) || cng_is_err(tail) || cng_is_err((long)ref) ||
+        cng_is_err((long)rtail)) {
+        cng_dprintf(1, "execmap: mapping failed (ours=%ld tail=%ld ref=%ld"
+                       " rtail=%ld) -> FAIL\n",
+                    ours, tail, (long)ref, (long)rtail);
+        return 1;
+    }
+    /* Page 0: the marker. Page 1: the marker up to byte 100, then zeroes
+     * (the partial page). Page 2: wholly past EOF. Then the tail mapping. */
+    struct {
+        const char *what;
+        unsigned long o, r;
+    } legs[] = {
+        {"page0", (unsigned long)ours, (unsigned long)ref},
+        {"page1-head", (unsigned long)ours + pg + 50, (unsigned long)ref + pg + 50},
+        {"page1-zeroes", (unsigned long)ours + pg + 200,
+         (unsigned long)ref + pg + 200},
+        {"page2-past-eof", (unsigned long)ours + 2 * pg,
+         (unsigned long)ref + 2 * pg},
+        {"whole-mapping-past-eof", (unsigned long)tail, (unsigned long)rtail},
+    };
+    for (unsigned i = 0; i < sizeof legs / sizeof legs[0]; i++) {
+        int o = execmap_probe(legs[i].o), r = execmap_probe(legs[i].r);
+        int ok = o == r;
+        cng_dprintf(1, "execmap %s: ours=%d kernel=%d -> %s\n", legs[i].what, o,
+                    r, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* ...and the kernel's answer for the pages past EOF really is SIGBUS, so
+     * an agreement above is not two mappings that both merely died. */
+    int sb = execmap_probe((unsigned long)ref + 2 * pg) == 107;
+    cng_dprintf(1, "execmap kernel past-eof is SIGBUS: %d -> %s\n", sb,
+                sb ? "OK" : "FAIL");
+    fails += !sb;
+    sys_munmap((void *)ours, 3 * pg);
+    sys_munmap((void *)tail, pg);
+    sys_munmap(ref, 3 * pg);
+    sys_munmap(rtail, pg);
+    sys_close((int)fd);
+    cng_dprintf(1, "execmap: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _elfspan — a PT_LOAD whose file part reaches past its memory part, and the
+ * well-formed object it has to be told apart from.
+ *
+ * "p_filesz must always be <= p_memsz", says fs/binfmt_elf.c, and it refuses a
+ * header claiming otherwise with -EINVAL (measured on the host: the exec fails
+ * and takes the caller with it, the kernel being past its own point of no
+ * return). Here it was accepted, and everything lands in one reservation: sized
+ * from p_memsz alone the pread ran off the end of it — -EFAULT partway through
+ * and a short read (CNG_LOAD_EIO), or, with something mapped after, no error at
+ * all and that mapping quietly overwritten — and sized from the larger of the
+ * two it stayed inside, but the protections cover the p_memsz range, so the
+ * bytes past it kept the reserve's read-write instead of the segment's own.
+ * Refused in the pass that maps nothing now, which is the answer the kernel
+ * gives without being able to leave a caller alive to hear it.
+ *
+ * Both objects are built here — one PT_LOAD and 128 KiB of file, behind a 4 KiB
+ * memory image and behind one that covers it — because the malformed one is a
+ * header no toolchain emits, and the well-formed one is what says the refusal
+ * is the geometry and not the size: it must still load, with its last byte in
+ * place, which is the reserve covering every byte written into it.
+ *
+ * A memfd rather than a path: the object never has to exist in a rootfs, and
+ * the fd form is the one the emulated execve uses for /proc/self/fd targets. */
+#define ELFSPAN_FILESZ 0x20000u
+#define ELFSPAN_MEMSZ  0x1000u
+#define ELFSPAN_MARK   0x5Au
+
+/* A memfd holding a minimal, well-formed AArch64 ELF64 with one PT_LOAD whose
+ * geometry the caller dictates — the only way to hand the loader a header no
+ * toolchain emits. `flags` is p_flags; PF_X is left to the caller because an
+ * executable segment pulls the -R trampoline pool in behind the span. Returns
+ * the fd (positioned past the header, for a caller that wants to pad it out)
+ * or a negative errno. */
+#define SYNTH_ELF_NSEG  4
+#define SYNTH_ELF_HDRSZ (64 + SYNTH_ELF_NSEG * 56) /* Ehdr + the phdr table */
+
+struct synth_seg {
+    unsigned long vaddr, filesz, memsz;
+    unsigned flags;         /* p_flags; PF_X is the caller's call, see below */
+    unsigned long offset;   /* p_offset; last, so the callers that want 0
+                             * (all but the page-offset leg) say nothing */
+};
+
+static long synth_elf_memfd(unsigned short type, const struct synth_seg *segs,
+                            int nseg) {
+    if (nseg < 1 || nseg > SYNTH_ELF_NSEG)
+        return -EINVAL;
+    long fd = sys_memfd_create("cng-synth-elf", 0);
+    if (fd < 0)
+        return fd;
+    unsigned char hdr[SYNTH_ELF_HDRSZ];
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 0x7f;
+    hdr[1] = 'E';
+    hdr[2] = 'L';
+    hdr[3] = 'F';
+    hdr[4] = 2; /* ELFCLASS64 */
+    hdr[5] = 1; /* ELFDATA2LSB */
+    hdr[6] = 1; /* EV_CURRENT */
+    *(unsigned short *)(hdr + 16) = type;
+    *(unsigned short *)(hdr + 18) = 183; /* e_machine = EM_AARCH64 */
+    *(unsigned *)(hdr + 20) = 1;         /* e_version */
+    *(unsigned long *)(hdr + 32) = 0x40; /* e_phoff */
+    *(unsigned short *)(hdr + 52) = 64;  /* e_ehsize */
+    *(unsigned short *)(hdr + 54) = 56;  /* e_phentsize */
+    *(unsigned short *)(hdr + 56) = (unsigned short)nseg; /* e_phnum */
+    for (int i = 0; i < nseg; i++) {
+        unsigned char *p = hdr + 0x40 + (size_t)i * 56;
+        *(unsigned *)(p + 0) = 1;              /* p_type = PT_LOAD */
+        *(unsigned *)(p + 4) = segs[i].flags;  /* p_flags */
+        *(unsigned long *)(p + 8) = segs[i].offset;
+        *(unsigned long *)(p + 16) = segs[i].vaddr;
+        *(unsigned long *)(p + 24) = segs[i].vaddr;
+        *(unsigned long *)(p + 32) = segs[i].filesz;
+        *(unsigned long *)(p + 40) = segs[i].memsz;
+        *(unsigned long *)(p + 48) = 0x1000;   /* p_align */
+    }
+    if (cng_write_all((int)fd, hdr, sizeof hdr) != (long)sizeof hdr) {
+        sys_close((int)fd);
+        return -EIO;
+    }
+    return fd;
+}
+
+/* One PT_LOAD at p_offset `offset` (0 or SYNTH_ELF_HDRSZ, so the arithmetic
+ * below is one expression), ELFSPAN_FILESZ of file behind `memsz` of memory,
+ * the file padded out behind it and ending in a byte the caller can look for
+ * once it is in memory. `flags` is p_flags: PF_R|PF_W for every span leg,
+ * never PF_X — an executable segment would draw the -R trampoline pool in
+ * after the span and hide an overrun. The execmem leg needs PF_X for the
+ * opposite reason: only an executable segment asks for the mprotect that a
+ * host denying anonymous exec memory refuses. Returns the fd or -errno. */
+static long elfspan_memfd_f(unsigned long memsz, unsigned long offset,
+                            unsigned flags) {
+    struct synth_seg one = {0, ELFSPAN_FILESZ, memsz, flags, offset};
+    long fd = synth_elf_memfd(3 /*ET_DYN*/, &one, 1);
+    if (fd < 0)
+        return fd;
+    static unsigned char pad[4096];
+    memset(pad, 0, sizeof pad);
+    unsigned long left = offset + ELFSPAN_FILESZ - SYNTH_ELF_HDRSZ;
+    while (left) {
+        unsigned long k = left > sizeof pad ? sizeof pad : left;
+        if (k == left)
+            pad[k - 1] = ELFSPAN_MARK;
+        if (cng_write_all((int)fd, pad, k) != (long)k) {
+            sys_close((int)fd);
+            return -EIO;
+        }
+        left -= k;
+    }
+    return fd;
+}
+
+static long elfspan_memfd(unsigned long memsz, unsigned long offset) {
+    return elfspan_memfd_f(memsz, offset, 6 /*PF_R|PF_W*/);
+}
+
+int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    long fd = elfspan_memfd(ELFSPAN_MEMSZ, 0);
+    if (fd < 0) {
+        cng_dprintf(1, "elfspan: build errno=%d -> SKIP\n", (int)-fd);
+        return 0;
+    }
+    struct cng_loaded prog;
+    int over = cng_load_elf_fd((int)fd, 0, &prog);
+    sys_close((int)fd);
+
+    /* The same file behind a memory image that covers it: this one loads, and
+     * its last byte is in place. */
+    fd = elfspan_memfd(ELFSPAN_FILESZ, 0);
+    int rc = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &prog);
+    if (fd >= 0)
+        sys_close((int)fd);
+    int tail = 0;
+    if (rc == CNG_LOAD_OK)
+        tail = *(unsigned char *)(prog.base + ELFSPAN_FILESZ - 1) ==
+               ELFSPAN_MARK;
+    int ok = over == CNG_LOAD_EINVAL && rc == CNG_LOAD_OK && tail;
+    cng_dprintf(1, "elfspan: over=%d rc=%d tail=%d -> %s\n", over, rc, tail,
+                ok ? "OK" : "FAIL");
+
+    /* The other malformed geometry, and the one the two strategies answer
+     * differently on purpose: a p_offset that does not share the page offset of
+     * its p_vaddr. mmap can only put a page-aligned file offset at a
+     * page-aligned address, so there is no such mapping to make and the
+     * file-backed strategy has to refuse — where it used to round p_offset down
+     * and map the wrong bytes at the right address, silently, leaving the guest
+     * running whatever was there. The anonymous strategy preads at any offset
+     * and does not care, which is exactly what runs a 4 KiB-aligned binary on a
+     * 16 KiB kernel, so it must still load and be right byte for byte. Both
+     * halves are asserted, since either one alone would pass by doing nothing.
+     *
+     * cng_g_loader_file is what picks the strategy, so it is forced for the
+     * first half and put back afterwards. */
+    int save_file = cng_g_loader_file;
+    fd = elfspan_memfd(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ);
+    cng_g_loader_file = 1;
+    int skew_file = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &prog);
+    cng_g_loader_file = save_file;
+    if (fd >= 0)
+        sys_close((int)fd);
+
+    fd = elfspan_memfd(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ);
+    int skew_anon = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &prog);
+    if (fd >= 0)
+        sys_close((int)fd);
+    int skew_tail = skew_anon == CNG_LOAD_OK &&
+                    *(unsigned char *)(prog.base + ELFSPAN_FILESZ - 1) ==
+                        ELFSPAN_MARK;
+    int sok = skew_file == CNG_LOAD_EINVAL && skew_anon == CNG_LOAD_OK &&
+              skew_tail;
+    cng_dprintf(1, "elfspan pgoff: file=%d anon=%d tail=%d -> %s\n", skew_file,
+                skew_anon, skew_tail, sok ? "OK" : "FAIL");
+    ok = ok && sok;
+
+    /* The same object, planned while the anonymous strategy is in force — so
+     * the header pass records the geometry rather than refusing it — and
+     * mapped once the file-backed one is. That is the ordering map_anon's
+     * EEXEC fall back creates (it picks the strategy after the header pass has
+     * run), and the one another thread's load creates by flipping the flag in
+     * between. The map pass has to answer with the header's own verdict,
+     * before it maps anything: CNG_LOAD_EINVAL, an object no strategy can
+     * carry, and not the CNG_LOAD_EMAP of a mapping that was attempted and
+     * failed — which past an execve's point of no return is the difference
+     * between an errno and a fatal signal. */
+    int save_late = cng_g_loader_file;
+    cng_g_loader_file = 0;
+    fd = elfspan_memfd(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ);
+    struct cng_elf_plan lplan;
+    struct cng_loaded lout;
+    int lp = fd < 0 ? (int)fd : cng_elf_plan_fd((int)fd, &lplan, &lout);
+    int lfok = lp == CNG_LOAD_OK ? lplan.file_ok : -1;
+    cng_g_loader_file = 1; /* the fall back's own flip, before the map pass */
+    int lmap = lp == CNG_LOAD_OK ? cng_elf_map(&lplan, 0, &lout) : lp;
+    cng_g_loader_file = save_late;
+    if (lp == CNG_LOAD_OK)
+        cng_elf_plan_release(&lplan); /* borrowed fd: closed below */
+    if (fd >= 0)
+        sys_close((int)fd);
+    int lok = lp == CNG_LOAD_OK && lfok == 0 && lmap == CNG_LOAD_EINVAL;
+    cng_dprintf(1, "elfspan pgoff-late: plan=%d file_ok=%d map=%d -> %s\n", lp,
+                lfok, lmap, lok ? "OK" : "FAIL");
+    ok = ok && lok;
+
+    /* ...and the same arithmetic one step out. What gets reserved is the span
+     * plus, under -R, a trampoline pool on top of it, and that sum is a mapping
+     * length: a span within a pool's distance of the top of the address space
+     * wraps it. The mmap then succeeds at a few pages while the load writes at
+     * bias + p_vaddr and the rewriter at seg + span — both far outside. Two
+     * PT_LOADs are all it takes, and each passes the per-segment wrap check on
+     * its own. Refused with -R off and on alike, since whether -R is running is
+     * not a property of the header (and with it on there is nothing left to
+     * report the failure with). */
+    struct synth_seg wrap[2] = {
+        {0, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/, 0},
+        {0xFFFFFFFFFFF80000UL, 0, 0x1000, 6 /*PF_R|PF_W*/, 0},
+    };
+    int wrc[2];
+    int saved = cng_g_rewrite;
+    for (int i = 0; i < 2; i++) {
+        cng_g_rewrite = i; /* the pool is only added when -R asked for one */
+        long wfd = synth_elf_memfd(3 /*ET_DYN*/, wrap, 2);
+        wrc[i] = wfd < 0 ? (int)wfd : cng_load_elf_fd((int)wfd, 0, &prog);
+        if (wfd >= 0)
+            sys_close((int)wfd);
+    }
+    cng_g_rewrite = saved;
+    int wok = wrc[0] == CNG_LOAD_EFORMAT && wrc[1] == CNG_LOAD_EFORMAT;
+    cng_dprintf(1, "elfspan wrap: plain=%d rewrite=%d -> %s\n", wrc[0], wrc[1],
+                wok ? "OK" : "FAIL");
+
+    /* ...and the end that does not wrap but rounds up to nothing. p_vaddr 0
+     * and p_memsz a page's worth short of 2^64 sum to an address within the
+     * last page, which cng_page_up turns into 0: the same 0 as the segment's
+     * start, so the old `e < s` let it through with a span of 0. Without -R
+     * that was an mmap of length 0 (EMAP); with it, the pool on top made a
+     * mapping that succeeded and the load was reported done — a pool's size
+     * of memory for a segment claiming the address space, with the file part
+     * read into it however long it was. One page short of 2^64 rounds to 0 on
+     * a 4, 16 or 64 KiB kernel alike. */
+    struct synth_seg rwrap = {0, SYNTH_ELF_HDRSZ, ~0UL - 0xFFE, 6 /*PF_R|PF_W*/,
+                              0};
+    int rrc[2];
+    for (int i = 0; i < 2; i++) {
+        cng_g_rewrite = i;
+        long rfd = synth_elf_memfd(3 /*ET_DYN*/, &rwrap, 1);
+        rrc[i] = rfd < 0 ? (int)rfd : cng_load_elf_fd((int)rfd, 0, &prog);
+        if (rfd >= 0)
+            sys_close((int)rfd);
+    }
+    cng_g_rewrite = saved;
+    int rok = rrc[0] == CNG_LOAD_EFORMAT && rrc[1] == CNG_LOAD_EFORMAT;
+    cng_dprintf(1, "elfspan roundwrap: plain=%d rewrite=%d -> %s\n", rrc[0],
+                rrc[1], rok ? "OK" : "FAIL");
+    wok = wok && rok;
+
+    /* The real route, with the denial that produces it. PR_SET_MDWE refuses an
+     * mprotect that adds PROT_EXEC — the same EACCES Android's execmem
+     * revocation gives — so map_anon reports CNG_LOAD_EEXEC and the fall back
+     * runs for real. Two things then have to hold, and neither could be
+     * reached before:
+     *
+     *  - a plan made BEFORE the denial and mapped after it answers with the
+     *    header's verdict (EINVAL), not with map_file's EMAP;
+     *  - a plan made after it never gets that far: the header pass probes
+     *    execmem for an object it cannot file-map and refuses while the caller
+     *    is still alive, which is the whole point of the split.
+     *
+     * MDWE is per-process and irreversible, so this is the last thing the
+     * command does. Where it is not available (a pre-6.3 kernel, or qemu-user,
+     * which answers EINVAL) the leg reports SKIP: nothing on such a host can
+     * deny anonymous exec memory. */
+    int save_x = cng_g_loader_file;
+    cng_g_loader_file = 0;
+    long xfd = elfspan_memfd_f(ELFSPAN_FILESZ, SYNTH_ELF_HDRSZ, 5 /*PF_R|PF_X*/);
+    struct cng_elf_plan xplan;
+    struct cng_loaded xout;
+    int xp = xfd < 0 ? (int)xfd : cng_elf_plan_fd((int)xfd, &xplan, &xout);
+    if (sys_prctl(CNG_PR_SET_MDWE, CNG_PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) != 0) {
+        if (xp == CNG_LOAD_OK)
+            cng_elf_plan_release(&xplan);
+        if (xfd >= 0)
+            sys_close((int)xfd);
+        cng_g_loader_file = save_x;
+        cng_dprintf(1, "elfspan execmem: no PR_SET_MDWE here -> SKIP\n");
+        return ok && wok ? 0 : 1;
+    }
+    int xmap = xp == CNG_LOAD_OK ? cng_elf_map(&xplan, 0, &xout) : xp;
+    if (xp == CNG_LOAD_OK)
+        cng_elf_plan_release(&xplan);
+    /* The fall back remembers the denial; put it back so the second half asks
+     * the question the header pass is meant to ask for itself. */
+    cng_g_loader_file = 0;
+    int xp2 = xfd < 0 ? (int)xfd : cng_elf_plan_fd((int)xfd, &xplan, &xout);
+    if (xp2 == CNG_LOAD_OK)
+        cng_elf_plan_release(&xplan);
+    if (xfd >= 0)
+        sys_close((int)xfd);
+    int xok = xp == CNG_LOAD_OK && xmap == CNG_LOAD_EINVAL &&
+              xp2 == CNG_LOAD_EINVAL && cng_g_loader_file == 1;
+    cng_dprintf(1,
+                "elfspan execmem: plan=%d map=%d replan=%d file-mode=%d -> %s\n",
+                xp, xmap, xp2, cng_g_loader_file, xok ? "OK" : "FAIL");
+    cng_g_loader_file = save_x;
+    return ok && wok && xok ? 0 : 1;
+}
+
+/* _elfinterp — a PT_INTERP the loader cannot honor has to be refused, never
+ * dropped.
+ *
+ * The path used to be taken only when it fit the buffer and the read came back
+ * whole; anything else left has_interp at 0, and a dynamic object then loaded as
+ * if it were static and was entered at its own e_entry — the _start that expects
+ * ld.so to have relocated it. The guest died on the first GOT reference with no
+ * errno anywhere, where the kernel refuses the exec outright and the caller
+ * lives to read why. Four headers no toolchain emits, all judged in the pass
+ * that maps nothing (cng_elf_plan_fd), plus a well-formed one to show the path
+ * still arrives. */
+#define SYNTH_INTERP_HDRSZ (64 + 2 * 56) /* Ehdr + PT_LOAD + PT_INTERP */
+
+/* A memfd holding an ELF64 with those two headers, where `claim` is the
+ * p_filesz PT_INTERP advertises and str/slen what the file actually holds at
+ * p_offset. The two differ on purpose: that is how a file too short for the path
+ * it names gets built. */
+static long synth_interp_memfd(unsigned long claim, const char *str,
+                               unsigned long slen) {
+    long fd = sys_memfd_create("cng-synth-interp", 0);
+    if (fd < 0)
+        return fd;
+    unsigned char hdr[SYNTH_INTERP_HDRSZ];
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 0x7f;
+    hdr[1] = 'E';
+    hdr[2] = 'L';
+    hdr[3] = 'F';
+    hdr[4] = 2; /* ELFCLASS64 */
+    hdr[5] = 1; /* ELFDATA2LSB */
+    hdr[6] = 1; /* EV_CURRENT */
+    *(unsigned short *)(hdr + 16) = 3;   /* e_type = ET_DYN */
+    *(unsigned short *)(hdr + 18) = 183; /* e_machine = EM_AARCH64 */
+    *(unsigned *)(hdr + 20) = 1;         /* e_version */
+    *(unsigned long *)(hdr + 32) = 0x40; /* e_phoff */
+    *(unsigned short *)(hdr + 52) = 64;  /* e_ehsize */
+    *(unsigned short *)(hdr + 54) = 56;  /* e_phentsize */
+    *(unsigned short *)(hdr + 56) = 2;   /* e_phnum */
+    unsigned char *p = hdr + 0x40;       /* PT_LOAD over the header itself */
+    *(unsigned *)(p + 0) = 1;            /* p_type */
+    *(unsigned *)(p + 4) = 6;            /* p_flags = PF_R|PF_W */
+    *(unsigned long *)(p + 32) = SYNTH_INTERP_HDRSZ; /* p_filesz */
+    *(unsigned long *)(p + 40) = 0x1000;             /* p_memsz */
+    *(unsigned long *)(p + 48) = 0x1000;             /* p_align */
+    p = hdr + 0x40 + 56;                 /* PT_INTERP, right behind it */
+    *(unsigned *)(p + 0) = 3;            /* p_type = PT_INTERP */
+    *(unsigned *)(p + 4) = 4;            /* p_flags = PF_R */
+    *(unsigned long *)(p + 8) = SYNTH_INTERP_HDRSZ; /* p_offset */
+    *(unsigned long *)(p + 32) = claim;             /* p_filesz */
+    *(unsigned long *)(p + 40) = claim;             /* p_memsz */
+    *(unsigned long *)(p + 48) = 1;                 /* p_align */
+    if (cng_write_all((int)fd, hdr, sizeof hdr) != (long)sizeof hdr ||
+        (slen && cng_write_all((int)fd, str, slen) != (long)slen)) {
+        sys_close((int)fd);
+        return -EIO;
+    }
+    return fd;
+}
+
+int cng_cmd_elfinterp(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static const char want[] = "/lib/ld-cng-test.so.1";
+    /* The terminator is part of p_filesz, so `sizeof want` is the whole
+     * string — and 257 is one past what this buffer can hold. */
+    static const struct {
+        unsigned long claim, slen;
+        const char *str;
+        int want;
+    } leg[] = {
+        {sizeof want, sizeof want, want, CNG_LOAD_OK},
+        {257, sizeof want, want, CNG_LOAD_ETOOBIG},  /* longer than we hold */
+        {1, sizeof want, want, CNG_LOAD_ETOOBIG},    /* no room for a NUL */
+        {64, sizeof want, want, CNG_LOAD_EINTERP},   /* names bytes past EOF */
+        {4, 4, "abcd", CNG_LOAD_EFORMAT},            /* never terminated */
+    };
+    enum { NLEG = sizeof leg / sizeof leg[0] };
+    int rc[NLEG], ok = 1, has = 0, path = 0;
+    for (int i = 0; i < NLEG; i++) {
+        long fd = synth_interp_memfd(leg[i].claim, leg[i].str, leg[i].slen);
+        if (fd < 0) {
+            cng_dprintf(1, "elfinterp: memfd_create errno=%d -> SKIP\n",
+                        (int)-fd);
+            return 0;
+        }
+        struct cng_elf_plan plan;
+        struct cng_loaded out;
+        rc[i] = cng_elf_plan_fd((int)fd, &plan, &out);
+        cng_elf_plan_release(&plan); /* borrowed fd: ours to close */
+        sys_close((int)fd);
+        if (i == 0) {
+            has = out.has_interp;
+            path = !strcmp(out.interp, want);
+        }
+        ok &= rc[i] == leg[i].want;
+    }
+    int good = rc[0] == CNG_LOAD_OK && has && path;
+    cng_dprintf(1, "elfinterp: rc=%d has_interp=%d path=%d -> %s\n", rc[0], has,
+                path, good ? "OK" : "FAIL");
+    cng_dprintf(1,
+                "elfinterp refusals: too-long=%d too-short=%d past-eof=%d "
+                "unterminated=%d -> %s\n",
+                rc[1], rc[2], rc[3], rc[4], ok ? "OK" : "FAIL");
+    return ok && good ? 0 : 1;
+}
+
+/* _o2test ROOT — openat2's open_how.resolve.
+ *
+ * Two halves, both reachable without the syscall itself, which matters: no
+ * qemu-user build implements openat2, so on a cross host the only thing that
+ * can be exercised is everything decided *before* the re-issue — which is where
+ * all of the new judgement lives.
+ *
+ *  - the constraint walk (cng_resolve_lim): NO_SYMLINKS, NO_MAGICLINKS and
+ *    NO_XDEV are answered against the GUEST's namespace, since that is the one
+ *    the guest described. A bind is the only mount crossing a guest can see, so
+ *    it is what NO_XDEV is judged against;
+ *  - the ABI half (read_open_how, through the dispatcher): `size` below the
+ *    struct is EINVAL, above it a non-zero tail is E2BIG and a zero tail is the
+ *    same call, and a pointer that will not read is EFAULT. All three are the
+ *    kernel's own rules, and all three are decided before any path is touched.
+ *
+ * ROOT must contain w/ (writable). A bind of ROOT/b onto /mnt is added here, so
+ * the crossing exists without needing a real mount.
+ */
+int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *rootfs = argc > 1 ? argv[1] : "/";
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    cng_g_fs = &fs;
+    char bhost[CNG_PATH_MAX];
+    size_t n = cng_strlcpy(bhost, rootfs, sizeof bhost);
+    cng_strlcpy(bhost + n, "/b", sizeof bhost - n);
+    cng_fs_add_bind(&fs, "/mnt", bhost, 0);
+    int fails = 0;
+
+    /* The tree, made through the dispatcher so it lands in the rootfs. */
+    long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/file",
+                           CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fd >= 0) {
+        sys_write((int)fd, "X", 1);
+        sys_close((int)fd);
+    }
+    fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/mnt/file",
+                      CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+    if (fd >= 0)
+        sys_close((int)fd);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/link", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/mag", 0, 0, 0, 0, 0);
+    cng_dispatch(__NR_symlinkat, (long)"file", CNG_AT_FDCWD, (long)"/w/link", 0,
+                 0, 0, 0);
+    cng_dispatch(__NR_symlinkat, (long)"/proc/self/fd/0", CNG_AT_FDCWD,
+                 (long)"/w/mag", 0, 0, 0, 0);
+
+    char out[CNG_PATH_MAX];
+    struct cng_res_limit lim;
+#define O2_RESOLVE(path, deref, setup)                                         \
+    (memset(&lim, 0, sizeof lim), setup,                                       \
+     cng_resolve_lim((path), (deref), out, sizeof out, &lim))
+
+    /* NO_SYMLINKS: any link, and only a link. */
+    {
+        long a = O2_RESOLVE("/w/link", 1, lim.no_symlinks = 1);
+        long b = O2_RESOLVE("/w/link", 1, (void)0);
+        long c = O2_RESOLVE("/w/file", 1, lim.no_symlinks = 1);
+        int ok = a == -ELOOP && b == 0 && c == 0;
+        cng_dprintf(1, "o2test nosym link=%ld plain=%ld unconstrained=%ld -> %s\n",
+                    a, c, b, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A magic link is a link too: NO_MAGICLINKS refuses it, NO_SYMLINKS
+     * implies NO_MAGICLINKS, and an ordinary link is none of its business. */
+    {
+        long a = O2_RESOLVE("/w/mag", 1, lim.no_magiclinks = 1);
+        long b = O2_RESOLVE("/w/mag", 1, lim.no_symlinks = 1);
+        long c = O2_RESOLVE("/w/link", 1, lim.no_magiclinks = 1);
+        long d = O2_RESOLVE("/w/mag", 1, (void)0);
+        int ok = a == -ELOOP && b == -ELOOP && c == 0 && d == 0;
+        cng_dprintf(1,
+                    "o2test nomagic magic=%ld via-nosym=%ld ordinary=%ld"
+                    " unconstrained=%ld -> %s\n",
+                    a, b, c, d, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* NO_XDEV against the guest's own mount table: the rootfs and a bind are
+     * two mounts, and the crossing is refused in both directions. */
+    {
+        long a = O2_RESOLVE("/mnt/file", 1, lim.no_xdev = 1);
+        long b = O2_RESOLVE("/w/file", 1, lim.no_xdev = 1);
+        long c = O2_RESOLVE("/mnt/file", 1, (void)0);
+        /* ...and out of one: a walk that starts inside the bind may not climb
+         * back into the rootfs. */
+        memset(&lim, 0, sizeof lim);
+        lim.no_xdev = 1;
+        lim.xdev_base = "/mnt";
+        long d = cng_resolve_lim("/mnt/../w/file", 1, out, sizeof out, &lim);
+        int ok = a == -EXDEV && b == 0 && c == 0 && d == -EXDEV;
+        cng_dprintf(1,
+                    "o2test noxdev into-bind=%ld same-mount=%ld out-of-bind=%ld"
+                    " unconstrained=%ld -> %s\n",
+                    a, b, d, c, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* --- RESOLVE_BENEATH / RESOLVE_IN_ROOT, where the walk has to do them ---
+     *
+     * The kernel applies these exactly, so the call goes over untranslated
+     * wherever the guest's namespace has nothing to add under the dirfd. Where
+     * it does, the kernel would resolve in the HOST's view of that subtree —
+     * which is a different tree — so the scope is applied by the walk instead.
+     * These are the walk's own answers, judged against the kernel's rules
+     * (measured on 6.17, see tests/m24_openat2.sh).
+     *
+     * "<rootfs><suffix>", for comparing a walk's answer against the host path
+     * it should have produced. */
+    char want[CNG_PATH_MAX];
+#define O2_WANT(sfx)                                                          \
+    (cng_snprintf(want, sizeof want, "%s%s", rootfs, sfx), want)
+
+    /* A bind crossing, which is the whole reason these are walked at all: the
+     * kernel's own scoped resolution would find the empty mount point under
+     * the rootfs. Both spellings cross it — only NO_XDEV refuses a crossing. */
+    {
+        long a = O2_RESOLVE("mnt/file", 1, (lim.in_root = 1, lim.scope = "/"));
+        int aok = a == 0 && strcmp(out, O2_WANT("/b/file")) == 0;
+        long b = O2_RESOLVE("mnt/file", 1, (lim.beneath = 1, lim.scope = "/"));
+        int bok = b == 0 && strcmp(out, O2_WANT("/b/file")) == 0;
+        /* ...and the same name with no scope at all, so the leg cannot pass by
+         * the translation being right for some other reason. */
+        long c = O2_RESOLVE("/mnt/file", 1, (void)0);
+        int cok = c == 0 && strcmp(out, O2_WANT("/b/file")) == 0;
+        int ok = aok && bok && cok;
+        cng_dprintf(1,
+                    "o2test scope bind in-root=%d beneath=%d unscoped=%d"
+                    " -> %s\n",
+                    aok, bok, cok, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* Escaping the scope. BENEATH refuses an absolute name and a `..` run that
+     * leaves the directory (EXDEV); IN_ROOT takes the same two as the root it
+     * is standing in for — re-rooted, and clamped. */
+    {
+        long a = O2_RESOLVE("/w/file", 1, (lim.beneath = 1, lim.scope = "/w"));
+        long b = O2_RESOLVE("../w/file", 1, (lim.beneath = 1, lim.scope = "/w"));
+        long c = O2_RESOLVE("sub/../file", 1, (lim.beneath = 1, lim.scope = "/w"));
+        int cok = c == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        long d = O2_RESOLVE("/file", 1, (lim.in_root = 1, lim.scope = "/w"));
+        int dok = d == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        long e = O2_RESOLVE("../../file", 1, (lim.in_root = 1, lim.scope = "/w"));
+        int eok = e == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        int ok = a == -EXDEV && b == -EXDEV && cok && dok && eok;
+        cng_dprintf(1,
+                    "o2test scope escape beneath-abs=%ld beneath-dotdot=%ld"
+                    " beneath-inside=%d in-root-abs=%d in-root-dotdot=%d"
+                    " -> %s\n",
+                    a, b, cok, dok, eok, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A symlink with an absolute target is a jump out of the scope: BENEATH
+     * refuses it, IN_ROOT re-roots the target onto the scope (so "/w/file"
+     * read from a scope of "/w" names "/w/w/file", which is what the kernel
+     * makes of it too). */
+    {
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/abs", 0, 0, 0, 0, 0);
+        cng_dispatch(__NR_symlinkat, (long)"/w/file", CNG_AT_FDCWD,
+                     (long)"/w/abs", 0, 0, 0, 0);
+        long a = O2_RESOLVE("abs", 1, (lim.beneath = 1, lim.scope = "/w"));
+        long b = O2_RESOLVE("abs", 1, (lim.in_root = 1, lim.scope = "/w"));
+        int bok = b == 0 && strcmp(out, O2_WANT("/w/w/file")) == 0;
+        /* Unscoped it is re-rooted at the guest root, as every absolute target
+         * is, and names the file it was made to name. */
+        long c = O2_RESOLVE("/w/abs", 1, (void)0);
+        int cok = c == 0 && strcmp(out, O2_WANT("/w/file")) == 0;
+        int ok = a == -EXDEV && bok && cok;
+        cng_dprintf(1,
+                    "o2test scope abslink beneath=%ld in-root=%d unscoped=%d"
+                    " -> %s\n",
+                    a, bok, cok, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A magic link is refused under either scope — "not currently safe for
+     * scoped-lookups", says nd_jump_link(), and it answers EXDEV rather than
+     * the ELOOP the NO_*LINKS bits get. The directory the fd links live in is
+     * not one of them and opens normally. */
+    {
+        long a = O2_RESOLVE("proc/self/fd/0", 1, (lim.beneath = 1, lim.scope = "/"));
+        long b = O2_RESOLVE("proc/self/fd/0", 1, (lim.in_root = 1, lim.scope = "/"));
+        long c = O2_RESOLVE("proc/self/fd", 1, (lim.in_root = 1, lim.scope = "/"));
+        long d = O2_RESOLVE("/proc/self/fd/0", 1, (void)0); /* unscoped: fine */
+        int ok = a == -EXDEV && b == -EXDEV && c == 0 && d == 0;
+        cng_dprintf(1,
+                    "o2test scope magic beneath=%ld in-root=%ld fd-dir=%ld"
+                    " unscoped=%ld -> %s\n",
+                    a, b, c, d, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* And the route itself. The scope is the dirfd's guest path; the question
+     * is whether the guest's namespace has anything to add under it. The bind
+     * at /mnt does for a dirfd on "/", so that one is walked; nothing does
+     * under "/w", so the kernel is handed the call as the guest wrote it; and
+     * a dirfd on the bind's own mount point is the bind, so there is nothing
+     * under it the kernel would see differently either. */
+    {
+        char g[CNG_PATH_MAX];
+        long rf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long wf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long mf = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/mnt",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        int at_root = rf >= 0 && cng_scope_needs_walk(rf, g, sizeof g) == 1 &&
+                      strcmp(g, "/") == 0;
+        int plain = wf >= 0 && cng_scope_needs_walk(wf, g, sizeof g) == 0;
+        int at_bind = mf >= 0 && cng_scope_needs_walk(mf, g, sizeof g) == 0;
+        if (rf >= 0)
+            sys_close((int)rf);
+        if (wf >= 0)
+            sys_close((int)wf);
+        if (mf >= 0)
+            sys_close((int)mf);
+        int ok = at_root && plain && at_bind;
+        cng_dprintf(1,
+                    "o2test scope route root=%d plain=%d at-bind=%d -> %s\n",
+                    at_root, plain, at_bind, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+#undef O2_WANT
+#undef O2_RESOLVE
+
+    /* End to end, through the dispatcher: a scoped openat2 whose name lands on
+     * a file chroot-ng synthesizes. The kernel cannot produce that answer — the
+     * pass-through route would hand it the HOST's /proc/mounts — so an fd
+     * holding the guest's own mount table (the bind at /mnt is in it, and the
+     * device column is ours) is the walked route's answer and nothing else's.
+     * The same on a host that cannot issue openat2 at all (a pre-5.6 kernel,
+     * qemu-user, or Android's filter refusing it), where the call is emulated
+     * and every scope is walked: it used to be ENOSYS there. */
+    {
+        struct cng_open_how h = {CNG_O_RDONLY, 0, CNG_RESOLVE_IN_ROOT};
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long mfd = dfd < 0 ? dfd
+                           : cng_dispatch(__NR_openat2, dfd, (long)"proc/mounts",
+                                          (long)&h, (long)sizeof h, 0, 0, 0);
+        char mb[512];
+        long n = mfd < 0 ? mfd : sys_read((int)mfd, mb, sizeof mb - 1);
+        int guest_table = 0;
+        if (n > 0) {
+            mb[n] = '\0';
+            int dev = 0, bind = 0;
+            for (char *q = mb; *q; q++) {
+                if (!strncmp(q, "/dev/root", 9))
+                    dev = 1;
+                if (!strncmp(q, " /mnt ", 6))
+                    bind = 1;
+            }
+            guest_table = dev && bind;
+        }
+        if (mfd >= 0)
+            sys_close((int)mfd);
+        if (dfd >= 0)
+            sys_close((int)dfd);
+        cng_dprintf(1, "o2test scope synth table -> %s\n",
+                    guest_table ? "OK" : "FAIL");
+        fails += !guest_table;
+    }
+
+    /* The size/pointer rules, through the dispatcher. Each is answered before
+     * any path is looked at, so the answer does not depend on this host having
+     * openat2 at all. */
+    {
+        struct {
+            struct cng_open_how how;
+            unsigned long tail;
+        } big = {{CNG_O_RDONLY, 0, 0}, 0};
+        long small = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                  (long)&big, 8, 0, 0, 0);
+        big.tail = 1;
+        long e2big = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                  (long)&big, (long)sizeof big, 0, 0, 0);
+        big.tail = 0;
+        long zero = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                 (long)&big, (long)sizeof big, 0, 0, 0);
+        long bad = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file", 0,
+                                (long)sizeof big.how, 0, 0, 0);
+        /* ...and the page bound on the other end of `size`, which openat2
+         * answers before it looks at the pointer at all. The struct here is
+         * real and its tail genuinely zero, so only the bound can be refusing
+         * it — and without one the tail scan was the guest's to size. */
+        unsigned long pg = cng_page_size;
+        long over = 0;
+        char *hm = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                            CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (hm != CNG_MAP_FAILED && !cng_is_err((long)hm)) {
+            memset(hm, 0, 2 * pg);
+            memcpy(hm, &big.how, sizeof big.how);
+            over = cng_dispatch(__NR_openat2, CNG_AT_FDCWD, (long)"/w/file",
+                                (long)hm, (long)pg + 1, 0, 0, 0);
+            sys_munmap(hm, 2 * pg);
+        }
+        /* A zero tail is the same call as a sized one, so it must NOT be
+         * refused by either rule: it opens, on a host with openat2 and on one
+         * where the call is emulated alike. */
+        int ok = small == -EINVAL && e2big == -E2BIG && bad == -EFAULT &&
+                 over == -E2BIG && zero >= 0;
+        if (zero >= 0)
+            sys_close((int)zero);
+        cng_dprintf(1,
+                    "o2test abi small=%ld tail=%ld null=%ld over=%ld"
+                    " zero-tail=%ld -> %s\n",
+                    small, e2big, bad, over, zero, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "o2test: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _sharedtest — the two objects chroot-ng leaves in a world-writable directory.
+ *
+ * cng_broker_shared_dir() is /dev/shm, $XDG_RUNTIME_DIR, $TMPDIR, /data/local/tmp
+ * or /tmp — on a normal machine every user can create names there. The System V
+ * shm backing file gets an unguessable name and O_EXCL, so there is nothing to
+ * squat; the process registry cannot, because its name IS how separate
+ * --shared-proc invocations find each other, so it proves the file is ours after
+ * opening it instead. This drives the second: plant a symlink, then a file with
+ * group/other permission, on the exact name the registry will compute, and the
+ * tier must decline both — leaving the planted file untouched and degrading to
+ * the per-process anonymous table rather than sharing one it does not own.
+ *
+ * Each case runs in a fork, since cng_procreg_init is one-shot per process.
+ */
+static int shared_child(const char *key) {
+    cng_procreg_init(key);
+    /* The file tier must not have been adopted. Reported as the exit status so
+     * the parent can tell "declined" from "took it". */
+    return cng_g_procreg_backing == CNG_PROCREG_B_FILE ? 1 : 0;
+}
+
+int cng_cmd_sharedtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)auxv;
+    cng_g_host_envp = envp;
+    const char *scratch = argc > 1 ? argv[1] : "/tmp";
+    int fails = 0;
+
+    const char *dir = cng_broker_shared_dir();
+    if (!dir) {
+        cng_dprintf(1, "sharedtest: no writable shared dir -> SKIP\n");
+        return 0;
+    }
+    /* A key nobody else can be using: the scratch directory mktemp made. */
+    char path[CNG_PATH_MAX];
+    size_t n = cng_snprintf(path, sizeof path,
+                            "%s/chroot-ng-procreg.v4.%u.%016llx", dir,
+                            (unsigned)sys_getuid(),
+                            (unsigned long long)cng_broker_key_hash(scratch));
+    if (n >= sizeof path) {
+        cng_dprintf(1, "sharedtest: name does not fit -> SKIP\n");
+        return 0;
+    }
+    char victim[CNG_PATH_MAX];
+    n = cng_snprintf(victim, sizeof victim, "%s/cng-sharedtest-victim", scratch);
+    if (n >= sizeof victim) {
+        cng_dprintf(1, "sharedtest: victim name does not fit -> SKIP\n");
+        return 0;
+    }
+
+    /* Case 1: the name is a symlink onto a file of ours. Following it would
+     * ftruncate that file to the table's size and then share it. */
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+    long vfd = sys_openat(CNG_AT_FDCWD, victim,
+                          CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0600);
+    int wrote = vfd >= 0 && sys_write((int)vfd, "keep-me", 7) == 7;
+    if (vfd >= 0)
+        sys_close((int)vfd);
+    long sl = CNG_SYS(__NR_symlinkat, (long)victim, CNG_AT_FDCWD, (long)path, 0,
+                      0, 0);
+    int declined = 0, intact = 0;
+    if (wrote && sl == 0) {
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        declined = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0);
+        char sb[144];
+        intact = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)victim, (long)sb,
+                         0, 0, 0) == 0 &&
+                 *(unsigned long *)(sb + 48) == 7; /* st_size */
+    }
+    int ok = wrote && sl == 0 && declined && intact;
+    cng_dprintf(1, "sharedtest symlinked registry declined=%d victim_intact=%d"
+                   " -> %s\n",
+                declined, intact, ok ? "OK" : "FAIL");
+    fails += !ok;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+
+    /* Case 2: a real file on the name, but group/other-readable — which our own
+     * 0600 creation never produces, so somebody else put it there. */
+    long ffd = sys_openat(CNG_AT_FDCWD, path,
+                          CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0666);
+    int declined2 = 0;
+    if (ffd >= 0) {
+        CNG_SYS(__NR_fchmod, ffd, 0666, 0, 0, 0, 0); /* past any umask */
+        sys_close((int)ffd);
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        declined2 = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0);
+    }
+    ok = ffd >= 0 && declined2;
+    cng_dprintf(1, "sharedtest world-readable registry declined=%d -> %s\n",
+                declined2, ok ? "OK" : "FAIL");
+    fails += !ok;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+
+    /* Case 3: a file exactly as our own creation leaves it — private, regular,
+     * the layout's size, a sealed record at the table's end — for ANOTHER
+     * rootfs, which is what a hash collision between two rootfs of one user
+     * looks like on disk (the name is 64 bits of the path; the record is all
+     * of it). Declined, and left as it was. */
+    struct {
+        u64 seal;
+        u32 len, pad;
+        char key[CNG_PATH_MAX];
+    } rec;
+    memset(&rec, 0, sizeof rec);
+    const char *other = "/some/other/rootfs";
+    rec.len = (u32)strlen(other);
+    memcpy(rec.key, other, rec.len);
+    rec.seal = cng_broker_hash(rec.key, rec.len);
+    unsigned long tabsz = cng_procreg_table_size();
+    long ofd = sys_openat(CNG_AT_FDCWD, path,
+                          CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0600);
+    int planted = ofd >= 0 && sys_ftruncate((int)ofd, (long)(tabsz + sizeof rec)) == 0 &&
+                  CNG_SYS(__NR_pwrite64, ofd, &rec, sizeof rec, tabsz, 0, 0) ==
+                      (long)sizeof rec;
+    if (ofd >= 0)
+        sys_close((int)ofd);
+    int declined3 = 0, intact3 = 0;
+    if (planted) {
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        declined3 = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0);
+        long rfd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY, 0);
+        char back[sizeof rec];
+        intact3 = rfd >= 0 &&
+                  sys_pread64((int)rfd, back, sizeof back, (long)tabsz) ==
+                      (long)sizeof back &&
+                  memcmp(back, &rec, sizeof rec) == 0;
+        if (rfd >= 0)
+            sys_close((int)rfd);
+    }
+    ok = planted && declined3 && intact3;
+    cng_dprintf(1,
+                "sharedtest another rootfs' registry declined=%d intact=%d "
+                "-> %s\n",
+                declined3, intact3, ok ? "OK" : "FAIL");
+    fails += !ok;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+
+    /* ...and the control: with nothing planted, the tier IS adopted, so the
+     * refusals above are refusals and not a tier that never engages; and a
+     * second joiner of the same rootfs adopts the same file, which is the
+     * tier doing its job. */
+    int adopted = 0;
+    {
+        long p = sys_fork();
+        if (p == 0)
+            sys_exit_group(shared_child(scratch));
+        int st = 0;
+        sys_wait4((int)p, &st, 0, 0);
+        adopted = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 1);
+        if (adopted) {
+            p = sys_fork();
+            if (p == 0)
+                sys_exit_group(shared_child(scratch));
+            st = 0;
+            sys_wait4((int)p, &st, 0, 0);
+            adopted = ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 1) ? 2 : 0;
+        }
+    }
+    cng_dprintf(1, "sharedtest an unplanted name is adopted=%d -> %s\n", adopted,
+                adopted == 2 ? "OK" : "FAIL");
+    fails += adopted != 2;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)path, 0, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)victim, 0, 0, 0, 0);
+
+    cng_dprintf(1, "sharedtest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _imgtest — an ET_EXEC guest is mapped MAP_FIXED at its link-time vaddr, and
+ * the monitor is in the same address space. A vaddr reaching chroot-ng's own
+ * image therefore does not fail: it succeeds, over the code performing the
+ * load, and the process dies with no monitor left to say why. That is how the
+ * pre-relocation build died on gcc's cc1 at 0x400000 (STATUS.md); moving the
+ * base to 64 GiB put it clear of every real toolchain, but p_vaddr is a field
+ * in a file, so the collision has to be refused rather than designed around.
+ *
+ * Three legs, all against the live linker symbols rather than a constant:
+ *   - an ET_EXEC covering __cng_image_start is refused, and the first
+ *     instruction of the gate is unchanged afterwards (a refusal that "passed"
+ *     by mapping over us would read as a pass otherwise);
+ *   - an ET_EXEC one page below the image still loads, so the guard is the
+ *     overlap and not the neighbourhood;
+ *   - the same vaddr as ET_DYN loads, because a shared object carries a hint
+ *     the kernel is free to ignore and nothing goes down MAP_FIXED. */
+int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    unsigned long img = (unsigned long)__cng_image_start;
+    unsigned int gate0 = *(volatile unsigned int *)__cng_gate_start;
+    struct cng_loaded ld;
+
+    struct synth_seg over_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/,
+                                 0};
+    long fd = synth_elf_memfd(2 /*ET_EXEC*/, &over_seg, 1);
+    if (fd < 0) {
+        cng_dprintf(1, "imgtest: memfd_create errno=%d -> SKIP\n", (int)-fd);
+        return 0;
+    }
+    int over = cng_load_elf_fd((int)fd, 0, &ld);
+    sys_close((int)fd);
+    int intact = *(volatile unsigned int *)__cng_gate_start == gate0;
+
+    /* One page below the base, sized to end exactly where the image starts. */
+    unsigned long below = img - cng_page_size;
+    struct synth_seg under_seg = {below, SYNTH_ELF_HDRSZ, cng_page_size,
+                                  6 /*PF_R|PF_W*/, 0};
+    fd = synth_elf_memfd(2 /*ET_EXEC*/, &under_seg, 1);
+    int under = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+    if (fd >= 0)
+        sys_close((int)fd);
+    if (under == CNG_LOAD_OK)
+        sys_munmap((void *)below, cng_page_size);
+
+    struct synth_seg dyn_seg = {img, SYNTH_ELF_HDRSZ, 0x1000, 6 /*PF_R|PF_W*/,
+                                0};
+    fd = synth_elf_memfd(3 /*ET_DYN*/, &dyn_seg, 1);
+    int dyn = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, img, &ld);
+    if (fd >= 0)
+        sys_close((int)fd);
+    if (dyn == CNG_LOAD_OK)
+        sys_munmap((void *)ld.base, 0x1000);
+
+    /* The image is not the only thing of ours a file can name. The exec sweep
+     * knows three kinds of mapping to leave alone — the image, the own-map
+     * registry, the scratch stacks — and the MAP_FIXED preflight used to ask
+     * about the first only: an ET_EXEC over a registered region or over the
+     * scratch stack the exec was running on went down, and the monitor died
+     * with the guest. Three more legs, each against a live address:
+     *   - an ET_EXEC over a region recorded with cng_own_map is refused;
+     *   - one over this thread's scratch stack is refused;
+     *   - one planned over a free page that becomes ours between the plan and
+     *     the map is refused at the map, since the answer the header pass gave
+     *     is re-asked at the last moment before the MAP_FIXED. */
+    unsigned long pg = cng_page_size;
+    int own = -1, own_still = 0;
+    void *ownp = sys_mmap(0, pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (!cng_is_err((long)ownp)) {
+        *(volatile unsigned long *)ownp = 0x0e1f0e1f;
+        cng_own_map(ownp, pg);
+        struct synth_seg own_seg = {(unsigned long)ownp, SYNTH_ELF_HDRSZ, pg,
+                                    6 /*PF_R|PF_W*/, 0};
+        fd = synth_elf_memfd(2 /*ET_EXEC*/, &own_seg, 1);
+        own = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+        if (fd >= 0)
+            sys_close((int)fd);
+        own_still = *(volatile unsigned long *)ownp == 0x0e1f0e1f;
+        cng_own_drop(ownp, pg);
+        sys_munmap(ownp, pg);
+    }
+
+    int scr = -1;
+    unsigned long scr_hi = 0;
+    if (cng_scratch_slot_for(sys_gettid(), &scr_hi) >= 0 && scr_hi) {
+        /* One page inside the stack, from its top: the slot's [lo, hi) is what
+         * cng_scr_hit tests, and hi is what the allocator hands out. */
+        struct synth_seg scr_seg = {scr_hi - pg, SYNTH_ELF_HDRSZ, pg,
+                                    6 /*PF_R|PF_W*/, 0};
+        fd = synth_elf_memfd(2 /*ET_EXEC*/, &scr_seg, 1);
+        scr = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+        if (fd >= 0)
+            sys_close((int)fd);
+    }
+
+    int race_plan = -1, race_map = -1;
+    void *hole = sys_mmap(0, pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (!cng_is_err((long)hole)) {
+        sys_munmap(hole, pg); /* a free page whose address is known */
+        struct synth_seg hole_seg = {(unsigned long)hole, SYNTH_ELF_HDRSZ, pg,
+                                     6 /*PF_R|PF_W*/, 0};
+        fd = synth_elf_memfd(2 /*ET_EXEC*/, &hole_seg, 1);
+        struct cng_elf_plan plan;
+        struct cng_loaded out;
+        race_plan = fd < 0 ? (int)fd : cng_elf_plan_fd((int)fd, &plan, &out);
+        if (race_plan == CNG_LOAD_OK) {
+            void *late = sys_mmap(hole, pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                                  CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS |
+                                      CNG_MAP_FIXED_NOREPLACE,
+                                  -1, 0);
+            if (late == hole) {
+                cng_own_map(late, pg);
+                race_map = cng_elf_map(&plan, 0, &out);
+                cng_own_drop(late, pg);
+                sys_munmap(late, pg);
+            }
+            cng_elf_plan_release(&plan);
+        }
+        if (fd >= 0)
+            sys_close((int)fd);
+    }
+
+    /* Under -R the reservation is the span plus the trampoline pool on top
+     * of it, MAP_FIXED alike, so an ET_EXEC whose span ends exactly where a
+     * mapping of ours begins puts its pool over that mapping: refused with -R
+     * on, loaded with it off. Two pages, the first given back as the hole
+     * the image goes into, the second recorded as ours. */
+    int pool_plain = -1, pool_rw = -1;
+    void *pair = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (!cng_is_err((long)pair)) {
+        sys_munmap(pair, pg);
+        cng_own_map((char *)pair + pg, pg);
+        struct synth_seg edge_seg = {(unsigned long)pair, SYNTH_ELF_HDRSZ, pg,
+                                     6 /*PF_R|PF_W*/, 0};
+        int saved = cng_g_rewrite;
+        for (int rw = 0; rw < 2; rw++) {
+            cng_g_rewrite = rw;
+            fd = synth_elf_memfd(2 /*ET_EXEC*/, &edge_seg, 1);
+            int r = fd < 0 ? (int)fd : cng_load_elf_fd((int)fd, 0, &ld);
+            if (fd >= 0)
+                sys_close((int)fd);
+            if (r == CNG_LOAD_OK)
+                sys_munmap(pair, pg);
+            if (rw)
+                pool_rw = r;
+            else
+                pool_plain = r;
+        }
+        cng_g_rewrite = saved;
+        cng_own_drop((char *)pair + pg, pg);
+        sys_munmap((char *)pair + pg, pg);
+    }
+
+    int ok = over == CNG_LOAD_ECLOBBER && intact && under == CNG_LOAD_OK &&
+             dyn == CNG_LOAD_OK && own == CNG_LOAD_ECLOBBER && own_still &&
+             scr == CNG_LOAD_ECLOBBER && race_plan == CNG_LOAD_OK &&
+             race_map == CNG_LOAD_ECLOBBER && pool_plain == CNG_LOAD_OK &&
+             pool_rw == CNG_LOAD_ECLOBBER;
+    cng_dprintf(1,
+                "imgtest exec-over=%d intact=%d exec-below=%d dyn-hint=%d"
+                " own=%d own-intact=%d scratch=%d late=%d/%d pool=%d/%d -> %s\n",
+                over, intact, under, dyn, own, own_still, scr, race_plan,
+                race_map, pool_plain, pool_rw, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* _clonetest — a CLONE_VFORK|CLONE_VM clone must be converted to a real (COW)
+ * fork by cng_clone_convert, so the child gets a private address space (our
+ * emulated execve would otherwise corrupt the shared parent). Verify the child
+ * runs and exits, and that a write in the child is NOT visible in the parent.
+ * Driven with a register frame the way both tiers drive it; a bare vfork (no
+ * child stack) must leave the frame's sp alone on both sides. */
+int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    volatile long marker = 0;
+    unsigned long sentinel = 0x5eed0d5eed0d0000UL;
+    static struct cng_uregs fr;
+    memset(&fr, 0, sizeof fr);
+    fr.x[0] = CNG_CLONE_VM | CNG_CLONE_VFORK | 17; /* SIGCHLD */
+    fr.x[8] = __NR_clone;
+    fr.sp = sentinel;
+    cng_clone_convert(&fr);
+    long pid = (long)fr.x[0];
+    if (pid == 0) {        /* child */
+        marker = 1;        /* if the VM were shared, the parent would see this */
+        sys_exit_group(fr.sp == sentinel ? 7 : 8);
+    }
+    int status = 0;
+    sys_wait4((int)pid, &status, 0, 0);
+    int exited7 = ((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 7);
+    int private_vm = (marker == 0); /* real fork => parent's copy untouched */
+    int sp_kept = (fr.sp == sentinel);
+    int ok = (pid > 0 && exited7 && private_vm && sp_kept);
+    cng_dprintf(1,
+                "clone: pid>0=%d child_exit7=%d private_vm=%d sp_kept=%d -> %s\n",
+                pid > 0, exited7, private_vm, sp_kept, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* _clonestktest — a vfork-style clone with a caller-provided child stack (as
+ * musl's __clone/posix_spawn passes) must, after conversion, resume the child on
+ * that stack. Drive cng_sigsys_body (the real SIGSYS path) with a synthetic
+ * clone context and check it forks and sets the child's uc->sp to the child
+ * stack while leaving the parent's untouched. */
+int cng_cmd_clonestktest(int argc, char **argv, char **envp,
+                         unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+
+    void *cs = sys_mmap(0, 65536, CNG_PROT_READ | CNG_PROT_WRITE,
+                        CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (cs == CNG_MAP_FAILED || cng_is_err((long)cs)) {
+        cng_dprintf(1, "clonestk: mmap -> FAIL\n");
+        return 1;
+    }
+    unsigned long cs_top = ((unsigned long)cs + 65536) & ~15UL;
+    unsigned long sentinel = 0x5eed0d5eed0d0000UL;
+
+    static struct cng_ucontext uc;
+    memset(&uc, 0, sizeof uc);
+    unsigned long long *r = uc.uc_mcontext.regs;
+    r[8] = __NR_clone;
+    r[0] = CNG_CLONE_VM | CNG_CLONE_VFORK | 17; /* SIGCHLD */
+    r[1] = cs_top;                              /* caller-provided child stack */
+    uc.uc_mcontext.sp = sentinel;               /* guest's original sp */
+
+    cng_siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_code = CNG_SYS_SECCOMP;
+    si._u._sigsys.call_addr = (void *)0x1000; /* not in gate -> guest syscall */
+    si._u._sigsys.syscall = __NR_clone;
+
+    cng_sigsys_body(&uc, &si); /* forks internally */
+
+    if (uc.uc_mcontext.regs[0] == 0)           /* child */
+        sys_exit_group(uc.uc_mcontext.sp == cs_top ? 7 : 8);
+
+    long pid = (long)uc.uc_mcontext.regs[0];
+    int status = 0;
+    sys_wait4((int)pid, &status, 0, 0);
+    int child_sp_ok = ((status & 0x7f) == 0 && ((status >> 8) & 0xff) == 7);
+    int parent_sp_ok = (uc.uc_mcontext.sp == sentinel);
+    int ok = (pid > 0 && child_sp_ok && parent_sp_ok);
+    cng_dprintf(1,
+                "clonestk: pid>0=%d child_sp=childstk=%d parent_sp=orig=%d "
+                "-> %s\n",
+                pid > 0, child_sp_ok, parent_sp_ok, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* _nettest — drive cng_sigsys_body with synthetic seccomp contexts to validate
+ * the Android SIGSYS net branching (no real seccomp needed). */
+int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    int fails = 0;
+
+    /* 1) gate-net: a seccomp trap whose svc is our gate -> ENOSYS. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)__cng_gate_start;
+        si._u._sigsys.syscall = 144; /* setgid */
+        uc.uc_mcontext.regs[8] = 144;
+        uc.uc_mcontext.regs[0] = 0x1234;
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        int ok = (got == -ENOSYS);
+        cng_dprintf(1, "nettest gate-net: regs0=%d want=%d -> %s\n", (int)got,
+                    (int)-ENOSYS, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2) non-gate seccomp trap of a translated path syscall -> dispatched and
+     * re-issued (faccessat "/" with identity rootfs succeeds). */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        const char *root = "/";
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000; /* not the gate */
+        uc.uc_mcontext.regs[8] = __NR_faccessat;
+        uc.uc_mcontext.regs[0] = (unsigned long long)(long)CNG_AT_FDCWD;
+        uc.uc_mcontext.regs[1] = (unsigned long long)(unsigned long)root;
+        uc.uc_mcontext.regs[2] = 0; /* F_OK */
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        int ok = (got == 0);
+        cng_dprintf(1, "nettest dispatch: faccessat(/)=%d -> %s\n", (int)got,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2b) a blocked non-path syscall reaching default -> emulated ENOSYS.
+     * get_robust_list: Android refuses it and the dispatcher has no case for
+     * it. (setgid stood here, but never reached default — it had a case of its
+     * own, whose ENOSYS was the bug cred.c's real_set fixes.) */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000;
+        uc.uc_mcontext.regs[8] = __NR_get_robust_list;
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        int ok = (got == -ENOSYS);
+        cng_dprintf(1,
+                    "nettest blocked-direct: get_robust_list=%d want=%d -> %s\n",
+                    (int)got, (int)-ENOSYS, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2c) rt_sigprocmask(SETMASK, block-all) must apply the mask but leave
+     * SIGSYS unblocked (else a later blocked seccomp trap force-kills). */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        unsigned long block_all = ~0UL;
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000;
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 2; /* SIG_SETMASK */
+        uc.uc_mcontext.regs[1] = (unsigned long)&block_all;
+        uc.uc_mcontext.regs[3] = sizeof(cng_sigset_t);
+        uc.uc_sigmask.sig[0] = 0;
+        cng_sigsys_body(&uc, &si);
+        int sigsys_blocked = (uc.uc_sigmask.sig[0] >> (CNG_SIGSYS - 1)) & 1;
+        long ret = (long)uc.uc_mcontext.regs[0];
+        int ok = (ret == 0 && !sigsys_blocked);
+        cng_dprintf(1, "nettest sigprocmask: ret=%d sigsys_blocked=%d -> %s\n",
+                    (int)ret, sigsys_blocked, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2d) the same call with ONE variable for both masks — sigprocmask(how, &m,
+     * &m) is legal and common. The writability probe validates a range by
+     * zeroing it, so the new mask has to be read out before the old-mask pointer
+     * is probed, or SIG_UNBLOCK clears everything instead of the one signal
+     * named. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        unsigned long usr1 = 1UL << (CNG_SIGUSR1 - 1);
+        unsigned long usr2 = 1UL << (12 /*SIGUSR2*/ - 1);
+        unsigned long m = usr1;
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000;
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 1; /* SIG_UNBLOCK */
+        uc.uc_mcontext.regs[1] = (unsigned long)&m;
+        uc.uc_mcontext.regs[2] = (unsigned long)&m; /* the same variable */
+        uc.uc_mcontext.regs[3] = sizeof(cng_sigset_t);
+        uc.uc_sigmask.sig[0] = usr1 | usr2;
+        cng_sigsys_body(&uc, &si);
+        int ok = (long)uc.uc_mcontext.regs[0] == 0 &&
+                 uc.uc_sigmask.sig[0] == usr2 && m == (usr1 | usr2);
+        cng_dprintf(1, "nettest sigprocmask aliased: mask=0x%lx old=0x%lx -> %s\n",
+                    uc.uc_sigmask.sig[0], m, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 2e) the two argument checks the kernel makes before it changes anything:
+     * a sigsetsize that is not its own, and a `how` outside the three it
+     * defines. This call is answered entirely in the handler, so nothing else
+     * was going to make them — a bad size passed silently, and any other `how`
+     * was taken as SIG_SETMASK, which REPLACES the mask a miscalled SIG_BLOCK
+     * meant to add to. Both must leave the mask exactly as it was. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        unsigned long usr1 = 1UL << (CNG_SIGUSR1 - 1);
+        unsigned long set = 0;
+        long bad_size, bad_how;
+        int kept_size, kept_how;
+        memset(&si, 0, sizeof si);
+        si.si_code = CNG_SYS_SECCOMP;
+        si._u._sigsys.call_addr = (void *)0x1000;
+
+        memset(&uc, 0, sizeof uc);
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 2; /* SIG_SETMASK */
+        uc.uc_mcontext.regs[1] = (unsigned long)&set;
+        uc.uc_mcontext.regs[3] = 4; /* not the kernel's sigset_t */
+        uc.uc_sigmask.sig[0] = usr1;
+        cng_sigsys_body(&uc, &si);
+        bad_size = (long)uc.uc_mcontext.regs[0];
+        kept_size = uc.uc_sigmask.sig[0] == usr1;
+
+        memset(&uc, 0, sizeof uc);
+        uc.uc_mcontext.regs[8] = __NR_rt_sigprocmask;
+        uc.uc_mcontext.regs[0] = 7; /* no such `how` */
+        uc.uc_mcontext.regs[1] = (unsigned long)&set;
+        uc.uc_mcontext.regs[3] = sizeof(cng_sigset_t);
+        uc.uc_sigmask.sig[0] = usr1;
+        cng_sigsys_body(&uc, &si);
+        bad_how = (long)uc.uc_mcontext.regs[0];
+        kept_how = uc.uc_sigmask.sig[0] == usr1;
+
+        int ok = bad_size == -EINVAL && kept_size && bad_how == -EINVAL &&
+                 kept_how;
+        cng_dprintf(1,
+                    "nettest sigprocmask args: size=%d kept=%d how=%d kept=%d "
+                    "-> %s\n",
+                    (int)bad_size, kept_size, (int)bad_how, kept_how,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    /* 3) guest-directed SIGSYS (si_code != SYS_SECCOMP) -> untouched. */
+    {
+        struct cng_ucontext uc;
+        cng_siginfo_t si;
+        memset(&uc, 0, sizeof uc);
+        memset(&si, 0, sizeof si);
+        si.si_code = 0;
+        uc.uc_mcontext.regs[0] = 0xABCD;
+        cng_sigsys_body(&uc, &si);
+        long got = (long)uc.uc_mcontext.regs[0];
+        int ok = (got == 0xABCD);
+        cng_dprintf(1, "nettest passthrough: regs0=0x%lx -> %s\n",
+                    (unsigned long)got, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    return fails ? 1 : 0;
+}
+
+/* _proctest -r ROOT [-b G:H] — exercise the /proc emulation through the
+ * dispatcher: the passthrough and its hidden-process view, the registry-backed
+ * files (cmdline, environ), the synthesized mount table, the time-varying
+ * files and their refresh-on-rewind, the fake-id status remap, and the fd-link
+ * untranslation. No seccomp needed: every check calls cng_dispatch directly. */
+
+/* Read a whole synthesized fd into `buf`; returns the byte count or -1. */
+static long pt_slurp(long fd, char *buf, size_t cap) {
+    if (fd < 0)
+        return -1;
+    long total = 0;
+    for (;;) {
+        long n = sys_read((int)fd, buf + total, cap - 1 - (size_t)total);
+        if (n <= 0)
+            break;
+        total += n;
+        if ((size_t)total >= cap - 1)
+            break;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
+/* Open a guest path through the dispatcher (the openat the guest would make). */
+static long pt_open(const char *guest) {
+    return cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)guest,
+                        CNG_O_RDONLY | CNG_O_CLOEXEC, 0, 0, 0, /*trapped=*/0);
+}
+
+/* 1 if `hay` contains `needle`. */
+static int pt_has(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++)
+        if (!strncmp(p, needle, nl))
+            return 1;
+    return 0;
+}
+
+/* capget through the dispatcher for one pid: the result in *out, the effective
+ * set returned (0 when the call failed or wrote nothing). */
+static unsigned dbg_capget(int pid, long *out) {
+    unsigned hdr[2] = {0x20080522u, (unsigned)pid};
+    unsigned dat[6];
+    memset(dat, 0, sizeof dat);
+    *out = cng_dispatch(__NR_capget, (long)hdr, (long)dat, 0, 0, 0, 0, 1);
+    return dat[0];
+}
+
+/* proctest's slow parent: held after its clone, before it publishes the child,
+ * until the child has reported. */
+static int g_slow_rfd = -1;
+static char g_slow_verdict;
+
+static void proc_slow_parent(long kid) {
+    (void)kid;
+    while (sys_read(g_slow_rfd, &g_slow_verdict, 1) == -EINTR)
+        ;
+}
+
+/* Count of NUL-separated entries in a cmdline/environ blob. */
+static int pt_nul_fields(const char *b, long n) {
+    int c = 0;
+    for (long i = 0; i < n; i++)
+        if (!b[i])
+            c++;
+    return c;
+}
+
+int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)auxv;
+    const char *rootfs = "/";
+    const char *bind_spec = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            rootfs = argv[++i];
+        else if (!strcmp(argv[i], "-b") && i + 1 < argc)
+            bind_spec = argv[++i];
+    }
+
+    static struct cng_fs fs;
+    cng_fs_init(&fs, rootfs);
+    if (bind_spec) {
+        char spec[512];
+        cng_strlcpy(spec, bind_spec, sizeof spec);
+        char *c = strchr(spec, ':');
+        if (c) { /* SRC:DST[:ro] — host first, as the -b CLI option spells it */
+            *c = '\0';
+            char *dst = c + 1;
+            int ro = 0;
+            unsigned long dl = strlen(dst);
+            if (dl >= 3 && !strcmp(dst + dl - 3, ":ro")) {
+                ro = 1;
+                dst[dl - 3] = '\0';
+            }
+            cng_fs_add_bind(&fs, dst, spec, ro);
+        }
+    }
+    cng_g_fs = &fs;
+    cng_g_exe_guest = "/bin/busybox";
+    cng_g_procstat_synth = 1; /* exercise the fallback where the host allows /proc/stat */
+    cng_g_overflowid_synth = 1; /* ...and /proc/sys/kernel/overflow{u,g}id */
+
+    int fails = 0;
+    char buf[8192];
+    int self = (int)sys_getpid();
+
+    /* The guest identity this process publishes; the registry-backed files must
+     * hand back exactly these bytes. The registry runs broker-backed
+     * (--shared-proc) so every check below also exercises that plumbing; the
+     * mktemp rootfs keys a fresh broker per run. */
+    static char *gargv[] = {"/bin/busybox", "sh", "-c", "true", 0};
+    static char *genvp[] = {"PATH=/usr/bin:/bin", "HOME=/root", 0};
+    cng_g_host_envp = envp; /* shared_dir env lookups (file-tier fallback) */
+    /* The views from files of ours rather than memfds, as a host that will
+     * not reopen a memfd makes them — taken from the environment, since the
+     * same checks are run both ways. */
+    const char *rdeny = cng_broker_env("CNG_PROCFS_REOPEN_DENY");
+    cng_g_procfs_reopen_deny = rdeny && rdeny[0] != '0';
+    cng_g_shared_proc = 1;
+    cng_procfs_init();
+    cng_procreg_publish(gargv, genvp, 0, 0, 0, cng_g_exe_guest, "/");
+
+    /* 0) the --shared-proc backing actually engaged: the broker daemon must
+     *    have spawned and handed us its memfd (a degrade to the file or
+     *    anonymous tier on a normal host is a broker bug). */
+    {
+        int ok = cng_g_procreg_backing == CNG_PROCREG_B_BROKER;
+        cng_dprintf(1, "proctest shared-proc backing: %d -> %s\n",
+                    cng_g_procreg_backing, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 1) passthrough + hidden-process view, at the path layer. */
+    {
+        char out[CNG_PATH_MAX];
+        int ok = 1;
+        ok &= cng_fs_translate(&fs, "/proc/self/status", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/self/status");
+        ok &= cng_fs_translate(&fs, "/proc/version", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/version");
+        /* our own pid is a guest process: visible */
+        char mine[64];
+        cng_snprintf(mine, sizeof mine, "/proc/%d/stat", self);
+        ok &= cng_fs_translate(&fs, mine, out, sizeof out) == 0 &&
+              !strcmp(out, mine);
+        /* pid 1 is a host process: redirected to /proc/0, which never exists */
+        ok &= cng_fs_translate(&fs, "/proc/1/stat", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/0/stat");
+        cng_dprintf(1, "proctest passthrough+hidden -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 1b) the hidden view keys on where the path LANDS, not on which map rule
+     *     put it there: binding the host /proc at /proc must not hand the guest
+     *     the host's process list back. The listing side of the same rule is
+     *     proc_name_visible, driven through the getdents64 hook. */
+    {
+        static struct cng_fs pb;
+        cng_fs_init(&pb, rootfs);
+        cng_fs_add_bind(&pb, "/proc", "/proc", 0);
+        char out[CNG_PATH_MAX];
+        int ok = 1;
+        ok &= cng_fs_translate(&pb, "/proc/1/stat", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/0/stat");
+        char mine[64];
+        cng_snprintf(mine, sizeof mine, "/proc/%d/stat", self);
+        ok &= cng_fs_translate(&pb, mine, out, sizeof out) == 0 &&
+              !strcmp(out, mine);
+        /* non-numeric names are unaffected by the bind */
+        ok &= cng_fs_translate(&pb, "/proc/version", out, sizeof out) == 0 &&
+              !strcmp(out, "/proc/version");
+        cng_dprintf(1, "proctest bound-proc hidden -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 1c) the listing filter itself: host pids are dropped from a /proc
+     *     listing, guest pids and named entries survive. */
+    {
+        long dfd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC,
+                                0, 0, 0, /*trapped=*/0);
+        int ok = dfd >= 0, saw_self = 0, saw_mine = 0, saw_host = 0;
+        while (dfd >= 0) {
+            long n = cng_dispatch(__NR_getdents64, dfd, (long)buf, sizeof buf, 0,
+                                  0, 0, /*trapped=*/0);
+            if (n <= 0)
+                break;
+            for (long o = 0; o + 19 <= n;) {
+                unsigned short reclen;
+                memcpy(&reclen, buf + o + 16, 2);
+                if (reclen == 0 || o + reclen > n)
+                    break;
+                const char *nm = buf + o + 19;
+                if (!strcmp(nm, "self"))
+                    saw_self = 1;
+                if (nm[0] >= '0' && nm[0] <= '9') {
+                    long pid = 0;
+                    for (const char *p = nm; *p >= '0' && *p <= '9'; p++)
+                        pid = pid * 10 + (*p - '0');
+                    if (pid == self)
+                        saw_mine = 1;
+                    else if (!cng_procreg_has((int)pid))
+                        saw_host = 1;
+                }
+                o += reclen;
+            }
+        }
+        if (dfd >= 0)
+            sys_close((int)dfd);
+        ok = ok && saw_self && saw_mine && !saw_host;
+        cng_dprintf(1, "proctest listing: self=%d own_pid=%d host_pids=%d -> %s\n",
+                    saw_self, saw_mine, saw_host, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) cmdline and environ come from the registry, not from our own exec. */
+    {
+        long fd = pt_open("/proc/self/cmdline");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0 && !strcmp(buf, "/bin/busybox") &&
+                 pt_nul_fields(buf, n) == 4 && pt_has(buf + 13, "sh");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest cmdline: %ld bytes argv0=%s -> %s\n", n, buf,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        fd = pt_open("/proc/self/environ");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && pt_nul_fields(buf, n) == 2 && !strcmp(buf, genvp[0]);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest environ: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3) the same files for ANOTHER guest process, via a real fork the parent
+     *    registers exactly as the clone hook does. */
+    {
+        long kid = sys_fork();
+        if (kid == 0) { /* outlive the parent's checks, then go away */
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        int ok = kid > 0;
+        if (ok) {
+            cng_procreg_fork((int)kid);
+            ok &= cng_procreg_has((int)kid);
+            char p[64];
+            cng_snprintf(p, sizeof p, "/proc/%d/cmdline", (int)kid);
+            long fd = pt_open(p);
+            long n = pt_slurp(fd, buf, sizeof buf);
+            ok &= n > 0 && !strcmp(buf, "/bin/busybox");
+            if (fd >= 0)
+                sys_close((int)fd);
+            /* and its exe/cwd links resolve in guest terms */
+            char lb[CNG_PATH_MAX];
+            cng_snprintf(p, sizeof p, "/proc/%d/exe", (int)kid);
+            long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                  (long)lb, sizeof lb - 1, 0, 0, 0);
+            if (r > 0)
+                lb[r] = '\0';
+            ok &= r > 0 && !strcmp(lb, "/bin/busybox");
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+        }
+        cng_dprintf(1, "proctest other-pid: -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3b) two registry properties around a child's slot. First, ordering: an
+     *     exec the child has already published must survive the parent's
+     *     later fork-publish (cng_procreg_fork backs off from a slot already
+     *     stamped with the child's own incarnation). Second, death: once the
+     *     child is reaped its slot must stop answering, or a host process
+     *     that gets the pid next would inherit the dead guest's identity —
+     *     exit is not a trapped syscall, so the starttime check inside
+     *     cng_procreg_has is the only thing standing there. */
+    {
+        int pfd[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_pipe2, pfd, 0, 0, 0, 0, 0) == 0;
+        long kid = ok ? sys_fork() : -1;
+        if (kid == 0) { /* the "exec": publish an identity of our own */
+            static char *kargv[] = {"/bin/kid-prog", 0};
+            static char *kenvp[] = {"K=1", 0};
+            cng_procreg_publish(kargv, kenvp, 0, 0, 0, "/bin/kid-prog", "/");
+            sys_close(pfd[0]);
+            cng_write_all(pfd[1], "x", 1);
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        ok &= kid > 0;
+        int st = 0; /* first failed stage, 0 = none */
+        if (ok) {
+            char c;
+            sys_close(pfd[1]);
+            if (sys_read(pfd[0], &c, 1) != 1)
+                st = 1; /* child never published its exec */
+            sys_close(pfd[0]);
+            cng_procreg_fork((int)kid); /* must not clobber it */
+            struct cng_procsnap snap;
+            if (!st && cng_procreg_get((int)kid, &snap) != 1)
+                st = 2;
+            if (!st && strcmp(snap.cmd, "/bin/kid-prog"))
+                st = 3; /* the fork publish overwrote the child's exec */
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+            if (!st && cng_procreg_has((int)kid))
+                st = 4; /* a dead pid still answers */
+            if (!st && cng_procreg_get((int)kid, &snap))
+                st = 5;
+            ok &= !st;
+        }
+        if (st)
+            cng_dprintf(1, "proctest fork-guard+stale-pid: stage %d -> FAIL\n",
+                        st);
+        else
+            cng_dprintf(1, "proctest fork-guard+stale-pid: -> %s\n",
+                        ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3c) a child that forks before its parent has published it. The parent
+     *     publishes the child once its clone returns, and the scheduler need
+     *     not run it again before the child is well into guest code. A child
+     *     that forked in that gap found no entry of its own to copy, so its
+     *     own child was never published at all: invisible in /proc, refused
+     *     to PTRACE_ATTACH with ESRCH and hidden from kill. That orphaned
+     *     the waitnowait grandchild in m18 now and then. The child now waits
+     *     for its parent's copy a bounded time, then makes its own. The probe
+     *     holds the parent in exactly that gap until the child has looked, so
+     *     the child has to fall back to its own copy (about 100 ms). */
+    {
+        int vfd[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_pipe2, vfd, 0, 0, 0, 0, 0) == 0;
+        g_slow_rfd = vfd[0];
+        g_slow_verdict = 0;
+        cng_g_fork_parent_probe = proc_slow_parent;
+        long kid = ok ? cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0,
+                                     0, 0)
+                      : -1;
+        if (kid == 0) {
+            cng_g_fork_parent_probe = 0; /* our own fork must not wait */
+            struct cng_procsnap snap;
+            char v = cng_procreg_get((int)sys_getpid(), &snap) ? 'y' : 's';
+            long g = cng_dispatch(__NR_clone, 17, 0, 0, 0, 0, 0, 0);
+            if (g == 0) {
+                struct cng_timespec nap = {5, 0};
+                CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+                sys_exit_group(0);
+            }
+            if (v == 'y' && (g <= 0 || !cng_procreg_has((int)g)))
+                v = 'g';
+            if (g > 0) {
+                CNG_SYS(__NR_kill, g, 9, 0, 0, 0, 0);
+                sys_wait4((int)g, 0, 0, 0);
+            }
+            cng_write_all(vfd[1], &v, 1);
+            sys_exit_group(0);
+        }
+        cng_g_fork_parent_probe = 0;
+        if (vfd[0] >= 0) {
+            sys_close(vfd[0]);
+            sys_close(vfd[1]);
+        }
+        ok &= kid > 0 && g_slow_verdict == 'y';
+        if (kid > 0)
+            sys_wait4((int)kid, 0, 0, 0);
+        /* 's': the child had no entry of its own; 'g': it had, and still the
+         * grandchild it forked was not published. */
+        cng_dprintf(1, "proctest fork before the parent publishes: %c -> %s\n",
+                    g_slow_verdict ? g_slow_verdict : '-', ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 4) the mount table describes the rootfs and the binds, never the host's
+     *    real mount namespace. */
+    {
+        long fd = pt_open("/proc/mounts");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0 && pt_has(buf, "/dev/root / ") && pt_has(buf, "proc /proc proc ");
+        /* A bind is one row, named by where the guest mounted it — and never by
+         * where it came from: a real table names a device in that field, and the
+         * directory it was bound from is a host path, which is the one thing the
+         * path layer exists to keep out of the guest's hands. */
+        if (bind_spec)
+            ok &= pt_has(buf, fs.binds[0].guest) && !pt_has(buf, fs.binds[0].host);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest mounts: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        fd = pt_open("/proc/self/mountinfo");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && pt_has(buf, "1 1 ") && pt_has(buf, " / / rw,relatime - ");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest mountinfo: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 5) loadavg/uptime/stat: shape, and refresh-on-rewind (the same fd, read
+     *    twice from offset 0, must be regenerated — top holds its fd open). */
+    {
+        long fd = pt_open("/proc/loadavg");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int fields = 0;
+        for (long i = 0; i < n; i++)
+            if (buf[i] == ' ')
+                fields++;
+        int ok = n > 0 && fields == 4 && pt_has(buf, ".") && pt_has(buf, "/");
+        cng_dprintf(1, "proctest loadavg: %ld bytes 4-spaces=%d -> %s\n", n,
+                    fields == 4, ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (fd >= 0) {
+            /* rewind + reread through the dispatcher, as procps does */
+            sys_lseek((int)fd, 0, CNG_SEEK_SET);
+            char again[512];
+            long m = cng_dispatch(__NR_read, fd, (long)again, sizeof again - 1,
+                                  0, 0, 0, 0);
+            if (m > 0)
+                again[m] = '\0';
+            int fresh = m > 0 && again[0] >= '0' && again[0] <= '9';
+            cng_dprintf(1, "proctest loadavg refresh: %ld bytes -> %s\n", m,
+                        fresh ? "OK" : "FAIL");
+            fails += !fresh;
+            /* the same rewind through readv — the rest of the read family
+             * takes the identical pre-read hook, so one representative is
+             * enough at this layer (the filter side is bpftest's job) */
+            sys_lseek((int)fd, 0, CNG_SEEK_SET);
+            struct {
+                void *base;
+                unsigned long len;
+            } iov = {again, sizeof again - 1};
+            m = cng_dispatch(__NR_readv, fd, (long)&iov, 1, 0, 0, 0, 0);
+            if (m > 0)
+                again[m] = '\0';
+            fresh = m > 0 && again[0] >= '0' && again[0] <= '9';
+            cng_dprintf(1, "proctest loadavg readv refresh: %ld bytes -> %s\n",
+                        m, fresh ? "OK" : "FAIL");
+            fails += !fresh;
+            /* ...and the same hook off the p-variants, where the offset is the
+             * caller's argument rather than the description's. pread(2) is
+             * defined never to move that description, but the regeneration
+             * rewinds the file it rewrites, so a sequential reader that pread's
+             * its own held fd at 0 had its position reset under it. */
+            sys_lseek((int)fd, 0, CNG_SEEK_SET);
+            m = cng_dispatch(__NR_read, fd, (long)again, 8, 0, 0, 0, 0);
+            long before = sys_lseek((int)fd, 0, CNG_SEEK_CUR);
+            cng_dispatch(__NR_pread64, fd, (long)again, sizeof again - 1, 0, 0,
+                         0, 0);
+            long after = sys_lseek((int)fd, 0, CNG_SEEK_CUR);
+            int kept = m == 8 && before == 8 && after == 8;
+            cng_dprintf(1, "proctest pread keeps the offset: %ld then %ld -> %s\n",
+                        before, after, kept ? "OK" : "FAIL");
+            fails += !kept;
+            /* The refresh is keyed on the number, and close(2) is not
+             * trapped: a guest file moved onto it must be left exactly as
+             * it is. The identity that decides is the (device, inode) pair —
+             * an inode number is per filesystem, so the memfd's number on
+             * another device is not the memfd — asked of the helper
+             * directly, since no guest can be made to produce that
+             * collision to order; then the reuse itself, through the
+             * dispatcher, on a file whose inode differs as any real one
+             * would. */
+            struct cng_fdid id, alias;
+            int ident = cng_fdid_of((int)fd, &id) == 0 && cng_fd_is((int)fd, &id);
+            alias = id;
+            alias.dev ^= 1;
+            ident &= !cng_fd_is((int)fd, &alias);
+            alias = id;
+            alias.ino ^= 1;
+            ident &= !cng_fd_is((int)fd, &alias);
+            char keep[CNG_PATH_MAX];
+            cng_snprintf(keep, sizeof keep, "%s/keep", rootfs);
+            long kf = sys_openat(CNG_AT_FDCWD, keep,
+                                 CNG_O_RDWR | CNG_O_CREAT | CNG_O_TRUNC, 0644);
+            int reuse = kf >= 0 && sys_write((int)kf, "kept\n", 5) == 5 &&
+                        CNG_SYS(__NR_dup3, kf, fd, 0, 0, 0, 0) == fd;
+            if (reuse) {
+                sys_lseek((int)fd, 0, CNG_SEEK_SET);
+                m = cng_dispatch(__NR_read, fd, (long)again, sizeof again - 1,
+                                 0, 0, 0, 0);
+                reuse = m == 5 && !strncmp(again, "kept\n", 5);
+            }
+            if (kf >= 0)
+                sys_close((int)kf);
+            cng_dprintf(1,
+                        "proctest synth fd identity: dev+ino=%d reused number "
+                        "left alone=%d -> %s\n",
+                        ident, reuse, ident && reuse ? "OK" : "FAIL");
+            fails += !(ident && reuse);
+            sys_close((int)fd);
+        }
+
+        /* A refreshable file opened onto the number another one just had:
+         * the entry that number carried describes the file before, and it
+         * is the one taken for the new file's (pf_track), not left beside
+         * it for the first read to find, retire, and skip the refresh on.
+         * The rewind must regenerate, as uptime's advancing clock shows,
+         * and as uptime rather than as the loadavg the number had. */
+        {
+            long la = pt_open("/proc/loadavg");
+            if (la >= 0)
+                sys_close((int)la);
+            long up = pt_open("/proc/uptime");
+            char u1[128], u2[128];
+            long n1 = up >= 0 ? cng_dispatch(__NR_read, up, (long)u1,
+                                             sizeof u1 - 1, 0, 0, 0, 0)
+                              : -1;
+            struct {
+                long s, ns;
+            } nap = {0, 30000000};
+            CNG_SYS(__NR_nanosleep, (long)&nap, 0, 0, 0, 0, 0);
+            long n2 = -1;
+            if (up >= 0) {
+                sys_lseek((int)up, 0, CNG_SEEK_SET);
+                n2 = cng_dispatch(__NR_read, up, (long)u2, sizeof u2 - 1, 0,
+                                  0, 0, 0);
+            }
+            int spaces = 0;
+            for (long i = 0; i < n2; i++)
+                spaces += u2[i] == ' ';
+            int moved = n1 > 0 && n2 > 0 && (n1 != n2 || memcmp(u1, u2, (size_t)n1));
+            int ok = la >= 0 && up == la && spaces == 1 && moved;
+            cng_dprintf(1,
+                        "proctest synth fd reused by another kind: same=%d "
+                        "uptime=%d refreshed=%d -> %s\n",
+                        la >= 0 && up == la, spaces == 1, moved,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+            if (up >= 0)
+                sys_close((int)up);
+        }
+
+        fd = pt_open("/proc/uptime");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && buf[0] >= '0' && buf[0] <= '9' && pt_has(buf, ".");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest uptime: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        fd = pt_open("/proc/stat");
+        n = pt_slurp(fd, buf, sizeof buf);
+        ok = n > 0 && !strncmp(buf, "cpu  ", 5) && pt_has(buf, "\nbtime ") &&
+             pt_has(buf, "\nprocs_running 1\n");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest stat: %ld bytes -> %s\n", n, ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        /* overflowuid / overflowgid: the kernel's default id and nothing else,
+         * and from a view of ours — forced above, since a test host can read
+         * the real ones, which would otherwise pass through and prove nothing.
+         * The fd's own link says which it was: the memfd's name, or the name
+         * of the file of ours that stands in where the memfd stayed writable
+         * (CNG_PROCFS_REOPEN_DENY, Android). */
+        static const char *const ovf[] = {"/proc/sys/kernel/overflowuid",
+                                          "/proc/sys/kernel/overflowgid"};
+        for (int i = 0; i < 2; i++) {
+            fd = pt_open(ovf[i]);
+            n = pt_slurp(fd, buf, sizeof buf);
+            char lk[40], tgt[CNG_PATH_MAX + 64], want[CNG_PATH_MAX + 64];
+            cng_snprintf(lk, sizeof lk, "/proc/self/fd/%ld", fd);
+            long tl = fd >= 0 ? sys_readlinkat(CNG_AT_FDCWD, lk, tgt, sizeof tgt - 1)
+                              : -1;
+            if (tl >= 0)
+                tgt[tl] = '\0';
+            ok = n == 6 && !strcmp(buf, "65534\n") && tl > 0 &&
+                 cng_procfs_link_name(tgt, want, sizeof want) &&
+                 !strcmp(want, ovf[i]);
+            if (fd >= 0)
+                sys_close((int)fd);
+            cng_dprintf(1, "proctest %s: %ld bytes -> %s\n", ovf[i] + 17, n,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
+    /* 5a) the description a synthesized open hands over is what the real file
+     *     gives: read-only, and refused the same things. memfd_create only
+     *     makes O_RDWR files, and that was what the guest got — a /proc file it
+     *     could write(), ftruncate() and mmap(MAP_SHARED|PROT_WRITE), that
+     *     reported O_RDWR from F_GETFL. The status flags it did ask for
+     *     (O_APPEND here) still have to come back from F_GETFL, as the kernel
+     *     records them on any file. Every answer here is the host kernel's for
+     *     the real file (measured).
+     *
+     *     The one way to a read-only description of a memfd is to reopen it
+     *     through its own /proc link, and a host policy may refuse that —
+     *     Android's does (EACCES), and CNG_PROCFS_REOPEN_DENY says it does.
+     *     The view is then a file of ours, opened read-only for real, in a
+     *     private directory under the temp directory. Only where neither can
+     *     be had does the fd stay writable, as synth_seal says it does, and
+     *     there is nothing to assert: that is reported as such, rather than
+     *     as the guest being handed a writable /proc file on a host that
+     *     could have given it a read-only one. */
+    long ro_probe = -1, ro_mfd = sys_memfd_create("cng-probe", CNG_MFD_CLOEXEC);
+    if (ro_mfd >= 0) {
+        char rl[40];
+        cng_snprintf(rl, sizeof rl, "/proc/self/fd/%ld", ro_mfd);
+        ro_probe = cng_g_procfs_reopen_deny
+                       ? -EACCES
+                       : sys_openat(CNG_AT_FDCWD, rl, CNG_O_RDONLY | CNG_O_CLOEXEC,
+                                    0);
+        if (ro_probe >= 0)
+            sys_close((int)ro_probe);
+        sys_close((int)ro_mfd);
+    }
+    char ro_dir[CNG_PATH_MAX];
+    if (ro_mfd >= 0 && ro_probe < 0 &&
+        cng_private_tmp_dir("chroot-ng-proc.v1", ro_dir, sizeof ro_dir, 0,
+                            0) != 0) {
+        cng_dprintf(1,
+                    "proctest synth fd is read-only: unavailable (the host "
+                    "refuses to reopen a memfd, errno %ld, and there is no "
+                    "private temp directory)\n",
+                    -ro_probe);
+    } else {
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_APPEND | CNG_O_CLOEXEC, 0, 0,
+                               0, 0);
+        long fl = fd >= 0 ? sys_fcntl((int)fd, CNG_F_GETFL, 0) : -1;
+        long wr = fd >= 0 ? sys_write((int)fd, "x", 1) : 0;
+        long tr = fd >= 0 ? sys_ftruncate((int)fd, 0) : 0;
+        void *m = fd >= 0 ? sys_mmap(0, 4096, CNG_PROT_READ | CNG_PROT_WRITE,
+                                     CNG_MAP_SHARED, (int)fd, 0)
+                          : 0;
+        long mm = (long)m;
+        if (m && !cng_is_err(mm))
+            sys_munmap(m, 4096);
+        /* ...and the content still reads after all that. */
+        long n = pt_slurp(fd, buf, sizeof buf);
+        if (fd >= 0)
+            sys_close((int)fd);
+        int ro = fl >= 0 && (fl & CNG_O_ACCMODE) == CNG_O_RDONLY &&
+                 (fl & CNG_O_APPEND);
+        int ok = ro && wr == -EBADF && tr == -EINVAL && mm == -EACCES && n > 0;
+        cng_dprintf(1,
+                    "proctest synth fd is read-only: accmode=%ld append=%d "
+                    "write=%ld ftruncate=%ld mmap_rw=%ld read=%ld -> %s\n",
+                    fl >= 0 ? fl & CNG_O_ACCMODE : fl, fl >= 0 && (fl & CNG_O_APPEND),
+                    wr, tr, mm, n, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 5b) the open flags are judged as the kernel judges them on the real
+     *     file, in its order. Write intent — a non-read access mode, or
+     *     O_TRUNC, which build_open_flags() folds into MAY_WRITE — is EACCES on
+     *     a 0444 file; O_CREAT|O_EXCL is EEXIST on a name that exists; a
+     *     regular file is ENOTDIR to O_DIRECTORY; O_DIRECT is EINVAL on an
+     *     inode with no direct_IO; O_NOATIME is the owner's, and the global
+     *     files are root's (unless we are root, when the kernel allows it);
+     *     and /proc/mounts is itself a symlink, so O_NOFOLLOW on that spelling
+     *     is ELOOP where the same flag on self/mounts opens. O_PATH ignores
+     *     everything else and hands over the real inode, which cannot be read
+     *     from: the old code answered it with a readable memfd. Each of these
+     *     used to synthesize as if nothing had been asked. */
+    {
+        long tr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_TRUNC, 0, 0, 0, 0);
+        long ex = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_CREAT | CNG_O_EXCL, 0600, 0,
+                               0, 0);
+        long dr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/uptime",
+                               CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long di = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/uptime",
+                               CNG_O_RDONLY | CNG_O_DIRECT, 0, 0, 0, 0);
+        long na = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_NOATIME, 0, 0, 0, 0);
+        long na_want = sys_geteuid() == 0 ? 0 : -EPERM;
+        if (na >= 0) {
+            sys_close((int)na);
+            na = 0;
+        }
+        /* our own entries are ours to O_NOATIME */
+        long nself = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                                  (long)"/proc/self/cmdline",
+                                  CNG_O_RDONLY | CNG_O_NOATIME, 0, 0, 0, 0);
+        if (nself >= 0)
+            sys_close((int)nself);
+        /* Differential: the real answer for the symlink spelling is whatever
+         * the host gives the same raw call — ELOOP on a kernel, but qemu-user
+         * realpath()s the name first and opens the target. */
+        long el = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/mounts",
+                               CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        long el_want = sys_openat(CNG_AT_FDCWD, "/proc/mounts",
+                                  CNG_O_RDONLY | CNG_O_NOFOLLOW, 0);
+        if (el_want >= 0) {
+            sys_close((int)el_want);
+            el_want = 0;
+        }
+        if (el >= 0) {
+            sys_close((int)el);
+            el = 0;
+        }
+        long nf = cng_dispatch(__NR_openat, CNG_AT_FDCWD,
+                               (long)"/proc/self/mounts",
+                               CNG_O_RDONLY | CNG_O_NOFOLLOW, 0, 0, 0, 0);
+        long nfn = pt_slurp(nf, buf, sizeof buf);
+        if (nf >= 0)
+            sys_close((int)nf);
+        long pa = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_PATH | CNG_O_RDWR | CNG_O_TRUNC, 0, 0, 0, 0);
+        long pa_read = pa >= 0 ? sys_read((int)pa, buf, 8) : 0;
+        long pa_fl = pa >= 0 ? sys_fcntl((int)pa, CNG_F_GETFL, 0) : 0;
+        if (pa >= 0)
+            sys_close((int)pa);
+        /* a plain O_CREAT on the existing name opens it, as the kernel does */
+        long cr = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/loadavg",
+                               CNG_O_RDONLY | CNG_O_CREAT, 0600, 0, 0, 0);
+        long crn = pt_slurp(cr, buf, sizeof buf);
+        if (cr >= 0)
+            sys_close((int)cr);
+        int ok = tr == -EACCES && ex == -EEXIST && dr == -ENOTDIR &&
+                 di == -EINVAL && na == na_want && nself >= 0 &&
+                 el == el_want && nf >= 0 && nfn > 0 && pa >= 0 &&
+                 pa_read == -EBADF && (pa_fl & CNG_O_PATH) && cr >= 0 && crn > 0;
+        cng_dprintf(1,
+                    "proctest open flags: trunc=%ld creat_excl=%ld dir=%ld "
+                    "direct=%ld noatime=%ld noatime_self=%d mounts_nofollow=%ld "
+                    "(host %ld) self_mounts_nofollow=%d path_read=%ld path_fl=%d "
+                    "creat=%d -> %s\n",
+                    tr, ex, dr, di, na, nself >= 0, el, el_want,
+                    nf >= 0 && nfn > 0,
+                    pa_read, (pa_fl & CNG_O_PATH) != 0, cr >= 0 && crn > 0,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 5c) what the fd says about itself is what the path says: fstat, the
+     *     AT_EMPTY_PATH forms of newfstatat and statx, and fstatfs on a
+     *     synthesized fd used to describe the memfd behind it — 0777, no
+     *     links, the content's size, a tmpfs inode — where stat() of the path
+     *     (host passthrough) reports the real /proc file. Each answer is
+     *     compared with the path form on the same name, for a root-owned
+     *     global file and one of our own entries. Then a held /proc/<pid>
+     *     file after its process is gone: the kernel's pinned inode keeps
+     *     answering (measured) where a re-stat of the path is ENOENT, so the
+     *     fd must still describe a /proc regular file — 0444, one link, no
+     *     size, procfs's device, the same owner. An ordinary fd is untouched. */
+    {
+        static const char *const names[] = {"/proc/loadavg",
+                                            "/proc/self/cmdline",
+                                            "/proc/self/mounts"};
+        int st_ok = 1, sx_ok = 1, fs_ok = 1, sx_none = 0;
+        char proc_st[144];
+        long rproc = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/proc",
+                                  (long)proc_st, 0, 0, 0, 0);
+        for (int k = 0; k < 3; k++) {
+            char ps[144], fs[144], px[256], fx[256], pf[120], ff[120];
+            long fd = pt_open(names[k]);
+            long r1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                   (long)names[k], (long)ps, 0, 0, 0, 0);
+            long r2 = fd >= 0 ? cng_dispatch(__NR_fstat, fd, (long)fs, 0, 0,
+                                             0, 0, 0)
+                              : -1;
+            /* fstat and newfstatat(fd, "", AT_EMPTY_PATH) must say the same */
+            char es[144];
+            long r2b = fd >= 0 ? cng_dispatch(__NR_newfstatat, fd, (long)"",
+                                              (long)es, CNG_AT_EMPTY_PATH, 0, 0,
+                                              0)
+                               : -1;
+            long r3 = cng_dispatch(__NR_statx, CNG_AT_FDCWD, (long)names[k], 0,
+                                   CNG_STATX_BASIC_STATS | 0x1000, (long)px, 0,
+                                   0);
+            long r4 = fd >= 0 ? cng_dispatch(__NR_statx, fd, (long)"",
+                                             CNG_AT_EMPTY_PATH,
+                                             CNG_STATX_BASIC_STATS | 0x1000,
+                                             (long)fx, 0, 0)
+                              : -1;
+            long r5 = cng_dispatch(__NR_statfs, (long)names[k], (long)pf, 0, 0,
+                                   0, 0, 0);
+            long r6 = fd >= 0 ? cng_dispatch(__NR_fstatfs, fd, (long)ff, 0, 0,
+                                             0, 0, 0)
+                              : -1;
+            if (fd >= 0)
+                sys_close((int)fd);
+            /* A host with no statx to issue — a kernel before 4.11, or a
+             * filter that predates it and traps it — answers ENOSYS to both
+             * forms, and there is nothing to compare: statx reads -1. */
+            int no_sx = r3 == -ENOSYS && r4 == -ENOSYS;
+            sx_none |= no_sx;
+            if (r1 == -EACCES) {
+                /* The host refuses the path form outright — Android denies
+                 * stat of the global files it hides, which is why they are
+                 * synthesized — so there is no real file to be compared
+                 * with. The descriptor is held to the shape every /proc
+                 * regular file has instead, which is what the real one would
+                 * say: 0444, one link, no size, procfs's device, root's. */
+                st_ok &= r2 == 0 && r2b == 0 && rproc == 0 &&
+                         !memcmp(fs, es, 120) &&
+                         ST_MODE(fs) == (0100000 | 0444) &&
+                         *(unsigned *)(fs + 20) == 1 &&   /* st_nlink */
+                         *(unsigned *)(fs + 24) == 0 &&   /* st_uid */
+                         *(long long *)(fs + 48) == 0 &&  /* st_size */
+                         !memcmp(fs, proc_st, 8);         /* st_dev */
+                sx_ok &= no_sx || (r4 == 0 &&
+                         *(unsigned *)(fx + 16) == 1 &&   /* stx_nlink */
+                         *(unsigned *)(fx + 20) == 0 &&   /* stx_uid */
+                         *(unsigned short *)(fx + 28) == (0100000 | 0444) &&
+                         *(unsigned long long *)(fx + 40) == 0); /* stx_size */
+                fs_ok &= r6 == 0 && *(long *)ff == 0x9fa0; /* PROC_SUPER_MAGIC */
+                continue;
+            }
+            /* the whole struct: dev, ino, mode, nlink, uid, gid, size,
+             * blksize, blocks and the times */
+            st_ok &= r1 == 0 && r2 == 0 && r2b == 0 &&
+                     !memcmp(ps, fs, 120) && !memcmp(fs, es, 120);
+            /* statx: everything but the spare tail */
+            sx_ok &= no_sx || (r3 == 0 && r4 == 0 && !memcmp(px, fx, 152));
+            fs_ok &= r5 == 0 && r6 == 0 && !memcmp(pf, ff, 120);
+        }
+        /* a held entry outlives its process */
+        long kid = sys_fork();
+        if (kid == 0) {
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        int keep_ok = 0;
+        if (kid > 0) {
+            cng_procreg_fork((int)kid);
+            char kp[64];
+            cng_snprintf(kp, sizeof kp, "/proc/%ld/cmdline", kid);
+            char before[144], after[144], gone[144];
+            long kfd = pt_open(kp);
+            long rb = kfd >= 0 ? cng_dispatch(__NR_fstat, kfd, (long)before, 0,
+                                              0, 0, 0, 0)
+                               : -1;
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+            long ra = kfd >= 0 ? cng_dispatch(__NR_fstat, kfd, (long)after, 0,
+                                              0, 0, 0, 0)
+                               : -1;
+            long rg = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)kp,
+                                   (long)gone, 0, 0, 0, 0);
+            if (kfd >= 0)
+                sys_close((int)kfd);
+            char pst[144];
+            long rp = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                   (long)"/proc", (long)pst, 0, 0, 0, 0);
+            keep_ok = rb == 0 && ra == 0 && rp == 0 && rg == -ENOENT &&
+                      ST_MODE(after) == (0100000 | 0444) &&
+                      *(unsigned *)(after + 20) == 1 &&        /* st_nlink */
+                      *(long long *)(after + 48) == 0 &&       /* st_size */
+                      *(int *)(after + 56) == 1024 &&          /* st_blksize */
+                      !memcmp(after, pst, 8) &&                /* st_dev */
+                      !memcmp(after + 24, before + 24, 8);     /* uid, gid */
+        }
+        /* the fd's link names the file, a stat through it describes the
+         * file, and a dup of the fd is the same fd */
+        int link_ok = 0, dup_ok = 0;
+        {
+            char ps[144], ls[144], ds[144], lk[64], tg[CNG_PATH_MAX];
+            long fd = pt_open("/proc/self/mounts");
+            long r1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                   (long)"/proc/self/mounts", (long)ps, 0, 0,
+                                   0, 0);
+            cng_snprintf(lk, sizeof lk, "/proc/self/fd/%ld", fd);
+            long rl = fd >= 0 ? cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                             (long)lk, (long)tg, sizeof tg - 1,
+                                             0, 0, 0)
+                              : -1;
+            if (rl > 0)
+                tg[rl] = '\0';
+            char want[64];
+            cng_snprintf(want, sizeof want, "/proc/%d/mounts",
+                         (int)sys_getpid());
+            long r2 = fd >= 0 ? cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD,
+                                             (long)lk, (long)ls, 0, 0, 0, 0)
+                              : -1;
+            long d = fd >= 0 ? CNG_SYS(__NR_dup, fd, 0, 0, 0, 0, 0) : -1;
+            long r3 = d >= 0 ? cng_dispatch(__NR_fstat, d, (long)ds, 0, 0, 0,
+                                            0, 0)
+                             : -1;
+            if (d >= 0)
+                sys_close((int)d);
+            if (fd >= 0)
+                sys_close((int)fd);
+            link_ok = r1 == 0 && rl > 0 && !strcmp(tg, want) && r2 == 0 &&
+                      !memcmp(ps, ls, 120);
+            dup_ok = r1 == 0 && r3 == 0 && !memcmp(ps, ds, 120);
+        }
+        /* an ordinary fd is left to the kernel */
+        long ofd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        char os[144], ok_[144];
+        long ro1 = ofd >= 0 ? cng_dispatch(__NR_fstat, ofd, (long)os, 0, 0, 0,
+                                           0, 0)
+                            : -1;
+        long ro2 = ofd >= 0 ? CNG_SYS(__NR_fstat, ofd, ok_, 0, 0, 0, 0) : -1;
+        if (ofd >= 0)
+            sys_close((int)ofd);
+        int plain_ok = ro1 == 0 && ro2 == 0 && !memcmp(os, ok_, 120);
+        int ok = st_ok && sx_ok && fs_ok && keep_ok && link_ok && dup_ok &&
+                 plain_ok;
+        cng_dprintf(1,
+                    "proctest synth fd stat: fstat=%d statx=%d fstatfs=%d "
+                    "outlives=%d link=%d dup=%d plain=%d -> %s%s\n",
+                    st_ok, sx_none ? -1 : sx_ok, fs_ok, keep_ok, link_ok,
+                    dup_ok, plain_ok, ok ? "OK" : "FAIL",
+                    sx_none ? " (-1 = not issuable here)" : "");
+        fails += !ok;
+    }
+
+    /* 6) maps: the guest's own mappings, with no host path left in them. */
+    {
+        long fd = pt_open("/proc/self/maps");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0;
+        if (fs.rootfs[0])
+            ok &= !pt_has(buf, fs.rootfs); /* no rootfs host prefix leaked */
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest maps: %ld bytes no-host-prefix -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 7) an fd link reports the guest path, not the host one. */
+    {
+        char hp[CNG_PATH_MAX];
+        long ffd = -1;
+        int ok = 0;
+        if (cng_fs_translate(&fs, "/", hp, sizeof hp) == 0)
+            ffd = sys_openat(CNG_AT_FDCWD, hp, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+        if (ffd >= 0) {
+            char p[64], lb[CNG_PATH_MAX];
+            cng_snprintf(p, sizeof p, "/proc/self/fd/%d", (int)ffd);
+            long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                  (long)lb, sizeof lb - 1, 0, 0, 0);
+            if (r > 0)
+                lb[r] = '\0';
+            ok = r > 0 && !strcmp(lb, "/");
+            cng_dprintf(1, "proctest fdlink: %s -> %s\n", r > 0 ? lb : "(err)",
+                        ok ? "OK" : "FAIL");
+            sys_close((int)ffd);
+        } else {
+            cng_dprintf(1, "proctest fdlink: cannot open rootfs -> FAIL\n");
+        }
+        fails += !ok;
+    }
+
+    /* 7a) ...and a buffer too small for it cuts the GUEST spelling, never the
+     *     host one. readlink truncates to the buffer and reports the cut
+     *     length, so the bytes a short buffer gets are the head of whatever
+     *     value was mapped into it: skipping the fixup whenever the answer
+     *     filled the buffer handed back the head of the HOST path, which for
+     *     any buffer shorter than the rootfs prefix is nothing but where the
+     *     rootfs lives on the device. Mapped first, cut second — so every
+     *     answer here is a prefix of the guest's own name. */
+    {
+        char hr[CNG_PATH_MAX], hp[CNG_PATH_MAX], line[160];
+        size_t li = 0;
+        int ok = 1;
+        long ffd = -1;
+        line[0] = '\0';
+        size_t hrl = cng_fs_translate(&fs, "/", hr, sizeof hr) == 0
+                         ? strlen(hr)
+                         : 0;
+        while (hrl > 1 && hr[hrl - 1] == '/')
+            hr[--hrl] = '\0'; /* the join below adds its own separator */
+        if (hrl && cng_snprintf(hp, sizeof hp, "%s/rl", hr) < sizeof hp)
+            ffd = sys_openat(CNG_AT_FDCWD, hp,
+                             CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC, 0644);
+        if (ffd >= 0) {
+            char p[64];
+            cng_snprintf(p, sizeof p, "/proc/self/fd/%d", (int)ffd);
+            for (int n = 1; n <= 4 && li < sizeof line; n++) {
+                char lb[8];
+                memset(lb, 0, sizeof lb);
+                long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                      (long)lb, n, 0, 0, 0);
+                long want = n < 3 ? n : 3; /* "/rl", cut to the buffer */
+                if (r != want || strncmp(lb, "/rl", (size_t)want))
+                    ok = 0;
+                li += cng_snprintf(line + li, sizeof line - li, " %d=%s", n,
+                                   r > 0 ? lb : "(err)");
+            }
+            /* ...and nothing of the host path is left lying past the answer.
+             * The kernel wrote its own, longer value here before the fixup
+             * replaced the head of it, so the tail stayed behind: a buffer
+             * filled and then strlen'd — how much of the world reads a link —
+             * spelled out where the rootfs lives on the device. */
+            char big[256];
+            memset(big, 'X', sizeof big);
+            long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)p,
+                                  (long)big, sizeof big, 0, 0, 0);
+            /* Looked for by the rootfs directory's own last component rather
+             * than by the whole prefix: the mapped answer overwrites the head
+             * of what the kernel wrote, so the leak that was here showed up as
+             * the TAIL of the host path ("...tmp.XXXXXXXXXX/rl"). */
+            const char *tail = strrchr(hr, '/');
+            tail = tail && tail[1] ? tail + 1 : hr;
+            int residue = 0;
+            size_t hl = strlen(tail);
+            for (size_t i = 0; hl > 1 && i + hl <= sizeof big; i++)
+                if (!memcmp(big + i, tail, hl))
+                    residue = 1;
+            if (r != 3 || strncmp(big, "/rl", 3) || residue)
+                ok = 0;
+            li += cng_snprintf(line + li, sizeof line - li,
+                               " residue=%d", residue);
+            sys_close((int)ffd);
+            cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/rl", 0, 0, 0, 0,
+                         0);
+        } else {
+            ok = 0;
+            cng_strlcpy(line, " (no rootfs file)", sizeof line);
+        }
+        cng_dprintf(1, "proctest fdlink short:%s -> %s\n", line,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 7b) a map_files link target is mapped back into the guest view, like an
+     *     fd link: map a file that lives inside the rootfs and readlink its
+     *     map_files entry. The range must come from the HOST's view of our
+     *     mappings — under qemu-user the guest-facing maps file is address-
+     *     translated, so its ranges don't name host map_files entries;
+     *     "/proc/self/../self/maps" dodges qemu's interception and is the
+     *     same file on a native kernel. A denied readlink (pre-4.3 kernels
+     *     want CAP_SYS_ADMIN) skips the assertion rather than failing it. */
+    {
+        int ok = 1, skipped = 0;
+        char fpath[CNG_PATH_MAX], range[64];
+        range[0] = '\0';
+        cng_snprintf(fpath, sizeof fpath, "%s/mf", rootfs);
+        long ffd = sys_openat(CNG_AT_FDCWD, fpath,
+                              CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC, 0644);
+        ok &= ffd >= 0;
+        if (ok) {
+            cng_write_all((int)ffd, "map_files probe\n", 16);
+            void *mp = sys_mmap(0, 4096, CNG_PROT_READ, CNG_MAP_PRIVATE,
+                                (int)ffd, 0);
+            ok &= mp != CNG_MAP_FAILED && !cng_is_err((long)mp);
+            if (ok) {
+                static char mbuf[32768];
+                long mfd = sys_openat(CNG_AT_FDCWD, "/proc/self/../self/maps",
+                                      CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+                long mn = pt_slurp(mfd, mbuf, sizeof mbuf);
+                if (mfd >= 0)
+                    sys_close((int)mfd);
+                const char *hit = 0;
+                size_t fl = strlen(fpath);
+                for (const char *p = mbuf; mn > 0 && *p; p++)
+                    if (!strncmp(p, fpath, fl)) {
+                        hit = p;
+                        break;
+                    }
+                ok &= hit != 0; /* our own mapping must be in the host maps */
+                if (hit) {
+                    const char *ls = hit;
+                    while (ls > mbuf && ls[-1] != '\n')
+                        ls--;
+                    unsigned ri = 0;
+                    while (ls[ri] && ls[ri] != ' ' && ri < sizeof range - 1) {
+                        range[ri] = ls[ri];
+                        ri++;
+                    }
+                    range[ri] = '\0';
+                }
+                if (ok && range[0]) { /* readlink while the mapping is live */
+                    char lp[CNG_PATH_MAX], lb[CNG_PATH_MAX];
+                    cng_snprintf(lp, sizeof lp, "/proc/self/map_files/%s",
+                                 range);
+                    long r = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD,
+                                          (long)lp, (long)lb, sizeof lb - 1,
+                                          0, 0, 0);
+                    if (r < 0) {
+                        skipped = 1; /* kernel or LSM policy: no verdict */
+                    } else {
+                        lb[r] = '\0'; /* r < sizeof lb - 1: the size arg */
+                        ok &= !strcmp(lb, "/mf");
+                    }
+                }
+                CNG_SYS(__NR_munmap, mp, 4096, 0, 0, 0, 0);
+            }
+            sys_close((int)ffd);
+            CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, fpath, 0, 0, 0, 0);
+        }
+        cng_dprintf(1, "proctest map_files: %s -> %s\n",
+                    skipped ? "(denied; skipped)" : range,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 8) under --fake-id the status Uid:/Gid: lines carry the fake identity. */
+    {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = 0;
+        cng_g_fake_gid = 0;
+        cng_g_host_uid = (unsigned)sys_getuid();
+        cng_g_host_gid = (unsigned)sys_getgid();
+        cng_cred_seed();
+        long fd = pt_open("/proc/self/status");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = n > 0 && pt_has(buf, "\nUid:\t0\t0\t0\t0\n");
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1, "proctest status remap: %ld bytes -> %s\n", n,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_g_fake_id = 0;
+    }
+
+    /* 8b) ...and it follows the live set, not the one the process started with.
+     * The ids here are the ones getresuid/getresgid/getgroups answer, so the
+     * two views of one process have to agree — a thing the kernel cannot get
+     * wrong and every reader of /proc assumes. */
+    {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = 0;
+        cng_g_fake_gid = 0;
+        cng_g_host_uid = (unsigned)sys_getuid();
+        cng_g_host_gid = (unsigned)sys_getgid();
+        cng_cred_seed();
+        /* Privileged calls first: the euid change below gives up the privilege
+         * the other two need, exactly as it would for a guest. */
+        unsigned gl[3] = {5, 7, 9};
+        long sg = cng_cred_handle(__NR_setgroups, 3, (long)gl, 0, 0, 0, 0);
+        long rg = cng_cred_handle(__NR_setresgid, 21, 22, 23, 0, 0, 0);
+        long ru = cng_cred_handle(__NR_setresuid, 11, 12, 13, 0, 0, 0);
+
+        unsigned r = 0, e = 0, s = 0, gr = 0, ge = 0, gs = 0, got[3] = {0, 0, 0};
+        cng_cred_handle(__NR_getresuid, (long)&r, (long)&e, (long)&s, 0, 0, 0);
+        cng_cred_handle(__NR_getresgid, (long)&gr, (long)&ge, (long)&gs, 0, 0, 0);
+        long ng = cng_cred_handle(__NR_getgroups, 3, (long)got, 0, 0, 0, 0);
+
+        /* What the credential syscalls report, spelled the way /proc does. */
+        char uline[64], gline[64], grline[64];
+        cng_snprintf(uline, sizeof uline, "\nUid:\t%u\t%u\t%u\t%u\n", r, e, s, e);
+        cng_snprintf(gline, sizeof gline, "\nGid:\t%u\t%u\t%u\t%u\n", gr, ge, gs,
+                     ge);
+        cng_snprintf(grline, sizeof grline, "\nGroups:\t%u %u %u \n", got[0],
+                     got[1], got[2]);
+
+        long fd = pt_open("/proc/self/status");
+        long n = pt_slurp(fd, buf, sizeof buf);
+        int ok = sg == 0 && rg == 0 && ru == 0 && ng == 3 && n > 0 &&
+                 pt_has(buf, uline) && pt_has(buf, gline) && pt_has(buf, grline);
+        if (fd >= 0)
+            sys_close((int)fd);
+        cng_dprintf(1,
+                    "proctest status live: uid=%u/%u/%u gid=%u/%u/%u groups=%ld "
+                    "-> %s\n",
+                    r, e, s, gr, ge, gs, ng, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_g_fake_id = 0;
+        cng_cred_seed(); /* leave the set as the later blocks found it */
+    }
+
+    /* 8c) capget names a task, and the kernel looks it up: 0 and the caller's
+     *     own tid are the caller, any other pid is found (any thread, not only
+     *     a leader) or is ESRCH. The fake set used to be synthesized for every
+     *     non-negative pid, so a pid that named nothing was fully capable.
+     *     Under fake-root here: ourselves and our own tid get the full set,
+     *     another guest process is described as running under the configured
+     *     identity (root, so full) — for as long as it lives, then ESRCH like
+     *     any pid that is gone — a host process is whatever the kernel says of
+     *     it, a negative pid EINVAL, and a pid that is not there ESRCH. */
+    {
+        cng_g_fake_id = 1;
+        cng_g_fake_uid = 0;
+        cng_g_fake_gid = 0;
+        cng_g_host_uid = (unsigned)sys_getuid();
+        cng_g_host_gid = (unsigned)sys_getgid();
+        cng_cred_seed();
+        long self_r, tid_r, kid_r, dead_r, host_r, neg_r, none_r;
+        unsigned self_e, tid_e, kid_e;
+        self_e = dbg_capget(0, &self_r);
+        tid_e = dbg_capget((int)sys_gettid(), &tid_r);
+        long kid = sys_fork();
+        if (kid == 0) {
+            struct cng_timespec nap = {5, 0};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_exit_group(0);
+        }
+        int ok = kid > 0;
+        kid_e = 0;
+        kid_r = dead_r = -1;
+        if (kid > 0) {
+            cng_procreg_fork((int)kid);
+            kid_e = dbg_capget((int)kid, &kid_r);
+            CNG_SYS(__NR_kill, kid, 9, 0, 0, 0, 0);
+            sys_wait4((int)kid, 0, 0, 0);
+            dbg_capget((int)kid, &dead_r);
+        }
+        dbg_capget((int)CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0), &host_r);
+        dbg_capget(-1, &neg_r);
+        /* a pid that is certainly not there: just under pid_max's ceiling,
+         * walked down until the kernel agrees nothing owns it */
+        long none = 0x3ffff0;
+        while (CNG_SYS(__NR_kill, none, 0, 0, 0, 0, 0) != -ESRCH)
+            none--;
+        dbg_capget((int)none, &none_r);
+        ok &= self_r == 0 && self_e == 0xffffffffu && tid_r == 0 &&
+              tid_e == 0xffffffffu && kid_r == 0 && kid_e == 0xffffffffu &&
+              dead_r == -ESRCH && host_r == 0 && neg_r == -EINVAL &&
+              none_r == -ESRCH;
+        cng_dprintf(1,
+                    "proctest capget by pid: self=%ld/%x tid=%ld/%x guest=%ld/%x "
+                    "dead=%ld host=%ld neg=%ld none=%ld -> %s\n",
+                    self_r, self_e, tid_r, tid_e, kid_r, kid_e, dead_r, host_r,
+                    neg_r, none_r, ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        /* 8d) What a guest publishes of its ids (procreg.h): a forked child
+         *     that drops them is read by them, all eight and its groups —
+         *     its effective uid is what capget judges another guest by now,
+         *     so a dropped one has no capabilities — a claim is recorded
+         *     with them, and the next change of the set drops the claim. The
+         *     child goes through the dispatcher's own fork-child step first,
+         *     as a guest does. */
+        int up[2] = {-1, -1}, dn[2] = {-1, -1};
+        ok = CNG_SYS(__NR_pipe2, up, 0, 0, 0, 0, 0) == 0 &&
+             CNG_SYS(__NR_pipe2, dn, 0, 0, 0, 0, 0) == 0;
+        int forker = (int)sys_getpid();
+        kid = ok ? sys_fork() : -1;
+        if (kid == 0) {
+            cng_procreg_fork_child(forker);
+            struct cng_cred_write w;
+            struct cng_cred *c = cng_cred_write_begin(&w);
+            c->ruid = c->euid = 1234;
+            c->suid = 1235, c->fsuid = 1236;
+            c->rgid = c->egid = 1234;
+            c->sgid = 1237, c->fsgid = 1238;
+            c->groups[0] = 7, c->groups[1] = 8;
+            c->ngroups = 2;
+            cng_cred_write_end(&w, 1);
+            cng_procreg_claim(0, 1234);
+            char b = 'a';
+            sys_write(up[1], &b, 1);
+            sys_read(dn[0], &b, 1);
+            c = cng_cred_write_begin(&w);
+            c->suid = c->fsuid = 1234; /* a commit, whatever it changes */
+            cng_cred_write_end(&w, 1);
+            sys_write(up[1], &b, 1);
+            sys_read(dn[0], &b, 1);
+            sys_exit_group(0);
+        }
+        struct cng_procids d1, d2;
+        memset(&d1, 0, sizeof d1);
+        memset(&d2, 0, sizeof d2);
+        u32 kg[CNG_PROCREG_GROUPS], nkg = 0;
+        long cap_r = -1;
+        unsigned cap_e = ~0u;
+        int got1 = 0, got2 = 0;
+        if (kid > 0) {
+            cng_procreg_fork((int)kid);
+            char b;
+            if (sys_read(up[0], &b, 1) == 1) {
+                got1 = cng_procreg_cred((int)kid, &d1, kg, &nkg);
+                cap_e = dbg_capget((int)kid, &cap_r);
+            }
+            sys_write(dn[1], &b, 1);
+            if (sys_read(up[0], &b, 1) == 1)
+                got2 = cng_procreg_ids((int)kid, &d2);
+            sys_write(dn[1], &b, 1);
+            sys_wait4((int)kid, 0, 0, 0);
+        }
+        for (int i = 0; i < 2; i++) {
+            if (up[i] >= 0)
+                sys_close(up[i]);
+            if (dn[i] >= 0)
+                sys_close(dn[i]);
+        }
+        if (nkg > 2)
+            nkg = 2; /* only two are printed, and checked */
+        ok = got1 && d1.fake && d1.ruid == 1234 && d1.euid == 1234 &&
+             d1.suid == 1235 && d1.fsuid == 1236 && d1.rgid == 1234 &&
+             d1.egid == 1234 && d1.sgid == 1237 && d1.fsgid == 1238 &&
+             nkg == 2 && kg[0] == 7 && kg[1] == 8 && d1.claim &&
+             d1.claim_uid == 0 && d1.claim_gid == 1234 && cap_r == 0 &&
+             cap_e == 0 && got2 && d2.euid == 1234 && !d2.claim;
+        cng_dprintf(1,
+                    "proctest ids by pid: dropped=%d fake=%u "
+                    "%u/%u/%u/%u:%u/%u/%u/%u groups=%u:%u,%u claim=%u %u:%u "
+                    "capget=%ld/%x changed=%d claim=%u -> %s\n",
+                    got1, d1.fake, d1.ruid, d1.euid, d1.suid, d1.fsuid, d1.rgid,
+                    d1.egid, d1.sgid, d1.fsgid, nkg, nkg > 0 ? kg[0] : 0,
+                    nkg > 1 ? kg[1] : 0, d1.claim, d1.claim_uid, d1.claim_gid,
+                    cap_r, cap_e, got2, d2.claim, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_g_fake_id = 0;
+        cng_cred_seed();
+    }
+
+    /* 9) --no-proc turns all of it off. */
+    {
+        cng_g_no_proc = 1;
+        char out[CNG_PATH_MAX];
+        long pr = 0;
+        int ok = cng_procfs_open("/proc/loadavg", CNG_O_RDONLY, &pr) == 0;
+        ok &= cng_fs_translate(&fs, "/proc/self/status", out, sizeof out) == 0 &&
+              strncmp(out, "/proc/", 6) != 0;
+        cng_g_no_proc = 0;
+        cng_dprintf(1, "proctest no-proc -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    (void)envp;
+    cng_dprintf(1, "proctest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _bpftest — build the seccomp filter and run it through a classic-BPF
+ * interpreter, checking the action for representative (nr, arg0, ip) triples.
+ * The filter itself only ever executes on a real AArch64 kernel (qemu-user does
+ * not honor a guest's seccomp filter), so this is the only place its logic can
+ * be verified before a build reaches a device. */
+
+/* The interpreter is the monitor's own (cng_bpf_run, seccomp.c): the one that
+ * also judges a trap a SIGSYS of ours displaced. */
+#define bpf_run cng_bpf_run
+
+/* Fill a seccomp_data image: nr, arch, instruction_pointer, args[0]. args[1]
+ * mirrors args[0] so an ioctl case can drive the request without a second
+ * column: nothing reads args[1] except the ioctl band test, and that only after
+ * the syscall number has matched. */
+static void bpf_data(u32 *d, int nr, unsigned long ip, unsigned long arg0) {
+    memset(d, 0, 64);
+    d[0] = (u32)nr;
+    d[1] = CNG_AUDIT_ARCH_AARCH64;
+    d[2] = (u32)ip;
+    d[3] = (u32)(ip >> 32);
+    d[4] = (u32)arg0;
+    d[5] = (u32)(arg0 >> 32);
+    d[6] = (u32)arg0;
+    d[7] = (u32)(arg0 >> 32);
+}
+
+int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    cng_g_synth_fd_base = 1008; /* as cng_procfs_init would compute it */
+
+    static struct sock_filter f[CNG_SECCOMP_MAX_INSNS];
+    int n = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+    if (n <= 0) {
+        cng_dprintf(1, "bpftest: build failed (%d) -> FAIL\n", n);
+        return 1;
+    }
+
+    /* Every jump must land inside the program, and the last instruction must be
+     * a RET — the two structural rules the kernel's verifier enforces. */
+    int fails = 0, structural = 1;
+    for (int i = 0; i < n; i++) {
+        int cls = f[i].code & 0x07;
+        if (cls == CNG_BPF_JMP) {
+            if (i + 1 + f[i].jt >= n || i + 1 + f[i].jf >= n)
+                structural = 0;
+        }
+    }
+    if ((f[n - 1].code & 0x07) != CNG_BPF_RET)
+        structural = 0;
+    cng_dprintf(1, "bpftest structure: %d insns jumps_in_range=%d -> %s\n", n,
+                structural, structural ? "OK" : "FAIL");
+    fails += !structural;
+
+    unsigned long gate = (unsigned long)__cng_gate_start;
+    struct {
+        const char *what;
+        int nr;
+        unsigned long ip, arg0;
+        u32 want;
+    } cases[] = {
+        {"openat traps", __NR_openat, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"getpid runs native", __NR_getpid, 0x1000, 0, CNG_SECCOMP_RET_ALLOW},
+        {"in-gate reissue allowed", __NR_openat, gate, 0,
+         CNG_SECCOMP_RET_ALLOW},
+        /* clone: process creation traps, thread creation does not */
+        {"fork traps", __NR_clone, 0x1000, 17 /*SIGCHLD*/,
+         CNG_SECCOMP_RET_TRAP},
+        {"vfork traps", __NR_clone, 0x1000, CNG_CLONE_VM | CNG_CLONE_VFORK,
+         CNG_SECCOMP_RET_TRAP},
+        {"thread runs native", __NR_clone, 0x1000, CNG_CLONE_VM | 0x10000,
+         CNG_SECCOMP_RET_ALLOW},
+        /* read: only the reserved synthesized fd range traps */
+        {"ordinary read runs native", __NR_read, 0x1000, 5,
+         CNG_SECCOMP_RET_ALLOW},
+        {"read of a synth fd traps", __NR_read, 0x1000, 1008,
+         CNG_SECCOMP_RET_TRAP},
+        {"read with a dirty upper half is judged on the low word", __NR_read,
+         0x1000, 0xdeadbeef00000005uL, CNG_SECCOMP_RET_ALLOW},
+        {"pread of a synth fd traps", __NR_pread64, 0x1000, 1100,
+         CNG_SECCOMP_RET_TRAP},
+        {"readv of a synth fd traps", __NR_readv, 0x1000, 1008,
+         CNG_SECCOMP_RET_TRAP},
+        {"readv of an ordinary fd runs native", __NR_readv, 0x1000, 4,
+         CNG_SECCOMP_RET_ALLOW},
+        {"preadv of a synth fd traps", __NR_preadv, 0x1000, 1023,
+         CNG_SECCOMP_RET_TRAP},
+        {"preadv2 of an ordinary fd runs native", __NR_preadv2, 0x1000, 7,
+         CNG_SECCOMP_RET_ALLOW},
+        {"write is never trapped", __NR_write, 0x1000, 1008,
+         CNG_SECCOMP_RET_ALLOW},
+        /* System V shm: always trapped, so the guest gets the emulated
+         * namespace whatever the host's own IPC would have allowed. */
+        {"shmget traps", __NR_shmget, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"shmat traps", __NR_shmat, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"shmdt traps", __NR_shmdt, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"shmctl traps", __NR_shmctl, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        /* Designed-ENOSYS: io_uring must be refused by the filter itself. Its
+         * ring operations never execute an svc, so a created ring would reach
+         * the host filesystem with no trap and no translation. */
+        {"io_uring_setup is refused ENOSYS", __NR_io_uring_setup, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38 /*ENOSYS*/},
+        {"io_uring_enter is refused ENOSYS", __NR_io_uring_enter, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"io_uring_register is refused ENOSYS", __NR_io_uring_register, 0x1000,
+         0, CNG_SECCOMP_RET_ERRNO | 38},
+        /* ...including from inside the gate. The gate exempts our own
+         * re-issues, but we never issue io_uring, so it must not be a hole. */
+        {"in-gate io_uring is refused too", __NR_io_uring_setup, gate, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        /* acct(2) carries a path and reached the host with the guest's own
+         * spelling: unprivileged that is EPERM, but chroot-ng run as root would
+         * have turned on the machine's process accounting to whatever the guest
+         * named. */
+        {"acct is refused ENOSYS", __NR_acct, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        /* clone3 carries its flags behind a pointer, so BPF cannot tell a
+         * thread from a vfork. Refusing it puts glibc's posix_spawn and
+         * pthread_create back on __NR_clone, which the conversion below
+         * handles. A CLONE_VM|CLONE_VFORK clone3 would otherwise reach the
+         * emulated execve with the parent's address space still shared. */
+        {"clone3 is refused ENOSYS", __NR_clone3, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        /* SysV sem/msg: emulated from the same broker as shm, and trapped
+         * unconditionally for the same reason — one guest namespace whatever
+         * the host's own IPC would have allowed. */
+        {"semget traps", __NR_semget, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"semop traps", __NR_semop, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"semtimedop traps", __NR_semtimedop, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"msgget traps", __NR_msgget, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"msgsnd traps", __NR_msgsnd, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        {"msgrcv traps", __NR_msgrcv, 0x1000, 0, CNG_SECCOMP_RET_TRAP},
+        /* POSIX mqueue: the same leak in the namespace next door. An mq name is
+         * not a path, so nothing translates it — left native the guest opened
+         * queues in the HOST's mqueue namespace. */
+        {"mq_open is refused ENOSYS", __NR_mq_open, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"mq_timedsend is refused ENOSYS", __NR_mq_timedsend, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"mq_getsetattr is refused ENOSYS", __NR_mq_getsetattr, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        /* ...while shm stays emulated, not refused. */
+        {"shmget still traps for emulation", __NR_shmget, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        /* fchmodat2 is translated, not refused: it is glibc's modern chmod. */
+        {"fchmodat2 traps for translation", __NR_fchmodat2, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        /* The path-bearing syscalls born after this table's last entry: the
+         * numbers come from our own table now, so a binary built anywhere
+         * traps them on a kernel that has them (6.13 and 6.17). */
+        {"setxattrat traps for translation", __NR_setxattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"getxattrat traps for translation", __NR_getxattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"listxattrat traps for translation", __NR_listxattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"removexattrat traps for translation", __NR_removexattrat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"file_getattr traps for translation", __NR_file_getattr, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"file_setattr traps for translation", __NR_file_setattr, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"open_tree_attr is refused ENOSYS", __NR_open_tree_attr, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"open_tree is refused ENOSYS", __NR_open_tree, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"statmount is refused ENOSYS", __NR_statmount, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"openat2 traps for translation", __NR_openat2, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"execveat traps for emulation", __NR_execveat, 0x1000, 0,
+         CNG_SECCOMP_RET_TRAP},
+        {"plain clone still traps for the conversion", __NR_clone, 0x1000,
+         CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP},
+        /* seccomp(2): a guest filter would also govern the syscalls the handler
+         * re-issues through the gate. Refused by the filter itself. */
+        {"seccomp(2) is refused ENOSYS", __NR_seccomp, 0x1000, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        {"in-gate seccomp(2) is refused too", __NR_seccomp, gate, 0,
+         CNG_SECCOMP_RET_ERRNO | 38},
+        /* prctl is selective: the four ops that describe OUR confinement are
+         * trapped, and the rest of the syscall — real process state, some of it
+         * on the hot path — is not. */
+        {"prctl PR_SET_SECCOMP traps", __NR_prctl, 0x1000, CNG_PR_SET_SECCOMP,
+         CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_GET_SECCOMP traps", __NR_prctl, 0x1000, CNG_PR_GET_SECCOMP,
+         CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_SET_NO_NEW_PRIVS traps", __NR_prctl, 0x1000,
+         CNG_PR_SET_NO_NEW_PRIVS, CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_GET_NO_NEW_PRIVS traps", __NR_prctl, 0x1000,
+         CNG_PR_GET_NO_NEW_PRIVS, CNG_SECCOMP_RET_TRAP},
+        {"prctl PR_SET_NAME runs native", __NR_prctl, 0x1000, CNG_PR_SET_NAME,
+         CNG_SECCOMP_RET_ALLOW},
+        {"prctl PR_SET_VMA runs native", __NR_prctl, 0x1000, 0x53564d41,
+         CNG_SECCOMP_RET_ALLOW},
+        {"our own prctl re-issue is allowed", __NR_prctl, gate,
+         CNG_PR_SET_SECCOMP, CNG_SECCOMP_RET_ALLOW},
+        /* ioctl: the SIOCxIF request band traps, and so do the four termios2
+         * requests and TIOCGSID (tty.c), so a terminal TCGETS and every
+         * driver call keep running native. The request is args[1]. */
+        {"SIOCGIFCONF traps", __NR_ioctl, 0x1000, 0x8912,
+         CNG_SECCOMP_RET_TRAP},
+        {"SIOCGIFADDR traps", __NR_ioctl, 0x1000, 0x8915,
+         CNG_SECCOMP_RET_TRAP},
+        {"the band's last request traps", __NR_ioctl, 0x1000, 0x8970,
+         CNG_SECCOMP_RET_TRAP},
+        {"TCGETS runs native", __NR_ioctl, 0x1000, 0x5401,
+         CNG_SECCOMP_RET_ALLOW},
+        {"TCSETS runs native", __NR_ioctl, 0x1000, 0x5402,
+         CNG_SECCOMP_RET_ALLOW},
+        {"TIOCGWINSZ runs native", __NR_ioctl, 0x1000, 0x5413,
+         CNG_SECCOMP_RET_ALLOW},
+        {"TCGETS2 traps", __NR_ioctl, 0x1000, 0x802c542a,
+         CNG_SECCOMP_RET_TRAP},
+        {"TCSETS2 traps", __NR_ioctl, 0x1000, 0x402c542b,
+         CNG_SECCOMP_RET_TRAP},
+        {"TCSETSW2 traps", __NR_ioctl, 0x1000, 0x402c542c,
+         CNG_SECCOMP_RET_TRAP},
+        {"TCSETSF2 traps", __NR_ioctl, 0x1000, 0x402c542d,
+         CNG_SECCOMP_RET_TRAP},
+        {"TIOCGSID traps", __NR_ioctl, 0x1000, 0x5429, CNG_SECCOMP_RET_TRAP},
+        {"TIOCGPGRP runs native", __NR_ioctl, 0x1000, 0x540f,
+         CNG_SECCOMP_RET_ALLOW},
+        {"our own TIOCGSID re-issue is allowed", __NR_ioctl, gate, 0x5429,
+         CNG_SECCOMP_RET_ALLOW},
+        {"a request beside the termios2 four runs native", __NR_ioctl, 0x1000,
+         0x402c542e, CNG_SECCOMP_RET_ALLOW},
+        {"our own termios2 re-issue is allowed", __NR_ioctl, gate, 0x802c542a,
+         CNG_SECCOMP_RET_ALLOW},
+        {"just below the band runs native", __NR_ioctl, 0x1000, 0x890f,
+         CNG_SECCOMP_RET_ALLOW},
+        {"just above the band runs native", __NR_ioctl, 0x1000, 0x8971,
+         CNG_SECCOMP_RET_ALLOW},
+    };
+    for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        u32 d[16];
+        int bad = 0;
+        bpf_data(d, cases[k].nr, cases[k].ip, cases[k].arg0);
+        u32 got = bpf_run(f, n, d, &bad);
+        int ok = !bad && got == cases[k].want;
+        cng_dprintf(1, "bpftest %s: %s -> %s\n", cases[k].what,
+                    bad             ? "malformed"
+                    : got == CNG_SECCOMP_RET_TRAP ? "TRAP"
+                    : got == CNG_SECCOMP_RET_ALLOW ? "ALLOW"
+                    : (got & 0xffff0000U) == CNG_SECCOMP_RET_ERRNO ? "ERRNO"
+                                                   : "other",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* mmap's band is two arguments wide — prot in args[2], flags in args[3] —
+     * so it needs a data buffer the single-arg table above cannot express. Only
+     * a PROT_EXEC mapping that is NOT anonymous may trap: that is a library
+     * text mapping, the one thing a noexec mount refuses outright, and
+     * everything else mmap does is the guest's ordinary allocation traffic. */
+    {
+        static const struct {
+            const char *what;
+            u32 prot, flags;
+            u32 want;
+        } mm[] = {
+            {"exec file mapping traps", CNG_PROT_READ | CNG_PROT_EXEC,
+             CNG_MAP_PRIVATE, CNG_SECCOMP_RET_TRAP},
+            {"exec fixed file mapping traps", CNG_PROT_EXEC,
+             CNG_MAP_PRIVATE | CNG_MAP_FIXED, CNG_SECCOMP_RET_TRAP},
+            {"anonymous exec runs native", CNG_PROT_READ | CNG_PROT_EXEC,
+             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, CNG_SECCOMP_RET_ALLOW},
+            {"a plain RW file mapping runs native",
+             CNG_PROT_READ | CNG_PROT_WRITE, CNG_MAP_PRIVATE,
+             CNG_SECCOMP_RET_ALLOW},
+            {"an anonymous RW allocation runs native",
+             CNG_PROT_READ | CNG_PROT_WRITE,
+             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, CNG_SECCOMP_RET_ALLOW},
+        };
+        for (unsigned k = 0; k < sizeof mm / sizeof mm[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, __NR_mmap, 0x1000, 0);
+            d[8] = mm[k].prot;  /* args[2] low */
+            d[10] = mm[k].flags; /* args[3] low */
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == mm[k].want;
+            cng_dprintf(1, "bpftest mmap %s: %s -> %s\n", mm[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
+    /* mprotect traps when — and only when — it asks for PROT_EXEC (args[2]):
+     * that is the call SELinux judges against the whole VMA the range lies in,
+     * stack pointer and all, so the dispatcher has to make it from its own
+     * stack. RELRO, guard pages and the allocator's growth carry no PROT_EXEC
+     * and stay off the handler. The call is also allowed from the gate, where
+     * the dispatcher's own re-issue comes from. */
+    {
+        static const struct {
+            const char *what;
+            u32 prot;
+            unsigned long ip;
+            u32 want;
+        } mp[] = {
+            {"RWX traps", CNG_PROT_READ | CNG_PROT_WRITE | CNG_PROT_EXEC,
+             0x1000, CNG_SECCOMP_RET_TRAP},
+            {"RX traps", CNG_PROT_READ | CNG_PROT_EXEC, 0x1000,
+             CNG_SECCOMP_RET_TRAP},
+            {"X alone traps", CNG_PROT_EXEC, 0x1000, CNG_SECCOMP_RET_TRAP},
+            {"RW runs native", CNG_PROT_READ | CNG_PROT_WRITE, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"PROT_NONE runs native", CNG_PROT_NONE, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"the dispatcher's own re-issue is allowed",
+             CNG_PROT_READ | CNG_PROT_EXEC, 0, CNG_SECCOMP_RET_ALLOW},
+        };
+        for (unsigned k = 0; k < sizeof mp / sizeof mp[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, __NR_mprotect, mp[k].ip ? mp[k].ip : gate, 0);
+            d[8] = mp[k].prot; /* args[2] low */
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == mp[k].want;
+            cng_dprintf(1, "bpftest mprotect %s: %s -> %s\n", mp[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
+    /* mremap traps when — and only when — its flags (args[3]) carry
+     * MREMAP_DONTUNMAP: the move that leaves the old range mapped, which a
+     * loader copy has to answer as the file mapping it stands in for. A
+     * realloc's growth and an ordinary move stay native, and so does the
+     * dispatcher's own re-issue. */
+    {
+        static const struct {
+            const char *what;
+            u32 flags;
+            unsigned long ip;
+            u32 want;
+        } mr[] = {
+            {"DONTUNMAP traps",
+             CNG_MREMAP_MAYMOVE | CNG_MREMAP_FIXED | CNG_MREMAP_DONTUNMAP,
+             0x1000, CNG_SECCOMP_RET_TRAP},
+            {"a growth that may move runs native", CNG_MREMAP_MAYMOVE, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"a fixed move runs native", CNG_MREMAP_MAYMOVE | CNG_MREMAP_FIXED,
+             0x1000, CNG_SECCOMP_RET_ALLOW},
+            {"an in-place resize runs native", 0, 0x1000,
+             CNG_SECCOMP_RET_ALLOW},
+            {"the dispatcher's own re-issue is allowed",
+             CNG_MREMAP_MAYMOVE | CNG_MREMAP_DONTUNMAP, 0,
+             CNG_SECCOMP_RET_ALLOW},
+        };
+        for (unsigned k = 0; k < sizeof mr / sizeof mr[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, __NR_mremap, mr[k].ip ? mr[k].ip : gate, 0);
+            d[10] = mr[k].flags; /* args[3] low */
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == mr[k].want;
+            cng_dprintf(1, "bpftest mremap %s: %s -> %s\n", mr[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
+    /* The mask-taking waits: trapped only with a sigset pointer, which is a
+     * pointer, so both halves are tested — a pointer whose low word is zero
+     * is still a pointer. The always-trapped three and signalfd4 sit in the
+     * plain table. */
+    {
+        static const struct {
+            const char *what;
+            int nr, arg;
+            u32 lo, hi;
+            u32 want;
+        } wt[] = {
+            {"ppoll with a mask traps", __NR_ppoll, 3, 0x7ffc0000, 0x0,
+             CNG_SECCOMP_RET_TRAP},
+            {"ppoll with no mask (poll) runs native", __NR_ppoll, 3, 0, 0,
+             CNG_SECCOMP_RET_ALLOW},
+            {"ppoll with a mask whose low word is zero traps", __NR_ppoll, 3,
+             0, 0x4000, CNG_SECCOMP_RET_TRAP},
+            {"pselect6 with a sigset pair traps", __NR_pselect6, 5, 0x1234, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"pselect6 with none (select) runs native", __NR_pselect6, 5, 0,
+             0, CNG_SECCOMP_RET_ALLOW},
+            {"epoll_pwait with a mask traps", __NR_epoll_pwait, 4, 0x5678, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"epoll_pwait with none (epoll_wait) runs native",
+             __NR_epoll_pwait, 4, 0, 0, CNG_SECCOMP_RET_ALLOW},
+            {"epoll_pwait2 with a mask traps", __NR_epoll_pwait2, 4, 0x9abc,
+             0, CNG_SECCOMP_RET_TRAP},
+            {"epoll_pwait2 with none runs native", __NR_epoll_pwait2, 4, 0, 0,
+             CNG_SECCOMP_RET_ALLOW},
+            {"rt_sigsuspend always traps", __NR_rt_sigsuspend, 0, 0, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"rt_sigtimedwait always traps", __NR_rt_sigtimedwait, 0, 0, 0,
+             CNG_SECCOMP_RET_TRAP},
+            {"signalfd4 always traps", __NR_signalfd4, 0, 0, 0,
+             CNG_SECCOMP_RET_TRAP},
+        };
+        for (unsigned k = 0; k < sizeof wt / sizeof wt[0]; k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, wt[k].nr, 0x1000, 0);
+            d[4 + 2 * wt[k].arg] = wt[k].lo;
+            d[5 + 2 * wt[k].arg] = wt[k].hi;
+            u32 got = bpf_run(f, n, d, &bad);
+            int ok = !bad && got == wt[k].want;
+            cng_dprintf(1, "bpftest wait %s: %s -> %s\n", wt[k].what,
+                        bad ? "malformed"
+                        : got == CNG_SECCOMP_RET_TRAP    ? "TRAP"
+                        : got == CNG_SECCOMP_RET_ALLOW   ? "ALLOW"
+                                                         : "other",
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+    }
+
+    /* A foreign architecture must be killed, not allowed. */
+    {
+        u32 d[16];
+        int bad = 0;
+        bpf_data(d, __NR_openat, 0x1000, 0);
+        d[1] = 0xc000003e; /* AUDIT_ARCH_X86_64 */
+        u32 got = bpf_run(f, n, d, &bad);
+        int ok = !bad && got == CNG_SECCOMP_RET_KILL_THREAD;
+        cng_dprintf(1, "bpftest foreign arch killed -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* fstat is trapped only where it has something to do, and this is the only
+     * place that can be seen. Under --fake-id it joins the trapped set (stat
+     * and fstat must agree about ownership) along with fchmod (a chmod on a
+     * descriptor needs the same fail-soft the path form gets); with the /proc
+     * synthesis on it is trapped too, since an fd that synthesis hands out is a
+     * memfd whose own stat is not the real file's, and so is fstatfs. With the
+     * identity off and --no-proc, an ordinary fstat costs nothing. Rebuilds
+     * the filter, so it runs after every case above. */
+    {
+        int was = cng_g_fake_id, was_np = cng_g_no_proc;
+        u32 d[16];
+        int bad = 0;
+        cng_g_fake_id = 0;
+        cng_g_no_proc = 1;
+        int n0 = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_fstat, 0x1000, 3);
+        int off_ok = n0 > 0 && bpf_run(f, n0, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        bpf_data(d, __NR_fstatfs, 0x1000, 3);
+        off_ok &= n0 > 0 && bpf_run(f, n0, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        cng_g_no_proc = 0;
+        int np = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_fstat, 0x1000, 3);
+        int proc_ok = np > 0 && bpf_run(f, np, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_fstatfs, 0x1000, 3);
+        proc_ok &= np > 0 && bpf_run(f, np, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_no_proc = 1;
+        cng_g_fake_id = 1;
+        int n1 = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_fstat, 0x1000, 3);
+        int on_ok = n1 > 0 && bpf_run(f, n1, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_fchmod, 0x1000, 3);
+        int ch_ok = n1 > 0 && bpf_run(f, n1, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_fake_id = was;
+        cng_g_no_proc = was_np;
+        int ok2 = !bad && off_ok && proc_ok && on_ok && ch_ok;
+        cng_dprintf(1,
+                    "bpftest fake-id: fstat_off=%d fstat_proc=%d fstat_on=%d "
+                    "fchmod_on=%d -> %s\n",
+                    off_ok, proc_ok, on_ok, ch_ok, ok2 ? "OK" : "FAIL");
+        fails += !ok2;
+
+        /* The hidden-process view by pid (M46): process_vm_readv/writev and
+         * pidfd_open trap while there is a view to apply, and run native
+         * under --no-proc, where nothing is hidden. */
+        cng_g_no_proc = 0;
+        int nh = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_process_vm_readv, 0x1000, 1);
+        int pvm_on = nh > 0 && bpf_run(f, nh, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_process_vm_writev, 0x1000, 1);
+        pvm_on &= nh > 0 && bpf_run(f, nh, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        bpf_data(d, __NR_pidfd_open, 0x1000, 1);
+        int pfd_on = nh > 0 && bpf_run(f, nh, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_no_proc = 1;
+        int nq = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        bpf_data(d, __NR_process_vm_readv, 0x1000, 1);
+        int pvm_off = nq > 0 && bpf_run(f, nq, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        bpf_data(d, __NR_pidfd_open, 0x1000, 1);
+        int pfd_off = nq > 0 && bpf_run(f, nq, d, &bad) == CNG_SECCOMP_RET_ALLOW;
+        /* ...while pidfd_getfd, whose import is judged whatever the view,
+         * traps either way. */
+        bpf_data(d, __NR_pidfd_getfd, 0x1000, 1);
+        int getfd_off = nq > 0 && bpf_run(f, nq, d, &bad) == CNG_SECCOMP_RET_TRAP;
+        cng_g_no_proc = was_np;
+        int ok3 = !bad && pvm_on && pfd_on && pvm_off && pfd_off && getfd_off;
+        cng_dprintf(1,
+                    "bpftest hidden-pid: pvm_proc=%d pidfd_proc=%d pvm_off=%d "
+                    "pidfd_off=%d getfd_always=%d -> %s\n",
+                    pvm_on, pfd_on, pvm_off, pfd_off, getfd_off,
+                    ok3 ? "OK" : "FAIL");
+        fails += !ok3;
+
+        /* ...and the signal family, by pid and by group: trapped while there
+         * is a view and a registry to tell a guest by, native under --no-proc
+         * and without a registry, where every other pid would read hidden. */
+        static const int sigs[] = {__NR_kill, __NR_tkill, __NR_tgkill,
+                                   __NR_rt_sigqueueinfo,
+                                   __NR_rt_tgsigqueueinfo};
+        int was_rb = cng_g_procreg_backing;
+        int sig_on = 1, sig_np = 1, sig_noreg = 1;
+        for (int pass = 0; pass < 3; pass++) {
+            cng_g_no_proc = pass == 1;
+            cng_g_procreg_backing =
+                pass == 2 ? CNG_PROCREG_B_NONE : CNG_PROCREG_B_ANON;
+            int ns = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+            u32 want = pass ? CNG_SECCOMP_RET_ALLOW : CNG_SECCOMP_RET_TRAP;
+            int *ok = pass == 0 ? &sig_on : pass == 1 ? &sig_np : &sig_noreg;
+            for (unsigned k = 0; k < sizeof sigs / sizeof sigs[0]; k++) {
+                bpf_data(d, sigs[k], 0x1000, 10);
+                *ok &= ns > 0 && bpf_run(f, ns, d, &bad) == want;
+            }
+        }
+        cng_g_no_proc = was_np;
+        cng_g_procreg_backing = was_rb;
+        int ok4 = !bad && sig_on && sig_np && sig_noreg;
+        cng_dprintf(1,
+                    "bpftest hidden-pid signals: trap_view=%d native_noproc=%d "
+                    "native_noreg=%d -> %s\n",
+                    sig_on, sig_np, sig_noreg, ok4 ? "OK" : "FAIL");
+        fails += !ok4;
+
+        /* The descriptor side of a :ro bind (M45): with one in the view,
+         * fchmod, fchown and the fd xattr setters trap, and so does every
+         * ioctl request that writes the mount — one JEQ each in the ioctl
+         * block, behind the SIOCxIF band test, which must keep working. A
+         * terminal TCGETS and the flag *getter* stay native, since the block
+         * runs for every ioctl a guest makes. Without a :ro bind none of it
+         * is in the filter at all: the calls run native, as before. */
+        {
+            static struct cng_fs rofs;
+            struct cng_fs *was_fs = cng_g_fs;
+            cng_fs_init(&rofs, "/tmp/cng-bpftest-root");
+            cng_fs_add_bind(&rofs, "/ro", "/tmp/cng-bpftest-ro", 1);
+            cng_g_fs = &rofs;
+            int nro = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+            static const struct {
+                const char *what;
+                int nr;
+                unsigned long arg;
+                u32 want;
+            } rc[] = {
+                {"fchmod traps", __NR_fchmod, 0, CNG_SECCOMP_RET_TRAP},
+                {"fchown traps", __NR_fchown, 0, CNG_SECCOMP_RET_TRAP},
+                {"fsetxattr traps", __NR_fsetxattr, 0, CNG_SECCOMP_RET_TRAP},
+                {"fremovexattr traps", __NR_fremovexattr, 0,
+                 CNG_SECCOMP_RET_TRAP},
+                {"FS_IOC_SETFLAGS traps", __NR_ioctl, CNG_FS_IOC_SETFLAGS,
+                 CNG_SECCOMP_RET_TRAP},
+                {"FS_IOC_FSSETXATTR traps", __NR_ioctl, CNG_FS_IOC_FSSETXATTR,
+                 CNG_SECCOMP_RET_TRAP},
+                {"FIDEDUPERANGE traps", __NR_ioctl, CNG_FIDEDUPERANGE,
+                 CNG_SECCOMP_RET_TRAP},
+                {"F2FS_IOC_SET_PIN_FILE traps", __NR_ioctl,
+                 CNG_F2FS_IOC_SET_PIN_FILE, CNG_SECCOMP_RET_TRAP},
+                {"SIOCGIFCONF still traps", __NR_ioctl, 0x8912,
+                 CNG_SECCOMP_RET_TRAP},
+                {"TCGETS still runs native", __NR_ioctl, 0x5401,
+                 CNG_SECCOMP_RET_ALLOW},
+                {"TCGETS2 still traps", __NR_ioctl, 0x802c542a,
+                 CNG_SECCOMP_RET_TRAP},
+                {"TCSETSF2 still traps", __NR_ioctl, 0x402c542d,
+                 CNG_SECCOMP_RET_TRAP},
+                {"TIOCGSID still traps", __NR_ioctl, 0x5429,
+                 CNG_SECCOMP_RET_TRAP},
+                {"FS_IOC_GETFLAGS runs native", __NR_ioctl, 0x80086601,
+                 CNG_SECCOMP_RET_ALLOW},
+                {"FICLONE runs native (a write descriptor)", __NR_ioctl,
+                 0x40049409, CNG_SECCOMP_RET_ALLOW},
+            };
+            int ro_ok = nro > 0;
+            for (unsigned k = 0; k < sizeof rc / sizeof rc[0]; k++) {
+                u32 d[16];
+                int b2 = 0;
+                bpf_data(d, rc[k].nr, 0x1000, rc[k].arg);
+                u32 got = nro > 0 ? bpf_run(f, nro, d, &b2) : 0;
+                int ok = nro > 0 && !b2 && got == rc[k].want;
+                cng_dprintf(1, "bpftest ro-fd %s: %s -> %s\n", rc[k].what,
+                            b2                              ? "malformed"
+                            : got == CNG_SECCOMP_RET_TRAP  ? "TRAP"
+                            : got == CNG_SECCOMP_RET_ALLOW ? "ALLOW"
+                                                           : "other",
+                            ok ? "OK" : "FAIL");
+                ro_ok &= ok;
+            }
+            /* ...and the same calls with no :ro bind: native. */
+            rofs.binds[0].ro = 0;
+            int nrw = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+            static const struct {
+                const char *what;
+                int nr;
+                unsigned long arg;
+            } rw[] = {
+                {"fchmod", __NR_fchmod, 0},
+                {"fsetxattr", __NR_fsetxattr, 0},
+                {"FS_IOC_SETFLAGS", __NR_ioctl, CNG_FS_IOC_SETFLAGS},
+                {"FIDEDUPERANGE", __NR_ioctl, CNG_FIDEDUPERANGE},
+            };
+            for (unsigned k = 0; k < sizeof rw / sizeof rw[0]; k++) {
+                u32 d[16];
+                int b2 = 0;
+                bpf_data(d, rw[k].nr, 0x1000, rw[k].arg);
+                u32 got = nrw > 0 ? bpf_run(f, nrw, d, &b2) : 0;
+                int ok = nrw > 0 && !b2 && got == CNG_SECCOMP_RET_ALLOW;
+                cng_dprintf(1, "bpftest rw-fd %s runs native: %s -> %s\n",
+                            rw[k].what, ok ? "ALLOW" : "other",
+                            ok ? "OK" : "FAIL");
+                ro_ok &= ok;
+            }
+            cng_g_fs = was_fs;
+            fails += !ro_ok;
+        }
+
+        /* The largest filter there is: every optional set on at once, with
+         * a :ro bind in the view. The builder writes into a
+         * CNG_SECCOMP_MAX_INSNS buffer with no bounds check of its own, and
+         * the tail's per-syscall jump offset is a u8, so both limits have to
+         * hold with room for the next syscall somebody adds — this is where
+         * that is found out, rather than in the installer's stack frame. */
+        int was_l2s = cng_g_l2s, was_nd = cng_g_no_dev;
+        static struct cng_fs maxfs;
+        struct cng_fs *was_fs = cng_g_fs;
+        cng_fs_init(&maxfs, "/tmp/cng-bpftest-root");
+        cng_fs_add_bind(&maxfs, "/ro", "/tmp/cng-bpftest-ro", 1);
+        cng_g_fs = &maxfs;
+        cng_g_fake_id = 1;
+        cng_g_no_proc = 0;
+        cng_g_l2s = 1;
+        cng_g_no_dev = 0;
+        cng_g_procreg_backing = CNG_PROCREG_B_ANON;
+        int nmax = cng_build_seccomp(f, CNG_SECCOMP_MAX_INSNS);
+        cng_g_fake_id = was;
+        cng_g_no_proc = was_np;
+        cng_g_l2s = was_l2s;
+        cng_g_no_dev = was_nd;
+        cng_g_procreg_backing = was_rb;
+        cng_g_fs = was_fs;
+        int fits = nmax > 0 && nmax <= CNG_SECCOMP_MAX_INSNS - 8;
+        cng_dprintf(1, "bpftest largest filter: %d of %d insns -> %s\n", nmax,
+                    CNG_SECCOMP_MAX_INSNS, fits ? "OK" : "FAIL");
+        fails += !fits;
+    }
+
+    /* The two filters a ptrace role stacks on a task. Neither can be observed
+     * any other way — they are only installed once a guest traces, and a guest
+     * filter never runs under qemu-user — so simulating them here is the only
+     * check they get before a device sees them. */
+    {
+        static struct sock_filter tf[CNG_SECCOMP_TRACEALL_INSNS];
+        int tn = cng_build_seccomp_traceall(tf, CNG_SECCOMP_TRACEALL_INSNS);
+        struct {
+            const char *what;
+            int nr;
+            unsigned long ip, arg0;
+            u32 want;
+        } tcases[] = {
+            /* The point of the filter: a tracee must stop on everything, not
+             * just the path-bearing set the base filter traps — and with its
+             * tag, which is how a task that inherited it is known to. */
+            {"traceall: read traps", __NR_read, 0x1000, 0,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
+            {"traceall: getpid traps", __NR_getpid, 0x1000, 0,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
+            {"traceall: openat traps", __NR_openat, 0x1000, 0,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
+            /* Our own re-issue must not re-trap, or the handler recurses. */
+            {"traceall: in-gate reissue allowed", __NR_read, gate, 0,
+             CNG_SECCOMP_RET_ALLOW},
+            /* rt_sigreturn must execute with sp still on the kernel's signal
+             * frame; there is no way to re-issue it from the handler, so it
+             * has to stay native. */
+            {"traceall: rt_sigreturn stays native", __NR_rt_sigreturn, 0x1000,
+             0, CNG_SECCOMP_RET_ALLOW},
+            /* A thread-creating clone likewise cannot be re-issued from the
+             * handler; process creation can, and must trap so the fork event
+             * and the child's attach happen. */
+            {"traceall: thread clone stays native", __NR_clone, 0x1000,
+             CNG_CLONE_VM | 0x10000, CNG_SECCOMP_RET_ALLOW},
+            {"traceall: fork traps", __NR_clone, 0x1000, 17 /*SIGCHLD*/,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
+            {"traceall: vfork traps", __NR_clone, 0x1000,
+             CNG_CLONE_VM | CNG_CLONE_VFORK, CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL},
+        };
+        int tf_ok = tn > 0;
+        for (unsigned k = 0; tf_ok && k < sizeof tcases / sizeof tcases[0];
+             k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, tcases[k].nr, tcases[k].ip, tcases[k].arg0);
+            u32 got = bpf_run(tf, tn, d, &bad);
+            int ok = !bad && got == tcases[k].want;
+            cng_dprintf(1, "bpftest %s -> %s\n", tcases[k].what,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        if (!tf_ok) {
+            cng_dprintf(1, "bpftest traceall: build failed -> FAIL\n");
+            fails++;
+        }
+
+        static struct sock_filter rf[CNG_SECCOMP_TRACER_INSNS];
+        int rn = cng_build_seccomp_tracer(rf, CNG_SECCOMP_TRACER_INSNS);
+        struct {
+            const char *what;
+            int nr;
+            u32 want;
+        } rcases[] = {
+            /* A tracer's wait has to account for stops that are not the
+             * kernel's, and its SIGSTOP has to become a cooperative one. */
+            {"tracer: wait4 traps", __NR_wait4,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            {"tracer: waitid traps", __NR_waitid,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            {"tracer: kill traps", __NR_kill,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            {"tracer: tgkill traps", __NR_tgkill,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            {"tracer: process_vm_readv traps", __NR_process_vm_readv,
+             CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER},
+            /* ...and nothing else does: this is the filter an ordinary tracer
+             * (gdb, strace) runs its own work through. */
+            {"tracer: read stays native", __NR_read, CNG_SECCOMP_RET_ALLOW},
+            {"tracer: openat stays native", __NR_openat,
+             CNG_SECCOMP_RET_ALLOW},
+        };
+        int rf_ok = rn > 0;
+        for (unsigned k = 0; rf_ok && k < sizeof rcases / sizeof rcases[0];
+             k++) {
+            u32 d[16];
+            int bad = 0;
+            bpf_data(d, rcases[k].nr, 0x1000, 0);
+            u32 got = bpf_run(rf, rn, d, &bad);
+            int ok = !bad && got == rcases[k].want;
+            cng_dprintf(1, "bpftest %s -> %s\n", rcases[k].what,
+                        ok ? "OK" : "FAIL");
+            fails += !ok;
+        }
+        if (!rf_ok) {
+            cng_dprintf(1, "bpftest tracer: build failed -> FAIL\n");
+            fails++;
+        }
+    }
+
+    cng_dprintf(1, "bpftest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* ---- M18: ptrace single-step decoder (-t ptracetest) ---------------------
+ *
+ * The next-PC decoder is the one piece of the ptrace emulation with no safety
+ * net: everything else fails visibly (a stop that does not arrive, a request
+ * that answers an error), but a branch this misreads plants the breakpoint at
+ * an address the tracee never executes, and the "stepped" tracee runs away.
+ * It is also pure — registers in, address out — so it is checked directly here
+ * rather than through a guest, and on every host.
+ */
+/* `absolute` distinguishes "the answer is this address" (a register-form
+ * branch, or the 0 that means "not decodable") from "the answer is this far
+ * past pc". */
+static int ptstep_case(const char *what, u32 insn, struct cng_uregs *r, u64 want,
+                       int absolute) {
+    static u32 code[2];
+    code[0] = insn;
+    code[1] = 0xD503201Fu; /* nop, so a fall-through lands on something real */
+    r->pc = (u64)(unsigned long)&code[0];
+    if (!absolute)
+        want += r->pc;
+    u64 got = cng_pt_next_pc(r);
+    int ok = got == want;
+    cng_dprintf(1, "ptracetest %s: %s\n", what, ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  want=+%ld got=%ld\n", (long)(want - r->pc),
+                    (long)((long)got - (long)r->pc));
+    return !ok;
+}
+
+/* The SIGSYS tier's stop path, driven without a filter.
+ *
+ * On a device that tier is the one that runs, and on a cross host it cannot be
+ * reached at all: qemu-user does not apply a guest seccomp filter, so every
+ * live-guest ptrace test in the suite goes through the -R trampoline instead.
+ * Both tiers call the same emulation, but the wrapper around it is separate
+ * code, so this drives the SIGSYS one directly — a real fork, a real
+ * tracer/tracee pair over the real registry and mailbox, with the trap itself
+ * synthesized: a ucontext whose x8 says getpid and a siginfo that says seccomp,
+ * which is exactly what the kernel hands cng_sigsys_body.
+ */
+static int pt_sim_child(int wfd) {
+    cng_pt_sig_install_kick();
+    if (cng_pt_syscall(CNG_PTRACE_TRACEME, 0, 0, 0) != 0)
+        return 91;
+    char c = 'r';
+    sys_write(wfd, &c, 1);
+    /* Stop cooperatively so the tracer can arm us, the way a tracee's own
+     * SIGSTOP is routed. The kick lands as soon as the queueing syscall
+     * returns, and its handler parks us. */
+    cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/);
+
+    /* Now the synthesized trap. */
+    static struct cng_ucontext uc;
+    static cng_siginfo_t si;
+    memset(&uc, 0, sizeof uc);
+    memset(&si, 0, sizeof si);
+    uc.uc_mcontext.regs[8] = __NR_getpid;
+    uc.uc_mcontext.pc = 0x1000;
+    uc.uc_mcontext.sp = 0x2000;
+    si.si_code = CNG_SYS_SECCOMP;
+    si._u._sigsys.call_addr = (void *)0x1000; /* outside the gate */
+    si._u._sigsys.syscall = __NR_getpid;
+    cng_sigsys_body(&uc, &si);
+    return (long)uc.uc_mcontext.regs[0] == sys_getpid() ? 0 : 92;
+}
+
+static int pt_sim_sigsys(unsigned long *auxv) {
+    int fds[2];
+    if (CNG_SYS(__NR_pipe2, fds, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest sigsys tier: no pipe -> FAIL\n");
+        return 1;
+    }
+    long kid = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        sys_close(fds[0]);
+        CNG_SYS(__NR_exit_group, pt_sim_child(fds[1]), 0, 0, 0, 0, 0);
+    }
+    sys_close(fds[1]);
+    /* The child's TRACEME kicks us, and the kick handler is installed without
+     * SA_RESTART on purpose (it has to interrupt a native wait4): this read
+     * comes back EINTR when the kick lands first. Returning then closed the
+     * pipe under the child's readiness write, and its very first stop was a
+     * SIGPIPE stop rather than the cooperative one — once in ten runs under
+     * load. Retry, as every real reader does. */
+    char c = 0;
+    while (sys_read(fds[0], &c, 1) == -EINTR)
+        ;
+    sys_close(fds[0]);
+    if (kid < 0) {
+        cng_dprintf(1, "ptracetest sigsys tier: no fork -> FAIL\n");
+        return 1;
+    }
+
+    int fails = 0, st = 0;
+    long r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    int ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 19;
+    cng_dprintf(1, "ptracetest sigsys tier: cooperative stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    cng_pt_syscall(CNG_PTRACE_SETOPTIONS, kid, 0, CNG_PTRACE_O_TRACESYSGOOD);
+    cng_pt_syscall(CNG_PTRACE_SYSCALL, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == (5 | 0x80);
+    cng_dprintf(1, "ptracetest sigsys tier: syscall-entry stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* NT_ARM_PAC_MASK, which gdb asks for whenever AT_HWCAP advertises pointer
+     * authentication and is fatal about ("unable to fetch pauth registers").
+     * The kernel's answer is GENMASK(54, vabits_actual); ours is measured, so
+     * check the shape it must have — a contiguous field ending at bit 54 — and
+     * print it, since no oracle here can confirm the exact width. */
+    {
+        u64 pac[2] = {0, 0};
+        u64 piov[2] = {(u64)(unsigned long)pac, sizeof pac};
+        long pr = cng_pt_syscall(CNG_PTRACE_GETREGSET, kid,
+                                 CNG_NT_ARM_PAC_MASK,
+                                 (u64)(unsigned long)piov);
+        unsigned long hwcap = 0;
+        for (unsigned long *a = auxv; a && a[0]; a += 2)
+            if (a[0] == 16 /*AT_HWCAP*/)
+                hwcap = a[1];
+        if (hwcap & (1UL << 30)) {
+            int shape = pac[0] != 0 && pac[0] == pac[1] &&
+                        (pac[0] & ~0x007FFFFFFFFFFFFFuLL) == 0 &&
+                        pac[0] + (pac[0] & (~pac[0] + 1)) ==
+                            0x0080000000000000uLL;
+            ok = pr == 0 && piov[1] == sizeof pac && shape;
+            cng_dprintf(1,
+                        "ptracetest sigsys tier: pauth mask 0x%lx -> %s\n",
+                        (unsigned long)pac[0], ok ? "OK" : "FAIL");
+        } else {
+            ok = pr < 0; /* no PAC here: the kernel refuses it too */
+            cng_dprintf(1,
+                        "ptracetest sigsys tier: no pauth, refused -> %s\n",
+                        ok ? "OK" : "FAIL");
+        }
+        fails += !ok;
+    }
+
+    /* The register file the tracer sees is the trapped ucontext itself. */
+    struct cng_uregs regs;
+    memset(&regs, 0, sizeof regs);
+    u64 iov[2] = {(u64)(unsigned long)&regs, sizeof regs};
+    cng_pt_syscall(CNG_PTRACE_GETREGSET, kid, CNG_NT_PRSTATUS,
+                   (u64)(unsigned long)iov);
+    ok = (long)regs.x[8] == __NR_getpid && regs.pc == 0x1000;
+    cng_dprintf(1, "ptracetest sigsys tier: regs at the entry stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    cng_pt_syscall(CNG_PTRACE_SYSCALL, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == (5 | 0x80);
+    fails += !ok;
+    iov[1] = sizeof regs;
+    cng_pt_syscall(CNG_PTRACE_GETREGSET, kid, CNG_NT_PRSTATUS,
+                   (u64)(unsigned long)iov);
+    int rok = (long)regs.x[0] == kid; /* the syscall really ran */
+    cng_dprintf(1, "ptracetest sigsys tier: syscall-exit stop -> %s\n",
+                (ok && rok) ? "OK" : "FAIL");
+    fails += !(ok && rok);
+
+    cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+    cng_dprintf(1, "ptracetest sigsys tier: tracee exited clean -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    return fails;
+}
+
+/* A tracer's PTRACE_ATTACH reaching a new process on the way out of its fork.
+ * The parent hands the pid over as soon as its fork returns, so the attach
+ * kick can be delivered to the child before the child-side hooks of the
+ * converted clone have run. The -R tier ran those hooks on the guest's own
+ * mask, so the kick was handled first, and cng_pt_fork_child then wiped the
+ * per-task table the attach had been recorded in: the tracee stopped for the
+ * attach and never again. Its signals went straight to its own dispositions
+ * and its exit was never published. That is what `ptrace waitnowait` hit,
+ * about one run in a hundred, as "usr1 odd: killed 9". The probe parks the
+ * child in exactly that window until the tracer's attach has queued the kick.
+ * Then the child raises SIGUSR1 at itself, which must arrive as a stop. */
+static int g_fk_ready, g_fk_go;
+
+static void pt_forkkick_probe(void) {
+    char c = 'r';
+    sys_write(g_fk_ready, &c, 1);
+    while (sys_read(g_fk_go, &c, 1) == -EINTR)
+        ;
+}
+
+static int pt_sim_forkkick(void) {
+    static char *argv[] = {"/pt-forkkick", 0};
+    static char *envp[] = {0};
+    /* The attach is refused for a pid the registry does not know, and the
+     * converted clone publishes the child only for a parent it knows. */
+    cng_procreg_init(0);
+    cng_procreg_publish(argv, envp, 0, 0, 0, argv[0], "/");
+    int rdy[2], go[2];
+    if (CNG_SYS(__NR_pipe2, rdy, 0, 0, 0, 0, 0) < 0 ||
+        CNG_SYS(__NR_pipe2, go, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest fork kick: no pipe -> FAIL\n");
+        return 1;
+    }
+    g_fk_ready = rdy[1];
+    g_fk_go = go[0];
+    cng_g_fork_child_probe = pt_forkkick_probe;
+    long kid = cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), 10 /*SIGUSR1*/, 0, 0,
+                0);
+        sys_exit_group(3);
+    }
+    cng_g_fork_child_probe = 0;
+    sys_close(rdy[1]);
+    sys_close(go[0]);
+    if (kid < 0) {
+        cng_dprintf(1, "ptracetest fork kick: no fork -> FAIL\n");
+        return 1;
+    }
+    /* The tracer's own kicks (its tracees' stops wake it) interrupt reads. */
+    char c = 0;
+    while (sys_read(rdy[0], &c, 1) == -EINTR)
+        ;
+    long ar = cng_pt_syscall(CNG_PTRACE_ATTACH, kid, 0, 0);
+    sys_write(go[1], &c, 1);
+    sys_close(rdy[0]);
+    sys_close(go[1]);
+
+    int fails = 0, st = 0;
+    long r = ar == 0 ? cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0) : ar;
+    int ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 19;
+    cng_dprintf(1, "ptracetest fork kick: attach stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+    st = 0;
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 10;
+    cng_dprintf(1, "ptracetest fork kick: the next signal stops -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  wait=%ld status=0x%x\n", r, st);
+    fails += !ok;
+    /* Suppressed, so the tracee leaves by its own exit. A wait that already
+     * reaped it above has nothing left to collect. */
+    if (r == kid && (st & 0xff) == 0x7f) {
+        cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+        r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+        ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 3;
+    } else {
+        ok = 0;
+    }
+    cng_dprintf(1, "ptracetest fork kick: tracee exited clean -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    return fails;
+}
+
+/* The -R tier's native wait (cng_pt_wait_native): the kernel's own wait for a
+ * process that cannot be owed an emulated stop, which has to let go the moment
+ * one can be. Every -R wait used to poll the registry in 50 ms slices instead,
+ * so a shell's every fork and waitpid took 51 ms under it.
+ *
+ * Checked: the kick handler's part on frames inside the wait (synthesized — no
+ * live thread can be held at a chosen pc); a kick taken between the wait's look
+ * at the registry and its svc, which only the compare can catch, and the probe
+ * is exactly there; a child's PTRACE_TRACEME while its parent sleeps in the
+ * kernel's wait, whose kick must end that wait and hand it to the registry; and
+ * a tracer's fork, which traces nothing and gets the kernel's wait back. Run
+ * before anything here makes this process a tracer. */
+static int g_nw_calls, g_nw_wfd;
+
+static void pt_nwait_kick_probe(void) {
+    char c = 'g';
+    if (g_nw_calls++ == 0)
+        cng_pt_kick((s32)sys_getpid(), (s32)sys_gettid(), CNG_PT_KICK_WAKE);
+    else
+        sys_write(g_nw_wfd, &c, 1); /* let the child exit */
+}
+
+static void pt_nwait_traceme_probe(void) {
+    char c = 'w';
+    sys_write(g_nw_wfd, &c, 1);
+}
+
+/* Has task `pid` gone to sleep? Field 3 of its stat, after the ")". */
+static int pt_nwait_sleeping(long pid) {
+    char path[48], buf[256];
+    cng_snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    long n = sys_read((int)fd, buf, sizeof buf - 1);
+    sys_close((int)fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    const char *p = buf + n;
+    while (p > buf && p[-1] != ')')
+        p--;
+    return p > buf && p[0] == ' ' && p[1] == 'S';
+}
+
+static int pt_sim_nwait(void) {
+    int fails = 0;
+    long kicked = CNG_WAIT_KICKED;
+    u64 chk = (u64)(unsigned long)cng_wait_unless_check;
+    u64 svc = (u64)(unsigned long)cng_wait_unless_svc;
+    u64 bail = (u64)(unsigned long)cng_wait_unless_bail;
+    static struct cng_ucontext uc;
+    struct cng_uregs *f = cng_pt_uregs(&uc);
+    int ok = 1;
+    f->pc = chk; /* before the compare: it would pass on a stale count */
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == bail;
+    f->pc = svc; /* at the svc, made or about to be remade */
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == bail;
+    f->pc = svc + 4; /* the svc cut short by the kick */
+    f->x[0] = (u64)(s64)-EINTR;
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == svc + 4 && (s64)f->x[0] == kicked;
+    f->x[0] = 1234; /* the svc done: its answer stands */
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= f->pc == svc + 4 && f->x[0] == 1234;
+    f->pc = (u64)(unsigned long)cng_syscall6 + 8; /* anyone else's EINTR */
+    f->x[0] = (u64)(s64)-EINTR;
+    cng_pt_kick_taken(&uc, CNG_PT_KICK_WAKE);
+    ok &= (s64)f->x[0] == -EINTR;
+    cng_dprintf(1, "ptracetest native wait: a kick's frame -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    int p[2];
+    if (CNG_SYS(__NR_pipe2, p, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest native wait: no pipe -> FAIL\n");
+        return fails + 1;
+    }
+    long kid = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        /* Released by the second pass; a wait that slept through the kick
+         * never makes one, and is ended by this child giving up instead. */
+        struct { int fd; short ev, rev; } pfd = {p[0], 1 /*POLLIN*/, 0};
+        struct { long s, ns; } ts = {5, 0};
+        sys_close(p[1]);
+        long n;
+        while ((n = CNG_SYS(__NR_ppoll, &pfd, 1, &ts, 0, 8, 0)) == -EINTR)
+            ;
+        sys_exit_group(n > 0 ? 7 : 8);
+    }
+    sys_close(p[0]);
+    g_nw_wfd = p[1];
+    g_nw_calls = 0;
+    cng_g_wait_native_probe = pt_nwait_kick_probe;
+    int st = 0;
+    long out = 0;
+    int nat = kid > 0 && cng_pt_wait_native(__NR_wait4, kid,
+                                            (long)(unsigned long)&st, 0, 0, 0,
+                                            &out);
+    cng_g_wait_native_probe = 0;
+    sys_close(p[1]);
+    ok = nat && out == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 7 &&
+         g_nw_calls == 2;
+    cng_dprintf(1, "ptracetest native wait: a kick before the svc -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  native=%d wait=%ld status=0x%x passes=%d\n", nat,
+                    out, st, g_nw_calls);
+    fails += !ok;
+
+    if (CNG_SYS(__NR_pipe2, p, 0, 0, 0, 0, 0) < 0) {
+        cng_dprintf(1, "ptracetest native wait: no pipe -> FAIL\n");
+        return fails + 1;
+    }
+    long me = sys_getpid();
+    kid = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        char c = 0;
+        sys_close(p[1]);
+        while (sys_read(p[0], &c, 1) == -EINTR)
+            ;
+        /* The parent is past its look at the registry; let it reach the
+         * kernel's wait, so that is what the kick has to end. */
+        struct { long s, ns; } ts = {0, 5000000};
+        for (int i = 0; i < 400 && !pt_nwait_sleeping(me); i++)
+            CNG_SYS(__NR_nanosleep, &ts, 0, 0, 0, 0, 0);
+        if (cng_pt_syscall(CNG_PTRACE_TRACEME, 0, 0, 0) != 0)
+            sys_exit_group(91);
+        cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/);
+        sys_exit_group(4);
+    }
+    sys_close(p[0]);
+    g_nw_wfd = p[1];
+    cng_g_wait_native_probe = pt_nwait_traceme_probe;
+    st = 0;
+    nat = kid > 0 && cng_pt_wait_native(__NR_wait4, kid,
+                                        (long)(unsigned long)&st, 0, 0, 0,
+                                        &out);
+    cng_g_wait_native_probe = 0;
+    sys_close(p[1]);
+    ok = kid > 0 && !nat;
+    cng_dprintf(1, "ptracetest native wait: a child's TRACEME ends it -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  native=%d wait=%ld status=0x%x\n", nat, out, st);
+    fails += !ok;
+    if (kid <= 0 || nat)
+        return fails + 2;
+    long r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0xff) == 0x7f && ((st >> 8) & 0xff) == 19;
+    cng_dprintf(1, "ptracetest native wait: the registry has its stop -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+    cng_pt_syscall(CNG_PTRACE_CONT, kid, 0, 0);
+    r = cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0);
+    ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 4;
+    cng_dprintf(1, "ptracetest native wait: tracee exited clean -> %s\n",
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* A tracer now. Its fork is not, and waits as the kernel does. */
+    kid = cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0, 0);
+    if (kid == 0) {
+        long gk = CNG_SYS(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+        if (gk == 0)
+            sys_exit_group(6);
+        int gst = 0;
+        long gout = 0;
+        if (gk < 0 || !cng_pt_wait_native(__NR_wait4, gk,
+                                          (long)(unsigned long)&gst, 0, 0, 0,
+                                          &gout))
+            sys_exit_group(1);
+        sys_exit_group(gout == gk && (gst & 0x7f) == 0 &&
+                               ((gst >> 8) & 0xff) == 6
+                           ? 0
+                           : 2);
+    }
+    r = kid > 0 ? cng_pt_wait4(kid, (u64)(unsigned long)&st, 0, 0, 0) : kid;
+    ok = r == kid && (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+    cng_dprintf(1, "ptracetest native wait: a tracer's fork is none -> %s\n",
+                ok ? "OK" : "FAIL");
+    if (!ok)
+        cng_dprintf(1, "  wait=%ld status=0x%x\n", r, st);
+    fails += !ok;
+    return fails;
+}
+
+int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    /* The pauth-mask probe reads AT_HWCAP from here, as it does in a real run
+     * (cng_run sets it long before the monitor). */
+    if (!cng_host_auxv)
+        cng_host_auxv = auxv;
+    int fails = 0;
+    struct cng_uregs r;
+    memset(&r, 0, sizeof r);
+
+    /* Anything that is not a branch simply advances. */
+    fails += ptstep_case("nop advances by 4", 0xD503201Fu, &r, 4, 0);
+    fails += ptstep_case("svc advances by 4", 0xD4000001u, &r, 4, 0);
+
+    /* Unconditional, PC-relative. */
+    fails += ptstep_case("b +8", 0x14000002u, &r, 8, 0);
+    fails += ptstep_case("b -8", 0x17FFFFFEu, &r, (u64)-8, 0);
+    fails += ptstep_case("bl +4", 0x94000001u, &r, 4, 0);
+
+    /* Conditional: the flags in the frame decide, so exactly one target is
+     * planted rather than one on each side. */
+    r.pstate = 0x40000000u; /* Z set */
+    fails += ptstep_case("b.eq taken when Z", 0x54000040u, &r, 8, 0);
+    r.pstate = 0;
+    fails += ptstep_case("b.eq falls through when !Z", 0x54000040u, &r, 4, 0);
+    r.pstate = 0x40000000u;
+    fails += ptstep_case("b.ne falls through when Z", 0x54000041u, &r, 4, 0);
+    r.pstate = 0;
+
+    /* Compare-and-branch, including the 32-bit form's upper half. */
+    r.x[3] = 0;
+    fails += ptstep_case("cbz x3 taken when zero", 0xB4000043u, &r, 8, 0);
+    r.x[3] = 1;
+    fails += ptstep_case("cbz x3 falls through", 0xB4000043u, &r, 4, 0);
+    r.x[4] = 0x100000000uLL; /* w4 == 0, x4 != 0 */
+    fails += ptstep_case("cbnz w4 judges the low word", 0x35000044u, &r, 4, 0);
+    fails += ptstep_case("cbnz x4 judges all 64 bits", 0xB5000044u, &r, 8, 0);
+
+    /* Test-and-branch, both halves of the split bit number. */
+    r.x[5] = 0;
+    fails += ptstep_case("tbz x5,#3 taken when clear", 0x36180045u, &r, 8, 0);
+    r.x[5] = 8;
+    fails += ptstep_case("tbz x5,#3 falls through when set", 0x36180045u, &r, 4,
+                         0);
+    r.x[6] = 1uLL << 40;
+    fails += ptstep_case("tbnz x6,#40 taken (bit 5 of the index)", 0xB7400046u,
+                         &r, 8, 0);
+
+    /* Register forms read the frame. */
+    r.x[30] = 0x0BEE0;
+    fails += ptstep_case("ret follows x30", 0xD65F03C0u, &r, 0x0BEE0, 1);
+    r.x[7] = 0x12340;
+    fails += ptstep_case("br follows xn", 0xD61F00E0u, &r, 0x12340, 1);
+    r.x[9] = 0x9000;
+    fails += ptstep_case("blr follows xn", 0xD63F0120u, &r, 0x9000, 1);
+
+    /* A pointer-authenticated branch is not decoded, and must say so rather
+     * than guess: 0 makes the caller report the step in place instead of
+     * planting a breakpoint somewhere the tracee will never reach. */
+    fails += ptstep_case("braaz is refused, not guessed", 0xD61F0820u, &r, 0, 1);
+
+    cng_pt_init();
+    fails += pt_sim_nwait();
+    fails += pt_sim_sigsys(auxv);
+    fails += pt_sim_forkkick();
+
+    cng_dprintf(1, "ptracetest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* ---- M12: System V shared memory (-t shmtest) ---------------------------
+ *
+ * Drives the four syscalls through cng_dispatch, which is exactly what the
+ * SIGSYS handler does — so this needs no seccomp and runs under qemu. It spans
+ * a real fork (through the dispatcher's own clone path, so the fork hook is the
+ * one that ships) and a real broker daemon, which is the only way to see that
+ * two processes share the memory and that nattch tracks them.
+ *
+ * The test script re-runs this with CNG_SHM_FORCE_FILE=1 to cover the
+ * file-backed tier the broker falls back to where memfd_create is unavailable.
+ */
+#define SHMT_SZ 8192
+
+/* Every "chroot-ng-shm.v1.<our uid>." entry in the shared directory, weighed
+ * against the shape the daemon now gives them: sixteen hex digits of randomness
+ * and nothing else, a plain file, mode 0600, ours. The name used to end in the
+ * shmid, which made it both guessable and re-openable by anyone with write
+ * access to /tmp or /dev/shm — a symlink left on it had O_TRUNC destroy whatever
+ * it pointed at, and a file left on it was read back by its owner with the
+ * guest's shared memory in it. Returns the count and, through *bad, how many
+ * failed. -1 if the directory could not be listed at all. */
+static int shm_scan_files(int *bad) {
+    *bad = 0;
+    const char *dir = cng_broker_shared_dir();
+    if (!dir)
+        return -1;
+    long fd = sys_openat(CNG_AT_FDCWD, dir,
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char pfx[64];
+    size_t pl = cng_snprintf(pfx, sizeof pfx, "chroot-ng-shm.v1.%u.",
+                             (unsigned)sys_getuid());
+    int found = 0;
+    char buf[8192];
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, fd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        for (long off = 0; off + 19 <= n;) {
+            unsigned short reclen = *(unsigned short *)(buf + off + 16);
+            const char *name = buf + off + 19;
+            if (!reclen)
+                break;
+            if (!strncmp(name, pfx, pl)) {
+                found++;
+                const char *tag = name + pl;
+                int hex = 0;
+                while (tag[hex] && ((tag[hex] >= '0' && tag[hex] <= '9') ||
+                                    (tag[hex] >= 'a' && tag[hex] <= 'f')))
+                    hex++;
+                char full[CNG_PATH_MAX];
+                size_t k = cng_strlcpy(full, dir, sizeof full);
+                if (k < sizeof full - 1) {
+                    full[k++] = '/';
+                    cng_strlcpy(full + k, name, sizeof full - k);
+                }
+                char st[144];
+                long r = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, (long)full,
+                                 (long)st, CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+                unsigned mode = r == 0 ? *(unsigned *)(st + 16) : 0;
+                unsigned uid = r == 0 ? *(unsigned *)(st + 24) : ~0u;
+                if (hex != 16 || tag[hex] != '\0' || r != 0 ||
+                    (mode & 0170000) != 0100000 || (mode & 07777) != 0600 ||
+                    uid != (unsigned)sys_getuid())
+                    (*bad)++;
+            }
+            off += reclen;
+        }
+    }
+    sys_close((int)fd);
+    return found;
+}
+
+static long shm_call(long nr, long a0, long a1, long a2) {
+    return cng_dispatch(nr, a0, a1, a2, 0, 0, 0, /*trapped=*/0);
+}
+
+/* A libandroid-shmem client's fetch of a segment it did not create, as
+ * termux-x11's embedded copy and Termux's own library both make it
+ * (ashv_read_remote_segment): connect to the "/dev/shm/%08x" the id's high half
+ * names, send the id, read the key, then receive the descriptor on a one-byte
+ * message of its own. Returns the descriptor, or -1 when nobody answered. */
+static int shmt_ashv_fetch(s32 shmid, s32 *key) {
+    struct cng_sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.family = CNG_AF_UNIX;
+    size_t n = cng_snprintf(a.path + 1, sizeof a.path - 1, "/dev/shm/%08x",
+                            (unsigned)(shmid / 0x10000));
+    long s = CNG_SYS(__NR_socket, CNG_AF_UNIX,
+                     CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
+    if (s < 0)
+        return -1;
+    struct cng_timeval tv = {5, 0};
+    CNG_SYS(__NR_setsockopt, s, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO, &tv,
+            sizeof tv, 0);
+    int fd = -1;
+    char bang = 0;
+    if (CNG_SYS(__NR_connect, s, &a, sizeof a.family + 1 + n, 0, 0, 0) != 0 ||
+        cng_broker_write_full((int)s, &shmid, sizeof shmid) != 0 ||
+        cng_broker_read_full((int)s, key, sizeof *key) != 0 ||
+        cng_broker_recv((int)s, &bang, 1, &fd) != 0 || bang != '!') {
+        if (fd >= 0)
+            sys_close(fd);
+        fd = -1;
+    }
+    sys_close((int)s);
+    return fd;
+}
+
+/* The size the client learns: ashmem's ioctl, which is all libandroid-shmem
+ * asks, or fstat's for the memfd and file tiers. *ashmem says which answered. */
+static long shmt_backing_size(int fd, int *ashmem) {
+    long sz = sys_ioctl(fd, CNG_ASHMEM_GET_SIZE, 0);
+    *ashmem = sz > 0;
+    if (sz > 0)
+        return sz;
+    char st[144];
+    if (sys_fstat(fd, st) != 0)
+        return -1;
+    return *(long *)(st + 48); /* st_size */
+}
+
+static long shmt_stat(long id, struct cng_shmid64_ds *ds) {
+    return shm_call(__NR_shmctl, id, CNG_IPC_STAT | 0x100 /*IPC_64*/,
+                    (long)ds);
+}
+
+/* A page-aligned address that is currently free: map it, then drop it. Single
+ * threaded here, and nothing else in this process allocates behind our back. */
+static unsigned long shmt_hole(unsigned long len) {
+    void *p = sys_mmap(0, len, CNG_PROT_NONE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (p == CNG_MAP_FAILED || cng_is_err((long)p))
+        return 0;
+    sys_munmap(p, len);
+    return (unsigned long)p;
+}
+
+int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)auxv;
+    cng_g_host_envp = envp; /* the broker's env lookups (CNG_SHM_FORCE_FILE, TMPDIR) */
+    int fails = 0;
+    int self = (int)sys_getpid();
+    unsigned long pg = cng_page_size;
+
+    /* 0) the enumeration commands on a namespace that holds nothing yet — which
+     *    is what `ipcs -m` asks first, and the one state step 7 below cannot
+     *    reach because it creates a segment before looking. The kernel clamps
+     *    its "no ids" answer (-1) to 0, so both must succeed. */
+    {
+        struct cng_shm_info info;
+        struct cng_shminfo64 li;
+        memset(&info, 0, sizeof info);
+        memset(&li, 0, sizeof li);
+        long e1 = shm_call(__NR_shmctl, 0, CNG_SHM_INFO, (long)&info);
+        long e2 = shm_call(__NR_shmctl, 0, CNG_IPC_INFO, (long)&li);
+        int ok = e1 == 0 && e2 == 0 && info.used_ids == 0 && li.shmmni >= 1;
+        cng_dprintf(1, "shmtest empty-namespace shm_info+ipc_info -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 0b) a reply that carries an SCM_RIGHTS fd and then fails to complete must
+     *     not leave that fd behind. The ancillary fd arrives with the first
+     *     byte, so it is already installed by the time the top-up read finds
+     *     the peer gone — and host fd == guest fd here, so a leaked one is a
+     *     descriptor onto a segment's backing that the guest can see and use.
+     *     Staged exactly: 4 bytes plus an fd, writer closed, 64 asked for. */
+    {
+        int sv[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                         (long)sv, 0, 0) == 0;
+        long pass = ok ? sys_memfd_create("cng-leak", CNG_MFD_CLOEXEC) : -1;
+        ok = ok && pass >= 0 &&
+             cng_broker_send(sv[1], "abcd", 4, (int)pass) == 0;
+        if (pass >= 0)
+            sys_close((int)pass);
+        if (sv[1] >= 0)
+            sys_close(sv[1]);
+        /* With both of those closed, the lowest free descriptor is where the
+         * kernel will install the one riding on the message. */
+        long probe = CNG_SYS(__NR_fcntl, 0, 0 /*F_DUPFD*/, 0, 0, 0, 0);
+        int expect = (int)probe;
+        if (probe >= 0)
+            sys_close(expect);
+        char rb[64];
+        int got = 0;
+        ok = ok && probe >= 0 &&
+             cng_broker_recv(sv[0], rb, sizeof rb, &got) == -1 && got == -1 &&
+             CNG_SYS(__NR_fcntl, expect, 1 /*F_GETFD*/, 0, 0, 0, 0) < 0;
+        if (sv[0] >= 0)
+            sys_close(sv[0]);
+        cng_dprintf(1, "shmtest short reply leaks no fd -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 0c) ...and a message that completes normally, received by a caller that
+     *     asked for no fd at all. The control buffer rides on the recvmsg
+     *     either way, so the kernel installs whatever the peer attached before
+     *     the call returns: fd_out == NULL declines to look at the descriptor,
+     *     not to receive it. That caller is the daemon's request read — its one
+     *     and only path for a request, in a process that outlives every client
+     *     — so an fd attached to each request is a descriptor burned per
+     *     request until accept4 and memfd_create start failing with EMFILE. */
+    {
+        int sv[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                         (long)sv, 0, 0) == 0;
+        long pass = ok ? sys_memfd_create("cng-req", CNG_MFD_CLOEXEC) : -1;
+        ok = ok && pass >= 0 &&
+             cng_broker_send(sv[1], "abcd", 4, (int)pass) == 0;
+        if (pass >= 0)
+            sys_close((int)pass);
+        if (sv[1] >= 0)
+            sys_close(sv[1]);
+        long probe = CNG_SYS(__NR_fcntl, 0, 0 /*F_DUPFD*/, 0, 0, 0, 0);
+        int expect = (int)probe;
+        if (probe >= 0)
+            sys_close(expect);
+        char rb[4];
+        ok = ok && probe >= 0 &&
+             cng_broker_recv(sv[0], rb, sizeof rb, 0) == 0 &&
+             CNG_SYS(__NR_fcntl, expect, 1 /*F_GETFD*/, 0, 0, 0, 0) < 0;
+        if (sv[0] >= 0)
+            sys_close(sv[0]);
+        cng_dprintf(1, "shmtest an unwanted fd is not left installed -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 0d) A peer that closes with nothing sent is the one failure a caller may
+     *     retry, and it has to be told apart from the ones it must not. A
+     *     timeout means the peer may be alive and may already have acted on the
+     *     request; a truncated reply means it certainly did. Both stay -1. */
+    {
+        int sv[2] = {-1, -1};
+        char rb[64];
+        int ok = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                         (long)sv, 0, 0) == 0;
+        /* nothing sent, writer closed */
+        if (ok && sv[1] >= 0)
+            sys_close(sv[1]);
+        ok = ok && cng_broker_recv(sv[0], rb, sizeof rb, 0) == CNG_BROKER_GONE;
+        if (sv[0] >= 0)
+            sys_close(sv[0]);
+
+        /* half a reply, then the writer closed: NOT retryable */
+        int sv2[2] = {-1, -1};
+        int ok2 = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                          (long)sv2, 0, 0) == 0 &&
+                  cng_broker_send(sv2[1], "abcd", 4, -1) == 0;
+        if (sv2[1] >= 0)
+            sys_close(sv2[1]);
+        ok2 = ok2 && cng_broker_recv(sv2[0], rb, sizeof rb, 0) == -1;
+        if (sv2[0] >= 0)
+            sys_close(sv2[0]);
+
+        /* a peer that simply does not answer: NOT retryable either */
+        int sv3[2] = {-1, -1};
+        int ok3 = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                          (long)sv3, 0, 0) == 0;
+        struct cng_timeval tv = {0, 50 * 1000}; /* 50 ms stands in for the 2 s */
+        ok3 = ok3 && CNG_SYS(__NR_setsockopt, sv3[0], CNG_SOL_SOCKET,
+                             CNG_SO_RCVTIMEO, &tv, sizeof tv, 0) == 0 &&
+              cng_broker_recv(sv3[0], rb, sizeof rb, 0) == -1;
+        if (sv3[0] >= 0)
+            sys_close(sv3[0]);
+        if (sv3[1] >= 0)
+            sys_close(sv3[1]);
+
+        cng_dprintf(1,
+                    "shmtest gone/short/timeout told apart: %d%d%d -> %s\n", ok,
+                    ok2, ok3, ok && ok2 && ok3 ? "OK" : "FAIL");
+        fails += !(ok && ok2 && ok3);
+    }
+
+    /* 0e) A short send completed against a peer that has gone must answer -1
+     *     and nothing else. The first sendmsg carries MSG_NOSIGNAL; the
+     *     completion of a short one used a plain write(2), which is exactly
+     *     where a dead peer raises SIGPIPE — and SIGPIPE's default action is
+     *     the death of the process, the daemon included.
+     *
+     *     A stream socket takes a send short only when a signal lands after
+     *     some of it has gone, so that is staged: a sender with the smallest
+     *     buffer the kernel allows and a payload many times larger. The peer
+     *     waits until bytes have reached it — the sender is then blocked
+     *     mid-send — and sends SIGUSR1, which makes that sendmsg return the
+     *     part that went. The sender is now in the completion. The peer then
+     *     reads a little, so the completion's own write makes progress, and
+     *     shuts its reading side down: that write returns what it managed
+     *     and the NEXT one meets the dead peer with nothing sent — precisely
+     *     the call that raises SIGPIPE. (A close with unread bytes queued
+     *     answers ECONNRESET instead, and raises nothing, which is why the
+     *     drain and the shutdown are both needed.) Before the fix the test
+     *     binary died here. */
+    {
+        int sv[2] = {-1, -1};
+        int ok = CNG_SYS(__NR_socketpair, CNG_AF_UNIX, CNG_SOCK_STREAM, 0,
+                         (long)sv, 0, 0) == 0;
+        int one = 1;
+        ok = ok && CNG_SYS(__NR_setsockopt, sv[1], CNG_SOL_SOCKET,
+                           CNG_SO_SNDBUF, &one, sizeof one, 0) == 0;
+        long kid = ok ? sys_fork() : -1;
+        if (kid == 0) {
+            sys_close(sv[1]);
+            struct cng_pollfd pf = {sv[0], CNG_POLLIN, 0};
+            struct cng_timespec lim = {5, 0};
+            CNG_SYS(__NR_ppoll, &pf, 1, &lim, 0, 8 /*sigsetsize*/, 0);
+            CNG_SYS(__NR_kill, sys_getppid(), CNG_SIGUSR1, 0, 0, 0, 0);
+            struct cng_timespec nap = {0, 50 * 1000 * 1000};
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            char sink[4096];
+            for (long got = 0; got < 16384;) {
+                long n = sys_read(sv[0], sink, sizeof sink);
+                if (n <= 0)
+                    break;
+                got += n;
+            }
+            CNG_SYS(__NR_shutdown, sv[0], 0 /*SHUT_RD*/, 0, 0, 0, 0);
+            CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+            sys_close(sv[0]);
+            sys_exit_group(0);
+        }
+        if (sv[0] >= 0)
+            sys_close(sv[0]);
+        ok = ok && kid > 0 && cng_sig_install(CNG_SIGUSR1, sigtest_handler) == 0;
+        g_sig_ran = 0;
+        static char big[256 * 1024];
+        long r = ok ? cng_broker_send(sv[1], big, sizeof big, -1) : 0;
+        int st = 0;
+        if (kid > 0)
+            sys_wait4((int)kid, &st, 0, 0);
+        if (sv[1] >= 0)
+            sys_close(sv[1]);
+        ok = ok && r == -1 && g_sig_ran;
+        cng_dprintf(1, "shmtest short send to a gone peer is -1, not SIGPIPE -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 1) create, attach, and see the memory. */
+    long id = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                       CNG_IPC_CREAT | 0600);
+    long p = shm_call(__NR_shmat, id, 0, 0);
+    {
+        int ok = id > 0 && !cng_is_err(p);
+        if (ok)
+            cng_strlcpy((char *)p, "parent-wrote-this", 32);
+        struct cng_shmid64_ds ds;
+        ok = ok && shmt_stat(id, &ds) == 0 && ds.shm_segsz == SHMT_SZ &&
+             ds.shm_nattch == 1 && ds.shm_cpid == self &&
+             (ds.shm_perm.mode & 0777) == 0600;
+        cng_dprintf(1, "shmtest create+attach+stat -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!ok) { /* nothing below can mean anything without a segment */
+            cng_dprintf(1, "shmtest: %d failure(s)\n", fails + 1);
+            return 1;
+        }
+    }
+
+    /* 2) a fork child inherits the attachment: it must see our store, its own
+     *    store must come back to us, and nattch must count it — then drop it
+     *    again once the child is gone (chroot-ng traps no exit path, so that
+     *    last part is the broker's death reclaim doing its job). */
+    {
+        struct cng_shmid64_ds ds;
+        long kid = shm_call(__NR_clone, 17 /*SIGCHLD*/, 0, 0);
+        if (kid == 0) {
+            int saw = !strcmp((char *)p, "parent-wrote-this");
+            cng_strlcpy((char *)p, saw ? "child-wrote-this" : "child-saw-junk",
+                        32);
+            /* Prove the child's attach is counted while it is alive. */
+            if (shmt_stat(id, &ds) == 0 && ds.shm_nattch != 2)
+                cng_strlcpy((char *)p, "child-nattch-wrong", 32);
+            sys_exit_group(0);
+        }
+        int st = 0;
+        sys_wait4((int)kid, &st, 0, 0);
+        int ok = kid > 0 && !strcmp((char *)p, "child-wrote-this");
+        int reclaimed = shmt_stat(id, &ds) == 0 && ds.shm_nattch == 1;
+        cng_dprintf(1, "shmtest fork share=%d nattch-after-exit=%lu -> %s\n", ok,
+                    (unsigned long)ds.shm_nattch,
+                    ok && reclaimed ? "OK" : "FAIL");
+        fails += !(ok && reclaimed);
+    }
+
+    /* 3) attach-address rules, expressed as mmap flags here: an unaligned
+     *    address is EINVAL, SHM_RND rounds down to SHMLBA (the page size on
+     *    arm64), an occupied range is EINVAL, and SHM_REMAP takes it over. */
+    {
+        long bad = shm_call(__NR_shmat, id, 0x1234, 0);
+        unsigned long hole = shmt_hole(SHMT_SZ);
+        long rnd = shm_call(__NR_shmat, id, (long)(hole + 0x40), CNG_SHM_RND);
+        void *occ = sys_mmap(0, SHMT_SZ, CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        long taken = shm_call(__NR_shmat, id, (long)occ, 0);
+        long remap = shm_call(__NR_shmat, id, (long)occ, CNG_SHM_REMAP);
+        int ok = bad == -EINVAL && hole && (unsigned long)rnd == hole &&
+                 taken == -EINVAL && remap == (long)occ &&
+                 !strcmp((char *)remap, "child-wrote-this");
+        cng_dprintf(1, "shmtest attach-addr unaligned/rnd/occupied/remap -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!cng_is_err(rnd))
+            shm_call(__NR_shmdt, rnd, 0, 0);
+        if (!cng_is_err(remap))
+            shm_call(__NR_shmdt, remap, 0, 0);
+    }
+
+    /* 3b) ...and the one address SHM_REMAP must NOT take over: our own. The
+     *     monitor shares the guest's address space, so a MAP_FIXED attach
+     *     placed on chroot-ng's image replaces the code performing the attach.
+     *     Asserted on the live symbol rather than a constant, and with the
+     *     first instruction of the gate read back afterwards so a leg that
+     *     "passed" by mapping over us cannot go unnoticed. */
+    {
+        unsigned long img = (unsigned long)__cng_image_start;
+        unsigned int gate0 = *(volatile unsigned int *)__cng_gate_start;
+        long over = shm_call(__NR_shmat, id, (long)img, CNG_SHM_REMAP);
+        long rnd = shm_call(__NR_shmat, id, (long)(img + 0x40),
+                            CNG_SHM_REMAP | CNG_SHM_RND);
+        int intact = *(volatile unsigned int *)__cng_gate_start == gate0;
+        int ok = over == -EINVAL && rnd == -EINVAL && intact;
+        cng_dprintf(1, "shmtest remap over our own image refused=%d intact=%d"
+                       " -> %s\n",
+                    over == -EINVAL && rnd == -EINVAL, intact,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!cng_is_err(over))
+            shm_call(__NR_shmdt, over, 0, 0);
+        if (!cng_is_err(rnd))
+            shm_call(__NR_shmdt, rnd, 0, 0);
+    }
+
+    /* 3c) the file-backed tier's name. It lands in /dev/shm or /tmp, where every
+     *     user on the machine may create names, and nothing outside the daemon
+     *     needs to find it — attachers get the descriptor over SCM_RIGHTS, and
+     *     the path is kept only to unlink again. So it carries no meaning, just
+     *     random bits, and it is created O_EXCL|O_NOFOLLOW. Asserted in both
+     *     directions: forced onto the file tier there is one and it is well
+     *     formed, and on the memfd tier there is no file at all. */
+    {
+        int bad = 0;
+        int found = shm_scan_files(&bad);
+        int forced = cng_broker_env("CNG_SHM_FORCE_FILE") != 0;
+        int ok = found >= 0 && bad == 0 && (forced ? found > 0 : found == 0);
+        cng_dprintf(1,
+                    "shmtest backing files forced=%d found=%d malformed=%d"
+                    " -> %s\n",
+                    forced, found, bad, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 4) a read-only attach sees the same memory. */
+    {
+        long ro = shm_call(__NR_shmat, id, 0, CNG_SHM_RDONLY);
+        int ok = !cng_is_err(ro) && !strcmp((char *)ro, "child-wrote-this");
+        cng_dprintf(1, "shmtest rdonly attach -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (!cng_is_err(ro))
+            shm_call(__NR_shmdt, ro, 0, 0);
+    }
+
+    /* 5) detach, remove, and confirm the id is dead. A second shmdt of the same
+     *    address is EINVAL, as it is on a real kernel. */
+    {
+        long d1 = shm_call(__NR_shmdt, p, 0, 0);
+        long d2 = shm_call(__NR_shmdt, p, 0, 0);
+        long rm = shm_call(__NR_shmctl, id, CNG_IPC_RMID, 0);
+        long again = shm_call(__NR_shmat, id, 0, 0);
+        int ok = d1 == 0 && d2 == -EINVAL && rm == 0 && again == -EINVAL;
+        cng_dprintf(1, "shmtest detach+rmid -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 6) keyed lookup: the same key finds the same segment, IPC_EXCL refuses an
+     *    existing one, and a missing key without IPC_CREAT is ENOENT. */
+    {
+        s32 key = (s32)(0x51000000 + (self & 0xffffff));
+        long a = shm_call(__NR_shmget, key, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long b = shm_call(__NR_shmget, key, SHMT_SZ, 0);
+        long e = shm_call(__NR_shmget, key, SHMT_SZ,
+                          CNG_IPC_CREAT | CNG_IPC_EXCL | 0600);
+        long n = shm_call(__NR_shmget, key + 1, SHMT_SZ, 0);
+        long big = shm_call(__NR_shmget, key, SHMT_SZ * 4, 0);
+        int ok = a > 0 && b == a && e == -EEXIST && n == -ENOENT &&
+                 big == -EINVAL;
+        cng_dprintf(1, "shmtest keyed lookup -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (a > 0)
+            shm_call(__NR_shmctl, a, CNG_IPC_RMID, 0);
+    }
+
+    /* 7) the enumeration path ipcs(1) walks: SHM_INFO for the highest index,
+     *    then SHM_STAT by index until our own segment turns up. */
+    {
+        long id2 = shm_call(__NR_shmget, 0, 12288, CNG_IPC_CREAT | 0600);
+        struct cng_shm_info info;
+        long maxid = shm_call(__NR_shmctl, 0, CNG_SHM_INFO, (long)&info);
+        int found = 0, size_ok = 0, cpid_ok = 0;
+        for (long i = 0; i <= maxid; i++) {
+            struct cng_shmid64_ds ds;
+            long sid = shm_call(__NR_shmctl, i, CNG_SHM_STAT, (long)&ds);
+            if (sid != id2)
+                continue;
+            found = 1;
+            size_ok = ds.shm_segsz == 12288;
+            cpid_ok = ds.shm_cpid == self;
+        }
+        /* IPC_INFO reports the limits, not the segments; ipcs -m -l reads it. */
+        struct cng_shminfo64 li;
+        memset(&li, 0, sizeof li);
+        shm_call(__NR_shmctl, 0, CNG_IPC_INFO, (long)&li);
+        int limits_ok = li.shmmni >= 1 && li.shmseg >= 1 && li.shmmax >= 12288;
+        int ok = id2 > 0 && maxid >= 0 && info.used_ids >= 1 &&
+                 info.shm_tot >= 12288 / pg && found && size_ok && cpid_ok &&
+                 limits_ok;
+        cng_dprintf(1, "shmtest shm_info+shm_stat+ipc_info -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (id2 > 0)
+            shm_call(__NR_shmctl, id2, CNG_IPC_RMID, 0);
+    }
+
+    /* 8) IPC_SET writes the permission triad back. */
+    {
+        long id3 = shm_call(__NR_shmget, 0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        struct cng_shmid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        ds.shm_perm.mode = 0640;
+        ds.shm_perm.uid = (u32)sys_geteuid();
+        ds.shm_perm.gid = (u32)sys_getegid();
+        long set = shm_call(__NR_shmctl, id3, CNG_IPC_SET, (long)&ds);
+        struct cng_shmid64_ds back;
+        int ok = id3 > 0 && set == 0 && shmt_stat(id3, &back) == 0 &&
+                 (back.shm_perm.mode & 0777) == 0640;
+        cng_dprintf(1, "shmtest ipc_set -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (id3 > 0)
+            shm_call(__NR_shmctl, id3, CNG_IPC_RMID, 0);
+    }
+
+    /* 9) execve semantics: attaches do not survive it. cng_shm_detach_all is
+     *    what the emulated execve calls at its commit point. */
+    {
+        long id4 = shm_call(__NR_shmget, 0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long a1 = shm_call(__NR_shmat, id4, 0, 0);
+        long a2 = shm_call(__NR_shmat, id4, 0, 0);
+        struct cng_shmid64_ds ds;
+        int before = shmt_stat(id4, &ds) == 0 && ds.shm_nattch == 2;
+        cng_shm_detach_all();
+        int after = shmt_stat(id4, &ds) == 0 && ds.shm_nattch == 0;
+        /* The mappings are gone too, not just the accounting: both ranges must
+         * now be free, which MAP_FIXED_NOREPLACE reports by handing back the
+         * very address we asked for. */
+        int unmapped = 1;
+        for (int k = 0; k < 2; k++) {
+            long a = k ? a2 : a1;
+            void *m = sys_mmap((void *)a, SHMT_SZ, CNG_PROT_READ,
+                               CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS |
+                                   CNG_MAP_FIXED_NOREPLACE,
+                               -1, 0);
+            if (cng_is_err((long)m) || (long)m != a)
+                unmapped = 0;
+            if (!cng_is_err((long)m))
+                sys_munmap(m, SHMT_SZ);
+        }
+        int ok = id4 > 0 && !cng_is_err(a1) && !cng_is_err(a2) && before &&
+                 after && unmapped;
+        cng_dprintf(1, "shmtest execve detach-all -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+        if (id4 > 0)
+            shm_call(__NR_shmctl, id4, CNG_IPC_RMID, 0);
+    }
+
+    /* 10) a bad shmid, a zero size and an unknown command are refused. */
+    {
+        int ok = shm_call(__NR_shmat, 999999, 0, 0) == -EINVAL &&
+                 shm_call(__NR_shmctl, 999999, CNG_IPC_STAT, 0) == -EINVAL &&
+                 shm_call(__NR_shmget, 0, 0, CNG_IPC_CREAT | 0600) == -EINVAL &&
+                 shm_call(__NR_shmdt, 0, 0, 0) == -EINVAL;
+        cng_dprintf(1, "shmtest error cases -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 11) a host process attaches a segment the way libandroid-shmem does.
+     *
+     *     Termux's X servers (termux-x11, Xvfb, Xvnc) carry libandroid-shmem,
+     *     whose shmat of an id it did not make takes the id's high half for
+     *     the creator's socket id and fetches the backing from there. Our ids
+     *     were 1, 2, 3..., whose high half is the one a process that made
+     *     nothing takes for its own, so it asked nobody and a guest's
+     *     XShmAttach was BadAccess. Here the client side, spelled out: the
+     *     id's shape (a socket id of ours, and still positive), the key and
+     *     the memory for a private and a keyed segment, stores crossing in
+     *     both directions, no nattch for the host (the protocol has no detach
+     *     to drop it again), a removed segment served while the guest still
+     *     holds it and not once it is gone, and an id of ours that names
+     *     nothing left unanswered. Over the memfd and file tiers the size is
+     *     fstat's; m12 runs the real library on Termux. */
+    {
+        s32 key0 = (s32)(0x52000000 + (self & 0xffffff));
+        long ida = shm_call(__NR_shmget, 0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long idk = shm_call(__NR_shmget, key0, SHMT_SZ, CNG_IPC_CREAT | 0600);
+        long pa = ida > 0 ? shm_call(__NR_shmat, ida, 0, 0) : -EINVAL;
+        long sock = ida > 0 ? ida >> 16 : 0;
+        int shape = !cng_is_err(pa) && idk > 0 && sock >= 1 &&
+                    sock <= 0x7fff && idk >> 16 == sock;
+        if (!cng_is_err(pa))
+            cng_strlcpy((char *)pa, "guest-wrote-this", 32);
+
+        s32 key = -1, keyk = -1, junk;
+        int fd = shape ? shmt_ashv_fetch((s32)ida, &key) : -1;
+        int fdk = shape ? shmt_ashv_fetch((s32)idk, &keyk) : -1;
+        int keys = fd >= 0 && key == 0 && fdk >= 0 && keyk == key0;
+        if (fdk >= 0)
+            sys_close(fdk);
+
+        int ashmem = 0, shared = 0;
+        long sz = fd >= 0 ? shmt_backing_size(fd, &ashmem) : -1;
+        if (sz == (long)cng_page_up(SHMT_SZ)) {
+            void *m = sys_mmap(0, (unsigned long)sz,
+                               CNG_PROT_READ | CNG_PROT_WRITE, CNG_MAP_SHARED,
+                               fd, 0);
+            if (!cng_is_err((long)m)) {
+                shared = !strcmp((char *)m, "guest-wrote-this");
+                cng_strlcpy((char *)m, "host-wrote-this", 32);
+                shared = shared && !strcmp((char *)pa, "host-wrote-this");
+                sys_munmap(m, (unsigned long)sz);
+            }
+        }
+        if (fd >= 0)
+            sys_close(fd);
+
+        struct cng_shmid64_ds ds;
+        int uncounted = shape && shmt_stat(ida, &ds) == 0 && ds.shm_nattch == 1;
+
+        /* IPC_RMID with the guest still attached keeps it fetchable (an X
+         * client may remove before it attaches); the last detach ends it. */
+        int removed = 0, gone = 0;
+        if (shape && shm_call(__NR_shmctl, ida, CNG_IPC_RMID, 0) == 0) {
+            int f = shmt_ashv_fetch((s32)ida, &junk);
+            removed = f >= 0;
+            if (f >= 0)
+                sys_close(f);
+            shm_call(__NR_shmdt, pa, 0, 0);
+            f = shmt_ashv_fetch((s32)ida, &junk);
+            gone = f < 0;
+            if (f >= 0)
+                sys_close(f);
+        }
+        int f = shape ? shmt_ashv_fetch((s32)(sock << 16 | 0xffff), &junk) : 0;
+        int unknown = f < 0;
+        if (f >= 0)
+            sys_close(f);
+        if (idk > 0)
+            shm_call(__NR_shmctl, idk, CNG_IPC_RMID, 0);
+
+        int ok = shape && keys && shared && uncounted && removed && gone &&
+                 unknown;
+        cng_dprintf(1,
+                    "shmtest a libandroid-shmem client attaches a guest segment"
+                    " shape=%d keys=%d shared=%d uncounted=%d removed=%d"
+                    " gone=%d unknown=%d -> %s\n",
+                    shape, keys, shared, uncounted, removed, gone, unknown,
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+
+        /* ...and the backing is ashmem exactly where the host can open it,
+         * since that ioctl is the size probe. The file tier, when forced,
+         * takes precedence. */
+        long probe = sys_openat(CNG_AT_FDCWD, "/dev/ashmem",
+                                CNG_O_RDWR | CNG_O_CLOEXEC, 0);
+        if (probe >= 0)
+            sys_close((int)probe);
+        int want = probe >= 0 && !cng_broker_env("CNG_SHM_FORCE_FILE");
+        ok = fd >= 0 && ashmem == want;
+        cng_dprintf(1,
+                    "shmtest segment backing is ashmem where /dev/ashmem opens:"
+                    " ashmem=%d -> %s\n",
+                    ashmem, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* A daemon keeps its listener bound while it decides to leave, so a connect
+     * that lands in that window is queued on the backlog and succeeds, the
+     * request is buffered, and only the reply never comes. Staged with the
+     * timing made deterministic: a stand-in binds the rendezvous name, accepts
+     * one connection, gives the name up, and only then closes without
+     * answering — a dying daemon, in the order that removes the race. The RPC
+     * has to recover: its retry finds nothing listening, spawns a real daemon,
+     * and the shmget below succeeds. With one attempt the silence became a
+     * fabricated ENOSPC, which is what a guest saw for having gone quiet longer
+     * than the grace window.
+     *
+     * Last, and on a namespace of its own: re-seeding the session moves this
+     * off the name the daemon serving everything above is already bound to. */
+    {
+        cng_broker_seed_session();
+        struct cng_sockaddr_un a;
+        unsigned al = cng_broker_self_addr(&a);
+        long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX,
+                          CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
+        int ok = ls >= 0 && CNG_SYS(__NR_bind, ls, &a, al, 0, 0, 0) == 0 &&
+                 CNG_SYS(__NR_listen, ls, 8, 0, 0, 0, 0) == 0;
+        long kid = ok ? sys_fork() : -1;
+        if (kid == 0) {
+            /* Bounded: if the RPC never arrives, do not wedge the suite. */
+            struct cng_pollfd pf = {(int)ls, CNG_POLLIN, 0};
+            struct cng_timespec lim = {10, 0};
+            long c = -1;
+            if (CNG_SYS(__NR_ppoll, &pf, 1, &lim, 0, 8 /*sigsetsize*/, 0) > 0)
+                c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
+            sys_close((int)ls); /* release the name BEFORE hanging up */
+            if (c >= 0)
+                sys_close((int)c);
+            sys_exit_group(0);
+        }
+        if (ls >= 0)
+            sys_close((int)ls); /* the child is the only holder now */
+        long id = ok && kid > 0
+                      ? shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                                 CNG_IPC_CREAT | 0600)
+                      : -1;
+        if (kid > 0)
+            CNG_SYS(__NR_wait4, kid, 0, 0, 0, 0, 0);
+        if (id >= 0)
+            shm_call(__NR_shmctl, id, CNG_IPC_RMID, 0);
+        ok = ok && kid > 0 && id >= 0;
+        cng_dprintf(1, "shmtest a daemon on its way out is retried past: %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 15) the caller's pid in a request is the kernel's answer about the peer,
+     *     not the number the client put in the field.
+     *
+     *     Every registry the daemon keeps is keyed on that pid: which process an
+     *     attachment belongs to, whose semaphore undo rows apply, which parked
+     *     waiter to wake, and whose death reclaims all of it. A client that
+     *     names another process therefore detaches its segments, inherits its
+     *     undo and has its own rows reclaimed under it — and the socket is
+     *     abstract, so "a client" is anything on the machine that can reach the
+     *     name. The uid and gid cannot be taken from the kernel (they are the
+     *     guest's faked identity, which is the whole point of --fake-id), but
+     *     the pid can, and now is.
+     *
+     *     Driven at the protocol rather than through shm.c, because no client of
+     *     ours will send anything but its own pid: connect the ordinary way,
+     *     then overwrite the field before the request goes out. shm_cpid is the
+     *     daemon's record of who created the segment, so IPC_STAT reads it back. */
+    {
+        struct cng_breq q;
+        memset(&q, 0, sizeof q);
+        q.op = CNG_REQ_SHMGET;
+        q.size = SHMT_SZ;
+        q.arg = CNG_IPC_CREAT | 0600;
+        int s = cng_broker_open(&q); /* stamps pid/uid/gid, then connects */
+        q.pid = 0x7ffffff0;          /* the lie */
+        struct cng_bresp r;
+        memset(&r, 0, sizeof r);
+        int got = s >= 0 && cng_broker_send(s, &q, sizeof q, -1) == 0 &&
+                  cng_broker_recv(s, &r, sizeof r, 0) == 0;
+        if (s >= 0)
+            sys_close(s);
+        long fid = got ? r.ret : -1;
+        struct cng_shmid64_ds ds;
+        int ok = fid > 0 && shmt_stat(fid, &ds) == 0 && ds.shm_cpid == self;
+        if (fid > 0)
+            shm_call(__NR_shmctl, fid, CNG_IPC_RMID, 0);
+        cng_dprintf(1, "shmtest a forged caller pid is not believed -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 16) a peer the kernel will not identify is refused, in both directions.
+     *
+     *     SO_PEERCRED is the only thing standing between an abstract name
+     *     anybody can compute and a namespace of ours, so failing to read it has
+     *     to close the connection rather than leave the check unmade. Nothing on
+     *     a working host reaches that, hence CNG_BROKER_NO_PEERCRED.
+     *
+     *     Both sides in one sequence, on a namespace of its own. The first call
+     *     runs with the knob set: it finds nobody serving the name, starts a
+     *     daemon — which inherits the knob — and then refuses that daemon
+     *     itself, which is the client half. The second runs with the knob gone,
+     *     so the client is satisfied and the daemon now standing on the name is
+     *     the one that refuses, which is the daemon half. The leg can only pass
+     *     if a daemon really was left there: had the first call not started one,
+     *     the second would have started a clean one and been served. */
+    {
+        static char *noc_env[2];
+        noc_env[0] = (char *)"CNG_BROKER_NO_PEERCRED=1";
+        noc_env[1] = 0;
+        char **saved = cng_g_host_envp;
+        cng_broker_seed_session(); /* a name nobody is bound to yet */
+        cng_g_host_envp = noc_env;
+        long e1 = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                           CNG_IPC_CREAT | 0600);
+        cng_g_host_envp = saved;
+        long e2 = shm_call(__NR_shmget, 0 /*IPC_PRIVATE*/, SHMT_SZ,
+                           CNG_IPC_CREAT | 0600);
+        int ok = e1 == -ENOSPC && e2 == -ENOSPC;
+        cng_dprintf(1,
+                    "shmtest an unidentifiable peer is refused client=%ld "
+                    "daemon=%ld -> %s\n",
+                    e1, e2, ok ? "OK" : "FAIL");
+        fails += !ok;
+        cng_broker_seed_session(); /* leave the poisoned namespace behind */
+    }
+
+    /* 17) a client of another rootfs is not answered.
+     *
+     *     The --shared-proc rendezvous name is a hash of the rootfs path and
+     *     the peer check is by uid, so two rootfs of one user whose paths
+     *     hashed alike met at one daemon and shared a /proc view, a SysV
+     *     namespace and a process table between them. The hash is 64 bits
+     *     now, and the daemon is started for one path and told the client's
+     *     on every connection: a client presenting another is hung up on,
+     *     and degrades as one refused by uid does. Driven at the hello, since
+     *     no client of ours presents anything but its own path: the same
+     *     daemon, once with its own key and once with another's, on a rootfs
+     *     name nobody else is using (the daemon needs no directory behind it;
+     *     it leaves after its grace window). */
+    {
+        char root[64];
+        cng_snprintf(root, sizeof root, "/cng-shmtest-rootfs-%d", self);
+        int own = cng_broker_test_hello(root, root);
+        int other = cng_broker_test_hello(root, "/some/other/rootfs");
+        int own2 = cng_broker_test_hello(root, root);
+        int ok = own == 0 && other == -1 && own2 == 0;
+        cng_dprintf(1,
+                    "shmtest a client of another rootfs is not answered "
+                    "own=%d other=%d own_again=%d -> %s\n",
+                    own, other, own2, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "shmtest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* ---- _ipctest: System V semaphores and message queues ------------------- */
+
+/* The differential guests (tests/guests/sem_*.c) are the real coverage here —
+ * they diff the emulation against the host kernel's own SysV IPC. This drives
+ * the same dispatcher without a libc or a working host implementation, which is
+ * what makes it the only coverage available on Android, where bionic drops the
+ * API and the app domain is denied the syscalls outright. */
+
+static long ipc_call(long nr, long a0, long a1, long a2, long a3, long a4) {
+    return cng_dispatch(nr, a0, a1, a2, a3, a4, 0, /*trapped=*/0);
+}
+
+static long sem_ctl(long id, long num, long cmd, long arg) {
+    return ipc_call(__NR_semctl, id, num, cmd | 0x100 /*IPC_64*/, arg, 0);
+}
+
+int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)auxv;
+    cng_g_host_envp = envp; /* the broker's env lookups (TMPDIR, ...) */
+    int fails = 0;
+    int self = (int)sys_getpid();
+
+    long sid = ipc_call(__NR_semget, 0 /*IPC_PRIVATE*/, 3, CNG_IPC_CREAT | 0600,
+                        0, 0);
+    if (sid <= 0) {
+        cng_dprintf(1, "ipctest semget -> FAIL (%ld)\n", sid);
+        return 1;
+    }
+
+    /* 1) fresh semaphores read zero; SETVAL/GETVAL round-trip; a multi-op
+     *    vector applies as a whole and stamps sempid on every member. */
+    {
+        int ok = sem_ctl(sid, 0, CNG_GETVAL, 0) == 0 &&
+                 sem_ctl(sid, 2, CNG_GETVAL, 0) == 0 &&
+                 sem_ctl(sid, 1, CNG_SETVAL, 5) == 0 &&
+                 sem_ctl(sid, 1, CNG_GETVAL, 0) == 5;
+        struct cng_sembuf ops[2] = {{1, -2, 0}, {0, +3, 0}};
+        ok = ok && ipc_call(__NR_semop, sid, (long)ops, 2, 0, 0) == 0 &&
+             sem_ctl(sid, 0, CNG_GETVAL, 0) == 3 &&
+             sem_ctl(sid, 1, CNG_GETVAL, 0) == 3 &&
+             sem_ctl(sid, 0, CNG_GETPID, 0) == self;
+        cng_dprintf(1, "ipctest semget+setval+semop -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) the vector is atomic: an operation that cannot proceed rolls the whole
+     *    thing back, so the +9 in front of the blocking -99 must not stick. */
+    {
+        struct cng_sembuf mixed[2] = {{0, +9, 0}, {2, -99, CNG_IPC_NOWAIT}};
+        long r = ipc_call(__NR_semop, sid, (long)mixed, 2, 0, 0);
+        int ok = r == -EAGAIN && sem_ctl(sid, 0, CNG_GETVAL, 0) == 3;
+        cng_dprintf(1, "ipctest semop atomic rollback -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3) GETALL/SETALL, which stream their vector over the broker connection
+     *    rather than riding in the fixed request. */
+    {
+        u16 set[3] = {7, 8, 9}, got[3] = {0, 0, 0};
+        int ok = sem_ctl(sid, 0, CNG_SETALL, (long)set) == 0 &&
+                 sem_ctl(sid, 0, CNG_GETALL, (long)got) == 0 && got[0] == 7 &&
+                 got[1] == 8 && got[2] == 9;
+        cng_dprintf(1, "ipctest semctl getall+setall -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 3b) the same GETALL into an array whose tail is in a hole. The kernel
+     *     copies the vector out in one act, filling what it can before it
+     *     reports -EFAULT, so the values before the hole are the real ones
+     *     (measured on the host). Probing the whole array first answered the
+     *     same errno with those values wiped instead — the write probe
+     *     validates a range by ZEROING it — and that is guest memory a real
+     *     semctl would have left holding semaphore values.
+     *
+     *     Two pages with the second unmapped, as faulttest builds it; where no
+     *     pointer probe can be had at all the copy really would fault, and the
+     *     leg is skipped exactly as faulttest skips its own.
+     *
+     *     What is asserted is that the readable half is not WIPED, which is the
+     *     bug, and not that it holds 7,8, which is the kernel's side effect:
+     *     qemu-user is no oracle for a partial copy — it validates the whole
+     *     range before it starts and refuses without writing a byte — so under
+     *     it the values stay the caller's own. Both outcomes are what a guest
+     *     can survive; zeros in place of semaphore values are not. */
+    {
+        unsigned long pg = cng_page_size;
+        char *m = sys_mmap(0, 2 * pg, CNG_PROT_READ | CNG_PROT_WRITE,
+                           CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        if (m == CNG_MAP_FAILED || cng_is_err((long)m)) {
+            cng_dprintf(1, "ipctest getall partial: no mapping -> SKIP\n");
+        } else if (cng_user_writable((void *)0x10, 8)) {
+            sys_munmap(m, 2 * pg);
+            cng_dprintf(1, "ipctest getall partial: no pointer probe -> SKIP\n");
+        } else {
+            sys_munmap(m + pg, pg);
+            u16 set[3] = {7, 8, 9};
+            u16 *arr = (u16 *)(m + pg - 4); /* two values fit, the third does not */
+            arr[0] = arr[1] = 0x1111;
+            long sa = sem_ctl(sid, 0, CNG_SETALL, (long)set);
+            long ga = sem_ctl(sid, 0, CNG_GETALL, (long)arr);
+            int wiped = (arr[0] == 0 && arr[1] == 0);
+            int ok = sa == 0 && ga == -EFAULT && !wiped;
+            cng_dprintf(1,
+                        "ipctest getall partial=%d wiped=%d -> %s (vals %d,%d)\n",
+                        (int)ga, wiped, ok ? "OK" : "FAIL", arr[0], arr[1]);
+            fails += !ok;
+            sys_munmap(m, pg);
+        }
+    }
+
+    /* 4) IPC_STAT / IPC_SET, and the ipcs enumeration commands. */
+    {
+        struct cng_semid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        int ok = sem_ctl(sid, 0, CNG_IPC_STAT, (long)&ds) == 0 &&
+                 ds.sem_nsems == 3 && (ds.sem_perm.mode & 0777) == 0600;
+        ds.sem_perm.mode = 0640;
+        ok = ok && sem_ctl(sid, 0, CNG_IPC_SET, (long)&ds) == 0 &&
+             sem_ctl(sid, 0, CNG_IPC_STAT, (long)&ds) == 0 &&
+             (ds.sem_perm.mode & 0777) == 0640;
+        struct cng_seminfo si;
+        memset(&si, 0, sizeof si);
+        long maxidx = sem_ctl(sid, 0, CNG_SEM_INFO, (long)&si);
+        ok = ok && maxidx >= 0 && si.semusz >= 1 && si.semaem >= 3 &&
+             si.semmsl == CNG_SEMMSL;
+        /* SEM_STAT takes the array index SEM_INFO just reported, not an id. */
+        memset(&ds, 0, sizeof ds);
+        ok = ok && sem_ctl(maxidx, 0, CNG_SEM_STAT, (long)&ds) == sid;
+        cng_dprintf(1, "ipctest semctl stat+set+enumeration -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 5) a blocking semop, woken by a fork child — which also proves the daemon
+     *    keeps serving while one connection sits parked. */
+    {
+        u16 zero[3] = {0, 0, 0};
+        sem_ctl(sid, 0, CNG_SETALL, (long)zero);
+        long kid = cng_dispatch(__NR_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0, 0);
+        if (kid == 0) {
+            struct cng_timespec ms = {0, 200000000};
+            CNG_SYS(__NR_nanosleep, &ms, 0, 0, 0, 0, 0);
+            struct cng_sembuf up = {0, +1, 0};
+            ipc_call(__NR_semop, sid, (long)&up, 1, 0, 0);
+            sys_exit_group(0);
+        }
+        struct cng_sembuf down = {0, -1, 0};
+        long r = ipc_call(__NR_semop, sid, (long)&down, 1, 0, 0);
+        sys_wait4((int)kid, 0, 0, 0);
+        int ok = kid > 0 && r == 0;
+        cng_dprintf(1, "ipctest blocking semop woken -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 6) semtimedop's deadline, which the daemon owns (the client sets no
+     *    timeout of its own). */
+    {
+        struct cng_sembuf down = {0, -1, 0};
+        struct cng_timespec to = {0, 200000000};
+        long r = ipc_call(__NR_semtimedop, sid, (long)&down, 1, (long)&to, 0);
+        cng_dprintf(1, "ipctest semtimedop timeout -> %s\n",
+                    r == -EAGAIN ? "OK" : "FAIL");
+        fails += !(r == -EAGAIN);
+    }
+
+    /* 7) SEM_UNDO across a child's death. chroot-ng traps no exit path, so this
+     *    is the broker's incarnation check doing what the kernel does at exit —
+     *    and it has to be visible immediately after the reap, not a tick later. */
+    {
+        sem_ctl(sid, 0, CNG_SETVAL, 2);
+        long kid = cng_dispatch(__NR_clone, 17, 0, 0, 0, 0, 0, 0);
+        if (kid == 0) {
+            struct cng_sembuf d = {0, -2, CNG_SEM_UNDO};
+            ipc_call(__NR_semop, sid, (long)&d, 1, 0, 0);
+            sys_exit_group(0);
+        }
+        sys_wait4((int)kid, 0, 0, 0);
+        long v = sem_ctl(sid, 0, CNG_GETVAL, 0);
+        cng_dprintf(1, "ipctest sem_undo after exit val=%ld -> %s\n", v,
+                    v == 2 ? "OK" : "FAIL");
+        fails += !(v == 2);
+    }
+
+    /* 7b) the semadj range, at both ends. A vector naming one semaphore twice
+     *     accumulates its adjustment across the operations, so the middle
+     *     no-undo step below leaves the third asking for a semadj of -65534: the
+     *     kernel refuses the whole vector with ERANGE and changes nothing.
+     *     Applied one operation at a time the same total is legal, because the
+     *     bound is the s16 range and -32768 is inside it. */
+    {
+        sem_ctl(sid, 0, CNG_SETVAL, 0); /* also clears every pending semadj */
+        struct cng_sembuf over[3] = {
+            {0, +32767, CNG_SEM_UNDO}, {0, -32767, 0}, {0, +32767, CNG_SEM_UNDO}};
+        int ok = ipc_call(__NR_semop, sid, (long)over, 3, 0, 0) == -ERANGE &&
+                 sem_ctl(sid, 0, CNG_GETVAL, 0) == 0;
+
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        struct cng_sembuf up = {0, +32767, CNG_SEM_UNDO};
+        struct cng_sembuf down = {0, -32767, 0};
+        struct cng_sembuf one = {0, +1, CNG_SEM_UNDO};
+        ok = ok && ipc_call(__NR_semop, sid, (long)&up, 1, 0, 0) == 0 &&
+             ipc_call(__NR_semop, sid, (long)&down, 1, 0, 0) == 0 &&
+             ipc_call(__NR_semop, sid, (long)&one, 1, 0, 0) == 0 &&
+             sem_ctl(sid, 0, CNG_GETVAL, 0) == 1;
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        cng_dprintf(1, "ipctest sem_undo range -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 7c) nsops is `unsigned`: the kernel narrows it and acts on the low word,
+     *     so a 64-bit count with a set top half is one operation, not E2BIG. */
+    {
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        struct cng_sembuf up = {0, +1, 0};
+        int ok = ipc_call(__NR_semop, sid, (long)&up, 0x100000001L, 0, 0) == 0 &&
+                 sem_ctl(sid, 0, CNG_GETVAL, 0) == 1;
+        sem_ctl(sid, 0, CNG_SETVAL, 0);
+        cng_dprintf(1, "ipctest semop nsops width -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 8) the error cases, in the kernel's order. */
+    {
+        struct cng_sembuf bad = {99, -1, 0};
+        struct cng_sembuf ok1 = {0, 0, 0};
+        int ok = ipc_call(__NR_semop, sid, (long)&bad, 1, 0, 0) == -EFBIG &&
+                 ipc_call(__NR_semop, sid, (long)&ok1, 0, 0, 0) == -EINVAL &&
+                 sem_ctl(999999, 0, CNG_GETVAL, 0) == -EINVAL &&
+                 sem_ctl(sid, 0, CNG_SETVAL, 99999) == -ERANGE &&
+                 ipc_call(__NR_semget, 0, -1, CNG_IPC_CREAT | 0600, 0, 0) ==
+                     -EINVAL;
+        cng_dprintf(1, "ipctest sem error cases -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 9) keyed lookup, IPC_EXCL, and the id dying with IPC_RMID. */
+    {
+        long a = ipc_call(__NR_semget, 0x63bb0002, 2, CNG_IPC_CREAT | 0600, 0, 0);
+        long b = ipc_call(__NR_semget, 0x63bb0002, 2, 0, 0, 0);
+        int ok = a > 0 && a == b &&
+                 ipc_call(__NR_semget, 0x63bb0002, 2,
+                          CNG_IPC_CREAT | CNG_IPC_EXCL | 0600, 0, 0) == -EEXIST &&
+                 sem_ctl(a, 0, CNG_IPC_RMID, 0) == 0 &&
+                 ipc_call(__NR_semget, 0x63bb0002, 2, 0, 0, 0) == -ENOENT;
+        cng_dprintf(1, "ipctest sem keyed lookup -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+    sem_ctl(sid, 0, CNG_IPC_RMID, 0);
+
+    /* ---- message queues ---- */
+    long qid = ipc_call(__NR_msgget, 0, CNG_IPC_CREAT | 0600, 0, 0, 0);
+    if (qid <= 0) {
+        cng_dprintf(1, "ipctest msgget -> FAIL (%ld)\n", qid);
+        cng_dprintf(1, "ipctest: %d failure(s)\n", fails + 1);
+        return 1;
+    }
+
+    struct {
+        s64 mtype;
+        char t[32];
+    } m;
+
+    /* 10) send three types, then take them back by type, by "at most", and by
+     *     FIFO — the whole msgrcv selection rule in one group. */
+    {
+        int ok = 1;
+        for (long t = 1; t <= 3; t++) {
+            memset(&m, 0, sizeof m);
+            m.mtype = t;
+            m.t[0] = (char)('0' + t);
+            ok = ok && ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0) == 0;
+        }
+        struct cng_msqid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        ok = ok &&
+             ipc_call(__NR_msgctl, qid, CNG_IPC_STAT | 0x100, (long)&ds, 0, 0) ==
+                 0 &&
+             ds.msg_qnum == 3 && ds.msg_cbytes == 96 && ds.msg_lspid == self &&
+             ds.msg_qbytes == CNG_MSGMNB;
+        memset(&m, 0, sizeof m);
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 2, 0) == 32 &&
+             m.mtype == 2 && m.t[0] == '2';
+        memset(&m, 0, sizeof m);
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, -3, 0) == 32 &&
+             m.mtype == 1;
+        memset(&m, 0, sizeof m);
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 0, 0) == 32 &&
+             m.mtype == 3;
+        ok = ok && ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 0,
+                            CNG_IPC_NOWAIT) == -ENOMSG;
+        cng_dprintf(1, "ipctest msgsnd+msgrcv selection -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 10b) the msg enumeration commands, the counterpart of the sem group in 4:
+     *      MSG_INFO for the highest index, MSG_STAT by that index, and IPC_INFO
+     *      for the limits. msgssz/msgseg are asserted for both info commands
+     *      because msgctl_info fills them for both — MSG_INFO repurposes only
+     *      the pool/map/tql triple. */
+    {
+        struct cng_msginfo mi;
+        memset(&mi, 0, sizeof mi);
+        long maxidx = ipc_call(__NR_msgctl, 0, CNG_MSG_INFO, (long)&mi, 0, 0);
+        int ok = maxidx >= 0 && mi.msgpool >= 1 && mi.msgmnb == CNG_MSGMNB &&
+                 mi.msgmax == CNG_MSGMAX && mi.msgssz == 16 &&
+                 mi.msgseg == 0xffff;
+        struct cng_msqid64_ds ds;
+        memset(&ds, 0, sizeof ds);
+        ok = ok && ipc_call(__NR_msgctl, maxidx, CNG_MSG_STAT | 0x100, (long)&ds,
+                            0, 0) == qid;
+        memset(&mi, 0, sizeof mi);
+        ok = ok && ipc_call(__NR_msgctl, 0, CNG_IPC_INFO, (long)&mi, 0, 0) >= 0 &&
+             mi.msgmni >= 1 && mi.msgssz == 16 && mi.msgseg == 0xffff;
+        cng_dprintf(1, "ipctest msgctl enumeration -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 11) a buffer too small is E2BIG and leaves the message queued; with
+     *     MSG_NOERROR it is truncated instead. */
+    {
+        memset(&m, 0, sizeof m);
+        m.mtype = 9;
+        ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0);
+        struct {
+            s64 mtype;
+            char t[4];
+        } sm;
+        int ok = ipc_call(__NR_msgrcv, qid, (long)&sm, 4, 0, 0) == -E2BIG &&
+                 ipc_call(__NR_msgrcv, qid, (long)&sm, 4, 0, CNG_MSG_NOERROR) ==
+                     4 &&
+                 sm.mtype == 9;
+        cng_dprintf(1, "ipctest msgrcv E2BIG+MSG_NOERROR -> %s\n",
+                    ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 12) a receive that waits for a sender in another process. */
+    {
+        long kid = cng_dispatch(__NR_clone, 17, 0, 0, 0, 0, 0, 0);
+        if (kid == 0) {
+            struct cng_timespec ms = {0, 200000000};
+            CNG_SYS(__NR_nanosleep, &ms, 0, 0, 0, 0, 0);
+            memset(&m, 0, sizeof m);
+            m.mtype = 5;
+            m.t[0] = 'L';
+            ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0);
+            sys_exit_group(0);
+        }
+        memset(&m, 0, sizeof m);
+        long n = ipc_call(__NR_msgrcv, qid, (long)&m, sizeof m.t, 0, 0);
+        sys_wait4((int)kid, 0, 0, 0);
+        int ok = kid > 0 && n == 32 && m.mtype == 5 && m.t[0] == 'L';
+        cng_dprintf(1, "ipctest blocking msgrcv woken -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 13) the message error cases and IPC_RMID. */
+    {
+        memset(&m, 0, sizeof m);
+        m.mtype = 0;
+        int ok = ipc_call(__NR_msgsnd, qid, (long)&m, sizeof m.t, 0, 0) ==
+                     -EINVAL &&
+                 ipc_call(__NR_msgsnd, qid, (long)&m, CNG_MSGMAX + 1, 0, 0) ==
+                     -EINVAL &&
+                 ipc_call(__NR_msgctl, 999999, CNG_IPC_STAT | 0x100, (long)&m, 0,
+                          0) == -EINVAL &&
+                 ipc_call(__NR_msgctl, qid, CNG_IPC_RMID, 0, 0, 0) == 0 &&
+                 ipc_call(__NR_msgctl, qid, CNG_IPC_STAT | 0x100, (long)&m, 0,
+                          0) == -EINVAL;
+        cng_dprintf(1, "ipctest msg error cases+rmid -> %s\n", ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "ipctest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _tabtest — the growing table (tab.c) and the own-map registry on top of it.
+ * The registry used to be 96 fixed slots, and the 97th record disarmed the
+ * exec reclaim for good; the table it sits on now grows a page at a time, so
+ * this drives it well past several pages and asks the registry every question
+ * the sweep asks. */
+int cng_cmd_tabtest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    int fails = 0;
+
+    /* 1) elements are stable, zero on first reach, and the iteration covers
+     *    exactly what was reached, in order, across chunk boundaries. */
+    {
+        struct big {
+            unsigned long a, b, c;
+        };
+        struct cng_tab t = CNG_TAB_INIT(struct big);
+        const unsigned long N = 5000; /* ~30 pages of 4 KiB */
+        int ok = 1;
+        struct big *first = cng_tab_at(&t, 0);
+        for (unsigned long i = 0; i < N && ok; i++) {
+            struct big *e = cng_tab_at(&t, i);
+            ok = e && e->a == 0 && e->b == 0 && e->c == 0;
+            if (ok) {
+                e->a = i + 1;
+                e->c = ~i;
+            }
+        }
+        ok = ok && cng_tab_at(&t, 0) == first && cng_tab_peek(&t, N - 1) &&
+             ((struct big *)cng_tab_peek(&t, N - 1))->a == N;
+        /* peek maps nothing: past the end is 0, and the walk stops there */
+        unsigned long len = 0;
+        struct cng_tab_iter it;
+        for (struct big *e = cng_tab_first(&t, &it); e; e = cng_tab_next(&t, &it))
+            len++;
+        ok = ok && cng_tab_peek(&t, len) == 0 && len >= N &&
+             cng_tab_at(&t, N - 1) == cng_tab_peek(&t, N - 1);
+        unsigned long seen = 0, i2 = 0;
+        for (struct big *e = cng_tab_first(&t, &it); e; e = cng_tab_next(&t, &it), i2++)
+            if (i2 < N && e->a == i2 + 1 && e->c == ~i2)
+                seen++;
+        ok = ok && seen == N;
+        cng_dprintf(1, "tabtest %lu elements over %lu slots, stable and in order -> %s\n",
+                    N, len, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    /* 2) the registry: far more records than the old table held, every one
+     *    found by the sweep's question, every one droppable, and the reclaim
+     *    still armed at the end. The ranges are fictitious — the registry
+     *    records, it does not map — and lie above anything the process maps. */
+    {
+        cng_own_floor();
+        int ok = cng_own_ready();
+        const unsigned long N = 3000, base = 0x7e0000000000UL, pg = 4096;
+        for (unsigned long i = 0; i < N; i++)
+            cng_own_map((void *)(base + i * 2 * pg), pg);
+        ok = ok && cng_own_ready();
+        unsigned long hits = 0, misses = 0;
+        for (unsigned long i = 0; i < N; i++) {
+            hits += cng_own_hit(base + i * 2 * pg, base + i * 2 * pg + pg) == 1;
+            misses += cng_own_hit(base + i * 2 * pg + pg, base + (i + 1) * 2 * pg) == 0;
+        }
+        ok = ok && hits == N && misses == N;
+        for (unsigned long i = 0; i < N; i += 2)
+            cng_own_drop((void *)(base + i * 2 * pg), pg);
+        unsigned long kept = 0, gone = 0;
+        for (unsigned long i = 0; i < N; i++) {
+            int h = cng_own_hit(base + i * 2 * pg, base + i * 2 * pg + pg);
+            if (i & 1)
+                kept += h == 1;
+            else
+                gone += h == 0;
+        }
+        ok = ok && kept == N / 2 && gone == N / 2 && cng_own_ready();
+        cng_dprintf(1, "tabtest %lu own-map records, all found, half dropped, still armed -> %s\n",
+                    N, ok ? "OK" : "FAIL");
+        fails += !ok;
+    }
+
+    cng_dprintf(1, "tabtest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _lazytest — the lazy rewriter's region table. The first trap out of a
+ * mapping pays for a read of /proc/self/maps and the mapping is remembered so
+ * no later trap out of it does; the table was 32 fixed entries and the 33rd
+ * mapping was not remembered at all, so every trap out of it read the file
+ * again. Sixty distinct executable mappings, each with one svc site, each
+ * patched through the entry point the SIGSYS body calls with the site the
+ * CPU trapped from; then every patched site is called, so the trampoline it
+ * branches to is proven to run the syscall. */
+/* The permission column /proc/self/maps shows for the mapping holding `addr`
+ * ("r-xp"), into perm[5]; "" when no line covers it. */
+static void lz_perms(unsigned long addr, char perm[5]) {
+    static char mb[65536];
+    perm[0] = '\0';
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/maps",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long n = pt_slurp(fd, mb, sizeof mb);
+    if (fd >= 0)
+        sys_close((int)fd);
+    for (char *l = mb; n > 0 && *l;) {
+        char *e = strchr(l, '\n');
+        unsigned long lo = 0, hi = 0;
+        char *q = l;
+        for (; *q && *q != '-'; q++)
+            lo = lo * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10);
+        for (q++; *q && *q != ' '; q++)
+            hi = hi * 16 + (unsigned long)(*q <= '9' ? *q - '0' : *q - 'a' + 10);
+        if (*q == ' ' && addr >= lo && addr < hi) {
+            memcpy(perm, q + 1, 4);
+            perm[4] = '\0';
+            return;
+        }
+        if (!e)
+            break;
+        l = e + 1;
+    }
+}
+
+/* Write `nblk` getpid-and-return blocks of four words (the svc at +4 of
+ * each) into [p, p+len) and give the range protection `prot`. */
+static int lz_fill(unsigned long p, unsigned long len, int nblk, int prot) {
+    if (sys_mprotect((void *)p, len, CNG_PROT_READ | CNG_PROT_WRITE) != 0)
+        return 0;
+    uint32_t *code = (uint32_t *)p;
+    for (int i = 0; i < nblk; i++) {
+        code[4 * i + 0] = 0xD2801588u; /* mov x8, #172 (getpid) */
+        code[4 * i + 1] = 0xD4000001u; /* svc #0 */
+        code[4 * i + 2] = 0xD65F03C0u; /* ret */
+        code[4 * i + 3] = 0xD503201Fu; /* nop */
+    }
+    if (sys_mprotect((void *)p, len, prot) != 0)
+        return 0;
+    cng_flush_icache((void *)p, (void *)(p + 16 * (unsigned long)nblk));
+    return 1;
+}
+
+/* _lazytest stale [gone|shared|prot|full] — a record of the lazy rewriter
+ * says where a mapping was when a site in it first trapped, and the guest
+ * moves its own text without a word to us. Each leg makes the record, changes
+ * the mapping under it the way a guest can, then hands the patcher a site the
+ * record covers:
+ *
+ *  gone    the page is unmapped: what a sibling thread's munmap between the
+ *          trap and the patch leaves. The word was a load of ours, which
+ *          faulted in a handler with every signal masked.
+ *  shared  a MAP_SHARED memfd mapped over the same address: the record said
+ *          private, and the branch went into the memfd — into every other
+ *          mapping of it, a JIT's writable view included.
+ *  prot    the text made writable since (a JIT): the protection the record
+ *          was made with was put back after the store, taking write away.
+ *  full    more sites than a pool holds: the one that found it full unmapped
+ *          the pool, and every site already patched branched into nothing.
+ *
+ * Each leg is in its own pages of one reservation, PROT_NONE between them,
+ * so no two share a mapping or an address a record could outlive into. */
+static int lazy_stale(const char *only) {
+    unsigned long pg = cng_page_size, tsz = cng_tramp_size();
+    /* More blocks than a pool (128 KiB of trampolines) takes, and pages for
+     * them: sixteen bytes a block. */
+    int nfull = (int)(0x20000UL / tsz) + 16;
+    unsigned long flen = cng_page_up(16 * (unsigned long)nfull);
+    unsigned long span = 8 * pg + flen + pg;
+    void *res = sys_mmap(0, span, CNG_PROT_NONE,
+                         CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (res == CNG_MAP_FAILED || cng_is_err((long)res)) {
+        cng_dprintf(1, "lazytest stale: mmap failed -> FAIL\n");
+        return 1;
+    }
+    unsigned long base = (unsigned long)res;
+    long pid = sys_getpid();
+    int rx = CNG_PROT_READ | CNG_PROT_EXEC;
+    /* A pool is written while it stays executable, so a host that grants no
+     * writable executable memory (PR_SET_MDWE, a revoked execmem) has no lazy
+     * tier to test. */
+    if (sys_mprotect(res, pg, rx | CNG_PROT_WRITE) != 0) {
+        sys_munmap(res, span);
+        cng_dprintf(1, "lazytest stale: no writable executable memory -> SKIP\n");
+        return 0;
+    }
+    sys_mprotect(res, pg, CNG_PROT_NONE);
+    int gone = -1, shared = -1, prot = -1, full = -1;
+
+    if (!only || !strcmp(only, "gone")) {
+        unsigned long p = base + pg;
+        int a = lz_fill(p, pg, 2, rx) ? cng_rewrite_site(p + 4) : -1;
+        sys_munmap((void *)p, pg);
+        int b = cng_rewrite_site(p + 20);
+        gone = a == 1 && b == 0;
+    }
+    if (!only || !strcmp(only, "shared")) {
+        unsigned long p = base + 3 * pg;
+        int a = lz_fill(p, pg, 1, rx) ? cng_rewrite_site(p + 4) : -1;
+        long mfd = sys_memfd_create("cng-lazy-shared", CNG_MFD_CLOEXEC);
+        uint32_t blk[4] = {0xD2801588u, 0xD4000001u, 0xD65F03C0u, 0xD503201Fu};
+        int b = -1;
+        uint32_t w = 0;
+        if (mfd >= 0 && sys_ftruncate((int)mfd, (long)pg) == 0 &&
+            cng_write_all((int)mfd, blk, sizeof blk) == (long)sizeof blk) {
+            void *m = sys_mmap((void *)p, pg, rx, CNG_MAP_SHARED | CNG_MAP_FIXED,
+                               (int)mfd, 0);
+            if (!cng_is_err((long)m) && (unsigned long)m == p) {
+                b = cng_rewrite_site(p + 4);
+                sys_pread64((int)mfd, &w, sizeof w, 4);
+            }
+        }
+        if (mfd >= 0)
+            sys_close((int)mfd);
+        shared = a == 1 && b == 0 && w == 0xD4000001u;
+    }
+    if (!only || !strcmp(only, "prot")) {
+        unsigned long p = base + 5 * pg;
+        int a = lz_fill(p, pg, 2, rx) ? cng_rewrite_site(p + 4) : -1;
+        char perm[5] = "";
+        int b = -1;
+        if (sys_mprotect((void *)p, pg, rx | CNG_PROT_WRITE) == 0) {
+            b = cng_rewrite_site(p + 20);
+            lz_perms(p, perm);
+        }
+        long (*fn)(void) = (long (*)(void))(p + 16);
+        prot = a == 1 && b == 1 && !strcmp(perm, "rwxp") && fn() == pid;
+    }
+    if (!only || !strcmp(only, "full")) {
+        unsigned long p = base + 7 * pg;
+        int patched = 0, ran = 0;
+        if (lz_fill(p, flen, nfull, rx)) {
+            for (int i = 0; i < nfull; i++)
+                patched += cng_rewrite_site(p + 16 * (unsigned long)i + 4) == 1;
+            /* The first site patched and the last: both branch into the pool
+             * the site that found it full stopped at. */
+            long (*f0)(void) = (long (*)(void))p;
+            long (*fl)(void) = (long (*)(void))(p + 16 * (unsigned long)(patched - 1));
+            if (patched > 0)
+                ran = (f0() == pid) + (fl() == pid);
+        }
+        full = patched > 0 && patched < nfull && ran == 2;
+    }
+    sys_munmap(res, span);
+    int ok = gone != 0 && shared != 0 && prot != 0 && full != 0;
+    cng_dprintf(1,
+                "lazytest stale: gone=%d shared=%d prot=%d full=%d -> %s\n",
+                gone, shared, prot, full, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+int cng_cmd_lazytest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    static struct cng_fs fs;
+    cng_fs_init(&fs, "/");
+    cng_g_fs = &fs;
+    cng_g_rewrite = 1;
+    if (argc > 1 && !strcmp(argv[1], "stale"))
+        return lazy_stale(argc > 2 ? argv[2] : 0);
+
+    enum { N = 60 };
+    unsigned long pg = cng_page_size;
+    /* A run of pages with a hole after each, so the kernel keeps them as N
+     * separate mappings rather than merging neighbours of one protection. */
+    void *span = sys_mmap(0, pg * 2 * N, CNG_PROT_NONE,
+                          CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    if (span == CNG_MAP_FAILED || cng_is_err((long)span)) {
+        cng_dprintf(1, "lazytest: mmap failed\n");
+        return 1;
+    }
+    unsigned long site[N];
+    int mapped = 0, patched = 0, ran = 0;
+    long pid = sys_getpid();
+    for (int i = 0; i < N; i++) {
+        unsigned long p = (unsigned long)span + pg * 2 * (unsigned long)i;
+        sys_munmap((void *)(p + pg), pg); /* the hole */
+        if (sys_mprotect((void *)p, pg, CNG_PROT_READ | CNG_PROT_WRITE) != 0)
+            break;
+        uint32_t *code = (uint32_t *)p;
+        code[0] = 0xD2801588u; /* mov x8, #172 (getpid) */
+        code[1] = 0xD4000001u; /* svc #0 */
+        code[2] = 0xD65F03C0u; /* ret */
+        if (sys_mprotect((void *)p, pg, CNG_PROT_READ | CNG_PROT_EXEC) != 0)
+            break;
+        cng_flush_icache((void *)p, (void *)(p + 12));
+        site[i] = p + 4;
+        mapped++;
+    }
+    for (int i = 0; i < mapped; i++)
+        patched += cng_rewrite_site(site[i]) == 1;
+    for (int i = 0; i < mapped; i++) {
+        if (*(uint32_t *)site[i] == 0xD4000001u)
+            continue; /* still an svc: not patched, not ours to call */
+        long (*fn)(void) = (long (*)(void))(site[i] - 4);
+        ran += fn() == pid;
+    }
+    int ok = mapped == N && patched == N && ran == N;
+    cng_dprintf(1, "lazytest %d mappings: %d patched, %d ran through their "
+                   "trampolines -> %s\n",
+                N, patched, ran, ok ? "OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* _pintest -r ROOT — the pin (cng/pin.h) asked directly, on a tree made
+ * under ROOT: the forms a guest cannot be made to produce to order, and the
+ * one it can (the race) at the unit level. ROOT is the rootfs of the view,
+ * so its prefix is the kernel's own spelling and the readback comparison is
+ * exact; a doubled slash is the spelling that is not, and reaches the
+ * descriptor walk that decides by inodes. */
+static int pt_pin_names(const struct cng_pin *p, const char *dir) {
+    if (!p->pinned || !p->own || p->dfd < 0)
+        return 0;
+    char lk[40], real[CNG_PATH_MAX];
+    cng_snprintf(lk, sizeof lk, "/proc/self/fd/%d", p->dfd);
+    long n = sys_readlinkat(CNG_AT_FDCWD, lk, real, sizeof real - 1);
+    if (n <= 0)
+        return 0;
+    real[n] = '\0';
+    return strcmp(real, dir) == 0;
+}
+
+int cng_cmd_pintest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)envp;
+    (void)auxv;
+    const char *root = 0;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            root = argv[++i];
+    if (!root) {
+        cng_dprintf(2, "usage: _pintest -r ROOT\n");
+        return 2;
+    }
+    static struct cng_fs fs;
+    cng_fs_init(&fs, root);
+    cng_g_fs = &fs;
+    char a[CNG_PATH_MAX], b[CNG_PATH_MAX], x[CNG_PATH_MAX], p[CNG_PATH_MAX];
+    cng_snprintf(a, sizeof a, "%s/a", fs.rootfs);
+    cng_snprintf(b, sizeof b, "%s/a/b", fs.rootfs);
+    cng_snprintf(x, sizeof x, "%s/a/b/x", fs.rootfs);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)a, 0755, 0, 0, 0);
+    CNG_SYS(__NR_mkdirat, CNG_AT_FDCWD, (long)b, 0755, 0, 0, 0);
+    long fd = sys_openat(CNG_AT_FDCWD, x, CNG_O_WRONLY | CNG_O_CREAT, 0644);
+    if (fd >= 0)
+        sys_close((int)fd);
+    int fails = 0;
+    struct cng_pin pin;
+
+    /* 1) the plain case: the directory by its fd link, the name alone */
+    long r = cng_pin_at(CNG_AT_FDCWD, x, &pin);
+    int ok = r == 0 && pt_pin_names(&pin, b) && !strcmp(pin.name, "x") &&
+             !pin.want_dir;
+    cng_unpin(&pin);
+    cng_dprintf(1, "pintest plain: rc=%ld names_dir=%d -> %s\n", r, ok, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 2) a spelling the readback does not agree with: the walk decides */
+    cng_snprintf(p, sizeof p, "%s/a//b/x", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    ok = r == 0 && pt_pin_names(&pin, b) && !strcmp(pin.name, "x");
+    cng_unpin(&pin);
+    cng_dprintf(1, "pintest respelled: rc=%ld names_dir=%d -> %s\n", r, ok, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 3) a trailing slash: the leaf, which must be a directory */
+    cng_snprintf(p, sizeof p, "%s/a/b/", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    long l = r == 0 ? cng_pin_leaf(&pin, 0) : -1;
+    ok = r == 0 && pin.want_dir && !strcmp(pin.name, "b/") && l == 0 &&
+         pin.leaf >= 0 && !strncmp(pin.link, "/proc/self/fd/", 14);
+    cng_unpin(&pin);
+    cng_snprintf(p, sizeof p, "%s/a/b/x/", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    long lf = r == 0 ? cng_pin_leaf(&pin, 0) : -1;
+    cng_unpin(&pin);
+    ok &= lf == -ENOTDIR;
+    cng_dprintf(1, "pintest trailing slash: dir leaf=%ld file leaf=%ld -> %s\n",
+                l, lf, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 4) the race, held still: the directory replaced by an absolute link
+     *    after the walk would have seen it. Both routes refuse — the readback
+     *    names the target, and the walk meets the link. */
+    char b2[CNG_PATH_MAX];
+    cng_snprintf(b2, sizeof b2, "%s/a/b2", fs.rootfs);
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, (long)b, CNG_AT_FDCWD, (long)b2, 0, 0);
+    CNG_SYS(__NR_symlinkat, (long)b2, CNG_AT_FDCWD, (long)b, 0, 0, 0);
+    r = cng_pin_at(CNG_AT_FDCWD, x, &pin);
+    cng_unpin(&pin);
+    ok = r == -ELOOP;
+    /* ...and a leaf that became a link */
+    char y[CNG_PATH_MAX];
+    cng_snprintf(y, sizeof y, "%s/a/b2/y", fs.rootfs);
+    CNG_SYS(__NR_symlinkat, (long)"x", CNG_AT_FDCWD, (long)y, 0, 0, 0);
+    long r2 = cng_pin_at(CNG_AT_FDCWD, y, &pin);
+    long l2 = r2 == 0 ? cng_pin_leaf(&pin, 0) : -1;
+    cng_unpin(&pin);
+    ok &= r2 == 0 && l2 == -ELOOP;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)y, 0, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)b, 0, 0, 0, 0);
+    CNG_SYS(__NR_renameat, CNG_AT_FDCWD, (long)b2, CNG_AT_FDCWD, (long)b, 0, 0);
+    cng_dprintf(1, "pintest link in the way: dir=%ld leaf=%ld -> %s\n", r, l2,
+                ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 5) what is not pinned: /proc, a relative name (against the caller's
+     *    own descriptor), an empty name; and a directory that is not there */
+    r = cng_pin_at(CNG_AT_FDCWD, "/proc/self/status", &pin);
+    ok = r == 0 && !pin.pinned;
+    cng_unpin(&pin);
+    long dfd = sys_openat(CNG_AT_FDCWD, b, CNG_O_PATH | CNG_O_DIRECTORY, 0);
+    r = cng_pin_at((int)dfd, "x", &pin);
+    ok &= r == 0 && pin.pinned && !pin.own && pin.dfd == (int)dfd;
+    cng_unpin(&pin);
+    r = cng_pin_at((int)dfd, "", &pin);
+    ok &= r == 0 && !pin.pinned;
+    cng_unpin(&pin);
+    sys_close((int)dfd);
+    cng_snprintf(p, sizeof p, "%s/a/none/x", fs.rootfs);
+    r = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    cng_unpin(&pin);
+    ok &= r == -ENOENT;
+    cng_snprintf(p, sizeof p, "%s/a/b/x/y", fs.rootfs);
+    r2 = cng_pin_at(CNG_AT_FDCWD, p, &pin);
+    cng_unpin(&pin);
+    ok &= r2 == -ENOTDIR;
+    cng_dprintf(1, "pintest unpinned and missing: missing=%ld notdir=%ld -> %s\n",
+                r, r2, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    /* 6) through the dispatcher: the kernel's own order of refusals is kept
+     *    when the directory cannot be pinned — the flags are judged before
+     *    anything is resolved, so a bad flag on a missing name is EINVAL. */
+    char st[128];
+    long e1 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/a/none/x",
+                           (long)st, 0x8000, 0, 0, 0);
+    long e2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/a/none/x",
+                           (long)st, 0, 0, 0, 0);
+    long e3 = cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/a/none/x", 0x1,
+                           0, 0, 0, 0);
+    long e4 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/a/b/x",
+                           (long)st, 0, 0, 0, 0);
+    ok = e1 == -EINVAL && e2 == -ENOENT && e3 == -EINVAL && e4 == 0;
+    cng_dprintf(1, "pintest errno order: badflags=%ld missing=%ld unlink_badflags=%ld "
+                   "present=%ld -> %s\n",
+                e1, e2, e3, e4, ok ? "OK" : "FAIL");
+    fails += !ok;
+
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)x, 0, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)b, CNG_AT_REMOVEDIR, 0, 0, 0);
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, (long)a, CNG_AT_REMOVEDIR, 0, 0, 0);
+    cng_dprintf(1, "pintest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}
+
+/* _rttest — the freestanding mem/str primitives (src/rt/rt.c), which run
+ * word-at-a-time and so have edges a byte loop never had: the alignment
+ * prologues, the tail below a word, the overlap direction in memmove, and the
+ * rule that a scan loads a word only aligned and only once a byte of the
+ * string is known to be in it. Each is held against a byte-wise reference
+ * over every combination of source and destination alignment and every
+ * length up to a few words, with a canary around the destination; the scans
+ * are then run on strings whose terminator is the LAST byte before a
+ * PROT_NONE page, which is where an over-read is a fault and not a wrong
+ * answer. */
+static void *rt_ref_memcpy(void *d, const void *s, size_t n) {
+    unsigned char *a = d;
+    const unsigned char *b = s;
+    while (n--)
+        *a++ = *b++;
+    return d;
+}
+
+static int rt_bytes_eq(const void *a, const void *b, size_t n) {
+    const unsigned char *x = a, *y = b;
+    while (n--)
+        if (*x++ != *y++)
+            return 0;
+    return 1;
+}
+
+static void rt_fill(unsigned char *p, size_t n, unsigned seed) {
+    for (size_t i = 0; i < n; i++)
+        p[i] = (unsigned char)(seed * 31u + i * 7u + 1u); /* never 0 */
+}
+
+int cng_cmd_rttest(int argc, char **argv, char **envp, unsigned long *auxv) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    (void)auxv;
+    int fails = 0;
+    enum { W = 8, LMAX = 3 * W + 5, PAD = 2 * W, BUF = 256 };
+    static unsigned char src[BUF], dst[BUF], want[BUF];
+
+    /* 1) memcpy / memset / memcmp at every alignment pair, every length */
+    {
+        unsigned long cases = 0, bad = 0;
+        for (unsigned so = 0; so < 2 * W; so++)
+            for (unsigned dof = 0; dof < 2 * W; dof++)
+                for (size_t n = 0; n <= LMAX; n++) {
+                    rt_fill(src, BUF, so + 3);
+                    rt_fill(dst, BUF, dof + 11);
+                    rt_ref_memcpy(want, dst, BUF);
+                    rt_ref_memcpy(want + PAD + dof, src + PAD + so, n);
+                    void *r = memcpy(dst + PAD + dof, src + PAD + so, n);
+                    cases++;
+                    if (r != dst + PAD + dof || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+
+                    rt_fill(dst, BUF, dof + 5);
+                    rt_ref_memcpy(want, dst, BUF);
+                    for (size_t i = 0; i < n; i++)
+                        want[PAD + dof + i] = (unsigned char)(0x80 + so);
+                    r = memset(dst + PAD + dof, (int)(0x80 + so), n);
+                    cases++;
+                    if (r != dst + PAD + dof || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+
+                    /* memcmp: equal, then a single differing byte at every
+                     * position, with the sign of the answer checked */
+                    rt_fill(src, BUF, 7);
+                    rt_ref_memcpy(dst + PAD + dof, src + PAD + so, n);
+                    cases++;
+                    if (memcmp(dst + PAD + dof, src + PAD + so, n) != 0)
+                        bad++;
+                    for (size_t k = 0; k < n; k++) {
+                        dst[PAD + dof + k] = (unsigned char)(src[PAD + so + k] + 1);
+                        int got = memcmp(dst + PAD + dof, src + PAD + so, n);
+                        int ref = (int)dst[PAD + dof + k] - (int)src[PAD + so + k];
+                        cases++;
+                        if ((got > 0) != (ref > 0) || (got < 0) != (ref < 0))
+                            bad++;
+                        dst[PAD + dof + k] = src[PAD + so + k];
+                    }
+                }
+        cng_dprintf(1, "rttest memcpy/memset/memcmp: %lu cases, %lu wrong -> %s\n",
+                    cases, bad, bad ? "FAIL" : "OK");
+        fails += bad != 0;
+    }
+
+    /* 2) memmove over every overlap: the destination from 3 words below the
+     *    source to 3 words above it, every length */
+    {
+        unsigned long cases = 0, bad = 0;
+        for (int delta = -3 * W; delta <= 3 * W; delta++)
+            for (unsigned so = 0; so < W; so++)
+                for (size_t n = 0; n <= LMAX; n++) {
+                    rt_fill(dst, BUF, (unsigned)(delta + 64) + so);
+                    rt_ref_memcpy(want, dst, BUF);
+                    unsigned char tmp[BUF];
+                    unsigned char *s = dst + 4 * W + so, *d = s + delta;
+                    rt_ref_memcpy(tmp, s, n); /* the reference: via a copy */
+                    rt_ref_memcpy(want + (d - dst), tmp, n);
+                    void *r = memmove(d, s, n);
+                    cases++;
+                    if (r != d || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+                }
+        cng_dprintf(1, "rttest memmove: %lu cases, %lu wrong -> %s\n", cases,
+                    bad, bad ? "FAIL" : "OK");
+        fails += bad != 0;
+    }
+
+    /* 3) the scans, on strings ending exactly at a PROT_NONE page: strlen,
+     *    strnlen, strchr, strrchr (the byte present at every position, then
+     *    absent), and strlcpy into every size from 0 to past the string */
+    {
+        unsigned long cases = 0, bad = 0;
+        long pg = 4096;
+        char *map = sys_mmap(0, (size_t)(2 * pg), CNG_PROT_READ | CNG_PROT_WRITE,
+                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+        int ok = !cng_is_err((long)map) &&
+                 sys_mprotect(map + pg, (size_t)pg, CNG_PROT_NONE) == 0;
+        for (size_t len = 0; ok && len <= LMAX; len++) {
+            /* The terminator is the page's last byte, so every alignment of
+             * the start is covered by the lengths. */
+            char *s = map + pg - 1 - (long)len;
+            for (size_t i = 0; i < len; i++)
+                s[i] = (char)('a' + (i % 26));
+            s[len] = '\0';
+            cases++;
+            if (strlen(s) != len)
+                bad++;
+            for (size_t max = 0; max <= len + 2; max++) {
+                size_t ref = len < max ? len : max;
+                cases++;
+                if (cng_strnlen(s, max) != ref)
+                    bad++;
+            }
+            /* No 'A' anywhere: both scans run to the terminator. */
+            cases += 3;
+            if (strchr(s, 'A') != 0 || strrchr(s, 'A') != 0 ||
+                strchr(s, 0) != s + len || strrchr(s, 0) != s + len)
+                bad++;
+            for (size_t k = 0; k < len; k++) {
+                /* 'A' at k alone: strchr and strrchr both find it there; then
+                 * also at the first position: strrchr still says k. */
+                s[k] = 'A';
+                cases += 2;
+                if (strchr(s, 'A') != s + k || strrchr(s, 'A') != s + k)
+                    bad++;
+                if (k) {
+                    s[0] = 'A';
+                    cases += 2;
+                    if (strchr(s, 'A') != s || strrchr(s, 'A') != s + k)
+                        bad++;
+                    s[0] = 'a';
+                }
+                s[k] = (char)('a' + (k % 26));
+            }
+            for (size_t size = 0; size <= len + 3; size++) {
+                for (unsigned dof = 0; dof < W; dof++) {
+                    rt_fill(dst, BUF, (unsigned)len + dof);
+                    rt_ref_memcpy(want, dst, BUF);
+                    size_t keep = size ? (len < size - 1 ? len : size - 1) : 0;
+                    rt_ref_memcpy(want + PAD + dof, s, keep);
+                    if (size)
+                        want[PAD + dof + keep] = 0;
+                    size_t r = cng_strlcpy((char *)dst + PAD + dof, s, size);
+                    cases++;
+                    if (r != len || !rt_bytes_eq(dst, want, BUF))
+                        bad++;
+                }
+            }
+        }
+        if (!ok)
+            bad++;
+        cng_dprintf(1, "rttest strlen/strnlen/strchr/strrchr/strlcpy at a page "
+                       "edge: %lu cases, %lu wrong -> %s\n",
+                    cases, bad, bad ? "FAIL" : "OK");
+        fails += bad != 0;
+    }
+
+    cng_dprintf(1, "rttest: %d failure(s)\n", fails);
+    return fails ? 1 : 0;
+}

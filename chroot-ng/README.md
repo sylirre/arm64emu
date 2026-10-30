@@ -1,0 +1,254 @@
+# chroot-ng
+
+Ptrace-free `chroot`/bind-mount emulation for **rootless, SELinux-restricted
+Android without user namespaces** — the environment where `proot` works but its
+per-syscall `ptrace` overhead hurts, and where `LD_PRELOAD` tricks fail on
+static / Go / Rust / raw-syscall binaries.
+
+Instead of a ptrace tracer, chroot-ng intercepts only the path-bearing syscalls
+in-process via **seccomp `RET_TRAP` → `SIGSYS`**, and runs guest programs with
+its own **userland ELF loader** so it can also execute binaries off `noexec`
+mounts. See [docs/DESIGN.md](docs/DESIGN.md) for the full rationale and
+[docs/STATUS.md](docs/STATUS.md) for the milestone roadmap.
+
+> Status: early development. See `docs/STATUS.md` for what works today.
+
+## Target
+
+- AArch64, Linux 3.5+ (real floor), rootless, SELinux-confined, no `user_ns`.
+- Guest binaries on a true `noexec` mount.
+- Works for glibc/musl (dynamic & static) and Go/Rust without version pinning.
+- Containment, not a sandbox: the monitor shares the guest's address space, so
+  it confines a guest's mistakes, not a guest's malice. See
+  [Threat model](docs/DESIGN.md#threat-model--containment-not-a-sandbox).
+
+## Build
+
+On an x86_64 host: an `aarch64-linux-gnu` cross toolchain plus `qemu-aarch64`
+for running what it builds. On an AArch64 host (native Linux, or Termux with
+`clang`): just the native compiler — no emulator is involved.
+
+```sh
+make                       # -> build/chroot-ng
+make run ARGS="--version"  # run it (under qemu only where the host needs one)
+make test                  # run the test harness
+```
+
+Override the compiler/emulator if needed:
+
+```sh
+make CC=aarch64-linux-gnu-gcc-12 QEMU=qemu-aarch64
+```
+
+The test harness runs on all three hosts and adapts to each: it picks the
+emulator (or none), finds an AArch64 guest toolchain and the link mode that
+works there, and asks the binary which translation tier is actually live —
+the seccomp/SIGSYS tier only exists on a real AArch64 kernel, so on a cross
+host `-R` svc-rewriting is what carries translation. Legs that a host cannot
+support (no guest toolchain, no rootfs image, no SysV shm to diff against) are
+reported as `skip` and counted separately from passes. See
+[tests/README.md](tests/README.md) for the environment knobs.
+
+## Usage (evolving)
+
+```
+chroot-ng [options] <rootfs> <program> [args...]   # run a guest program
+chroot-ng --probe [path...]                        # report caps, then exit
+chroot-ng --help                                   # full option reference
+```
+
+`<rootfs>` is a host directory holding an AArch64 userland (`/` runs
+host-native binaries directly); `<program>` is an absolute path inside it.
+Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
+`uid:gid`, defaulting to `0:0` root), `-b/--bind SRC:DST[:ro]` (expose host path
+SRC — a directory or a single file, as `mount --bind` takes either — at guest
+path DST, read-only with `:ro`), `-E/--env VAR=VAL` (set a guest environment
+variable — see below), `-w/--work-dir DIR` (start the guest in
+DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`;
+it also reads and keeps the hardlinks of a rootfs installed by `proot-distro`),
+`-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
+emulation described below), `--no-dev` (turn off the `/dev` passthrough),
+`--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
+independent invocations of the same rootfs, for both the process view and the
+System V IPC namespace), `--no-ptrace` (refuse guest `ptrace(2)` instead of
+emulating it).
+
+`/proc` is visible to the guest without a bind, and describes the guest rather
+than chroot-ng: host processes are hidden from it (by path and from listings,
+including under an explicit `-b /proc:/proc`), `cmdline`/`environ`/`auxv`
+report the guest program (no real `execve` ever happens, so the kernel's copies
+would name the chroot-ng invocation; `cmdline` and `environ` are the live
+strings, so a title written over argv shows, and where the kernel accepts
+`PR_SET_MM_MAP` its own record is pointed at them, which host-side `ps` sees
+too), `mounts`/`mountinfo` describe the rootfs
+and its binds instead of the host's mount namespace, `maps` and the `fd` links
+are mapped back to guest paths, and `loadavg`/`uptime`/`stat` (and the
+`sys/kernel/overflow{u,g}id` sysctls, which bubblewrap insists on reading) are
+synthesized where the host denies them (as Android does), `version` always (the real one
+names the host's kernel and build host). Their `stat` and access checks are
+answered to match, so a file the guest can read is one it can also `stat`.
+Separate invocations normally hide each other's processes; `--shared-proc`
+keys the process registry by the rootfs instead — served diskless by a
+per-rootfs broker daemon that exits by itself once the last guest is gone — so
+`ps`/`top` in one session see the guest processes of another.
+
+`/dev` works the same way, and for the same reason: a rootfs directory tree
+ships no device nodes and `mknod` needs privileges we lack. A fixed whitelist —
+`null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx`, `console`, `pts/*`,
+`shm/*`, `fd/*`, `std{in,out,err}` — resolves to the host's nodes, and everything
+else under `/dev` comes from the rootfs, so the guest cannot reach the host's
+block devices. This is deliberately narrower than the `-b /dev:/dev` people
+otherwise reach for, which exposes the host's whole `/dev`. Because these nodes
+and the `-b` mount points are pure path-resolution overlays with no directory
+entry behind them, `getdents64` splices them into listings — otherwise `ls /dev`
+shows nothing while `/dev/null` opens fine, and a bind destination stays
+invisible to anything that enumerates before opening. `--no-dev` turns the zone
+off.
+
+**Terminals.** A guest's `ioctl`s run in the kernel as they are, and Android's
+SELinux policy lets an app issue only a short list of them on its pty; the
+others answer `EACCES`, on a terminal and on a pipe alike. The ones a libc turns
+into a verdict about its terminal are trapped and, where the host refuses them,
+answered from the commands it allows: the termios2 family (`TCGETS2`,
+`TCSETS2`, ... — a glibc since 2.42 builds `tcgetattr`, and so `isatty`, on
+them, so without this an interactive bash in an Ubuntu 26.04 rootfs ran
+non-interactively and printed no prompt) from `TCGETS`/`TCSETS*`, and
+`TIOCGSID` (`tcgetsid(3)`: `login`, `script`, `agetty`) from `TCGETS`,
+`TIOCGPGRP` and `getsid`.
+
+**AF_UNIX sockets** are contained like any other path. A pathname socket carries
+a filesystem path in `sun_path`, so `bind`/`connect`/`sendto`/`sendmsg` translate
+it into the rootfs and `getsockname`/`getpeername`/`accept`/`recvfrom`/`recvmsg`
+map the answer back to the guest's name, so the guest never sees where its
+rootfs lives and a program comparing the readback against what it bound still
+agrees — in any process, not only the one that bound it: a pathname is bound
+against a directory handle the binder keeps open for as long as the socket is,
+and the spelling the kernel stores names that handle, which any process of the
+same user can read back. (Only the basename has to fit `sun_path`'s 108 bytes,
+whatever the rootfs prefix.) Abstract names have no filesystem node to contain, so they are isolated
+per rootfs by a short spliced tag (invisible to the guest, stripped on readback);
+a name with no room left under 108 bytes to carry the tag as well is stood in for
+by a digest of itself, which keeps the isolation and still lets two guests of one
+rootfs meet on it. `--share-abstract-sockets` opts out into the host's global
+namespace.
+
+**rtnetlink** is emulated where the host denies it, which Android does to app
+domains — and everything that asks the kernel about interfaces goes through it:
+`getifaddrs(3)`, iproute2, bubblewrap's `loopback_setup()`, glibc's
+source-address selection. The guest's `socket(AF_NETLINK, …, NETLINK_ROUTE)` is
+served by a stand-in fd whose far end the per-namespace broker daemon holds (the
+one System V IPC uses, below), answering each request as it arrives however it was
+sent — `write(2)` and `read(2)` included, which is how Firefox asks for the path
+MTU of its HTTP/3 connections. Dumps are relayed through an **unbound** host
+netlink socket, which works because the denial is on `bind(2)`, not on the query.
+Where even the socket is refused, dumps degrade to an empty result so
+`getifaddrs` succeeds with no interfaces rather than failing outright. Nothing
+engages where rtnetlink already works; `CNG_NETLINK_FORCE_BLOCK=1` forces the
+emulated path for testing.
+
+**The audit interface** is the other netlink protocol Android takes away, and it
+is answered rather than emulated — a guest has no business seeing the host's
+audit log, but it does need a refusal it recognises. `libaudit`'s `audit_open()`
+is a bare `socket(…, NETLINK_AUDIT)`, and shadow-utils treats
+`EINVAL`/`EPROTONOSUPPORT`/`EAFNOSUPPORT` as "this kernel has no audit" and
+carries on, while treating anything else as fatal. The `EACCES` SELinux returns
+is not one of the three, which is why `useradd`, `usermod`, `passwd`, `chage`,
+`groupadd` and shadow's `su` all die with *"Cannot open audit interface -
+aborting"* inside a rootfs on a device. So a refused audit socket is reported as
+`EPROTONOSUPPORT` — what the kernel itself returns for a protocol nobody
+registered — and those tools proceed. A host that grants the socket is left
+alone; `CNG_NETLINK_DENY_AUDIT=1` forces the refusal for testing.
+
+**System V IPC** works too — shared memory, semaphores and message queues.
+Android denies the whole family outright, so chroot-ng serves it itself from a
+per-namespace broker daemon, with no host SysV IPC and no `/dev/shm` anywhere in
+the path. A shared-memory segment is an ashmem region where `/dev/ashmem` opens,
+else an anonymous `memfd` (or a private file where `memfd_create` is
+unavailable), that the daemon owns and hands to attachers over `SCM_RIGHTS`. Its
+ids are libandroid-shmem's, so a Termux X server (termux-x11, Xvfb, Xvnc) can
+attach what a guest's MIT-SHM client hands it: `mpv --vo=x11`, GTK and cairo
+get XShm instead of `BadAccess`. Semaphore sets and message queues live entirely
+in the daemon, so a multi-operation `semop` is atomic and a guest that dies
+mid-call cannot corrupt anything. Blocking operations really block: a `semop`, `msgsnd` or
+`msgrcv` that must sleep parks in the daemon and is answered when it can proceed,
+when its `semtimedop` deadline passes, when the object is removed (`EIDRM`), or
+when a signal the guest would take delivery of arrives (`EINTR`). `SEM_UNDO` is
+honored even for a `SIGKILL`ed process. Objects are shared by every process of one
+invocation and isolated between invocations, unless `--shared-proc` widens the
+namespace to the rootfs — and in no configuration do they reach the host
+kernel's, where `ipcs` never sees them.
+
+POSIX message queues (`mq_open` and friends) are the one IPC namespace with no
+emulation behind it: an mq name is not a filesystem path, so nothing can scope it
+to the rootfs, and running them natively would put the guest in the host's queue
+namespace. They answer `ENOSYS`, which is what Android gives anyway.
+
+**`ptrace(2)` works inside the rootfs** — `strace`, `gdb` and `proot` all run
+there — even though chroot-ng itself uses none. It has to be emulated rather
+than passed through: the host kernel would show a guest tracer *our* re-issued
+syscalls, host paths with the rootfs prefix attached, and no post-`execve`
+`SIGTRAP` at all, since our execve never enters the kernel's exec path. So a
+tracee stops in our own code — the point where its registers are the frame the
+kernel just handed us and its memory is our memory — publishes the stop into a
+shared registry, and services `PEEK`/`POKE`/`GETREGSET`/`SETREGSET`/resume for
+itself over a futex mailbox. That needs no host ptrace permission, which
+Android's policy does not grant. Syscall stops, signal and fault stops (so gdb's
+breakpoints arrive), the fork/clone/exec/exit events, group-stops and
+`PTRACE_ATTACH` to a running process all behave as the kernel's do; the suite
+proves it by running the same program under chroot-ng and against the real
+kernel and requiring identical output. Two things are out of reach and
+documented as such: `rt_sigreturn` and thread-creating `clone` are never
+reported (neither can be re-issued from a signal handler), so `strace -f`
+follows forks but not new threads. One known gap is still open: a `poll`,
+`select`, `nanosleep` or timed futex that a task is sleeping in when a tracer
+attaches returns `EINTR`, where the kernel would let it finish. Single-step is
+emulated with breakpoints, since arming the hardware kind needs the kernel's
+own ptrace. A traced task stops on *every* syscall, which is slow by
+construction; a guest that never traces pays nothing at all, and `--no-ptrace`
+turns the whole thing off.
+
+**The environment** is built, not inherited. A host variable describes the host
+rather than the rootfs — `PATH`, `HOME`, `LD_LIBRARY_PATH`, `XDG_*`, `TMPDIR`
+would every one of them send a guest looking outside its own filesystem for
+things the rootfs has its own copies of — so the guest starts from a clean
+environment. Only `TERM` and `COLORTERM` are carried over, because they describe
+the terminal both sides share, and everything else is spelled out with
+`-E/--env VAR=VAL` (repeatable; an `-E` entry overrides an inherited
+`TERM`/`COLORTERM`, and a repeated name keeps the last value). chroot-ng's own
+`CNG_*` knobs are read from its own environment and are not part of the guest's.
+
+**The working directory** a guest starts in is the guest root `/`, not the host
+directory chroot-ng was launched from: that path names nothing inside the rootfs,
+and passing it through would send a relative `<program>` — and every relative
+access the guest goes on to make — looking outside its own filesystem.
+`-w/--work-dir DIR` names a different one. `DIR` is a guest path, resolved
+through the rootfs and its binds and following symlinks like any other, and must
+be an existing directory; a bad one is refused rather than quietly demoted to
+`/`. An identity rootfs (`/`) is the exception to the default: there the host cwd
+already *is* a guest path, so it is kept.
+
+```sh
+chroot-ng -u ./rootfs /bin/sh              # fake root (uid/gid 0)
+chroot-ng -u -w /root ./rootfs /bin/sh     # ...starting in /root
+chroot-ng -u -E HOME=/root -E TZ=UTC ./rootfs /bin/sh -l
+chroot-ng --fake-id 1000:1000 ./rootfs /bin/sh
+# non-root, but setuid-root `su` still works (--setuid/--setgid-root imply -u):
+chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -
+chroot-ng -u -l ./rootfs /sbin/apk add busybox   # hardlinked packages
+chroot-ng -u ./rootfs /usr/bin/strace -f /bin/ls  # tracing inside the rootfs
+```
+
+Run `chroot-ng --probe` on any target device **first** — the whole in-process
+design depends on the SELinux `execmem` permission being granted.
+
+## License
+
+**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+chroot-ng is original, freestanding (no libc) AArch64 C and assembly. The
+guest-PID registry, the synthesized `/proc` files, the System V IPC layer, the
+guest `ptrace` model and the help renderer are ported from the sibling
+[arm64chroot](https://github.com/sylirre/arm64emu-user) emulator, which has the
+same copyright holder and the same license. chroot-ng is functionally comparable
+to `proot` but shares no code with it; `qemu-aarch64` is used only as a
+differential-testing oracle and is neither included nor linked.

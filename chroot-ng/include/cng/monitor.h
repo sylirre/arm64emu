@@ -1,0 +1,723 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* The in-process syscall monitor: a seccomp filter traps the path-bearing
+ * syscalls to SIGSYS (unless the syscall's IP is inside our gate), and the
+ * handler translates path arguments via cng_fs before re-issuing the real
+ * syscall through the gate. See docs/DESIGN.md.
+ */
+#ifndef CNG_MONITOR_H
+#define CNG_MONITOR_H
+
+#include "cng/path.h"
+#include "cng/ucontext.h"
+
+/* Shared by --version and the CNG_DEBUG startup banner (which also stamps the
+ * build time: this repo is copied to devices by hand, so "am I running the
+ * build I just made?" is a question every device-side trace has to answer). */
+/* 0.1.0 reversed -b to SRC:DST (host first), matching arm64chroot. This tree
+ * reaches devices by hand-copy, so the version must distinguish a build that
+ * carries the old GUEST:HOST order from one that does not. */
+#define CNG_VERSION "1.6.0"
+
+/* The kernel identity the guest is told about, by uname(2) and by
+ * /proc/version, which must agree — faking one and leaking the other through
+ * the second is the failure mode, since anything that cross-checks them (and
+ * distro install scripts do) then sees a contradiction.
+ *
+ * Fixed rather than passed through: the host release is meaningless inside the
+ * rootfs and, on Android, carries `-android14-11-...`/`-perf` vendor suffixes
+ * that identify the device. It also lifts the effective floor for a modern
+ * glibc rootfs, which refuses to start below its build-time minimum. */
+#define CNG_KREL "6.1.0-chroot-ng"
+#define CNG_KVER "#1 SMP chroot-ng"
+
+/* Active filesystem view used by the dispatcher (set before install). */
+extern struct cng_fs *cng_g_fs;
+
+/* Host auxv captured at startup, reused to synthesize the auxv of programs
+ * started via emulated execve. */
+extern unsigned long *cng_host_auxv;
+
+/* Fidelity config (M7): fake user identity (--fake-id).
+ *
+ * When cng_g_fake_id is set the guest is presented a synthetic credential set
+ * (cng_g_cred) seeded from the configured uid:gid. Credential syscalls read and
+ * mutate this set following real POSIX privilege rules (so a privilege drop
+ * actually changes what getuid() reports, and a non-root fake id cannot regain
+ * uid 0); ownership/mode changes and denied access() checks are faked as
+ * succeeding while the effective uid is 0 (cng_fake_root), and a path call the
+ * host refuses for a mode is made again with the owner bits lent (dac_bypass in
+ * dispatch.c), which is root's DAC bypass; and stat ownership is
+ * remapped so files owned by the real invoking user (cng_g_host_uid/gid) appear
+ * owned by the fake id. The set is process-wide and, because the guest forks for
+ * real, is inherited across fork() exactly as the kernel would. cng_g_exe_guest
+ * is what /proc/self/exe reports. */
+/* How many supplementary groups the synthetic set holds. The kernel's own
+ * NGROUPS_MAX is 65536, and setgroups(2) beyond this answers -EINVAL, which is
+ * the right kind of answer but at the wrong number: 64 was low enough that
+ * initgroups(3) for a user in a directory-service environment could trip it,
+ * and take `su` and `login` down with it. Not the kernel's figure, though —
+ * struct cng_cred is copied by value in the setreuid and setregid paths, on
+ * the SIGSYS handler's 256 KiB scratch stack, so 65536 entries would be a
+ * 256 KiB copy there. 1024 is past anything real and costs 4 KiB. */
+#define CNG_NGROUPS_MAX 1024
+
+struct cng_cred {
+    unsigned ruid, euid, suid, fsuid;    /* real, effective, saved-set, fs uid */
+    unsigned rgid, egid, sgid, fsgid;    /* real, effective, saved-set, fs gid */
+    unsigned groups[CNG_NGROUPS_MAX];    /* supplementary groups */
+    int ngroups;
+};
+
+extern int cng_g_fake_id;                /* --fake-id active */
+extern int cng_g_fake_id_explicit;       /* an id was requested via -u/--fake-id
+                                          * (vs. only implied by --setuid-root):
+                                          * when 0, the identity defaults to the
+                                          * real invoking id, not 0:0 */
+extern unsigned cng_g_fake_uid;          /* configured id = stat remap target */
+extern unsigned cng_g_fake_gid;          /* (fixed; live ids live in cng_g_cred) */
+extern unsigned cng_g_host_uid;          /* real invoking uid, captured at start */
+extern unsigned cng_g_host_gid;          /* real invoking gid */
+/* The live credential set, published as one object: cng_g_cred points at the
+ * active copy, which is never written. Every reader — of one field as much as
+ * of several — takes the sequence and the pointer and re-checks the sequence
+ * after (a setter on another thread swapped the set meanwhile); a writer
+ * edits a copy and publishes it. See cred.c, and cng_cred_ids for the ids. */
+extern const struct cng_cred *cng_g_cred;
+unsigned cng_cred_read_begin(const struct cng_cred **c);
+int cng_cred_read_retry(unsigned s);
+/* The eight ids of the published set, taken under the sequence. A reader
+ * wanting one of them goes through this too: the pointer alone names a
+ * buffer, and with two of them the buffer a stale pointer names is the one
+ * the next writer fills (cred.c). */
+struct cng_cred_ids {
+    unsigned ruid, euid, suid, fsuid;
+    unsigned rgid, egid, sgid, fsgid;
+};
+void cng_cred_ids(struct cng_cred_ids *out);
+/* The published set's supplementary groups into out[CNG_NGROUPS_MAX], and its
+ * ids into *ids when that is not NULL: the count, the list and the ids read as
+ * one thing, since a setgroups on another thread publishes a whole new set
+ * rather than editing this one. Returns the count. */
+int cng_cred_groups(unsigned *out, struct cng_cred_ids *ids);
+struct cng_cred_write {
+    struct cng_cred *dst;
+    unsigned long mask;
+};
+struct cng_cred *cng_cred_write_begin(struct cng_cred_write *w);
+void cng_cred_write_end(struct cng_cred_write *w, int commit);
+extern const char *cng_g_exe_guest;
+
+/* Show setuid/setgid *executables* as owned by root (uid/gid 0), and — on exec —
+ * elevate the fake identity's effective id to 0. This is what lets a setuid-root
+ * binary such as `su` gain root under a non-root fake id. Both imply --fake-id
+ * (the credential subsystem they depend on). See cng_exec_vis_* / cng_cred_exec. */
+extern int cng_g_setuid_root;
+extern int cng_g_setgid_root;
+
+/* File-type / set-id mode bits: the fake-id ownership fixups test for a regular
+ * file, the -w/--work-dir check for a directory. */
+#define CNG_S_IFMT  0170000u
+#define CNG_S_IFREG 0100000u
+#define CNG_S_IFDIR 0040000u
+#define CNG_S_ISUID 0004000u
+#define CNG_S_ISGID 0002000u
+
+/* Seed the live credential set from cng_g_fake_uid/gid (r=e=s=fs, no groups).
+ * Call once cng_g_fake_uid/gid (and cng_g_host_uid/gid) are set. */
+void cng_cred_seed(void);
+
+/* Establish the fake identity at startup from the real invoking id: record it as
+ * the stat-remap source, and — when no id was requested explicitly (the identity
+ * is only implied by --setuid-root/--setgid-root) — default the fake id to it
+ * rather than 0:0, then seed the live set. Called once by cng_run. */
+void cng_cred_setup(unsigned host_uid, unsigned host_gid);
+
+/* Apply setuid/setgid-on-exec to the fake credential set: if `host` (the ELF
+ * being exec'd) is a setuid/setgid regular file, its effective/saved/fs id
+ * becomes the file's visible owner/group — root under --setuid-root/--setgid-root
+ * (see cng_exec_vis_*). No-op unless a fake identity is active and at least one
+ * of the flags is set. Applied by the emulated execve and the initial run. */
+void cng_cred_exec(const char *host);
+
+/* ---- de_thread (execve.c) ---- */
+/* Is `si` one of our thread-directed requests (a SIGSYS with SI_DETHREAD and
+ * our magic)? CNG_DT_DIE / CNG_DT_EXEC, else 0. */
+int cng_dethread_request(const cng_siginfo_t *si);
+#define CNG_DT_DIE  1
+#define CNG_DT_EXEC 2
+/* Is a sibling's exec killing this thread right now? Then whatever SIGSYS it
+ * takes is taken for the request, which that SIGSYS may have displaced. */
+int cng_dethread_doomed(void);
+/* Exit as a thread the kernel's de_thread kills. */
+__attribute__((noreturn)) void cng_dethread_die(void);
+/* One of the waits that install a signal mask of their own (rt_sigsuspend,
+ * rt_sigtimedwait, ppoll, pselect6, epoll_pwait[2])? Trapped when they carry
+ * a mask, so SIGSYS can be taken out of it. */
+int cng_is_masked_wait(long nr);
+/* In a fork child: nothing another thread of the parent had in flight. */
+void cng_exec_fork_child(void);
+/* Is an exec a sibling planned waiting for the leader to carry it? */
+int cng_exec_pending(void);
+/* Carry it, from a signal frame: the frame is rewritten to enter the new
+ * program and 1 is returned. 0 with the frame untouched when there was nothing
+ * to carry after all (another thread took it, or the request was spurious). */
+int cng_exec_takeover_frame(struct cng_ucontext *uc);
+
+/* Emulate a credential syscall (get/set uid/gid family, groups, capabilities)
+ * against cng_g_cred. Only the first three args are consumed by any of them;
+ * the rest are forwarded for the (rare) non-faking re-issue path. */
+long cng_cred_handle(long nr, long a0, long a1, long a2, long a3, long a4,
+                     long a5);
+
+/* True when a fake identity is active AND its effective uid is 0: root's DAC
+ * bypass applies (ownership/mode changes and denied access() checks are faked,
+ * and a refused path call is retried with the owner bits lent). Reads the
+ * published set (cred.c). */
+int cng_fake_root(void);
+
+/* Remap a host-side owner for stat results: a file owned by the real invoking
+ * user is shown as owned by the fake id; every other owner passes through. A
+ * no-op unless a fake identity is active. */
+static inline unsigned cng_remap_uid(unsigned u) {
+    return (cng_g_fake_id && u == cng_g_host_uid) ? cng_g_fake_uid : u;
+}
+static inline unsigned cng_remap_gid(unsigned g) {
+    return (cng_g_fake_id && g == cng_g_host_gid) ? cng_g_fake_gid : g;
+}
+
+/* Visible owner/group of a file with mode `mode`: a setuid/setgid *regular* file
+ * is shown as owned by root (0) when the matching --setuid-root/--setgid-root is
+ * set — so setuid-root binaries like `su` appear (and, on exec, act) as root;
+ * otherwise the plain host->fake remap applies. */
+static inline unsigned cng_exec_vis_uid(unsigned u, unsigned mode) {
+    if (cng_g_setuid_root && (mode & CNG_S_ISUID) &&
+        (mode & CNG_S_IFMT) == CNG_S_IFREG)
+        return 0;
+    return cng_remap_uid(u);
+}
+static inline unsigned cng_exec_vis_gid(unsigned g, unsigned mode) {
+    if (cng_g_setgid_root && (mode & CNG_S_ISGID) &&
+        (mode & CNG_S_IFMT) == CNG_S_IFREG)
+        return 0;
+    return cng_remap_gid(g);
+}
+
+/* Emulate execve/execveat in-process: load the new program, build its stack,
+ * and rewrite the signal context (pc/sp/regs) to enter it — so the seccomp
+ * filter and SIGSYS handler survive (a real execve would wipe them). On failure
+ * it sets the return register to -errno and returns (normal execve semantics). */
+void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
+                        char **argv, char **envp, int flags);
+
+/* Trampoline-path (-R) counterpart: same emulation from an ordinary call
+ * context — on success it enters the new program and never returns; on failure
+ * it returns -errno for the trampoline to hand back to the guest. */
+long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
+                      int flags);
+
+struct cng_loaded; /* cng/loader.h */
+
+/* The address space of the program an emulated execve replaces.
+ *
+ * cng_exec_generation names the mappings the loader has just made for the
+ * program now entering — its image, its interpreter's, and its stack — and
+ * retires the outgoing generation's. cng_exec_reap hands the retired ones back;
+ * it is deferred to the next dispatched syscall because the SIGSYS tier returns
+ * into the new program through a signal frame that lives on the outgoing stack.
+ * Both are no-ops until an exec has actually retired something. See the block
+ * comment in src/monitor/execve.c for what this does and does not cover. */
+void cng_exec_generation(const struct cng_loaded *prog,
+                         const struct cng_loaded *interp,
+                         unsigned long stack_lo, unsigned long stack_len);
+void cng_exec_reap(void);
+
+/* The program break before the first guest program ran. A real execve drops the
+ * heap with the address space; ours keeps the address space, so the break is
+ * wound back to this at each exec. 0 = never recorded, and nothing is done. */
+extern unsigned long cng_g_brk0;
+
+/* Record / forget a POSIX timer the guest created. A real execve deletes them
+ * all, and nothing enumerates a process's timers, so the dispatcher hands over
+ * every id as it is created (see cng_exec_reset). */
+void cng_timer_note(int id);
+void cng_timer_forget(int id);
+
+/* Record / forget the calling thread's rseq registration. A real execve drops
+ * it with the address space; ours has to unregister it, which takes the exact
+ * area, length and signature, so the dispatcher hands them over as the guest
+ * registers (see the table in execve.c). */
+void cng_rseq_note(unsigned long area, unsigned long len, unsigned int sig);
+void cng_rseq_forget(void);
+/* Across a trapped fork: the forking thread's entry, sampled before the clone,
+ * is the one the child inherits and re-keys to its own tid. */
+int cng_rseq_fork_prepare(void);
+void cng_rseq_fork_child(int keep);
+
+/* Close every FD_CLOEXEC descriptor, as a real execve would (emulated execve
+ * does not, so fork/exec launchers' O_CLOEXEC notify pipes must be closed here
+ * or the parent blocks). Exposed for testing. */
+void cng_close_cloexec(void);
+
+/* Emulate one syscall: translate path args, re-issue via the gate, return the
+ * kernel result. `trapped` says how the call got here, and any nonzero value
+ * means the filter trapped it (a syscall reaching `default` was then trapped by
+ * Android => emulate ENOSYS); 0 is an M8 trampoline (an unhandled syscall is
+ * ordinary => re-issue it). Under fake root, a path call the host refuses with
+ * EACCES is made again with root's DAC bypass lent to the inode that refused it
+ * (dac_bypass in dispatch.c). Directly callable for testing (no seccomp
+ * needed), where 0 and 1 are what a caller passes.
+ *
+ * The other two values exist because the SIGSYS handler runs with every signal
+ * masked, and a call that blocks in there cannot be interrupted by anything
+ * but SIGKILL — not a guest's SIGTERM, not a ^C, not a ptrace attach. The
+ * handler passes CNG_DISP_HANDLER, which lets the dispatcher answer a call that
+ * can block with one of the CNG_EBOUNCE_* codes below instead of making it, and
+ * the handler then runs the call from guest context (sigsys.c, the bounce).
+ * CNG_DISP_BOUNCED is that dispatch, made again from there. */
+#define CNG_DISP_TRAMP   0
+#define CNG_DISP_TRAP    1 /* a trap, answered inside the handler */
+#define CNG_DISP_HANDLER 2 /* ...from the handler, which can bounce it */
+#define CNG_DISP_BOUNCED 3 /* a trap dispatched from guest context */
+long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
+                  int trapped);
+
+/* What a CNG_DISP_HANDLER dispatch answers instead of making a call that can
+ * block, as negative values. Internal: in the kernel's own range of codes that
+ * never reach user space (ERESTARTSYS is 512), and none of them ever does. */
+#define CNG_EBOUNCE_RAW  540 /* run the guest's call itself, as it stands */
+#define CNG_EBOUNCE_DISP 541 /* run this whole dispatch from guest context */
+#define CNG_ERESTART     542 /* make the call again from its svc: a ptrace kick
+                              * is pending, and it has to land in guest code */
+
+/* The -R trampoline's entry point (tramp.S calls it with the frame it built):
+ * runs one rewritten syscall site, with the ptrace stops around it. */
+struct cng_uregs;
+void cng_tramp_dispatch(struct cng_uregs *r);
+
+/* The dispatch of a trapped call the handler moved into guest context
+ * (CNG_EBOUNCE_DISP): `r` is the guest's register file, saved below its stack
+ * by the handler, `nr` the call (a tracer may have redirected it), `owed` 1 when
+ * the handler reported the entry stop and the exit stop is this dispatch's to
+ * give. Writes the result into r->x[0]. */
+void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed);
+
+/* A dispatch in progress from guest context — the -R trampoline's, or a
+ * bounced one — as a ptrace stop taken inside it has to see it: the guest's
+ * registers, which hold the call's arguments until `done`, and its result
+ * after. Kept per thread, innermost first (a guest handler can run on top of a
+ * dispatch that is blocked, and make calls of its own), by cng_run_scratch_in. A
+ * stop inside the dispatch reports these instead of the monitor's own, and a
+ * tracer that changes them there `abandon`s the call: its result is dropped
+ * and the thread resumes with the registers the tracer left. `owed` is the
+ * exit stop the dispatch owes its tracer. A call abandoned at the entry stop
+ * of its own restart (the tracer resumed with PTRACE_SYSCALL, and changed it
+ * there) is `entered` already, with `nr` the number to make, -1 for one the
+ * tracer cancelled. `gsp`, when set, is a stack pointer on the guest's own
+ * stack for the blocking call the dispatch makes (reissue in dispatch.c): a
+ * guest handler that runs while it blocks is then delivered there, as for a
+ * call of its own, and not onto the scratch stack. */
+struct cng_gframe {
+    struct cng_uregs *r;
+    struct cng_gframe *prev;
+    int done;
+    int abandon;
+    int owed;
+    int entered;
+    long nr;
+    unsigned long gsp;
+};
+/* The innermost one on this thread, or 0. */
+struct cng_gframe *cng_gframe_cur(void);
+
+/* A trapped clone (the process-making kinds), answered in the guest's register
+ * frame rather than by return value: CLONE_VM|CLONE_VFORK become a COW fork,
+ * the result lands in x0 and — in the child — the caller-supplied child stack
+ * in sp, for the tier's exit to install. Both tiers and the tests call it. */
+void cng_clone_convert(struct cng_uregs *ur);
+/* Test aid: when set, run in the child the moment the clone returns there and
+ * before any fork-child hook, which is where a signal sent to the new pid on
+ * the way out of the clone is delivered (-t ptracetest). */
+extern void (*cng_g_fork_child_probe)(void);
+/* Test aid: when set, run in the parent the moment the clone returns there and
+ * before it publishes the child, which is a parent the scheduler has not run
+ * since its clone, with the child already going (-t proctest). */
+extern void (*cng_g_fork_parent_probe)(long kid);
+
+/* One-shot-per-number diagnostic for a syscall we emulate away (CNG_DEBUG). */
+void cng_note_blocked(int nr);
+
+/* Verbose diagnostic (set by CNG_DEBUG=1): log intercepted syscalls whose
+ * result is an error other than ENOENT, with the path where available. */
+extern int cng_g_debug;
+
+/* chroot-ng's OWN (host) environment, stashed at startup for the few places that
+ * need an env lookup after argv/envp are out of reach (procreg.c's shared_dir,
+ * the CNG_* knobs). Never the guest's: the guest gets a clean environment built
+ * from -E/--env (see cng_run), and the two must not be confused — a CNG_* knob
+ * is read from here, an -E entry is only ever handed to the guest. */
+extern char **cng_g_host_envp;
+
+/* openat2(2)'s scoping constraints, carried into the walk that translates the
+ * path. The guest asked for them against ITS namespace, so they are answered
+ * there and stripped before the call is re-issued: the rootfs prefix is not
+ * part of the resolution the guest described, and RESOLVE_NO_XDEV means the
+ * guest's own mount table (rootfs + binds + the /proc and /dev zones), which is
+ * also what the synthesized /proc/self/mounts shows it. NULL for every other
+ * caller, which is all of them — nothing else in the syscall table has these.
+ *
+ * RESOLVE_BENEATH and RESOLVE_IN_ROOT are here only for the resolutions that
+ * have to be walked: they scope the whole lookup to a dirfd, which the kernel
+ * applies exactly, so the call is handed over untranslated wherever the guest's
+ * namespace has nothing to add under that directory. Where it does — a bind
+ * mount, the /proc or /dev zone — the kernel would resolve in the host's view
+ * of that subtree, so the walk happens here and the scope is applied with it
+ * (see cng_scope_needs_walk and the openat2 case in dispatch.c) — as it is for
+ * every scoped call where the host cannot issue openat2 and the call is
+ * emulated. `scope` is the
+ * dirfd's own guest path: with IN_ROOT it is the root an absolute name, an
+ * absolute symlink target and a `..` run are all measured against; with
+ * BENEATH each of those is -EXDEV instead. */
+struct cng_res_limit {
+    unsigned no_symlinks : 1;   /* RESOLVE_NO_SYMLINKS: magic links included */
+    unsigned no_magiclinks : 1; /* RESOLVE_NO_MAGICLINKS */
+    unsigned no_xdev : 1;       /* RESOLVE_NO_XDEV */
+    unsigned beneath : 1;       /* RESOLVE_BENEATH */
+    unsigned in_root : 1;       /* RESOLVE_IN_ROOT */
+    const char *scope;          /* guest dir BENEATH/IN_ROOT are anchored at */
+    const char *xdev_base;      /* guest dir the walk starts in (0 = its base) */
+    long err;                   /* the violation: -ELOOP or -EXDEV */
+    unsigned check_dotdot : 1;  /* validate what each ".." leaves (below) */
+    long dotdot_err;            /* that verdict, kept apart from `err` because
+                                 * it is the only one a caller acts on rather
+                                 * than letting the kernel re-derive it */
+};
+
+/* Resolve a guest path to a host path, following symlinks within the guest
+ * (absolute link targets re-rooted into the rootfs). deref_final follows the
+ * last component's own symlink. Returns 0/-errno. Uses cng_g_fs + readlink.
+ * The _lim form applies an openat2 constraint set on the way; `lim` may be 0,
+ * which is what cng_resolve passes. */
+int cng_resolve(const char *path, int deref_final, char *out, size_t outsz);
+int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
+                    struct cng_res_limit *lim);
+
+/* The errno a guest path's ".." components earn it, or 0. Each one is walked
+ * THROUGH the directory it leaves, so that directory has to exist and be one:
+ * "f/.." is ENOTDIR and "missing/.." is ENOENT, where the canonicalization that
+ * keeps a guest inside its rootfs collapses the pair away and never looks. The
+ * dispatcher asks this of every path argument it handles; exec asks it of its
+ * own, being the one call that does not pass through there. See the block
+ * comment on the definition in dispatch.c. */
+long cng_dotdot_verdict(long dirfd, const char *path);
+
+/* Resolve (dirfd, path) to a HOST path: absolute names and AT_FDCWD through the
+ * rootfs, a real dirfd through the guest path it names — so a relative name is
+ * contained exactly as an absolute one is. `deref` follows the final component's
+ * own symlink. Returns 0/-1. */
+int cng_resolve_at(long dirfd, const char *path, int deref, char *out,
+                   size_t sz);
+
+/* The fd behind a host path that names one of this process's own descriptors
+ * ("/proc/self/fd/<n>" and its thread-self / own-pid spellings), else -1. */
+int cng_proc_self_fd(const char *host);
+
+/* Which route a scoped openat2 (RESOLVE_BENEATH / RESOLVE_IN_ROOT) has to take
+ * for `dirfd`: 1 when the guest's own namespace has something to say under that
+ * directory — a bind mount at or below it, or the /proc or /dev zone on the
+ * same branch — so the resolution must be walked here with the scope applied;
+ * 0 when the kernel's scoped resolution of the guest's own name is exactly
+ * right, which is what it is then handed. `gdir` comes back with the dirfd's
+ * guest path (the scope) whenever there is one — always when the answer is 1 —
+ * and empty where there is none (no descriptor, or one on no directory), which
+ * an emulated openat2, walking every scope, has to tell apart. -1 when the
+ * dirfd names a directory the guest has no name for at all — one from outside
+ * the view — which the caller refuses. Exposed for `-t o2test`. */
+int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz);
+
+/* Descriptors and the guest view. A descriptor that names a directory the
+ * guest has no name for — outside the rootfs, the binds and the /proc and /dev
+ * zones — is never let into its table: cng_fd_admit closes such a descriptor
+ * and returns 0 (1 for anything else, which is left alone), and
+ * cng_fds_sanitize runs it over everything the launcher handed down, once,
+ * before the first program is loaded. See the definitions for why a file is
+ * let in and a directory is not. */
+int cng_fd_admit(int fd);
+void cng_fds_sanitize(void);
+
+/* The guest name of a host directory the kernel reported (a /proc/self/fd
+ * readback, a getcwd): inside the view, or one of the two zones. 0/-1 — and
+ * -1 is a directory the guest has no name for, which every caller refuses. */
+int cng_host_dir_guest(const char *hdir, char *gdir, size_t sz);
+
+/* The identity of the file behind a descriptor of ours, for the descriptors
+ * kept across guest syscalls: close(2) is not trapped, so the guest can close
+ * one and be handed the number back for a file of its own, and every later use
+ * of the number has to check that it still names our file. The inode number
+ * alone is not that check — it is per filesystem, and a guest file on another
+ * one carries the same number as freely as a memfd or a socket does — so the
+ * device goes with it. cng_fdid_of records the pair (0/-1); cng_fd_is answers
+ * whether `fd` still names it, and 0 for a number that is closed. */
+struct cng_fdid {
+    unsigned long dev, ino;
+};
+int cng_fdid_of(int fd, struct cng_fdid *id);
+int cng_fd_is(int fd, const struct cng_fdid *id);
+
+/* Serve an open the host refused (`err`) on a path naming one of our own fds,
+ * from that descriptor: a duplicate when the inode grants the access anyway
+ * (a non-DAC refusal, e.g. SELinux on a memfd) and the description's access
+ * mode is the one asked for, or a mode-borrowing reopen under fake-root.
+ * Returns the new fd, or `err`. */
+long cng_fd_reopen(const char *host, long flags, long mode, long err);
+
+/* The script a #! exec ran from one of our fds (`fd`, or -1 for none): the one
+ * descriptor whose refused O_RDONLY reopen cng_fd_reopen still answers with a
+ * duplicate of a wider description, because the interpreter it was handed to
+ * only reads it. Set by every exec's commit. */
+void cng_fd_reopen_script(int fd);
+
+/* Is a guest byte range safe to dereference from the handler? Every signal but
+ * SIGSYS is masked there, so a SIGSEGV on a bad guest pointer is unblockable and
+ * kills the guest where a real kernel would have answered -EFAULT. Ask before
+ * dereferencing anything the guest handed us and return -EFAULT on 0. The write
+ * form zeroes the range it validates, so use it immediately before filling the
+ * buffer. Both answer 1 when they cannot ask (see uaccess.c). */
+int cng_user_readable(const void *p, unsigned long n);
+int cng_user_writable(void *p, unsigned long n);
+
+/* Settle which probe mechanism this host supports, returning 1 for the
+ * process_vm_* pair and 0 for the memfd fallback. Called once at monitor
+ * install so the question is never asked from inside the SIGSYS handler, where
+ * a refused syscall would need nested delivery to be survivable. */
+int cng_uaccess_probe_setup(void);
+
+/* Test aid only (see uaccess.c): the identity of this process's staging
+ * descriptor, which a forked child must not share with its parent. */
+unsigned long cng_uaccess_scratch_ino(void);
+
+/* Length of a guest string / entry count of a guest pointer vector, measured
+ * out of a copy so that neither the walk nor its answer can be raced. Returns
+ * the count, -EFAULT when it runs off readable memory, or -E2BIG when `max`
+ * passes with no terminator — the same two answers execve(2) gives for the same
+ * inputs. A caller that then wants the bytes must take its own copy
+ * (cng_user_strcopyin); the length alone says nothing about what is there now. */
+long cng_user_strlen(const char *s, unsigned long max);
+long cng_user_veclen(char *const *v, unsigned long max);
+
+/* Move guest bytes rather than probe-then-touch them: where the probes above
+ * only answer whether a range can be reached, these carry it, so nothing is
+ * touched twice and a range that goes away mid-copy is -EFAULT instead of a
+ * fault inside the handler (see uaccess.c). copyin takes guest memory into
+ * ours, copyout puts ours into the guest's; both return 0 or -EFAULT.
+ * cng_user_strcopyin returns the string length excluding the terminator, or
+ * -E2BIG when `cap` bytes hold none. Prefer these to the probes wherever the
+ * bytes are actually going to move. */
+long cng_user_copyin(void *dst, const void *src, unsigned long n);
+long cng_user_copyout(void *dst, const void *src, unsigned long n);
+
+/* The guest's own no_new_privs bit, which is per task and not per process (see
+ * dispatch.c). The getter is also how a trapped fork samples the value its
+ * child inherits, which the child then installs with cng_nnp_fork_child. */
+int cng_nnp_get(void);
+void cng_nnp_fork_child(int val);
+long cng_user_strcopyin(char *dst, const char *src, unsigned long cap);
+
+/* Ambient-seccomp block-list: cng_blocked[nr] != 0 means Android blocks that
+ * syscall, so dispatch emulates ENOSYS instead of re-issuing it — or, for the
+ * few with an answer of their own (accept, the uid/gid setters), gives that.
+ * Populated by cng_probe_blocked() at monitor install (a no-op result off
+ * Android). */
+#define CNG_NR_MAX 512
+extern unsigned char cng_blocked[CNG_NR_MAX];
+void cng_probe_blocked(void);
+/* CNG_SETID_DENY=1: take the uid and gid setters Android's app filter refuses
+ * as refused here too — marked blocked after the probe, and trapped by our own
+ * filter so they reach the dispatcher as that filter's trap would deliver them
+ * (cred.c). */
+extern int cng_g_setid_deny;
+extern const int cng_setid_deny_nrs[];
+extern const int cng_setid_deny_n;
+/* CNG_OPENAT2_DENY=1: take openat2 as refused by an ambient filter, as
+ * Android's refuses it — marked blocked after the probe, so chroot-ng never
+ * issues it on its own behalf and a guest's openat2 is emulated (dispatch.c).
+ * Our own filter traps the number already: it is a path syscall. */
+extern int cng_g_openat2_deny;
+
+/* Is a signal pending that the guest would take delivery of, judged against the
+ * mask of the frame `uc` will restore (NULL on the -R tier, which has no frame
+ * and whose live mask is the guest's) and against dispositions: a signal the
+ * guest ignores, or one that is discarded at the default (SIGCHLD and its kind),
+ * is not an interruption. cng_sig_deliverable() (sysvipc.h) finds the frame
+ * itself. Implemented in sigsys.c, which owns it. */
+int cng_sig_deliverable_in(const struct cng_ucontext *uc);
+/* ...and for a wait made inside the SIGSYS handler (`uc` its frame, 0 for
+ * none, which is then never one): is a ptrace kick queued that the frame's mask
+ * would let in? The kick is masked in the handler like everything else, so a
+ * wait that will not end by itself has to end for it, with CNG_ERESTART: a
+ * thread asleep in one could not be attached to. _waiting finds the frame
+ * itself. */
+int cng_sig_kick_pending(const struct cng_ucontext *uc);
+int cng_sig_kick_waiting(void);
+
+/* The frame a handler of ours last returned this thread to the guest with,
+ * noted (cng_sig_note_return) and asked about (cng_sig_returned_to): a ptrace
+ * request carried by SIGSYS that lands on that very frame was not delivered
+ * over a trap it displaced, since a handler of ours answered that trap. */
+void cng_sig_note_return(const struct cng_ucontext *uc);
+int cng_sig_returned_to(const struct cng_ucontext *uc);
+/* A ptrace request carried by SIGSYS left for the handler it landed in
+ * (sigsys.c, sigsys_kick): 1, and it is cleared, when there is one. */
+int cng_sig_take_deferred(void);
+/* Mark (d = 1) and unmark (d = -1) this thread as doing a handler of ours'
+ * own work, where a request carried by SIGSYS is left for later. Never across
+ * a guest's handler, which may siglongjmp out and leave the mark behind. */
+void cng_sig_in_handler(int d);
+/* Set once the SIGSYS handler has taken a trap out of guest code: the filter
+ * is live (it is not under qemu-user, which installs it and ignores it). */
+extern int cng_g_traps_live;
+/* Does the calling task carry the filter that tags its traps with `tag`
+ * (CNG_TRAP_TAG_*)? Asked of the kernel with a call that filter traps and no
+ * other filter of ours does, made outside the gate and answered by the handler
+ * without dispatching it. 0 when the answer cannot be had. */
+int cng_sig_filter_stacked(int tag);
+
+/* What the guest's rt_sigprocmask asked for, as far as "every signal blocked"
+ * goes, kept per thread (sigsys.c has the story): cng_sig_note_mask records it
+ * from the emulated call, cng_sig_all_blocked reads it for another thread. The
+ * exec's de_thread uses it to leave a thread that is unmapping its own stack. */
+void cng_sig_note_mask(int how, unsigned long set);
+int cng_sig_all_blocked(long tid);
+
+/* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
+int cng_sig_install(int signo, cng_sighandler_t h);
+
+/* Run `fn(arg)` on this thread's per-thread scratch stack, returning 1 when it
+ * switched and 0 when the caller must run it in place (no slot, or already on
+ * the stack). The path dispatcher needs far more stack than a guest thread is
+ * likely to have — see sigsys.c — so both tiers enter it through this.
+ * cng_scratch_leave gives the stack back for a call that never returns. */
+int cng_run_scratch(void (*fn)(void *), void *arg);
+void cng_scratch_leave(void);
+/* ...for a dispatch from guest context, with `f` (its r set) published as this
+ * thread's innermost cng_gframe for as long as `fn` runs. The slot lookup is
+ * the one the stack switch makes anyway, so this costs three stores. */
+int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f);
+
+/* A ptrace kick landed with `uc` inside one of the bounce stubs (sigsys.c):
+ * put the frame back to the guest's own state, as if the call had not been
+ * started (CNG_UNWIND_UNDONE: pc at the guest's svc, its arguments in x0..x5)
+ * or as if it had returned (CNG_UNWIND_DONE: pc after it, x0 its result), so
+ * that a stop taken on the frame shows the guest and a write to it is what the
+ * thread resumes with. `*owed` says an exit stop is owed for the call, and
+ * `*rval` is the result the tracer should see there (-ERESTARTSYS for an undo).
+ * An undo with `stop` 0 is made only for a wait the kernel would have
+ * restarted, and a frame left alone otherwise. CNG_UNWIND_NONE when `uc` is
+ * not in a stub, or was left alone. */
+#define CNG_UNWIND_NONE   0
+#define CNG_UNWIND_UNDONE 1
+#define CNG_UNWIND_DONE   2
+int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed, long *rval);
+
+/* The same allocator for a TID the caller names, with the slot's stack top (0
+ * when there is no slot). Exposed for testing: filling the table takes hundreds
+ * of threads, and what happens then — a slot whose thread has exited is taken
+ * over — has no other way to be reached. */
+int cng_scratch_slot_for(long tid, unsigned long *hi_out);
+/* Does [lo, hi) touch a scratch stack? Asked by the exec reclaim, which
+ * must not give a slot back as if it were the outgoing program's. */
+int cng_scr_hit(unsigned long lo, unsigned long hi);
+
+/* Install the SIGSYS handler alone (no filter, no probes): testing. */
+int cng_sigsys_install_only(void);
+
+/* Test aid: when set, the handler raises one real SIGSYS from the scratch stack
+ * — the nested-trap state, which otherwise needs an ambient filter to block a
+ * syscall we re-issue, i.e. a device. The two frame addresses land in
+ * cng_g_sigsys_frame[outer, nested]; they must not be the same one. */
+extern int cng_g_sigsys_nest;
+extern unsigned long cng_g_sigsys_frame[2];
+/* Queue a SIGSYS at the calling thread that the handler takes for a seccomp
+ * trap from the gate (answered -ENOSYS, nothing dispatched): how a test raises
+ * one where no filter will, now that a plain kill(SIGSYS) is the guest's. */
+void cng_sigsys_fabricate(void);
+
+/* Core SIGSYS logic (exposed for testing): given the trapped signal context and
+ * info, either translate+dispatch the guest syscall, or — when the trap is
+ * Android's seccomp filter blocking a syscall WE re-issued from the gate —
+ * convert it to -ENOSYS. Writes the result into the context's x0. */
+void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si);
+
+/* Build and install the seccomp filter (traps the path syscall set, allows the
+ * gate IP range, allows everything else). Returns 0 or -errno. */
+int cng_install_seccomp(void);
+
+/* Stack a second filter on the calling task when it enters a ptrace role:
+ * _traceall traps every syscall (a tracee must stop on all of them), _tracer
+ * traps only wait4/waitid/kill/process_vm_* (a tracer's answers must account
+ * for emulated stops). Both keep the gate allowlist. Filters cannot be
+ * removed, so each is installed at most once per task (see cng_pt_arm_*). */
+int cng_install_seccomp_traceall(void);
+int cng_install_seccomp_tracer(void);
+
+/* The data the two put in their RET_TRAP, which the kernel hands the handler
+ * as si_errno: each trap says which filter caught it. Equal actions keep the
+ * newest filter's data, so a task that carries the tracee's filter has every
+ * trap tagged by it, and that is how a task that inherited one is known to
+ * have it. A thread or a fork child created after its creator stacked one
+ * carries the filter but none of the creator's per-task state, and until
+ * the tag, the dispatcher answered every call it does not handle itself with
+ * ENOSYS there, taking the trap for one an Android filter makes (cng_pt_note
+ * _trap, ptrace.c). The base filter's traps carry none. */
+#define CNG_TRAP_TAG_TRACEALL 0x7ace
+#define CNG_TRAP_TAG_TRACER   0x7acf
+
+/* ...and the same split the base filter has, so a self-test can simulate them.
+ * Neither can be observed any other way: they are only installed once a guest
+ * traces, and guest filters do not run under qemu-user at all. */
+#define CNG_SECCOMP_TRACEALL_INSNS 24
+#define CNG_SECCOMP_TRACER_INSNS   24
+struct sock_filter;
+int cng_build_seccomp_traceall(struct sock_filter *f, int cap);
+int cng_build_seccomp_tracer(struct sock_filter *f, int cap);
+
+/* Upper bound on the filter's instruction count: prologue + the designed-ENOSYS
+ * block + gate + the clone/prctl/ioctl/mmap/mprotect/mremap/wait/read blocks +
+ * one check per trapped syscall + the two tail RETs. Raised from 128 for the
+ * AF_UNIX and credential additions and from 256 for the :ro-by-descriptor ones
+ * (M45), which put one check per mutating ioctl request into the ioctl block;
+ * the largest configuration (every optional set on, a :ro bind in the view) is
+ * measured by `-t bpftest`, which refuses a build that leaves fewer than eight
+ * spare, since the builder has no bounds check of its own. The kernel's own
+ * limit is 4096 instructions; the tail's per-syscall jump offset is a u8, which
+ * stays valid while the trapped set is under 255. */
+#define CNG_SECCOMP_MAX_INSNS 320
+
+/* The ioctl requests a :ro bind refuses by descriptor (see uapi.h): the
+ * filter traps them when the view has a :ro bind, the dispatcher answers them
+ * for a descriptor under one (fd_ro). One table, so the two cannot disagree. */
+extern const unsigned cng_ioctl_mnt_write[];
+extern const int cng_ioctl_mnt_write_n;
+
+/* Emit the filter into `f` (which must hold CNG_SECCOMP_MAX_INSNS entries) and
+ * return its length, or -1 if the buffer is too small. Split out of the install
+ * so a self-test can inspect and simulate it: the filter only ever runs on a
+ * real AArch64 kernel (qemu-user does not honor guest seccomp), so this is the
+ * only place its behaviour can be checked before shipping to a device. */
+struct sock_filter;
+int cng_build_seccomp(struct sock_filter *f, int cap);
+
+/* 1 if `nr` is in the designed-ENOSYS set: a syscall we must refuse because it
+ * reaches the filesystem by a route the path traps cannot see (io_uring's SQE
+ * ring, above all). The seccomp filter answers these with RET_ERRNO on its own;
+ * this is for the -R trampoline tier, which runs with no filter at all. */
+int cng_denied_syscall(long nr);
+
+/* Point the dispatcher at fs, install the SIGSYS handler, then the filter.
+ * Returns 0 on success or a negative errno (EINVAL under qemu-user, which
+ * rejects the filter, and on a kernel before 3.5; EACCES where policy forbids
+ * it). Without -R, cng_run does not enter the guest on a failure: nothing else
+ * would intercept its syscalls. */
+int cng_install_monitor(struct cng_fs *fs);
+
+#endif /* CNG_MONITOR_H */

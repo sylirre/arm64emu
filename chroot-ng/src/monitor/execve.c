@@ -1,0 +1,2476 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* In-process execve/execveat emulation.
+ *
+ * A real kernel execve replaces the address space, wiping our SIGSYS handler
+ * (the seccomp filter survives, but with no handler the next trap kills the
+ * process). So we never let execve reach the kernel: we load the new program
+ * ourselves and rewrite the trapped signal context to enter it, leaving the
+ * monitor resident. This is the piece that makes the in-process model hold
+ * together across program replacement.
+ *
+ * The address space stays, but the program it held does not. The incoming
+ * program gets a fresh stack and a kernel-chosen load base, so the two never
+ * collide, and what the outgoing one occupied is handed back in two parts:
+ *
+ *  - the images and the stack our loader mapped, whose extents we recorded.
+ *    cng_exec_generation retires them and cng_exec_reap unmaps them at the next
+ *    dispatched syscall, by which time nothing is standing on them any more;
+ *  - everything the outgoing program mapped for ITSELF — the libraries its
+ *    ld.so loaded, its allocator's reservations — which no record of ours
+ *    describes. exec_sweep asks the question the other way round and gives back
+ *    what in this address space was never the monitor's.
+ *
+ * Both halves happen only where the process is single-threaded, since another
+ * thread may still be running the old program on the old program's stack, and
+ * both fail closed: a guest with threads keeps every byte of the outgoing
+ * generation. By the time either runs the process IS single-threaded — the
+ * exec kills every other thread first, the way a real execve does (see the
+ * de_thread note below) — so the gate is what stands between the reclaim and
+ * a thread that could not be reached. See the block comments on each below.
+ */
+#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+#include "cng/execmap.h"
+#include "cng/l2s.h"
+#include "cng/loader.h"
+#include "cng/monitor.h"
+#include "cng/ownmap.h"
+#include "cng/path.h"
+#include "cng/pin.h"
+#include "cng/procfs.h"
+#include "cng/ptrace.h"
+#include "cng/rewrite.h"
+#include "cng/rt.h"
+#include "cng/shm.h"
+#include "cng/syscall.h"
+#include "cng/tab.h"
+#include "cng/uapi.h"
+#include "cng/ucontext.h"
+
+unsigned long *cng_host_auxv = 0;
+
+/* A real execve closes every FD_CLOEXEC descriptor. Our in-process emulation
+ * never issues a real execve, so we must do this ourselves — otherwise the
+ * exec-notify pipe that fork/exec launchers (git's run-command, posix_spawn)
+ * open with O_CLOEXEC never closes, and the parent blocks forever waiting for
+ * the EOF that signals "exec succeeded". Iterate /proc/self/fd and close each fd
+ * whose FD_CLOEXEC bit is set (skipping the directory fd we are scanning) —
+ * and where that directory cannot be opened, ask about every descriptor number
+ * there can be (cloexec_scan below): the pass used to return quietly then, and
+ * an exec leaked every close-on-exec descriptor of the program it replaced. */
+/* A real execve resets signal dispositions (caught -> default, ignored kept)
+ * and disables the alternate signal stack. Our in-process emulation must do the
+ * same, or the new program inherits the previous one's handlers and altstack —
+ * e.g. a C compiler exec'd from Go would inherit Go's SIGSEGV/SIGURG handlers
+ * and Go's small per-thread sigaltstack, onto which our SA_ONSTACK SIGSYS
+ * handler would then deliver. SIGSYS is left alone (our monitor owns it). */
+static void cng_reset_signals(void) {
+    /* kernel struct sigaction: handler, flags, restorer, mask (32 bytes). */
+    unsigned long cur[4], dfl[4] = {0, 0, 0, 0};
+    for (int s = 1; s <= 64; s++) {
+        if (s == CNG_SIGSYS)
+            continue;
+        if (CNG_SYS(__NR_rt_sigaction, s, 0, cur, 8, 0, 0) < 0)
+            continue;             /* SIGKILL/SIGSTOP etc.: unqueryable, skip */
+        if (cur[0] == 0 || cur[0] == 1)
+            continue;             /* already SIG_DFL, or SIG_IGN (keep ignored) */
+        CNG_SYS(__NR_rt_sigaction, s, dfl, 0, 8, 0, 0);
+    }
+    /* stack_t: ss_sp(8), ss_flags(4)@8, ss_size(8)@16 => 24 bytes. SS_DISABLE=2. */
+    unsigned long ss[3] = {0, 2, 0};
+    CNG_SYS(__NR_sigaltstack, ss, 0, 0, 0, 0, 0);
+    /* Same reset applied to the record ptsig.c keeps of what the guest asked
+     * for, and reinstatement of the dispositions that must outlive an exec:
+     * the ptrace kick handler, and our own hooks if this task is still traced
+     * (ptrace survives execve — that is what strace relies on). */
+    cng_pt_sig_exec_reset();
+}
+
+/* The pass without /proc/self/fd. Two hosts arrive here: one with no /proc to
+ * read at all (a container that mounts none, a hidepid that hides even self),
+ * and — far more often — one whose descriptor table is full, where the
+ * directory itself cannot be opened: EMFILE, from exactly the program that has
+ * the most descriptors to lose and the launcher waiting on one of them.
+ *
+ * The kernel walks its fdtable; from here the only way to ask "is this number
+ * open, and is it close-on-exec?" is F_GETFD on the number, one syscall each,
+ * a miss being EBADF. What bounds the walk is the highest number that can be
+ * open. RLIMIT_NOFILE is checked at open time against the soft limit, so a
+ * descriptor can sit above the limit in force now if the limit was lowered
+ * after it was opened — hence the larger of the two limits, and a floor under
+ * both, since the hard limit is what a process may lower but never raise.
+ * Where the hard limit is RLIM_INFINITY the ceiling is the kernel's own
+ * fs.nr_open, which defaults to 2^20 and cannot be read without /proc either.
+ * Tens of thousands of EBADFs is tens of milliseconds, once per exec, on the
+ * path that used to leak. */
+#define CLOEXEC_SCAN_FLOOR (64UL * 1024)
+#define CLOEXEC_SCAN_INF   (1UL << 20)
+static void cloexec_scan(void) {
+    unsigned long hi = CLOEXEC_SCAN_FLOOR;
+    struct cng_rlimit rl;
+    if (sys_prlimit64(0, CNG_RLIMIT_NOFILE, 0, &rl) == 0) {
+        unsigned long lim[2] = {rl.cur, rl.max};
+        for (int i = 0; i < 2; i++) {
+            unsigned long v = lim[i] == CNG_RLIM_INFINITY ? CLOEXEC_SCAN_INF
+                                                          : lim[i];
+            if (v > CLOEXEC_SCAN_INF)
+                v = CLOEXEC_SCAN_INF;
+            if (v > hi)
+                hi = v;
+        }
+    }
+    for (unsigned long fd = 0; fd < hi; fd++) {
+        long fl = CNG_SYS(__NR_fcntl, fd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+        if (fl >= 0 && (fl & 1 /*FD_CLOEXEC*/))
+            sys_close((int)fd);
+    }
+}
+
+void cng_close_cloexec(void) {
+    long dfd = sys_openat(CNG_AT_FDCWD, "/proc/self/fd",
+                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (dfd < 0) {
+        cloexec_scan();
+        return;
+    }
+    char buf[4096];
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, (int)dfd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        long o = 0;
+        while (o + 19 <= n) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > n)
+                break;
+            const char *nm = buf + o + 19; /* d_name at record offset +19 */
+            o += reclen;
+            int fd = 0, ok = (nm[0] >= '0' && nm[0] <= '9');
+            for (const char *c = nm; *c; c++) {
+                if (*c < '0' || *c > '9') {
+                    ok = 0;
+                    break;
+                }
+                fd = fd * 10 + (*c - '0');
+            }
+            if (!ok || fd == (int)dfd)
+                continue;
+            long fl = CNG_SYS(__NR_fcntl, fd, 1 /*F_GETFD*/, 0, 0, 0, 0);
+            if (fl >= 0 && (fl & 1 /*FD_CLOEXEC*/))
+                sys_close(fd);
+        }
+    }
+    sys_close((int)dfd);
+}
+
+/* Shebang nesting, as fs/exec.c bounds it: a chain of SHEB_MAX #! files runs and
+ * the next one is -ELOOP. Each level needs its interpreter (and optional
+ * argument) to stay alive until the stack is built, since both end up in the
+ * new argv.
+ *
+ * Measured, not read — at four this refused a chain the kernel executes. And it
+ * is not one number across kernels: the same ladder of scripts ending in an ELF
+ * runs six deep on the Android 13 device (5.15 GKI, seventh -ELOOP) and five
+ * deep on a 6.17 dev host (sixth -ELOOP). We advertise 6.1.0 through uname and
+ * exist to run on Android, so the device's answer is the one to match; a guest
+ * never reaches the host kernel with these anyway, which is why the divergence
+ * costs a level of nesting off-device and nothing else. */
+#define SHEB_MAX   6
+#define SHEB_WORD  256
+/* Pointer slots reserved ahead of the snapshot's argv for the shebang chain.
+ * Each level contributes its interpreter and at most one argument, and the
+ * script the guest named goes in once at the end: 2 * SHEB_MAX + 1. The
+ * rebuilt vector is written into those slots, ending where the caller's own
+ * argv[1] already sits — so the tail is not copied at all and there is no
+ * length to run out of. */
+#define SHEB_RESERVE (2 * SHEB_MAX + 1)
+
+/* argv/envp snapshot.
+ *
+ * The strings the exec'ing program hands us are copied into the NEW program's
+ * stack, and that copy happens after the new image is mapped. An ET_EXEC guest
+ * is mapped MAP_FIXED at its own link-time vaddr — so when the program calling
+ * execve is itself ET_EXEC at that same vaddr (every binary a plain `-static`
+ * toolchain produces lands at 0x400000), the load lands right on top of the
+ * .rodata/.data/heap holding those strings, and the exec'd program came up with
+ * garbage argv. The old image is legitimately dead by then, being replaced; what
+ * was wrong is reading the caller's arguments out of it afterwards.
+ *
+ * So take our own copy of path/argv/envp up front, before anything is mapped.
+ * One kernel-placed anonymous mapping: it lands in the high mmap region, which
+ * no ET_EXEC vaddr reaches, and is released once the stack is built. The total
+ * is bounded the way a real execve bounds it, with the same -E2BIG (which the
+ * emulation never answered before — the strings just ran off the guest stack). */
+struct exec_args {
+    void *mem;
+    unsigned long len;
+    const char *path;
+    char **argv;
+    char **envp;
+};
+
+/* Per-string and per-vector bounds, as fs/exec.c has them: MAX_ARG_STRLEN is
+ * 32 pages, and the entry count is capped well above anything real (the kernel's
+ * MAX_ARG_STRINGS is 0x7FFFFFFF, but the byte budget below bites long before
+ * that, and a bounded walk is what keeps a bogus vector from costing a probe
+ * per entry forever). Both answer -E2BIG, as the kernel does.
+ *
+ * 32 *pages*, which is not 32 * 4096 everywhere: the Android devices this
+ * exists for run 16 KiB pages, where the kernel's own MAX_ARG_STRLEN is 512 KiB
+ * and a hard-coded 128 KiB refused, with an -E2BIG of our own invention,
+ * strings a real execve there takes. exec_arg_max() below reads the page size
+ * for the same reason. */
+static unsigned long exec_max_strlen(void) { return 32 * cng_page_size; }
+#define EXEC_MAX_STRINGS 0x40000u
+
+/* What a real execve accepts: a quarter of RLIMIT_STACK, floored at 32 pages
+ * (fs/exec.c). Read the limit rather than inventing a number, so a command line
+ * the kernel would take is not refused here — but clamp to what the stack we
+ * actually hand the guest can hold, since ours is a fixed mapping rather than
+ * one that grows to RLIMIT_STACK. Being the kernel's own formula, it also cannot
+ * refuse anything that reached this process through a real execve: only a guest
+ * assembling an oversized argv itself can hit it, which is the case the kernel
+ * answers E2BIG for too. */
+static unsigned long exec_arg_max(void) {
+    unsigned long lim = CNG_GUEST_STACK_SIZE / 4;
+    struct cng_rlimit rl;
+    if (sys_prlimit64(0, CNG_RLIMIT_STACK, 0, &rl) == 0 &&
+        rl.cur != CNG_RLIM_INFINITY && rl.cur / 4 < lim)
+        lim = rl.cur / 4;
+    if (lim < 32 * cng_page_size)
+        lim = 32 * cng_page_size;
+    return lim;
+}
+
+/* Copy one NULL-terminated string vector in: pointers into dst_vec, strings out
+ * of *pool. Nothing here is trusted twice — src is guest memory, and another
+ * thread of the exec'ing process is free to change it between the sizing pass
+ * and this one. Two ways it used to bite:
+ *
+ *  - a strlen/memcpy straight off src[i] read guest memory the sizing pass had
+ *    validated some syscalls ago. A thread that unmapped the strings in the gap
+ *    turned execve's -EFAULT into a SIGSEGV inside the handler, where every
+ *    signal but SIGSYS is masked and the fault is fatal. So the bytes are taken
+ *    with cng_user_strcopyin, which measures and copies in one act and answers
+ *    -EFAULT for what will not come across.
+ *  - the vector itself is guest memory too, and it was walked a slot at a time
+ *    with the same exposure. It comes across in one act now, into the very slots
+ *    the strings' own pointers then replace — the entry count staying the sizing
+ *    pass's, which is also how fs/exec.c holds it (count() fixes bprm->argc and
+ *    copy_strings() copies exactly that many).
+ *
+ * Writes the slot after the terminator through *next. Returns 0, or -E2BIG /
+ * -EFAULT, which is what execve(2) answers for the same two inputs. */
+static long copy_vec(char **src, char **dst_vec, int slots, char **pool,
+                     char *end, char ***next) {
+    int i = 0;
+    if (src && slots > 1) {
+        long r = cng_user_copyin(dst_vec, src, (unsigned long)slots * sizeof *src);
+        if (r < 0)
+            return r;
+        for (; i < slots - 1 && dst_vec[i]; i++) {
+            /* Whichever bites first: the room left in the pool, or the per-string
+             * bound the sizing pass held this string to (MAX_ARG_STRLEN). */
+            unsigned long cap = (unsigned long)(end - *pool);
+            if (cap > exec_max_strlen())
+                cap = exec_max_strlen();
+            long n = cng_user_strcopyin(*pool, dst_vec[i], cap);
+            if (n < 0)
+                return n;
+            dst_vec[i] = *pool;
+            *pool += n + 1;
+        }
+    }
+    dst_vec[i] = 0; /* slots >= 1 always: the terminator has a slot of its own */
+    *next = dst_vec + i + 1;
+    return 0;
+}
+
+static void exec_args_free(struct exec_args *a) {
+    if (a->mem) {
+        cng_own_drop(a->mem, a->len);
+        sys_munmap(a->mem, a->len);
+    }
+    a->mem = 0;
+}
+
+/* Measure one vector, validating as it goes. argv/envp are guest memory the
+ * kernel never gets to check for us — walking them with a bare strlen is how a
+ * wild pointer became a fatal SIGSEGV inside the handler instead of the -EFAULT
+ * execve(2) promises.
+ *
+ * The slots are taken a window at a time rather than read where they lie: a
+ * validated vector is not a frozen one, and another thread of the exec'ing
+ * process can put a wild pointer into a slot the count pass already blessed.
+ * The strings themselves are measured out of a copy too (cng_user_strlen), and
+ * neither measurement is trusted afterwards — copy_vec re-takes both. What this
+ * pass is for is the arena size and the -E2BIG the kernel would give.
+ * Returns the total bytes of its strings, or -errno. */
+#define VEC_WIN 64
+static long vec_bytes(char **v, int *count) {
+    long n = cng_user_veclen(v, EXEC_MAX_STRINGS);
+    if (n < 0)
+        return n;
+    unsigned long bytes = 0;
+    char *win[VEC_WIN];
+    for (long i = 0; i < n;) {
+        long k = n - i < VEC_WIN ? n - i : VEC_WIN;
+        if (cng_user_copyin(win, v + i, (unsigned long)k * sizeof *win) < 0)
+            return -EFAULT;
+        for (long j = 0; j < k; j++) {
+            long len = cng_user_strlen(win[j], exec_max_strlen());
+            if (len < 0)
+                return len;
+            bytes += (unsigned long)len + 1;
+        }
+        i += k;
+    }
+    *count = (int)n;
+    return (long)bytes;
+}
+
+static long exec_args_take(struct exec_args *a, const char *path, char **argv,
+                           char **envp) {
+    int argc = 0, envc = 0;
+    long pn = cng_user_strlen(path, exec_max_strlen());
+    if (pn < 0)
+        return pn;
+    long ab = vec_bytes(argv, &argc);
+    if (ab < 0)
+        return ab;
+    long eb = vec_bytes(envp, &envc);
+    if (eb < 0)
+        return eb;
+    unsigned long bytes = (unsigned long)pn + 1 + (unsigned long)ab +
+                          (unsigned long)eb;
+    /* Two NULL-terminated pointer arrays, 8-aligned, ahead of the strings —
+     * plus the slots a shebang chain prepends into (see SHEB_RESERVE). */
+    unsigned long vecs = ((unsigned long)SHEB_RESERVE + (unsigned long)argc + 1 +
+                          (unsigned long)envc + 1) * 8;
+    unsigned long max = exec_arg_max();
+    if (bytes > max || vecs > max - bytes)
+        return -E2BIG;
+
+    a->len = cng_page_up(vecs + bytes);
+    a->mem = cng_own_map(sys_mmap(0, a->len, CNG_PROT_READ | CNG_PROT_WRITE,
+                                  CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0),
+                         a->len);
+    if (a->mem == CNG_MAP_FAILED || cng_is_err((long)a->mem)) {
+        a->mem = 0;
+        return -ENOMEM;
+    }
+
+    char *pool = (char *)a->mem + vecs;
+    char *end = (char *)a->mem + a->len;
+    a->argv = (char **)a->mem + SHEB_RESERVE;
+    char **envslot = 0, **after = 0;
+    long rc = copy_vec(argv, a->argv, argc + 1, &pool, end, &envslot);
+    a->envp = envslot;
+    if (rc == 0)
+        rc = copy_vec(envp, a->envp, envc + 1, &pool, end, &after);
+    /* The path last, into what the two vectors left. It is re-measured as it is
+     * taken, like every other string here: `pn` sized the arena, it does not
+     * decide what gets copied out of memory the guest may since have changed. */
+    if (rc == 0) {
+        long pl = cng_user_strcopyin(pool, path, (unsigned long)(end - pool));
+        rc = pl < 0 ? pl : 0;
+    }
+    if (rc < 0) { /* raced its own measurement, or ran off it: -E2BIG/-EFAULT */
+        exec_args_free(a);
+        return rc;
+    }
+    a->path = pool;
+    return 0;
+}
+
+/* ---- the exec in flight ---------------------------------------------------
+ *
+ * Everything an exec has decided before its point of no return, kept where a
+ * thread other than the one that decided it can carry it out. A real execve
+ * runs de_thread(): every other thread of the group is killed and, when the
+ * caller is not the group leader, the caller takes over the leader's identity
+ * — its tid becomes the pid — so the program that comes out of the exec is a
+ * single thread whose tid is its pid. Ours could do neither: the other
+ * threads went on running the old program while the exec'ing thread closed
+ * the CLOEXEC descriptors they were using, reset the signal dispositions they
+ * were relying on, wound the heap back from under them and entered the new
+ * image; a Go program calling syscall.Exec left runtime threads that then
+ * hit EBADF on their netpoll fd and aborted the NEW program.
+ *
+ * Both halves are done now, with the one thing a userspace process has that
+ * reaches every thread of it: SIGSYS, the signal the guest can never block,
+ * ignore or divert (rt_sigprocmask, rt_sigaction and the mask-taking waits are
+ * all mediated to keep it so). A thread-directed SIGSYS carrying our own
+ * si_code and magic is a request from one thread to another:
+ *
+ *  - CNG_DT_DIE: exit, now, wherever you are. Sent to every sibling by
+ *    cng_dethread(), which then waits for each to be gone — the kernel's
+ *    de_thread waits the same way. A thread parked in a syscall takes it when
+ *    the syscall is interrupted; one running takes it at once; one inside our
+ *    own dispatcher takes it nested (SA_NODEFER) and dies there, and every
+ *    lock the monitor has is either per-thread or taken over from a holder
+ *    that is gone. What cannot take it is a thread that has SIGSYS blocked,
+ *    which the mediation makes impossible for a guest short of editing its
+ *    own signal frame, and which qemu-user's own threads are: those are left
+ *    alone, since they are not the guest's. Sent once a second, not once a
+ *    round (see cng_dethread), and any SIGSYS a sibling takes meanwhile is
+ *    taken for it, which a request merged into a pending SIGSYS needs.
+ *  - CNG_DT_EXEC: carry out the exec I planned. Sent by a non-leader thread
+ *    to the group leader, with the plan in g_job; the requester then exits.
+ *    The leader kills the rest, maps the images, runs the commit and enters
+ *    the new program from its own signal frame — so the program that comes
+ *    out of the exec runs on the leader, tid == pid, with the requester's
+ *    signal mask, exactly as the kernel arranges it. A leader that cannot be
+ *    reached (a zombie: it called pthread_exit) or that has SIGSYS blocked
+ *    is not handed anything, and the requester carries the exec itself: the
+ *    old shape, one divergence (its tid), no hang.
+ *
+ * One exec at a time per process (g_exec_claim, the exec'ing thread's tid): a
+ * second thread reaching execve while one is in flight is one the first will
+ * kill, so it simply exits — unless it is the leader with a handoff pending,
+ * in which case it carries that exec instead of its own, which is what the
+ * kernel does with the loser's thread too (kills it; the winner's exec is the
+ * one that happens). */
+#define CNG_SI_DETHREAD (-7) /* SI_DETHREAD: the kernel's own code for this */
+#define CNG_DT_MAGIC    0x636e6744 /* "cngD" */
+#define CNG_DT_DIE      1
+#define CNG_DT_EXEC     2
+
+struct exec_job {
+    char host[CNG_PATH_MAX]; /* the image's resolved host path */
+    char sheb_interp[SHEB_MAX][SHEB_WORD], sheb_arg[SHEB_MAX][SHEB_WORD];
+    int sheb_hasarg[SHEB_MAX];
+    int depth;
+    int gfd;
+    int script_fd; /* the guest fd a #! script was run from, or -1 */
+    int dirfd, flags;
+    const char *path; /* the guest's spelling (in the snapshot) */
+    char **argv, **envp;
+    struct cng_elf_plan pplan, iplan;
+    struct cng_loaded prog, interp;
+    int have_interp;
+    struct exec_args args;  /* the snapshot: owned by whoever commits */
+    unsigned long sigmask;  /* the requester's guest mask, for the leader */
+    long requester;         /* its tid */
+    int pending;            /* a handoff the leader has not taken yet */
+};
+
+static struct exec_job g_job;
+static long g_exec_claim;
+
+/* The thread whose exec is killing its siblings, and the process it is
+ * doing it in, for as long as it is (cng_dethread); 0 otherwise. */
+static long g_dt_killer, g_dt_pid;
+
+int cng_exec_pending(void) {
+    return __atomic_load_n(&g_job.pending, __ATOMIC_ACQUIRE);
+}
+
+/* A fork child has one thread, and an exec some other thread of the parent
+ * had in flight — its claim, and a plan it had handed to the parent's leader
+ * — is not the child's to carry: the plan names the parent's program, and its
+ * argv snapshot is a mapping the child would then unmap from under nothing. */
+void cng_exec_fork_child(void) {
+    if (__atomic_exchange_n(&g_job.pending, 0, __ATOMIC_RELAXED))
+        exec_args_free(&g_job.args); /* the child's own copy of the snapshot */
+    __atomic_store_n(&g_exec_claim, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_dt_killer, 0, __ATOMIC_RELAXED);
+}
+
+/* Send a de_thread request to `tid`: 0, or -errno (-ESRCH: no such thread). */
+static long dethread_send(long tid, int what) {
+    struct {
+        int signo, errno_, code;
+        int pad;
+        int pid;
+        unsigned uid;
+        int sival_int;
+        int pad2;
+        unsigned long rest[12];
+    } si;
+    memset(&si, 0, sizeof si);
+    si.signo = CNG_SIGSYS;
+    si.code = CNG_SI_DETHREAD;
+    si.pid = (int)sys_getpid();
+    si.uid = (unsigned)sys_getuid();
+    si.sival_int = CNG_DT_MAGIC + what;
+    return CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), tid, CNG_SIGSYS, &si, 0,
+                   0);
+}
+
+/* Sequentially consistent, against cng_sig_note_mask's store: a thread that
+ * blocks every signal after this exec has read its mask sees the exec, and
+ * one this exec saw with a whole mask is left alone (dt_round). */
+int cng_dethread_doomed(void) {
+    long k = __atomic_load_n(&g_dt_killer, __ATOMIC_SEQ_CST);
+    return k && k != sys_gettid() &&
+           __atomic_load_n(&g_dt_pid, __ATOMIC_RELAXED) == sys_getpid();
+}
+
+/* Exit as the kernel's de_thread kills: a SIGKILL, which a tracer of this
+ * thread is shown, and the per-task ptrace state goes back with the task. */
+void cng_dethread_die(void) {
+    cng_pt_exit_report(9 /*SIGKILL*/);
+    for (;;)
+        sys_exit(0);
+}
+
+int cng_dethread_request(const cng_siginfo_t *si) {
+    if (si->si_code != CNG_SI_DETHREAD || (int)si->_u._pad[0] != sys_getpid())
+        return 0;
+    int v = (int)si->_u._pad[1] - CNG_DT_MAGIC;
+    return v == CNG_DT_DIE || v == CNG_DT_EXEC ? v : 0;
+}
+
+/* The fields of a status file (/proc/<pid>/status, /proc/<pid>/task/<tid>/
+ * status) wanted below, each as the remainder of its line after the field
+ * name, NUL-terminated in `out[i]`: a bitmask of the ones found. The file is
+ * read through in pieces rather than into one buffer, since a process with
+ * many supplementary groups has a Groups: line that runs to hundreds of
+ * kilobytes, and every field wanted here comes after it. A line that could
+ * not be one of these — longer than a key without beginning with it — is
+ * skipped however far it runs. */
+#define STATUS_LINE 80
+
+static unsigned status_scan(const char *path, const char *const *keys, int nkeys,
+                            char (*out)[STATUS_LINE]) {
+    char buf[1024];
+    long fd = sys_openat(CNG_AT_FDCWD, path, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    unsigned found = 0, all = (1u << nkeys) - 1, have = 0;
+    int skip = 0; /* inside a line that is none of them: drop it to its end */
+    while (found != all) {
+        long n = sys_read((int)fd, buf + have, sizeof buf - have);
+        if (n <= 0)
+            break;
+        have += (unsigned)n;
+        unsigned s = 0;
+        while (s < have) {
+            unsigned len = 0;
+            while (s + len < have && buf[s + len] != '\n')
+                len++;
+            int whole = s + len < have;
+            if (skip) {
+                s += whole ? len + 1 : len;
+                skip = !whole;
+                continue;
+            }
+            int k = -1;
+            unsigned kl = 0;
+            for (int i = 0; i < nkeys; i++) {
+                kl = (unsigned)strlen(keys[i]);
+                if (len >= kl && !strncmp(buf + s, keys[i], kl)) {
+                    k = i;
+                    break;
+                }
+            }
+            if (k < 0) {
+                /* Not one of them, or too short to say yet: a whole line is
+                 * done with; a partial one is kept for the next piece
+                 * unless it already runs past every key. */
+                unsigned longest = 0;
+                for (int i = 0; i < nkeys; i++)
+                    if (strlen(keys[i]) > longest)
+                        longest = (unsigned)strlen(keys[i]);
+                if (whole) {
+                    s += len + 1;
+                    continue;
+                }
+                if (len >= longest) {
+                    s = have;
+                    skip = 1;
+                }
+                break;
+            }
+            if (!whole)
+                break; /* the wanted line, cut short: read on */
+            unsigned l = len - kl;
+            if (l >= STATUS_LINE)
+                l = STATUS_LINE - 1;
+            memcpy(out[k], buf + s + kl, l);
+            out[k][l] = '\0';
+            found |= 1u << k;
+            s += len + 1;
+        }
+        memmove(buf, buf + s, have - s);
+        have -= s;
+        if (have == sizeof buf) {
+            have = 0; /* a candidate line longer than the buffer: none of ours */
+            skip = 1;
+        }
+    }
+    sys_close((int)fd);
+    return found;
+}
+
+/* The number in a status field, or -1. */
+static long status_num(const char *v) {
+    while (*v == ' ' || *v == '\t')
+        v++;
+    if (*v < '0' || *v > '9')
+        return -1;
+    long n = 0;
+    for (; *v >= '0' && *v <= '9'; v++)
+        n = n * 10 + (*v - '0');
+    return n;
+}
+
+/* A task of this process, as its status file has it: TASK_LIVE for one that
+ * can be sent a SIGSYS, TASK_NONE for one that is not there (any more),
+ * TASK_ZOMBIE for one that is a zombie (for good: a leader whose main()
+ * returned into pthread_exit, or a thread a tracer has yet to reap),
+ * TASK_BLOCKED for one that has SIGSYS blocked — which no guest thread has
+ * except for the few microseconds a writer of ours holds every signal off,
+ * and which qemu-user's own threads always do. */
+#define TASK_LIVE    0
+#define TASK_NONE    1
+#define TASK_ZOMBIE  2
+#define TASK_BLOCKED 3
+
+static int task_state(long tid) {
+    static const char *const keys[] = {"State:", "SigBlk:"};
+    char path[64], v[2][STATUS_LINE];
+    cng_snprintf(path, sizeof path, "/proc/self/task/%ld/status", tid);
+    unsigned got = status_scan(path, keys, 2, v);
+    if (!(got & 1))
+        return TASK_NONE;
+    const char *st = v[0];
+    while (*st == ' ' || *st == '\t')
+        st++;
+    if (*st == 'Z')
+        return TASK_ZOMBIE;
+    if (got & 2) {
+        const char *sb = v[1];
+        while (*sb == ' ' || *sb == '\t')
+            sb++;
+        unsigned long m = 0;
+        for (; *sb; sb++) {
+            int d = (*sb >= '0' && *sb <= '9')   ? *sb - '0'
+                    : (*sb >= 'a' && *sb <= 'f') ? *sb - 'a' + 10
+                    : (*sb >= 'A' && *sb <= 'F') ? *sb - 'A' + 10
+                                                 : -1;
+            if (d < 0)
+                break;
+            m = (m << 4) | (unsigned)d;
+        }
+        if (m & (1UL << (CNG_SIGSYS - 1)))
+            return TASK_BLOCKED;
+    }
+    return TASK_LIVE;
+}
+
+/* Is `tid` asleep in a syscall it can be woken from (State: S)? A thread on
+ * its way out is running, waiting to run, or in the uninterruptible wait of
+ * its unmap. */
+static int task_asleep(long tid) {
+    static const char *const keys[] = {"State:"};
+    char path[64], v[1][STATUS_LINE];
+    cng_snprintf(path, sizeof path, "/proc/self/task/%ld/status", tid);
+    if (!(status_scan(path, keys, 1, v) & 1))
+        return 0;
+    const char *st = v[0];
+    while (*st == ' ' || *st == '\t')
+        st++;
+    return *st == 'S';
+}
+
+/* The process's thread count as the kernel has it (Threads: in its status
+ * file): every task of the group not yet released, listed or not. -1 when it
+ * cannot be read. */
+static long nr_threads(void) {
+    static const char *const keys[] = {"Threads:"};
+    char v[1][STATUS_LINE];
+    if (!(status_scan("/proc/self/status", keys, 1, v) & 1))
+        return -1;
+    return status_num(v[0]);
+}
+
+/* Is `tid` a task the de_thread request cannot reach: a zombie, or one that
+ * keeps SIGSYS blocked? Sampled a few times a millisecond apart before the
+ * answer is yes, since a writer of ours holds every signal off for a few
+ * microseconds and must not be mistaken for one. A task that is not there
+ * is not unreachable, merely gone. */
+static int task_unreachable(long tid) {
+    for (int i = 0; i < 10; i++) {
+        int st = task_state(tid);
+        if (st == TASK_LIVE || st == TASK_NONE)
+            return 0;
+        if (st == TASK_ZOMBIE)
+            return 1;
+        struct cng_timespec nap = {0, 1000 * 1000}; /* 1 ms */
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+    }
+    return 1;
+}
+
+/* Kill every other thread of the process and wait for each to be gone: the
+ * kernel's de_thread.
+ *
+ * The siblings are the kernel's list, /proc/self/task, read afresh every
+ * round, and each listed one is told once and then only looked for, so that
+ * neither the count of them nor a thread that arrives late is a problem: a
+ * table of them used to hold 4096, and the exec went ahead beside the rest
+ * without a word; and a sibling can clone a thread between being listed and
+ * taking the request.
+ *
+ * Once, because a request the kernel has delivered is no longer pending, and
+ * one sent then is not merged with it the way a pending one is (SIGSYS is no
+ * realtime signal): it is delivered too, on top. A thread that the scheduler
+ * leaves sitting at the handler's first instruction — one of a few dozen on
+ * four slow cores — took a request every round, a frame of 4.6 KiB each on
+ * the alternate stack the handler runs on, and bionic's is 16 KiB: the
+ * fourth found no room, and the kernel killed the whole process with a
+ * SIGSEGV (Android 8's M6 chain shape, one run in fifteen). A request is
+ * still lost where one SIGSYS is pending already (a seccomp trap's, between
+ * the trap and its delivery) — and that one is then taken for the request
+ * (cng_dethread_doomed). What is left is a thread that took over the tid of
+ * one that died, which has been told nothing: so the told are forgotten once
+ * a second and every thread still listed is told again, a frame a second
+ * for one that is starved meanwhile.
+ *
+ * One with the request pending cannot clone (the kernel restarts its clone
+ * into the handler, which never comes back; under qemu-user the one clone in
+ * flight completes, and no other), so each round's newcomers were cloned by
+ * an earlier round's threads before their own request landed, and the rounds
+ * end. A listing that takes more than one read can skip a thread while
+ * others exit under it, so the kernel's count of them (Threads: in the
+ * status file, which covers every
+ * task a listing could show) has the last word: as long as it exceeds this
+ * thread plus what was given up on, something remains and the next round
+ * lists it.
+ *
+ * What cannot take the request is not waited for forever: a zombie (see
+ * task_state), or a thread that keeps SIGSYS blocked — qemu-user's own
+ * threads, or a signal frame the guest edited — is given up on after a
+ * second, and the exec then proceeds beside it, which is what every exec did
+ * before. Those are kept apart (g_dt_left) so as not to be told again or
+ * counted, and are looked at again once a second: a zombie a tracer reaps
+ * has its tid free to be reused by a thread that is the guest's. A thread
+ * that is reachable and merely slow — parked in an uninterruptible wait, say
+ * — is waited for as long as it takes, as the kernel would. */
+static struct cng_tab g_dt_left = CNG_TAB_INIT(long);
+static unsigned long g_dt_nleft;
+
+/* Who has been told since the last mark: a bit per tid, over every tid a
+ * 64-bit kernel can hand out (PID_MAX_LIMIT), which is 512 KiB of address
+ * space and only the pages holding this process's tids ever touched. Mapped
+ * for the de_thread, and mapped afresh at each mark to forget. Without it
+ * (no memory) every listed thread is told every round, as it used to be. */
+#define DT_TID_LIMIT (1UL << 22)
+static unsigned long *g_dt_told;
+
+static void dt_told_map(void) {
+    void *p = sys_mmap(0, DT_TID_LIMIT / 8, CNG_PROT_READ | CNG_PROT_WRITE,
+                       CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
+    g_dt_told = cng_is_err((long)p) ? 0 : cng_own_map(p, DT_TID_LIMIT / 8);
+}
+
+static void dt_told_unmap(void) {
+    if (g_dt_told) {
+        cng_own_drop(g_dt_told, DT_TID_LIMIT / 8);
+        sys_munmap(g_dt_told, DT_TID_LIMIT / 8);
+    }
+    g_dt_told = 0;
+}
+
+/* Has `tid` been told since the last mark? Records that it is, from now. */
+static int dt_told(long tid) {
+    if (!g_dt_told || tid <= 0 || (unsigned long)tid >= DT_TID_LIMIT)
+        return 0;
+    unsigned long bit = 1UL << (tid % 64), *w = &g_dt_told[tid / 64];
+    int was = (*w & bit) != 0;
+    *w |= bit;
+    return was;
+}
+
+static int dt_left(long tid) {
+    for (unsigned long i = 0; i < g_dt_nleft; i++)
+        if (*(long *)cng_tab_peek(&g_dt_left, i) == tid)
+            return 1;
+    return 0;
+}
+
+static void dt_leave(long tid) {
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] exec: de_thread: tid %ld cannot be reached; "
+                       "going on without it\n",
+                    tid);
+    long *slot = cng_tab_at(&g_dt_left, g_dt_nleft);
+    if (slot) {
+        *slot = tid;
+        g_dt_nleft++;
+    }
+    /* No page for the record: the thread is told and counted again next
+     * round, and given up on again at the next mark. */
+}
+
+/* Once a second: the given-up set, less those gone or reachable after all;
+ * returns how many of them the kernel still counts. */
+static long dt_left_revisit(long pid) {
+    long present = 0;
+    for (unsigned long i = 0; i < g_dt_nleft;) {
+        long *slot = cng_tab_peek(&g_dt_left, i);
+        int st = task_state(*slot);
+        if (st == TASK_NONE || st == TASK_LIVE ||
+            CNG_SYS(__NR_tgkill, pid, *slot, 0, 0, 0, 0) == -ESRCH) {
+            *slot = *(long *)cng_tab_peek(&g_dt_left, --g_dt_nleft);
+            continue;
+        }
+        present++;
+        i++;
+    }
+    return present;
+}
+
+/* One round: every task the kernel lists but the caller and the given-up is
+ * told to die, and counted if still there. At a mark (once a second, the
+ * first round included) each is first asked whether it can take the request
+ * at all, and given up on if not — except at the first mark, where one with
+ * every signal held off is told anyway and waited for: the request waits in
+ * its pending set for the mask to come back. Returns the count still there,
+ * or -1 when the list cannot be read (no /proc: nothing here can be done,
+ * and the exec goes ahead as it always did). */
+static char g_dt_dents[16384];
+
+static long dt_round(long pid, long me, int mark, int first, int grace,
+                     int patient, long *told) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    long live = 0;
+    for (;;) {
+        long r = CNG_SYS(__NR_getdents64, fd, g_dt_dents, sizeof g_dt_dents, 0,
+                         0, 0);
+        if (r <= 0)
+            break;
+        for (long o = 0; o + 19 <= r;) {
+            unsigned short reclen;
+            memcpy(&reclen, g_dt_dents + o + 16, 2);
+            if (reclen == 0 || o + reclen > r)
+                break;
+            const char *nm = g_dt_dents + o + 19;
+            o += reclen;
+            long tid = 0;
+            if (*nm < '1' || *nm > '9')
+                continue;
+            for (; *nm >= '0' && *nm <= '9'; nm++)
+                tid = tid * 10 + (*nm - '0');
+            if (tid == me || dt_left(tid))
+                continue;
+            if (mark) {
+                int st = task_state(tid);
+                if (st == TASK_NONE)
+                    continue;
+                if (st == TASK_ZOMBIE ||
+                    (st == TASK_BLOCKED && !first && task_unreachable(tid))) {
+                    dt_leave(tid);
+                    continue;
+                }
+            }
+            /* A thread that has asked for every signal to be blocked is, more
+             * often than not, on its way out: bionic and musl block everything,
+             * unmap their own stack and exit, and a request that lands between
+             * the unmap and the exit has no stack to put its frame on — the
+             * kernel kills the whole process for it. Held back while the
+             * grace lasts, and still waited for: it counts as there until it
+             * is gone, as the kernel's de_thread waits for one that is
+             * exiting. Past the grace, still for as long as it is running or
+             * waiting to run, up to a second: leaving takes microseconds,
+             * unless the scheduler leaves the thread between the unmap and
+             * the exit, which on a loaded device it did for longer than the
+             * grace. One asleep in a syscall is not leaving (a daemon's
+             * sigwait thread) and is told like any other past the grace, as
+             * is anything past the second, so a thread that sits with
+             * everything blocked for good is not left. One that blocks
+             * everything once this exec has begun never gets here: it sees
+             * the exec and exits there (cng_sig_note_mask). */
+            if (cng_sig_all_blocked(tid) &&
+                (grace || (patient && !task_asleep(tid)))) {
+                live++;
+                continue;
+            }
+            /* Told already (see cng_dethread): only whether it is there. */
+            if (dt_told(tid)) {
+                if (CNG_SYS(__NR_tgkill, pid, tid, 0, 0, 0, 0) != -ESRCH)
+                    live++;
+                continue;
+            }
+            if (dethread_send(tid, CNG_DT_DIE) == -ESRCH)
+                continue;
+            live++;
+            (*told)++;
+        }
+    }
+    sys_close((int)fd);
+    return live;
+}
+
+/* How many rounds (each a poll of 100 us and the listing it makes) a thread
+ * that has blocked every signal is left alone for: a thread leaving takes
+ * microseconds, so this is generous, and an exec that does have such a thread to
+ * kill waits that much longer for it and no more. */
+#define DT_GRACE_SPINS 100
+/* ...and while it is not asleep, how many more: a second's worth. */
+#define DT_PATIENCE_SPINS 10000
+
+static void cng_dethread(void) {
+    long pid = sys_getpid(), me = sys_gettid(), told = 0;
+    g_dt_nleft = 0;
+    __atomic_store_n(&g_dt_pid, pid, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_dt_killer, me, __ATOMIC_SEQ_CST);
+    dt_told_map();
+    for (unsigned spin = 0;; spin++) {
+        int mark = spin % 10000 == 0; /* once a second */
+        if (mark && spin) {
+            dt_left_revisit(pid);
+            dt_told_unmap(); /* forget who was told */
+            dt_told_map();
+        }
+        long live = dt_round(pid, me, mark, !spin, spin < DT_GRACE_SPINS,
+                             spin < DT_PATIENCE_SPINS, &told);
+        if (live < 0)
+            break;
+        if (!spin && cng_g_debug && live)
+            cng_dprintf(2, "[cng] exec: de_thread: %ld sibling thread(s)\n",
+                        live);
+        if (!live) {
+            /* Nothing listed remains. Nothing unlisted either? The kernel's
+             * count covers the given-up still there, so they are probed
+             * for; what is over is a thread the listing skipped. */
+            long n = nr_threads();
+            if (n < 0 || n <= 1 + dt_left_revisit(pid))
+                break;
+        }
+        struct cng_timespec nap = {0, 100 * 1000}; /* 100 us */
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+    }
+    dt_told_unmap();
+    __atomic_store_n(&g_dt_killer, 0, __ATOMIC_RELEASE);
+    if (cng_g_debug && told)
+        cng_dprintf(2, "[cng] exec: de_thread: done, %ld request(s) sent\n",
+                    told);
+}
+
+/* Is the group leader a thread that could carry an exec: alive, not a zombie
+ * (main() returned into pthread_exit), able to take a SIGSYS right now? */
+static int leader_reachable(void) {
+    return task_state(sys_getpid()) == TASK_LIVE;
+}
+
+/* Emulation body: resolve the target (shebang-aware), plan the program and its
+ * ELF interpreter, map them, build the stack, and pass the commit point (close
+ * FD_CLOEXEC fds, reset signal dispositions, retarget /proc/self/exe). Returns
+ * -errno on failure — every one of which is raised before the first mapping, so
+ * the caller is still there to receive it — or 0 with *out_sp and *out_entry set
+ * for the caller to transfer control into the new program. Past that first
+ * mapping the caller no longer exists and a failure is fatal (exec_fatal).
+ *
+ * path/argv/envp are the snapshot taken by execve_core, not the guest's own
+ * pointers: everything from cng_load_elf onwards would otherwise be reading
+ * memory the load just replaced. */
+unsigned long cng_g_brk0 = 0;
+
+/* POSIX timers the guest created. There is no syscall that enumerates a
+ * process's timers, so they are deleted at the next exec from two records:
+ *
+ *  - /proc/self/timers, the kernel's own list, read at the exec. Complete on
+ *    every real kernel, whatever was or was not seen being created;
+ *  - the ids the guest was handed, recorded as they are handed out (dispatch
+ *    traps timer_create and timer_delete for exactly this). Under qemu-user
+ *    the id a guest holds is the emulator's own (a magic word over an index),
+ *    not the number in that file, so the file's ids cannot be deleted there
+ *    and this record is what does it.
+ *
+ * The record was a 64-entry array with a plain count, so the 65th timer
+ * outlived the exec and two threads creating timers at once could lose one
+ * another's entry. It is now a table that grows (cng_tab) whose slots are
+ * claimed lock-free: `live` is the claim and the publication, `id` is written
+ * between the two. A forget takes any one live slot carrying the id — two
+ * slots can carry the same id when the kernel reuses one straight after a
+ * delete, and a forget racing the new create may then remove either; one
+ * record with that id remains, and the exec deletes what it names, which is
+ * the timer that is live. */
+struct timer_rec {
+    int id;
+    int live;
+};
+
+static struct cng_tab g_timers = CNG_TAB_INIT(struct timer_rec);
+
+void cng_timer_note(int id) {
+    for (unsigned long i = 0;; i++) {
+        struct timer_rec *r = cng_tab_at(&g_timers, i);
+        if (!r)
+            return; /* no page for the record: /proc/self/timers still has it */
+        int expect = 0;
+        if (__atomic_load_n(&r->live, __ATOMIC_RELAXED) ||
+            !__atomic_compare_exchange_n(&r->live, &expect, 1, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        r->id = id;
+        __atomic_store_n(&r->live, 2, __ATOMIC_RELEASE); /* id is in place */
+        return;
+    }
+}
+
+void cng_timer_forget(int id) {
+    struct cng_tab_iter it;
+    for (struct timer_rec *r = cng_tab_first(&g_timers, &it); r;
+         r = cng_tab_next(&g_timers, &it)) {
+        int two = 2;
+        if (__atomic_load_n(&r->live, __ATOMIC_ACQUIRE) != 2 || r->id != id)
+            continue;
+        if (__atomic_compare_exchange_n(&r->live, &two, 0, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED))
+            return;
+    }
+}
+
+/* Delete every timer the kernel lists for this process, then every one the
+ * record still holds. Each line of /proc/self/timers that names one reads
+ * "ID: <n>"; nothing else in the file is needed. */
+static void cng_timers_exec_reset(void) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/timers",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd >= 0) {
+        char buf[1024];
+        long n, keep = 0;
+        while ((n = sys_read((int)fd, buf + keep, sizeof buf - 1 - (size_t)keep)) >
+               0) {
+            n += keep;
+            buf[n] = '\0';
+            char *p = buf, *nl;
+            while ((nl = strchr(p, '\n'))) {
+                *nl = '\0';
+                if (!strncmp(p, "ID: ", 4)) {
+                    long id = 0;
+                    for (const char *d = p + 4; *d >= '0' && *d <= '9'; d++)
+                        id = id * 10 + (*d - '0');
+                    CNG_SYS(__NR_timer_delete, id, 0, 0, 0, 0, 0);
+                }
+                p = nl + 1;
+            }
+            keep = (long)strlen(p);
+            if (keep >= (long)sizeof buf - 1)
+                keep = 0; /* a line longer than the buffer: not one of ours */
+            else
+                memmove(buf, p, (size_t)keep);
+        }
+        sys_close((int)fd);
+    }
+    struct cng_tab_iter it;
+    for (struct timer_rec *r = cng_tab_first(&g_timers, &it); r;
+         r = cng_tab_next(&g_timers, &it)) {
+        if (__atomic_load_n(&r->live, __ATOMIC_ACQUIRE) != 2)
+            continue;
+        CNG_SYS(__NR_timer_delete, r->id, 0, 0, 0, 0, 0);
+        __atomic_store_n(&r->live, 0, __ATOMIC_RELEASE);
+    }
+}
+
+/* rseq registrations, for the same reason. A real execve drops the thread's
+ * rseq area with the address space (rseq_execve); ours kept it, so the kernel
+ * went on writing cpu ids into the old program's TCB — on every return to user
+ * mode after a preemption, through the notify-resume path — long after the
+ * heap it sat in had been wound back. A program that reached its next syscall
+ * quickly survived by accident: the new image's own TCB grew back over the
+ * same addresses. One that parked in between, a ptrace tracee at its exec
+ * stop, was killed by the kernel's forced SIGSEGV (SI_KERNEL, no address),
+ * which no handler can catch and no tracer sees. Measured on a 6.8 kernel
+ * with a glibc static-pie guest; qemu-user never registers (rseq is ENOSYS
+ * there), which is how it stayed hidden.
+ *
+ * Unregistering needs the exact area, length and signature registered, which
+ * nothing reports, so they are caught as they go by (dispatch traps rseq for
+ * this) and given back before the exec takes the address space apart. Per
+ * thread, keyed by tid, lock-free the way the scratch table is. A fork child
+ * inherits the forking thread's registration and nothing else (rseq_fork), so
+ * the child re-keys that one entry to its own tid and drops the rest — the
+ * same sampling the no_new_privs bit gets, since in the child gettid answers
+ * a tid this table has never seen. There is no thread-exit hook, so an exited
+ * thread's entry stays until its tid is reclaimed; at the exec, which is
+ * single-threaded, every entry is simply tried — the kernel checks all three
+ * values against the caller's own registration, so only that one succeeds
+ * and a stale entry answers EINVAL. A full table means a registration outlives
+ * the exec, as every one did before. */
+#define CNG_RSEQ_MAX 256
+#define CNG_RSEQ_FLAG_UNREGISTER 1
+static struct {
+    long tid;
+    unsigned long area, len;
+    unsigned int sig;
+} g_rseq[CNG_RSEQ_MAX];
+
+static int rseq_slot(long tid) {
+    for (int i = 0; i < CNG_RSEQ_MAX; i++)
+        if (__atomic_load_n(&g_rseq[i].tid, __ATOMIC_ACQUIRE) == tid)
+            return i;
+    return -1;
+}
+
+/* Claim a slot for `tid`: a free one, else one whose thread has exited (the
+ * tid probe is tgkill(0), ESRCH for a tid this thread group no longer has). */
+static int rseq_claim(long tid) {
+    long pid = sys_getpid();
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < CNG_RSEQ_MAX; i++) {
+            long cur = __atomic_load_n(&g_rseq[i].tid, __ATOMIC_ACQUIRE);
+            if (cur == 0 ||
+                (pass && cur != tid &&
+                 CNG_SYS(__NR_tgkill, pid, cur, 0, 0, 0, 0) == -ESRCH)) {
+                if (__atomic_compare_exchange_n(&g_rseq[i].tid, &cur, tid, 0,
+                                                __ATOMIC_ACQ_REL,
+                                                __ATOMIC_RELAXED))
+                    return i;
+            }
+        }
+    return -1;
+}
+
+void cng_rseq_note(unsigned long area, unsigned long len, unsigned int sig) {
+    long tid = sys_gettid();
+    int i = rseq_slot(tid);
+    if (i < 0)
+        i = rseq_claim(tid);
+    if (i < 0)
+        return;
+    g_rseq[i].area = area;
+    g_rseq[i].len = len;
+    g_rseq[i].sig = sig;
+}
+
+void cng_rseq_forget(void) {
+    int i = rseq_slot(sys_gettid());
+    if (i >= 0)
+        __atomic_store_n(&g_rseq[i].tid, 0, __ATOMIC_RELEASE);
+}
+
+int cng_rseq_fork_prepare(void) {
+    return rseq_slot(sys_gettid());
+}
+
+void cng_rseq_fork_child(int keep) {
+    long tid = sys_gettid();
+    for (int i = 0; i < CNG_RSEQ_MAX; i++)
+        __atomic_store_n(&g_rseq[i].tid, i == keep ? tid : 0, __ATOMIC_RELAXED);
+}
+
+static void cng_rseq_exec_reset(void) {
+    for (int i = 0; i < CNG_RSEQ_MAX; i++) {
+        if (!g_rseq[i].tid)
+            continue;
+        CNG_SYS(__NR_rseq, g_rseq[i].area, g_rseq[i].len,
+                CNG_RSEQ_FLAG_UNREGISTER, g_rseq[i].sig, 0, 0);
+        g_rseq[i].tid = 0;
+    }
+}
+
+/* ---- the address space of the program being replaced --------------------
+ *
+ * A real execve throws the whole mm away. Ours cannot: the monitor's code, its
+ * gate and its state are pages of the same address space, so the previous
+ * program's mappings were simply left behind and an exec chain accumulated all
+ * of them. Measured, a static guest exec'ing itself eight times: 66.8 MB of
+ * address space per generation — 64 MiB of it the stack, the rest the image.
+ *
+ * What can be given back is exactly what the loader mapped for the program
+ * being replaced: its image, its interpreter's, and the stack built for it.
+ * Each is one reservation with a recorded extent (cng_loaded.map_lo/map_len,
+ * cng_g_stack_lo/len), so nothing has to be inferred from /proc/self/maps and
+ * no mapping of ours can be caught up in it by accident.
+ *
+ * What the program mapped for ITSELF — the libraries its ld.so loaded, its
+ * arenas, its allocator's reservations — has no such extent, and following it
+ * would mean a VMA table of our own maintained on every mmap/munmap/mremap,
+ * which is the per-syscall cost the -R tier exists to avoid. That memory is
+ * given back by exec_sweep() below, which asks the question the other way
+ * round and needs no table at all. (The brk heap, the one such region with a
+ * handle on it, is wound back in cng_exec_reset instead.)
+ *
+ * Two conditions, both of them load-bearing:
+ *
+ *  - The process must be single-threaded. A real execve kills the other threads
+ *    (de_thread), and so does ours now (cng_dethread), before anything is
+ *    mapped; what this checks is that it succeeded — a thread it could not
+ *    reach goes on running the old program's code on the old program's stack,
+ *    and unmapping either would fault it where it merely keeps running. fork()
+ *    clones one thread, so the ordinary fork+exec — which is how nearly every
+ *    exec happens — arrives here alone either way.
+ *
+ *  - The old stack cannot be handed back at the exec itself. The SIGSYS tier
+ *    returns into the new program through rt_sigreturn, and the frame that
+ *    reads is on the stack the guest was interrupted on — that same stack,
+ *    whenever the guest has no sigaltstack. So a generation is *retired* rather
+ *    than freed, and given back at the next dispatched syscall, which is the new
+ *    program's first and is long past that sigreturn.
+ *
+ * The reap also refuses to unmap anything overlapping the live generation. An
+ * ET_EXEC guest is MAP_FIXED at its link-time vaddr, so a program that execs
+ * another one built the same way has the new image standing exactly where the
+ * old one did — and there the old range is not memory to give back, it is the
+ * new program. */
+#define EXEC_GEN_MAX 3 /* program, interpreter, stack */
+
+struct exec_range {
+    unsigned long lo, len;
+};
+
+static struct exec_range g_gen_live[EXEC_GEN_MAX];
+static struct exec_range g_gen_dead[EXEC_GEN_MAX];
+static int g_gen_have_dead;
+
+static int range_overlap(const struct exec_range *a, const struct exec_range *b) {
+    return a->len && b->len && a->lo < b->lo + b->len && b->lo < a->lo + a->len;
+}
+
+/* Is this the only thread of the process? /proc/self/task is the kernel's own
+ * answer rather than a count of ours, and it is two syscalls. A directory we
+ * cannot read answers "no", which costs the reclaim and not correctness. */
+static int exec_single_threaded(void) {
+    /* CNG_EXEC_RECLAIM_FORCE=1: take the answer as yes. It is meant for
+     * qemu-user, which runs a thread of its own (call_rcu) beside the guest's
+     * one and so never reads as single-threaded from inside — the emulator's
+     * thread touches no guest mapping, but nothing here can tell it from a
+     * guest's. Everything the reclaim then does is exercised as it is on a
+     * device. Same testing convention as CNG_SCRATCH_NONE and CNG_PROCREG_NONE;
+     * setting it against a genuinely multithreaded guest unmaps memory those
+     * threads are running on. */
+    if (cng_broker_env("CNG_EXEC_RECLAIM_FORCE"))
+        return 1;
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
+                         CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    int tids = 0;
+    char buf[1024];
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, fd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        for (long o = 0; o + 19 <= n;) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > n) {
+                tids = 2; /* a record we cannot walk: do not claim to know */
+                break;
+            }
+            if (buf[o + 19] >= '1' && buf[o + 19] <= '9') /* skip . and .. */
+                tids++;
+            o += reclen;
+        }
+        if (tids > 1)
+            break;
+    }
+    sys_close((int)fd);
+    return tids == 1;
+}
+
+void cng_exec_reap(void) {
+    if (!g_gen_have_dead)
+        return;
+    g_gen_have_dead = 0;
+    unsigned long sp = (unsigned long)&sp;
+    for (int i = 0; i < EXEC_GEN_MAX; i++) {
+        struct exec_range d = g_gen_dead[i];
+        g_gen_dead[i].lo = g_gen_dead[i].len = 0;
+        if (!d.len)
+            continue;
+        if (sp >= d.lo && sp < d.lo + d.len)
+            continue; /* we are standing on it; leave it to the kernel */
+        int clash = 0;
+        for (int j = 0; j < EXEC_GEN_MAX; j++)
+            if (range_overlap(&d, &g_gen_live[j]))
+                clash = 1;
+        if (!clash)
+            sys_munmap((void *)d.lo, d.len);
+    }
+}
+
+/* ---- everything the outgoing program mapped for itself -------------------
+ *
+ * The reap above gives back what our loader mapped, which is one reservation
+ * per image plus the stack, each with a recorded extent. It is not what a real
+ * execve does: that throws the whole mm away, and a program's own mappings —
+ * the libraries its ld.so loaded, its arenas, its allocator's reservations —
+ * go with it. Ours kept them, and an exec chain accumulated every generation's.
+ *
+ * The cost is not academic. Measured on an Android 13 device, a static bionic
+ * guest exec'ing itself: 8,667,232 kB per generation, almost all of it one
+ * `mmap(NULL, 8858370048, PROT_NONE, MAP_NORESERVE)` that scudo makes at libc
+ * init and that the next generation makes again. Sixty-four execs exhausted the
+ * address space outright — "Scudo ERROR: internal map failure (error desc=Out
+ * of memory) requesting 8650752KB", SIGABRT. A musl guest, which reserves
+ * nothing like it, cost 20 kB a generation and hid the whole thing.
+ *
+ * So the question is answered the other way round: not "what did our loader
+ * map", which cannot see a guest's own mmap, but "what in this address space
+ * was never the guest's". ownmap.c holds that — the floor taken before the
+ * first guest instruction ran, plus every long-lived region the monitor has
+ * mapped since — and sigsys.c holds the scratch stacks. What is left over is
+ * the outgoing program's, and this is where it goes back.
+ *
+ * Three things keep it honest:
+ *
+ *  - it runs inside the single-threaded gate below, for the same reason the
+ *    retirement does: another thread is still executing the old program on the
+ *    old program's stack, and this would unmap it out from under them;
+ *  - it runs here, after the new image and stack are mapped and before the new
+ *    program has executed a single instruction, so there is nothing of the
+ *    incoming generation to mistake for the outgoing one. Deferring it the way
+ *    the reap is deferred would not have that property: by the new program's
+ *    first dispatched syscall its ld.so has already mapped libraries, and on
+ *    the seccomp tier an anonymous mmap does not trap, so we would not have
+ *    seen them appear;
+ *  - it is fail-closed. cng_own_ready() is false until the floor is taken and
+ *    false forever after a record is lost, and a maps read that fails means
+ *    nothing is known rather than nothing is there. In all three cases the
+ *    address space is left exactly as it was, which is what every build before
+ *    this one did.
+ *
+ * The victims are collected first and unmapped after, rather than unmapped as
+ * the walk finds them: /proc/self/maps is a seq_file over the live VMA tree,
+ * and editing that tree mid-iteration is not something to ask of it. A walk
+ * that fills the table is followed by another, and another, until one runs to
+ * the end — there is no ceiling on the passes. There was one: eight passes of
+ * forty-eight, and the 385th reclaimable mapping and everything after it
+ * survived the exec. A JIT, a program that dlopens by the hundred, an
+ * allocator that reserves by the arena, all run through that many, and what
+ * they left behind accumulated per generation exactly as before the sweep
+ * existed. The one thing that ends the loop early is a pass that gave nothing
+ * back: an munmap the kernel refuses is refused on the next pass too, and
+ * walking it again would be walking forever. */
+#define SWEEP_MAX 256 /* victims per pass: 4 KiB of the scratch stack */
+
+struct sweep_ctx {
+    unsigned long sp;
+    struct exec_range hit[SWEEP_MAX];
+    int n;
+};
+
+/* The kernel's own pseudo-mappings, which are not memory we mapped and not
+ * memory to give back. The list is a prefix match on purpose: [vvar_vclock]
+ * appeared beside [vvar] in 6.13, and [stack:<tid>] is how older kernels
+ * spelled a thread stack.
+ *
+ * "[anon:" is deliberately NOT here. Android names ordinary anonymous
+ * mappings through PR_SET_VMA — [anon:libc_malloc], [anon:scudo:primary],
+ * [anon:.bss] — and those are exactly the guest's memory this exists to
+ * reclaim. */
+static int sweep_kernel_vma(const char *p) {
+    static const char *const keep[] = {"[heap]",  "[stack",    "[vdso]",
+                                       "[vvar",   "[sigpage]", "[vectors]",
+                                       "[uprobes]"};
+    if (*p != '[')
+        return 0;
+    for (unsigned i = 0; i < sizeof keep / sizeof keep[0]; i++)
+        if (!strncmp(p, keep[i], strlen(keep[i])))
+            return 1;
+    return 0;
+}
+
+static int sweep_seen(unsigned long lo, unsigned long hi, const char *path,
+                      void *ctx) {
+    struct sweep_ctx *s = ctx;
+    if (s->sp >= lo && s->sp < hi)
+        return 0; /* the stack this call is standing on */
+    if (sweep_kernel_vma(path))
+        return 0;
+    if (cng_hits_monitor(lo, hi - lo))
+        return 0;
+    struct exec_range r = {lo, hi - lo};
+    for (int i = 0; i < EXEC_GEN_MAX; i++)
+        if (range_overlap(&r, &g_gen_live[i]) || range_overlap(&r, &g_gen_dead[i]))
+            return 0; /* the incoming generation, or one the reap still owes */
+    if (s->n == SWEEP_MAX)
+        return 1; /* full: unmap these and walk again */
+    s->hit[s->n++] = r;
+    return 0;
+}
+
+static void exec_sweep(void) {
+    if (!cng_own_ready()) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] exec: sweep disarmed (no floor)\n");
+        return;
+    }
+    struct sweep_ctx s;
+    s.sp = (unsigned long)&s;
+    int total = 0, passes = 0;
+    unsigned long bytes = 0;
+    for (;;) {
+        s.n = 0;
+        if (cng_maps_walk(sweep_seen, &s) < 0)
+            break; /* no maps: nothing is known, so nothing is unmapped */
+        passes++;
+        int gone = 0;
+        for (int i = 0; i < s.n; i++) {
+            if (sys_munmap((void *)s.hit[i].lo, s.hit[i].len) != 0)
+                continue;
+            bytes += s.hit[i].len;
+            gone++;
+        }
+        total += gone;
+        if (s.n < SWEEP_MAX || !gone)
+            break; /* the walk ran to the end, or the rest will not go */
+    }
+    if (cng_g_debug && total)
+        cng_dprintf(2, "[cng] exec: swept %d mapping(s), %lu kB, %d pass(es)\n",
+                    total, bytes >> 10, passes);
+}
+
+void cng_exec_generation(const struct cng_loaded *prog,
+                         const struct cng_loaded *interp,
+                         unsigned long stack_lo, unsigned long stack_len) {
+    struct exec_range neu[EXEC_GEN_MAX];
+    memset(neu, 0, sizeof neu);
+    if (prog) {
+        neu[0].lo = prog->map_lo;
+        neu[0].len = prog->map_len;
+    }
+    if (interp) {
+        neu[1].lo = interp->map_lo;
+        neu[1].len = interp->map_len;
+    }
+    neu[2].lo = stack_lo;
+    neu[2].len = stack_len;
+    /* The images' copied pages are the ones an mremap has to move as file
+     * mappings from now on, and the outgoing images' are nobody's. */
+    cng_execmap_images(prog, interp);
+
+    /* Retire the outgoing generation, unless another thread may still be in it.
+     * A range the incoming one has already taken over is dropped rather than
+     * retired: unmapping it would unmap the new program. (The thread count is
+     * a /proc read, so it is only asked when there is something to retire —
+     * which the first program of an invocation, registering itself, has not.) */
+    int outgoing = 0;
+    for (int i = 0; i < EXEC_GEN_MAX; i++)
+        outgoing |= g_gen_live[i].len != 0;
+    if (outgoing && exec_single_threaded()) {
+        for (int i = 0; i < EXEC_GEN_MAX; i++) {
+            g_gen_dead[i] = g_gen_live[i];
+            for (int j = 0; j < EXEC_GEN_MAX; j++)
+                if (range_overlap(&g_gen_dead[i], &neu[j]))
+                    g_gen_dead[i].lo = g_gen_dead[i].len = 0;
+            if (g_gen_dead[i].len)
+                g_gen_have_dead = 1;
+        }
+        /* ...and everything the outgoing program mapped itself, which the
+         * ranges above cannot describe. Both live and dead are settled by now,
+         * so the sweep can tell them from what it is here to reclaim. */
+        memcpy(g_gen_live, neu, sizeof g_gen_live);
+        exec_sweep();
+        return;
+    }
+    memcpy(g_gen_live, neu, sizeof g_gen_live);
+}
+
+/* State a real execve drops with the address space, and ours does not.
+ *
+ * We keep the address space — that is the whole point of the in-process model —
+ * so each of these outlives the program that set it and goes on pointing into
+ * memory the next program now owns:
+ *
+ *  - POSIX timers keep firing, into a signal handler that no longer exists.
+ *  - clear_child_tid is where the kernel writes a zero and issues a FUTEX_WAKE
+ *    when the thread exits. Left pointing at the old libc's TCB, that write
+ *    lands in whatever the new program put there.
+ *  - the robust futex list is walked by the kernel on exit, following pointers
+ *    the old program owned.
+ *  - the heap keeps every byte the old program allocated, and an exec chain
+ *    (a wrapper script running a wrapper script) accumulates all of them.
+ *
+ * All best-effort: a kernel without POSIX timers has no such file, and a failed
+ * brk simply leaves the heap where it was. */
+static void cng_exec_reset(void) {
+    cng_rewrite_lazy_reset(); /* the sites those pools branch from are gone */
+    cng_timers_exec_reset();
+    CNG_SYS(__NR_set_tid_address, 0, 0, 0, 0, 0, 0);
+    /* Android blocks set_robust_list (measured: SIGSYS from the zygote filter on
+     * Android 13), and a syscall we know is refused is not one to issue — the
+     * trap would be answered by the gate-net, i.e. by the nested SIGSYS delivery
+     * the design does not want to depend on, and where no handler is installed
+     * at all (the direct-drive `-t exectest` driver) it is simply fatal.
+     *
+     * Nothing is left behind by skipping it, either. The filter that refuses it
+     * is one ambient filter over the whole process — which is what cng_blocked
+     * measures — so it refused the old program's own set_robust_list too, and a
+     * program that could never register a list has none for the kernel to walk
+     * at exit. The reset matters exactly where the call works, which is where
+     * it is made. */
+    if (!cng_blocked[__NR_set_robust_list])
+        CNG_SYS(__NR_set_robust_list, 0,
+                24 /* sizeof(struct robust_list_head) */, 0, 0, 0, 0);
+    if (cng_g_brk0) {
+        long cur = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+        if (cur > 0 && (unsigned long)cur > cng_g_brk0)
+            CNG_SYS(__NR_brk, cng_g_brk0, 0, 0, 0, 0, 0);
+    }
+}
+
+/* A failure after the point of no return.
+ *
+ * The kernel draws exactly this line around begin_new_exec(): everything that
+ * can be refused is refused before it, and a failure after it force_sigsegv()s
+ * the process — there is no caller left to hand an errno to. Ours is the same
+ * situation for the same reason: an ET_EXEC image goes down MAP_FIXED at its
+ * link-time vaddr, which is the calling program's own text, so `return -Esomething`
+ * would resume a program whose code has just been replaced.
+ *
+ * Die by the signal rather than by exit(), so a wait() sees WIFSIGNALED with
+ * SIGSEGV — what the shell prints as "Segmentation fault", and what a real
+ * kernel would have reported. Name only the guest path: `host` spells out where
+ * the rootfs lives on the device (see the load-failure trace below). */
+static _Noreturn void exec_fatal(const char *path, const char *what, long err) {
+    cng_dprintf(2,
+                "chroot-ng: exec %s: %s failed (code %d) with the new image "
+                "already mapped over the old one; nothing left to return to\n",
+                path, what, (int)err);
+    unsigned long dfl[4] = {0, 0, 0, 0};
+    CNG_SYS(__NR_rt_sigaction, CNG_SIGSEGV, dfl, 0, sizeof(cng_sigset_t), 0, 0);
+    unsigned long unblock = 1UL << (CNG_SIGSEGV - 1);
+    CNG_SYS(__NR_rt_sigprocmask, 1 /*SIG_UNBLOCK*/, &unblock, 0,
+            sizeof(cng_sigset_t), 0, 0);
+    CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), CNG_SIGSEGV, 0, 0, 0);
+    /* A blocked-or-ignored corner: leave no doubt about the outcome. */
+    CNG_SYS(__NR_exit_group, 0x80 | CNG_SIGSEGV, 0, 0, 0, 0, 0);
+    for (;;)
+        ;
+}
+
+/* What the kernel answers when an image cannot be loaded. All of it is measured
+ * on the host, because the two roles do not answer alike and neither is one
+ * errno:
+ *
+ *   image is...         program      interpreter
+ *   missing             ENOENT       ENOENT
+ *   a directory         EACCES       EACCES
+ *   not executable      EACCES       EACCES
+ *   shorter than a hdr  ENOEXEC      EIO
+ *   not an ELF for us   ENOEXEC      ELIBBAD
+ *   PT_INTERP past EOF  EIO          EIO
+ *
+ * The split is in fs/binfmt_elf.c: the program's header arrives in the 256-byte
+ * buffer bprm_execve already read, so a short file is simply a header that does
+ * not check out and every format declines it — ENOEXEC — while the interpreter
+ * is read on its own with elf_read(), which turns a short read into EIO and a
+ * failed check into ELIBBAD. The last row is that same elf_read() reached from
+ * the *program* side: the PT_INTERP string lives past the header buffer, so a
+ * file too short to hold it answers EIO whichever of the two roles it was in.
+ *
+ * This mattered less when it could not be observed: an interpreter that failed
+ * to load did so after the program had been mapped over the caller, so the
+ * guest died rather than read an errno. It is answered before anything is
+ * mapped now, and the caller lives to see which of the five it was. */
+static long exec_load_errno(int rc, const struct cng_elf_plan *plan, int interp) {
+    switch (rc) {
+    case CNG_LOAD_EOPEN:
+        return plan->err ? plan->err : -ENOENT;
+    case CNG_LOAD_EACCES:
+        return -EACCES;
+    case CNG_LOAD_EIO:
+        return interp ? -EIO : -ENOEXEC;
+    case CNG_LOAD_EINTERP:
+        return -EIO;
+    case CNG_LOAD_EINVAL:
+        /* fs/binfmt_elf.c answers -EINVAL for a PT_LOAD it cannot make sense
+         * of — a file part longer than its memory part, a segment mmap refuses
+         * — and answers it past its own point of no return, so a real caller
+         * never lives to read it (measured: execve reports EINVAL and the
+         * process is killed with SIGSEGV). Ours is refused in the pass that
+         * maps nothing, so the caller is still there. For an ELF interpreter
+         * the kernel's answer is unreachable in its own way — load_elf_interp
+         * reports into a process it is about to kill — so it joins the other
+         * malformed-interpreter cases at -ELIBBAD, which a caller can act on. */
+        return interp ? -ELIBBAD : -EINVAL;
+    default: /* EFORMAT, ETOOBIG, ECLOBBER: a header that does not check out */
+        return interp ? -ELIBBAD : -ENOEXEC;
+    }
+}
+
+/* The host path of the l2s link an exec of (dirfd, path) lands on, if any:
+ * the resolution followed, symlink by symlink, up to but not through the
+ * emulation's own hop — the point where a real kernel's walk would have
+ * arrived at the hardlink's dentry and stopped. An absolute target is re-rooted
+ * into the guest view as the resolver re-roots it; a relative one is taken
+ * against the guest spelling of the directory the link sits in. 1 with `out`
+ * filled, 0 for a chain that ends anywhere else (a plain file, a dangling
+ * link, a name outside the view). */
+static int l2s_exe_name(int dirfd, const char *path, char *out, size_t sz) {
+    char nm[CNG_PATH_MAX], tgt[CNG_PATH_MAX], next[CNG_PATH_MAX];
+    long d = dirfd;
+    const char *p = path;
+    for (int hops = 0; hops < 40; hops++) {
+        if (cng_resolve_at(d, p, 0, nm, sizeof nm) != 0)
+            return 0;
+        if (cng_l2s_resolve(nm, tgt, sizeof tgt, 0) == 1) {
+            cng_strlcpy(out, nm, sz);
+            return 1;
+        }
+        long n = cng_pin_readlink(nm, tgt, sizeof tgt - 1);
+        if (n <= 0)
+            return 0; /* not a symlink: the resolution above stands */
+        tgt[n] = '\0';
+        if (tgt[0] == '/') {
+            cng_strlcpy(next, tgt, sizeof next);
+        } else {
+            /* Relative: against the guest directory of the link itself. */
+            if (cng_fs_untranslate(cng_g_fs, nm, next, sizeof next) != 0)
+                return 0;
+            char *sl = strrchr(next, '/');
+            if (!sl)
+                return 0;
+            sl[1] = '\0';
+            if (cng_strlcpy(sl + 1, tgt, sizeof next - (size_t)(sl + 1 - next)) >=
+                sizeof next - (size_t)(sl + 1 - next))
+                return 0;
+        }
+        p = next;
+        d = CNG_AT_FDCWD;
+    }
+    return 0;
+}
+
+static long execve_plan(struct exec_job *j, int dirfd, const char *path,
+                        char **argv, char **envp, int flags) {
+    char *host = j->host;
+    char (*sheb_interp)[SHEB_WORD] = j->sheb_interp;
+    char (*sheb_arg)[SHEB_WORD] = j->sheb_arg;
+    int *sheb_hasarg = j->sheb_hasarg;
+    const char *cur = path; /* the guest path of the image at this level */
+    int gfd = -1;           /* an open fd for the image, when we have one */
+    int nofollow = (flags & CNG_AT_SYMLINK_NOFOLLOW) != 0;
+    int depth = 0;          /* how many #! levels were followed */
+    j->dirfd = dirfd;
+    j->flags = flags;
+    j->script_fd = -1;
+    j->path = path;
+    j->argv = argv;
+    j->envp = envp;
+
+    /* Whatever the last exec retired, before this one maps anything. It cannot
+     * be given back after: an ET_EXEC image goes down at its link-time vaddr,
+     * so a retired range may be exactly where the incoming program is about to
+     * land, and the range would then be the new program. Safe here — the frame
+     * that stood on the retired stack belonged to the exec before this one, and
+     * its sigreturn is what put the caller here. */
+    cng_exec_reap();
+
+    for (;; depth++) {
+        if (depth > SHEB_MAX) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] execve %s -> shebang nesting\n", path);
+            return -ELOOP;
+        }
+        /* Resolve through the rootfs/bind map. Level 0 honors the execveat
+         * dirfd — a relative name used to be handed to the kernel as-is, so it
+         * resolved against the HOST cwd and left the guest view entirely — and
+         * its AT_SYMLINK_NOFOLLOW; every level after it is an interpreter path
+         * from a #! line, which is absolute or cwd-relative by definition. */
+        if (depth == 0) {
+            if (cng_resolve_at(dirfd, cur, !nofollow, host, sizeof j->host) != 0) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve %s -> unresolved\n", cur);
+                return -ENOENT;
+            }
+            /* AT_SYMLINK_NOFOLLOW does not open the link's target, it refuses:
+             * the kernel answers ELOOP for a final symlink. Not for the l2s
+             * emulation's own link, which to the guest is the regular file it
+             * asked to run: that one takes the hop to its backing file. */
+            if (nofollow) {
+                char st[144];
+                if (cng_pin_fstatat(host, st, CNG_AT_SYMLINK_NOFOLLOW) == 0 &&
+                    (*(unsigned *)(st + 16) & 0170000) == 0120000) {
+                    char data[CNG_PATH_MAX];
+                    if (!(cng_g_l2s &&
+                          cng_l2s_resolve(host, data, sizeof data, 0) == 1))
+                        return -ELOOP;
+                    cng_strlcpy(host, data, sizeof j->host);
+                }
+            }
+        } else {
+            /* An interpreter path is resolved like any other name, so its ".."
+             * components are walked through the directories they leave just the
+             * same: "#!/bin/sh/../ls" is ENOTDIR to the kernel, which opens the
+             * interpreter with open_exec and hands back whatever that says.
+             * Collapsing the pair unasked resolved it to a name the kernel
+             * never reaches — EACCES here because that name was not executable,
+             * and a running program if it had been.
+             *
+             * AT_FDCWD rather than the execveat dirfd, which is what the
+             * resolve below assumes as well: fs/binfmt_script.c opens the
+             * interpreter by name, and a #! line is absolute or cwd-relative. */
+            long dd = cng_dotdot_verdict(CNG_AT_FDCWD, cur);
+            if (dd) {
+                if (cng_g_debug)
+                    cng_dprintf(2,
+                                "[cng] execve interp %s -> \"..\" errno=%ld\n",
+                                cur, -dd);
+                return dd;
+            }
+            if (cng_resolve(cur, 1, host, sizeof j->host) != 0) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve interp %s -> unresolved\n",
+                                cur);
+                return -ENOENT;
+            }
+        }
+        /* Every failure below this point is silent otherwise, and the guest only
+         * sees an errno — trace the resolution so a device-side failure says
+         * which stage produced it (and which build is running). */
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve resolve %s -> %s\n", cur, host);
+
+        /* When the target names one of our own fds ("/proc/self/fd/N", how apk
+         * runs package scripts, and what execveat(AT_EMPTY_PATH) becomes) work
+         * from that open file description instead of reopening the magic link.
+         * execve(2) checks *execute* permission on the inode; a reopen checks
+         * *read* — so a script a real (root) chroot execs happily can come back
+         * EACCES here, since our fake root has no DAC bypass. The fd we already
+         * hold needs no permission check at all, and covers the anonymous files
+         * (memfd, O_TMPFILE, deleted) that have no readable name. Everything
+         * below reads it with pread/mmap, so the guest's file offset — shared
+         * with its parent through fork — is left alone. */
+        gfd = cng_proc_self_fd(host); /* the guest's fd: never close it */
+        /* ...but only one whose contents we can reach. An O_PATH descriptor
+         * refers to a file without opening it: pread and mmap both answer
+         * EBADF, and everything below reads the image, so working from it
+         * produced ENOEXEC for a program the kernel runs. The kernel runs it by
+         * opening the file the descriptor names with its own exec flags, and
+         * opening the /proc/self/fd name — the ordinary route below — is that
+         * same act, so hand it back to that. (An O_PATH fd is the documented
+         * way to hold a file you intend to fexecve; both musl and glibc reach
+         * for these two spellings in this order.) What no route can recover is
+         * an image with no name left, since an O_PATH fd has no readable side
+         * to fall back on. */
+        if (gfd >= 0) {
+            long gfl = sys_fcntl(gfd, CNG_F_GETFL, 0);
+            if (gfl < 0 || (gfl & CNG_O_PATH))
+                gfd = -1;
+        }
+        if (gfd >= 0 && cng_g_debug) {
+            char st[128]; /* AArch64 struct stat: mode@16, uid@24, gid@28 */
+            if (CNG_SYS(__NR_fstat, gfd, st, 0, 0, 0, 0) == 0)
+                cng_dprintf(2, "[cng] execve fd=%d mode=%o uid=%u gid=%u\n", gfd,
+                            *(unsigned *)(st + 16) & 07777,
+                            *(unsigned *)(st + 24), *(unsigned *)(st + 28));
+        }
+
+        char hdr[257];
+        long fd = gfd;
+        if (gfd < 0) {
+            /* Pinned (cng/pin.h): the name the walk reached, and not what a
+             * second resolution of the string finds there. */
+            fd = cng_pin_open(host, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+            if (fd < 0) {
+                if (cng_g_debug)
+                    cng_dprintf(2, "[cng] execve open %s -> errno=%d\n", host,
+                                (int)-fd);
+                return fd; /* the real errno (EACCES, ELOOP, ENOENT, ...) */
+            }
+        }
+        /* Read the header the way the loader reads its own (read_exact in
+         * elf.c): accumulate and retry EINTR. A single pread may come back
+         * short of what was asked for, and treating that as "not a script"
+         * hands a perfectly good `#!` file to the ELF loader, which then
+         * rejects it as a short read — a valid script answered ENOEXEC. */
+        long n = 0;
+        for (;;) {
+            long r = sys_pread64((int)fd, hdr + n, (size_t)(256 - n), n);
+            if (r < 0) {
+                if (r == -EINTR)
+                    continue;
+                n = r; /* a hard error: let the loader produce the errno */
+                break;
+            }
+            if (r == 0 || (n += r) >= 256)
+                break; /* EOF, or the whole shebang line and then some */
+        }
+        if (gfd < 0)
+            sys_close((int)fd);
+        if (!(n >= 2 && hdr[0] == '#' && hdr[1] == '!'))
+            break; /* an ELF (or something the loader will reject) */
+
+        /* `#! interp [arg]`: the kernel replaces argv[0] with the interpreter,
+         * then the optional argument, then the path of the script being run —
+         * which at depth > 0 is the previous level's interpreter, so the chain
+         * accumulates rather than resetting. */
+        hdr[n < 256 ? n : 256] = '\0';
+        char *p = hdr + 2;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        char *i0 = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+            p++;
+        size_t ilen = (size_t)(p - i0);
+        while (*p == ' ' || *p == '\t')
+            p++;
+        char *a0 = p;
+        while (*p && *p != '\n' && *p != '\r')
+            p++;
+        size_t alen = (size_t)(p - a0);
+        /* The argument runs to the end of the line, embedded blanks and all
+         * ("#!/usr/bin/env python3 -u" is one argument) — but not the line's
+         * *trailing* blanks, which fs/binfmt_script.c walks back over before it
+         * parses anything. Keeping them handed the interpreter "-e   " where
+         * the kernel hands it "-e", and a shell rejects that as an illegal
+         * option: a shebang line with a stray space at the end, which editors
+         * leave behind routinely, ran everywhere but here. */
+        while (alen > 0 && (a0[alen - 1] == ' ' || a0[alen - 1] == '\t'))
+            alen--;
+        if (ilen == 0 || ilen >= SHEB_WORD) {
+            if (cng_g_debug)
+                cng_dprintf(2, "[cng] execve %s -> bad shebang\n", cur);
+            return -ENOEXEC;
+        }
+        if (depth == SHEB_MAX)
+            return -ELOOP; /* no room to record another level */
+        memcpy(sheb_interp[depth], i0, ilen);
+        sheb_interp[depth][ilen] = '\0';
+        sheb_hasarg[depth] = alen > 0 && alen < SHEB_WORD;
+        if (sheb_hasarg[depth]) {
+            memcpy(sheb_arg[depth], a0, alen);
+            sheb_arg[depth][alen] = '\0';
+        }
+        cur = sheb_interp[depth];
+        if (depth == 0)
+            j->script_fd = gfd; /* what the interpreter will be told to read */
+        gfd = -1; /* the image to load is now the interpreter, by path */
+        nofollow = 0;
+    }
+
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] exec %s host=%s file_backed=%d\n", path, host,
+                    cng_g_loader_file);
+
+    /* Header pass, program and ELF interpreter both: read, validate, map
+     * nothing. Every refusal an execve can produce has to be produced here,
+     * because the map pass below is what replaces the calling program. */
+    struct cng_elf_plan *pplan = &j->pplan, *iplan = &j->iplan;
+    struct cng_loaded *prog = &j->prog, *interp = &j->interp;
+    int rc = gfd >= 0 ? cng_elf_plan_fd(gfd, pplan, prog)
+                      : cng_elf_plan(host, pplan, prog);
+    if (rc != CNG_LOAD_OK) {
+        /* A failed exec tells the guest what the kernel would: the errno, and
+         * nothing else. This was an unconditional line on the guest's own
+         * stderr, and it named `host` — the one thing the whole path layer
+         * exists to keep from the guest, since it spells out where the rootfs
+         * lives on the device. It also put text no real execve produces into a
+         * stream package managers capture and log. Both belong under CNG_DEBUG
+         * with the rest of the exec tracing. */
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] exec %s (%s): load failed rc=%d\n", path,
+                        host, rc);
+        return exec_load_errno(rc, pplan, 0);
+    }
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng]   prog dyn=%d lo=%lx hi=%lx interp=%d\n",
+                    pplan->is_dyn, pplan->lo, pplan->hi, prog->has_interp);
+
+    /* The interpreter is planned here rather than loaded after the program,
+     * which is the whole point of the split: a rootfs without the loader the
+     * binary names is an ordinary, common failure — a partially populated tree,
+     * a musl binary under glibc — and the kernel answers it with ENOENT while
+     * the caller keeps running. Loading it *after* the program answered the same
+     * ENOENT into a program that had already been overwritten. */
+    int have_interp = 0;
+    if (prog->has_interp) {
+        char ip[CNG_PATH_MAX];
+        iplan->err = -ENOENT; /* a name that did not resolve has no open to ask */
+        int irc = cng_resolve(prog->interp, 1, ip, sizeof ip) != 0
+                      ? CNG_LOAD_EOPEN
+                      : cng_elf_plan(ip, iplan, interp);
+        if (irc != CNG_LOAD_OK) {
+            if (cng_g_debug) /* guest-visible stderr: see the load failure above */
+                cng_dprintf(2, "[cng] exec %s: interp %s load failed rc=%d\n",
+                            path, prog->interp, irc);
+            cng_elf_plan_release(pplan);
+            return exec_load_errno(irc, iplan, 1);
+        }
+        have_interp = 1;
+    }
+    /* Everything that can be refused has been. What follows is the job. */
+    j->depth = depth;
+    j->gfd = gfd;
+    j->have_interp = have_interp;
+    return 0;
+}
+
+/* The exec from its point of no return: map, build the stack, run the commit.
+ * On the thread that carries the exec, which may not be the one that planned
+ * it. Returns 0 with the sp and entry set; a failure here is fatal (exec_fatal),
+ * since the address space is being taken apart. */
+static long execve_commit(struct exec_job *j, unsigned long *out_sp,
+                          unsigned long *out_entry) {
+    char *host = j->host;
+    char (*sheb_interp)[SHEB_WORD] = j->sheb_interp;
+    char (*sheb_arg)[SHEB_WORD] = j->sheb_arg;
+    int *sheb_hasarg = j->sheb_hasarg;
+    int depth = j->depth, gfd = j->gfd, dirfd = j->dirfd;
+    const char *path = j->path;
+    const char *cur = depth ? sheb_interp[depth - 1] : path;
+    char **argv = j->argv, **envp = j->envp;
+    struct cng_elf_plan *pplan = &j->pplan, *iplan = &j->iplan;
+    struct cng_loaded *prog = &j->prog, *interp = &j->interp;
+    int have_interp = j->have_interp;
+    (void)gfd;
+
+    /* --- point of no return ------------------------------------------------
+     * Both images are known good; from here the address space is being taken
+     * apart and a failure can only be fatal (see exec_fatal). The program goes
+     * down first and the interpreter second, which is also the only safe order:
+     * the program is MAP_FIXED at a fixed vaddr while the interpreter is
+     * kernel-placed, so mapping the interpreter first risks the kernel putting
+     * it inside the span the program is about to claim.
+     *
+     * The rseq registration goes first of all: it is the one piece of the old
+     * program's state the kernel writes into on its own, and the first mapping
+     * below may already land on the area (an ET_EXEC program registering a
+     * static one, replaced by the next image at the same vaddr). Nothing after
+     * this line can fail non-fatally, so there is no registration to give
+     * back. */
+    cng_rseq_exec_reset();
+    int rc = cng_elf_map(pplan, 0, prog);
+    cng_elf_plan_release(pplan);
+    if (rc != CNG_LOAD_OK)
+        exec_fatal(path, "mapping the program", rc);
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng]   prog base=%lx entry=%lx phdr=%lx lo=%lx hi=%lx\n",
+                    prog->base, prog->entry, prog->phdr, prog->load_lo,
+                    prog->load_hi);
+    if (have_interp) {
+        rc = cng_elf_map(iplan, 0, interp);
+        cng_elf_plan_release(iplan);
+        if (rc != CNG_LOAD_OK)
+            exec_fatal(path, "mapping the ELF interpreter", rc);
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng]   interp %s base=%lx entry=%lx lo=%lx hi=%lx\n",
+                        prog->interp, interp->base, interp->entry,
+                        interp->load_lo, interp->load_hi);
+    }
+
+    /* The argv the kernel would have built for a #! chain: each level's
+     * interpreter and optional argument, innermost first, then the script as
+     * the guest named it, then the caller's argv from [1] on — [0] is what the
+     * interpreter name replaces.
+     *
+     * Written into the slots reserved in front of the caller's own vector, so
+     * the tail stays exactly where it already is. It used to be copied into a
+     * fixed 128-entry array, which silently dropped everything past ~123: a
+     * `#!/bin/sh` script run as `./s.sh *` in a directory of 500 files saw the
+     * first 123 of them and exited 0. The kernel has no such limit — argv is
+     * bounded by bytes, not entries — so nothing was reported and the rest of
+     * the files were simply never processed.
+     *
+     * An *empty* argv is a legal exec (the kernel's remove_arg_zero has nothing
+     * to remove), and there the tail is the terminator itself. */
+    char **eff_argv = argv;
+    int argc = 0;
+    if (argv)
+        while (argv[argc])
+            argc++;
+    if (depth > 0) {
+        char *pre[SHEB_RESERVE];
+        int np = 0;
+        for (int d = depth - 1; d >= 0; d--) {
+            pre[np++] = sheb_interp[d];
+            if (sheb_hasarg[d])
+                pre[np++] = sheb_arg[d];
+        }
+        pre[np++] = (char *)path; /* the script, as the guest named it */
+        char **tail = argc >= 1 ? argv + 1 : argv;
+        eff_argv = tail - np;
+        for (int i = 0; i < np; i++)
+            eff_argv[i] = pre[i];
+        argc = np + (argc >= 1 ? argc - 1 : 0);
+    }
+
+    /* The stack has to be built after the images, since AT_PHDR/AT_BASE/AT_ENTRY
+     * are only known once they are placed — so this is the one remaining thing
+     * that can fail past the commit, and it is fatal rather than -E2BIG.
+     *
+     * It should not be reachable: exec_args_take already refused anything above
+     * exec_arg_max(), which is clamped to a quarter of CNG_GUEST_STACK_SIZE,
+     * and the stack needs at most twice the vector plus once the strings — half
+     * the region, with the shebang chain's own additions (bounded by
+     * SHEB_RESERVE entries of SHEB_WORD) far inside the margin. Raise that clamp
+     * and the arithmetic stops holding, which is what this line is here to say. */
+    unsigned long sp = cng_build_stack(argc, eff_argv, envp, cng_host_auxv,
+                                       prog, have_interp ? interp : 0,
+                                       argc > 0 ? eff_argv[0] : path);
+    if (!sp)
+        exec_fatal(path, "building the initial stack", -E2BIG);
+    unsigned long entry = have_interp ? interp->entry : prog->entry;
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng]   argc=%d sp=%lx entry=%lx -> enter\n", argc, sp,
+                    entry);
+
+    /* Anything that needs a descriptor has to ask before the commit point below
+     * closes them. `host` may be a /proc/self/fd/N path — how apk runs a package
+     * script, and what every memfd exec looks like — and the kernel records
+     * /proc/self/exe as the file that fd names, so the magic link has to be read
+     * while the fd is still open. Asked afterwards, it answered ENOENT for the
+     * one caller shape that needs it (those fds are opened O_CLOEXEC, which is
+     * the point of them), the untranslated /proc/self/fd/N was kept instead, and
+     * /proc/self/exe came out as "/". `go` computes GOROOT from it. */
+    char linked[CNG_PATH_MAX];
+    const char *exe_host = host;
+    if (!strncmp(host, "/proc/", 6)) {
+        long n = sys_readlinkat(CNG_AT_FDCWD, host, linked, sizeof linked - 1);
+        if (n > 0) {
+            linked[n] = '\0';
+            if (linked[0] == '/')
+                exe_host = linked;
+        }
+    }
+    /* An l2s name is a name of the file in its own right, as a hardlink is,
+     * and the kernel records the name it resolved — not another name of the
+     * same inode. The resolution above took the emulation's hop to the backing
+     * file, whose path is in the store the guest cannot see: /proc/self/exe
+     * read "/.l2s/.l2s.<ino>", a name that does not even open. The name the
+     * chain ends at is what the link reports. `cur` is the guest name of the
+     * image loaded: level 0 against the execveat dirfd, an interpreter by its
+     * own #! spelling. */
+    else if (cng_g_l2s &&
+             l2s_exe_name(depth == 0 ? dirfd : CNG_AT_FDCWD, cur, linked,
+                          sizeof linked))
+        exe_host = linked;
+
+    /* Commit point: the new image loaded successfully, so from here we behave
+     * like a real execve. Close FD_CLOEXEC descriptors (see cng_close_cloexec)
+     * before entering the new program. */
+    cng_close_cloexec();
+    /* The interpreter is handed the script by the name the guest ran it by,
+     * and a /proc/self/fd one is a reopen the host may refuse (SELinux on a
+     * memfd): cng_fd_reopen answers it from the fd. Only from one that
+     * survived the close above — a close-on-exec one is gone, and the
+     * interpreter's open of it fails as it does on a kernel. */
+    cng_fd_reopen_script(j->script_fd);
+    cng_reset_signals();
+    /* System V shm attaches do not survive execve. A real one tears down the
+     * address space; ours keeps it, so the mappings have to go explicitly (and
+     * the broker's nattch with them). */
+    cng_shm_detach_all();
+    /* ...and neither do POSIX timers, the clear_child_tid futex, the robust
+     * futex list, or the heap. A real execve drops all four with the address
+     * space; ours keeps the address space, so each is state of a program that no
+     * longer exists, pointing into memory the new one now owns. (The rseq area
+     * is the fifth, unregistered at the point of no return above.) */
+    cng_exec_reset();
+
+    /* setuid/setgid-on-exec against the fake credential set (--setuid-root /
+     * --setgid-root): `host` is the ELF the kernel would honor the set-id bit on
+     * (the interpreter for a #! script, matching the kernel's script exception). */
+    cng_cred_exec(host);
+
+    /* Track the running program for /proc/self/exe fixups. A real kernel updates
+     * /proc/self/exe on every execve (symlinks resolved); tools derive their
+     * install root from it — notably `go`, which computes GOROOT from
+     * os.Executable(). `host` is the resolved host path of the ELF we actually
+     * load (the shebang interpreter for scripts, matching the kernel); store its
+     * guest path in a persistent buffer. */
+    static char exe_guest[CNG_PATH_MAX];
+    if (cng_fs_untranslate(cng_g_fs, exe_host, exe_guest, sizeof exe_guest) == 0)
+        cng_g_exe_guest = exe_guest;
+
+    /* Republish the guest identity: a real execve replaces cmdline, environ,
+     * auxv and comm, and this is where those change for us too. */
+    if (!cng_g_no_proc)
+        cng_procfs_publish_stack(sp);
+
+    /* ...and the address space itself: the images and stack just mapped are the
+     * generation now running, and the one they replace is retired. After the
+     * republish above, which is the last reader of the outgoing stack. */
+    cng_exec_generation(prog, have_interp ? interp : 0, cng_g_stack_lo,
+                        cng_g_stack_len);
+
+    *out_sp = sp;
+    *out_entry = entry;
+    return 0;
+}
+
+/* A guest string for the debug log, taken into `buf` rather than printed where
+ * it lies. CNG_DEBUG must never change what the guest gets, and %s on a guest
+ * pointer does exactly that: the print walks memory the guest owns, so a wild
+ * path — the very -EFAULT case the line below is tracing — faulted inside the
+ * SIGSYS handler, where every signal but SIGSYS is masked and the fault is the
+ * death of the guest. dispatch.c's dbg_path takes the same copy for the same
+ * reason. A string too long for the window is shown as far as it fits: a
+ * truncated path says more in a log than a placeholder does. */
+static const char *dbg_str(const char *s, char *buf, unsigned long sz) {
+    if (!s)
+        return "(null)";
+    long n = cng_user_strcopyin(buf, s, sz);
+    if (n >= 0)
+        return buf;
+    if (n != -E2BIG)
+        return "(unreadable)";
+    buf[sz - 1] = '\0';
+    return buf;
+}
+
+/* Shared emulation core: the checks that need nothing but the arguments as they
+ * arrive, then the snapshot (see exec_args_take), and from there on every check
+ * reads the snapshot rather than the guest's own memory. */
+/* execve_core's answer when the caller is the group leader and a sibling has
+ * handed it an exec: the caller carries that one instead of its own. */
+#define CNG_EXEC_TAKEOVER 1
+
+static void exec_claim_release(void) {
+    __atomic_store_n(&g_exec_claim, 0, __ATOMIC_RELEASE);
+}
+
+static long execve_core(int dirfd, const char *path, char **argv, char **envp,
+                        int flags, unsigned long guest_mask,
+                        unsigned long *out_sp, unsigned long *out_entry) {
+    if (cng_g_debug) {
+        char pb[CNG_PATH_MAX];
+        cng_dprintf(2, "[cng] execve enter path=%s flags=%x\n",
+                    dbg_str(path, pb, sizeof pb), (unsigned)flags);
+    }
+
+    /* execveat's flags word was never read, so AT_EMPTY_PATH and
+     * AT_SYMLINK_NOFOLLOW were both silently ignored — and so was every
+     * undefined bit, which the kernel refuses. */
+    if (flags & ~(CNG_AT_EMPTY_PATH | CNG_AT_SYMLINK_NOFOLLOW))
+        return -EINVAL;
+    /* The path is guest memory, and it is measured out of a copy (`path[0]` was
+     * a bare dereference once) because its length is what decides AT_EMPTY_PATH
+     * below. Only the length is kept: the bytes themselves are taken again by
+     * the snapshot, and every check past that point reads the snapshot. */
+    long plen = cng_user_strlen(path, exec_max_strlen());
+    if (plen < 0)
+        return plen;
+
+    /* AT_EMPTY_PATH: the dirfd IS the file to execute. Naming it through
+     * /proc/self/fd puts it back on the ordinary path — the resolver keeps that
+     * spelling in the host namespace, and the loader then works from the open
+     * description itself, which is what reaches an anonymous or deleted image.
+     *
+     * AT_FDCWD is the exception, because it is not a descriptor. The kernel
+     * resolves the empty name against the working directory and opens THAT for
+     * execution, which no directory can satisfy: may_open answers EACCES for
+     * MAY_EXEC on one. Asking fcntl about -100 instead said EBADF — an answer
+     * about a descriptor number for a call that never names one. Spelling it
+     * "." hands the working directory to the ordinary path, where the loader
+     * refuses it exactly as it refuses the directory a real dirfd names. */
+    char fdpath[40];
+    if (!plen) {
+        if (!(flags & CNG_AT_EMPTY_PATH))
+            return -ENOENT;
+        if (dirfd == CNG_AT_FDCWD) {
+            path = ".";
+        } else {
+            if (sys_fcntl(dirfd, CNG_F_GETFD, 0) < 0)
+                return -EBADF;
+            /* The descriptor IS the file, and one opened O_PATH|O_NOFOLLOW may
+             * hold a symlink — the only way a descriptor can. The kernel opens
+             * what it names for execution and refuses a final symlink there:
+             * ELOOP. Naming it below puts it back on the ordinary path, where
+             * the magic link is followed like any other and the TARGET runs.
+             * Both measured on 6.17, and the difference is the spelling, not
+             * the descriptor: the same fd written out by the guest as
+             * "/proc/self/fd/N" does run the target. So this belongs to the
+             * empty-path form alone, which is where it sits. */
+            char lst[144]; /* struct stat; st_mode at 16 on every arch we build */
+            if (CNG_SYS(__NR_fstat, dirfd, (long)lst, 0, 0, 0, 0) == 0 &&
+                (*(unsigned *)(lst + 16) & 0170000) == 0120000)
+                return -ELOOP;
+            cng_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", dirfd);
+            path = fdpath;
+            dirfd = CNG_AT_FDCWD;
+        }
+        flags &= ~CNG_AT_SYMLINK_NOFOLLOW; /* nothing left to follow */
+    }
+
+    struct exec_args a;
+    long rc = exec_args_take(&a, path, argv, envp);
+    if (rc < 0) {
+        if (cng_g_debug) {
+            /* `path` measured clean a moment ago, which is not the same as
+             * still being there: the snapshot failing is itself a sign the
+             * guest's memory moved under us. */
+            char pb[CNG_PATH_MAX];
+            cng_dprintf(2, "[cng] execve %s -> args snapshot errno=%ld\n",
+                        dbg_str(path, pb, sizeof pb), -rc);
+        }
+        return rc;
+    }
+
+    /* l2s machinery is invisible to the guest — not executable either. Both
+     * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
+     * here, so this covers every exec path.
+     *
+     * Judged on the snapshot, never on the guest's own pointer. The string this
+     * reads has to be the string that then gets loaded, and between the check
+     * and the copy the memory belongs to the exec'ing process: another of its
+     * threads can put a hidden name there once the check has passed on an
+     * innocent one, and can unmap it outright — which inside the handler, where
+     * SIGSEGV is masked, is not an -ENOENT but the death of the guest.
+     * cng_l2s_deny walks the path itself (basename, and a canonicalization for
+     * "/.l2s"), so it is exactly the kind of caller dispatch.c already hands a
+     * copy to. Being after the snapshot also puts the answer in the order the
+     * rest of this path already gives it: a name that does not resolve is
+     * -ENOENT from execve_load, likewise after -E2BIG/-EFAULT. */
+    if (cng_g_l2s && cng_l2s_deny(dirfd, a.path)) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve %s -> l2s-hidden\n", a.path);
+        exec_args_free(&a);
+        return -ENOENT;
+    }
+
+    /* ...and the ".." components of the name, for the same reason every other
+     * path-bearing syscall has them checked: "/bin/sh/../ls" is ENOTDIR to the
+     * kernel, which walks into sh before it goes back up. Taken on the snapshot
+     * like every check around it. */
+    long dd = cng_dotdot_verdict(dirfd, a.path);
+    if (dd) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] execve %s -> \"..\" errno=%ld\n", a.path, -dd);
+        exec_args_free(&a);
+        return dd;
+    }
+
+    /* One exec at a time (see the exec-in-flight note above). */
+    long me = sys_gettid(), pid = sys_getpid();
+    for (;;) {
+        long none = 0;
+        if (__atomic_compare_exchange_n(&g_exec_claim, &none, me, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+        if (cng_exec_pending()) {
+            /* A sibling planned an exec and handed it to the leader. The
+             * leader carries it; so does anyone, if the leader is gone. */
+            exec_args_free(&a);
+            if (me == pid || !leader_reachable())
+                return CNG_EXEC_TAKEOVER;
+            sys_exit(0); /* the exec in flight is about to kill this thread */
+        }
+        if (CNG_SYS(__NR_tgkill, pid, none, 0, 0, 0, 0) == -ESRCH) {
+            /* Held by a thread that is gone: a fork child inherited it, or a
+             * requester died before it could hand off. Ours to take. */
+            __atomic_compare_exchange_n(&g_exec_claim, &none, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            continue;
+        }
+        if (me != pid) {
+            exec_args_free(&a);
+            sys_exit(0); /* the holder's de_thread would kill us; go now */
+        }
+        /* The leader, with a sibling mid-plan: it will hand off to us or
+         * give the claim back. Either way, ask again. */
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
+
+    rc = execve_plan(&g_job, dirfd, a.path, a.argv, a.envp, flags);
+    if (rc < 0) {
+        exec_claim_release();
+        exec_args_free(&a);
+        return rc;
+    }
+    g_job.args = a;
+    g_job.sigmask = guest_mask;
+    g_job.requester = me;
+
+    /* A non-leader thread hands the exec to the leader and leaves (see the
+     * exec-in-flight note): the program that comes out of the exec is then
+     * the leader, tid == pid, as the kernel would have it. */
+    if (me != pid && leader_reachable()) {
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] exec: handing off to the leader (tid %ld)\n",
+                        pid);
+        __atomic_store_n(&g_job.pending, 1, __ATOMIC_RELEASE);
+        dethread_send(pid, CNG_DT_EXEC);
+        /* Gone once the leader has it. A leader that dies first — main()
+         * returning into pthread_exit between the check above and the signal
+         * — would leave the exec with nobody to carry it, so it is watched
+         * for, and the exec is then ours again (exec_takeover settles who,
+         * the leader's signal being possibly in flight still). A leader that
+         * merely has every signal held off for the moment is waited for; one
+         * that stays so — a signal frame edited to block SIGSYS — is given up
+         * on after a couple of seconds. */
+        unsigned long blocked_ns = 0;
+        for (unsigned long nap = 100 * 1000;; nap = nap < 10000000 ? nap * 2 : nap) {
+            if (!cng_exec_pending())
+                for (;;)
+                    sys_exit(0);
+            int st = task_state(pid);
+            if (st == TASK_NONE || st == TASK_ZOMBIE ||
+                (st == TASK_BLOCKED && blocked_ns > 2000000000UL))
+                return CNG_EXEC_TAKEOVER;
+            blocked_ns = st == TASK_BLOCKED ? blocked_ns + nap : 0;
+            struct cng_timespec ts = {0, (long)nap};
+            CNG_SYS(__NR_nanosleep, &ts, 0, 0, 0, 0, 0);
+        }
+    }
+
+    cng_dethread();
+    rc = execve_commit(&g_job, out_sp, out_entry);
+    /* The new stack owns its own copy of everything by now, so the snapshot
+     * goes. */
+    exec_args_free(&g_job.args);
+    exec_claim_release();
+    return rc;
+}
+
+/* The leader carrying an exec a sibling handed it: the point of no return
+ * onwards, on this thread. 0 with the sp and entry set, or -1 when nothing was
+ * pending after all (the request was answered from the leader's own execve
+ * before its signal arrived). */
+static long exec_takeover(unsigned long *out_sp, unsigned long *out_entry,
+                          unsigned long *mask_out) {
+    /* The claim first, from the requester that holds it, and only then the
+     * pending flag: a thread finding the flag down must find the claim held
+     * by a LIVE thread, or it would take a claim left by the dead requester
+     * and start an exec of its own beside this one. Whoever clears the flag
+     * carries the exec; the other — the leader's signal and the requester's
+     * watch can both get here — finds nothing to do. */
+    long req = __atomic_load_n(&g_job.requester, __ATOMIC_ACQUIRE);
+    long me = sys_gettid();
+    if (!__atomic_load_n(&g_job.pending, __ATOMIC_ACQUIRE))
+        return -1;
+    if (!__atomic_compare_exchange_n(&g_exec_claim, &req, me, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED) &&
+        req != me)
+        return -1; /* someone else already holds it: theirs to carry */
+    int one = 1;
+    if (!__atomic_compare_exchange_n(&g_job.pending, &one, 0, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        /* Lost the flag to the other taker after winning the claim: hand the
+         * claim on to it, which is what it expects to find. */
+        return -1;
+    }
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] exec: the leader takes over from tid %ld\n",
+                    g_job.requester);
+    cng_dethread();
+    long rc = execve_commit(&g_job, out_sp, out_entry);
+    exec_args_free(&g_job.args);
+    *mask_out = g_job.sigmask & ~(1UL << (CNG_SIGSYS - 1));
+    exec_claim_release();
+    return rc;
+}
+
+/* The frame the new program is entered through, from a signal handler: the
+ * registers cleared, the entry state in sp/pc, the requester's mask (the
+ * thread's own, on the direct path), and no alternate signal stack — a real
+ * execve has none, and this frame is what rt_sigreturn restores the
+ * alt-stack settings from, so the disable cng_reset_signals issued would
+ * otherwise be undone on the way out. */
+static void exec_frame(struct cng_ucontext *uc, unsigned long sp,
+                       unsigned long entry, const unsigned long *mask) {
+    unsigned long long *r = uc->uc_mcontext.regs;
+    for (int i = 0; i < 31; i++)
+        r[i] = 0;
+    uc->uc_mcontext.sp = sp;
+    uc->uc_mcontext.pc = entry;
+    if (mask)
+        uc->uc_sigmask.sig[0] = *mask;
+    uc->uc_stack.ss_sp = 0;
+    uc->uc_stack.ss_flags = CNG_SS_DISABLE;
+    uc->uc_stack.ss_size = 0;
+}
+
+int cng_exec_takeover_frame(struct cng_ucontext *uc) {
+    unsigned long sp, entry, mask;
+    if (exec_takeover(&sp, &entry, &mask) != 0)
+        return 0; /* nothing pending: the frame is left exactly as it was */
+    exec_frame(uc, sp, entry, &mask);
+    /* This thread may have been inside a dispatch of its own when the
+     * request arrived, and never returns to it. */
+    cng_scratch_leave();
+    cng_pt_set_frame(cng_pt_uregs(uc), uc);
+    cng_pt_report_exec(cng_pt_uregs(uc));
+    return 1;
+}
+
+static _Noreturn void exec_takeover_enter(void) {
+    unsigned long sp, entry, mask;
+    if (exec_takeover(&sp, &entry, &mask) != 0) {
+        /* Another thread is carrying it, and its de_thread is about to
+         * reach this one: nothing to enter here, so go. */
+        for (;;)
+            sys_exit(0);
+    }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
+    if (cng_pt_active()) {
+        struct cng_uregs regs;
+        memset(&regs, 0, sizeof regs);
+        regs.sp = sp;
+        regs.pc = entry;
+        cng_pt_set_frame(&regs, 0);
+        cng_pt_report_exec(&regs);
+        sp = regs.sp;
+        entry = regs.pc;
+        cng_pt_set_frame(0, 0);
+    }
+    cng_scratch_leave();
+    cng_enter(sp, entry);
+}
+
+void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
+                        char **argv, char **envp, int flags) {
+    unsigned long long *r = uc->uc_mcontext.regs;
+    unsigned long sp, entry;
+    long rc = execve_core(dirfd, path, argv, envp, flags, uc->uc_sigmask.sig[0],
+                          &sp, &entry);
+    if (rc < 0) {
+        r[0] = (unsigned long long)rc;
+        return;
+    }
+    if (rc == CNG_EXEC_TAKEOVER) {
+        /* Ours to carry — or another thread's already, whose de_thread is
+         * about to reach this one: then there is nothing to resume here. */
+        if (!cng_exec_takeover_frame(uc))
+            for (;;)
+                sys_exit(0);
+        return;
+    }
+
+    /* Rewrite the signal context to the new program's fresh entry state, then
+     * return: rt_sigreturn resumes at `entry` with the new stack, handler and
+     * filter still installed. */
+    exec_frame(uc, sp, entry, 0);
+    /* The post-execve stop. A real execve traps to the tracer with SIGTRAP once
+     * the new image is in place — the stop strace waits for before it starts
+     * following the program it launched, and the one our emulation would
+     * otherwise never produce, since it never enters the kernel's exec path. */
+    cng_pt_set_frame(cng_pt_uregs(uc), uc);
+    cng_pt_report_exec(cng_pt_uregs(uc));
+}
+
+long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
+                      int flags) {
+    unsigned long sp, entry, mask = 0;
+    /* Ordinary call context: the live mask is the guest's own. */
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &mask, 8, 0, 0);
+    long rc = execve_core(dirfd, path, argv, envp, flags, mask, &sp, &entry);
+    if (rc < 0)
+        return rc;
+    if (rc == CNG_EXEC_TAKEOVER)
+        exec_takeover_enter();
+    /* Ordinary call context (no signal frame): abandon the old program's stack
+     * and enter the new image directly, like the initial `run` does. */
+    if (cng_pt_active()) {
+        /* The post-execve stop, on a frame describing the entry state we are
+         * about to jump to — there is no signal context here to rewrite, so the
+         * tracer's register edits are read back before the jump. */
+        struct cng_uregs regs;
+        memset(&regs, 0, sizeof regs);
+        regs.sp = sp;
+        regs.pc = entry;
+        cng_pt_set_frame(&regs, 0);
+        cng_pt_report_exec(&regs);
+        sp = regs.sp;
+        entry = regs.pc;
+        cng_pt_set_frame(0, 0);
+    }
+    /* This is the one path out of the trampoline dispatcher that does not
+     * return: we enter the new program instead. Hand the scratch stack back
+     * first, or the flag stays set and every syscall the new program makes on
+     * this thread runs the dispatcher on the guest's own stack again. */
+    cng_scratch_leave();
+    cng_enter(sp, entry);
+}

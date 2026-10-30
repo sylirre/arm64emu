@@ -1,0 +1,341 @@
+/* NETLINK_ROUTE emulation guest (M16).
+ *
+ * Exercises the two things a guest actually does with rtnetlink:
+ *   - getifaddrs(3), which glibc/musl implement over an unbound netlink dump and
+ *     which apt, dnf, `ip addr`, and Java/Go runtimes all reach for;
+ *   - a raw RTM_GETLINK dump, the shape iproute2 issues, plus the getsockname
+ *     that iproute2 insists must return a 12-byte sockaddr_nl, and the same dump
+ *     read back with recvmmsg, which fills a source address per message.
+ *
+ * Prints one line per interface name found, then the raw-dump message count, so
+ * the output is byte-comparable between a run under the emulation and a run
+ * straight under qemu (where the guest talks to the real kernel).
+ */
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <ifaddrs.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    /* --- getifaddrs ---------------------------------------------------- */
+    struct ifaddrs *ifa = 0;
+    if (getifaddrs(&ifa) != 0) {
+        printf("getifaddrs: FAILED\n");
+    } else {
+        int n = 0;
+        int saw_lo = 0;
+        for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+            n++;
+            if (p->ifa_name && !strcmp(p->ifa_name, "lo"))
+                saw_lo = 1;
+        }
+        printf("getifaddrs: ok entries>0=%d lo=%d\n", n > 0, saw_lo);
+        freeifaddrs(ifa);
+    }
+
+    /* --- raw RTM_GETLINK dump, iproute2 style --------------------------- */
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0) {
+        printf("socket: FAILED\n");
+        return 1;
+    }
+    printf("socket: ok\n");
+
+    /* Which socket types netlink takes is the kernel's answer, and an emulated
+     * interface owes the same one: netlink_create accepts SOCK_RAW and
+     * SOCK_DGRAM and treats them alike, answers ESOCKTNOSUPPORT (94) for every
+     * other type in the table, and never sees a type outside it — __sock_create
+     * refuses that with EINVAL (22) first. Under emulation the type went
+     * unread, so a SOCK_STREAM netlink socket, which no kernel grants, came
+     * back working.
+     *
+     * The third refusal in that family, an unknown FLAG bit above the type,
+     * is not probed here: qemu-user rebuilds the flags word for the host
+     * socket() and drops bits it does not know, so under the cross-host
+     * emulator the unemulated run — this file's oracle — answers success for a
+     * call every real kernel refuses. The monitor still answers it (EINVAL,
+     * measured on 6.17 natively); there is just no oracle for it here. */
+    static const struct {
+        const char *tag;
+        int type;
+    } sk[] = {
+        {"dgram", SOCK_DGRAM},         {"stream", SOCK_STREAM},
+        {"seqpacket", SOCK_SEQPACKET}, {"rdm", SOCK_RDM},
+        {"zero", 0},                   {"outofrange", 15},
+    };
+    for (unsigned i = 0; i < sizeof sk / sizeof sk[0]; i++) {
+        errno = 0;
+        int t = socket(AF_NETLINK, sk[i].type, NETLINK_ROUTE);
+        printf("socktype %s: %d\n", sk[i].tag, t >= 0 ? 0 : errno);
+        if (t >= 0)
+            close(t);
+    }
+
+    struct sockaddr_nl sa;
+    memset(&sa, 0, sizeof sa);
+    sa.nl_family = AF_NETLINK;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0)
+        printf("bind: FAILED\n");
+    else
+        printf("bind: ok\n");
+
+    /* iproute2 rejects a getsockname answer that is not sockaddr_nl-sized. */
+    struct sockaddr_nl got;
+    socklen_t glen = sizeof got;
+    memset(&got, 0, sizeof got);
+    if (getsockname(fd, (struct sockaddr *)&got, &glen) < 0)
+        printf("getsockname: FAILED\n");
+    else
+        printf("getsockname: len=%d family=%d\n", (int)glen,
+               (int)got.nl_family);
+
+    /* accept(2) does not apply to a datagram socket, and netlink is one. The
+     * stand-in is a socketpair end the kernel would refuse for the same reason,
+     * but the kernel never sees the call — so the refusal has to be ours. */
+    socklen_t alen = sizeof got;
+    int ac = accept(fd, (struct sockaddr *)&got, &alen);
+    printf("accept: rc=%d errno=%d\n", ac, ac < 0 ? errno : 0);
+    if (ac >= 0)
+        close(ac);
+
+    struct {
+        struct nlmsghdr nlh;
+        struct rtgenmsg g;
+    } req;
+    memset(&req, 0, sizeof req);
+    req.nlh.nlmsg_len = sizeof req;
+    req.nlh.nlmsg_type = RTM_GETLINK;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nlh.nlmsg_seq = 4242;
+    req.g.rtgen_family = AF_UNSPEC;
+
+    if (sendto(fd, &req, sizeof req, 0, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        printf("sendto: FAILED\n");
+        close(fd);
+        return 1;
+    }
+    printf("sendto: ok\n");
+
+    char buf[8192];
+    long n = recv(fd, buf, sizeof buf, 0);
+    int msgs = 0, seq_ok = 1, newlink = 0;
+    if (n > 0) {
+        struct nlmsghdr *h = (struct nlmsghdr *)buf;
+        size_t len = (size_t)n;
+        for (; NLMSG_OK(h, len); h = NLMSG_NEXT(h, len)) {
+            msgs++;
+            if (h->nlmsg_seq != 4242)
+                seq_ok = 0;
+            if (h->nlmsg_type == RTM_NEWLINK)
+                newlink++;
+        }
+    }
+    /* The message *count* differs between host and guest views, so report only
+     * the properties that must hold either way. */
+    printf("dump: got>0=%d msgs>0=%d seq_ok=%d newlink>0=%d\n", n > 0, msgs > 0,
+           seq_ok, newlink > 0);
+    close(fd);
+
+    /* --- a NON-dump RTM_GETLINK, which is a different request entirely ---
+     *
+     * `ip link show dev NAME` and `ip route get ADDR` ask about one thing, and
+     * for those the payload IS the request: the kernel parses it with a header
+     * length of its own (sizeof ifinfomsg for GETLINK, sizeof rtmsg for
+     * GETROUTE) before the handler runs. An emulation that relays every
+     * RTM_GET* in the minimal dump form — header plus a family byte, which is
+     * what gets past Android's refusal of the attribute-bearing dump — hands
+     * the kernel a message four bytes short of either, and it answers EINVAL.
+     *
+     * Asked about interface index 1, which every host has, so the answer is a
+     * property both sides must share rather than a name that differs. */
+    int gfd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    int gone = 0, gerr = 0, gnew = 0;
+    if (gfd >= 0) {
+        struct timeval gtv = {2, 0};
+        setsockopt(gfd, SOL_SOCKET, SO_RCVTIMEO, &gtv, sizeof gtv);
+        struct {
+            struct nlmsghdr nlh;
+            struct ifinfomsg ifi;
+        } g1;
+        memset(&g1, 0, sizeof g1);
+        g1.nlh.nlmsg_len = sizeof g1;
+        g1.nlh.nlmsg_type = RTM_GETLINK;
+        g1.nlh.nlmsg_flags = NLM_F_REQUEST; /* no NLM_F_DUMP: one interface */
+        g1.nlh.nlmsg_seq = 4243;
+        g1.ifi.ifi_family = AF_UNSPEC;
+        g1.ifi.ifi_index = 1;
+        if (sendto(gfd, &g1, sizeof g1, 0, (struct sockaddr *)&sa, sizeof sa) >=
+            0) {
+            char gbuf[8192];
+            long gn = recv(gfd, gbuf, sizeof gbuf, 0);
+            if (gn > 0) {
+                struct nlmsghdr *h = (struct nlmsghdr *)gbuf;
+                size_t len = (size_t)gn;
+                for (; NLMSG_OK(h, len); h = NLMSG_NEXT(h, len)) {
+                    gone++;
+                    if (h->nlmsg_type == RTM_NEWLINK)
+                        gnew++;
+                    if (h->nlmsg_type == NLMSG_ERROR) {
+                        struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(h);
+                        if (e->error)
+                            gerr = -e->error;
+                    }
+                }
+            }
+        }
+        close(gfd);
+    }
+    printf("getlink1: msgs>0=%d newlink=%d err=%d\n", gone > 0, gnew, gerr);
+
+    /* --- the same dump read back with recvmmsg --------------------------- */
+    /* The array form fills one source address per message, and what a netlink
+     * client does with that address is decide whether the reply came from the
+     * kernel at all: glibc discards anything whose source is not nl_pid == 0.
+     * So the assertion here is the shape of the source, not the payload. A
+     * fresh socket, because a second dump on a socket whose first one is still
+     * draining is EBUSY on a real kernel. A receive timeout keeps a missing
+     * reply a failed check rather than a hung test. */
+    int mfd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    int mgot = 0, mmsgs = 0, src_nl = 1, src_pid0 = 1;
+    if (mfd >= 0) {
+        struct timeval tv = {2, 0};
+        setsockopt(mfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        if (bind(mfd, (struct sockaddr *)&sa, sizeof sa) == 0 &&
+            sendto(mfd, &req, sizeof req, 0, (struct sockaddr *)&sa,
+                   sizeof sa) >= 0) {
+            char mbuf[2][8192];
+            struct sockaddr_nl from[2];
+            struct iovec miov[2];
+            struct mmsghdr mvec[2];
+            memset(mvec, 0, sizeof mvec);
+            memset(from, 0, sizeof from);
+            for (int i = 0; i < 2; i++) {
+                miov[i].iov_base = mbuf[i];
+                miov[i].iov_len = sizeof mbuf[i];
+                mvec[i].msg_hdr.msg_name = &from[i];
+                mvec[i].msg_hdr.msg_namelen = sizeof from[i];
+                mvec[i].msg_hdr.msg_iov = &miov[i];
+                mvec[i].msg_hdr.msg_iovlen = 1;
+            }
+            mgot = recvmmsg(mfd, mvec, 2, MSG_WAITFORONE, NULL);
+            for (int i = 0; i < mgot; i++) {
+                if (mvec[i].msg_hdr.msg_namelen != sizeof(struct sockaddr_nl) ||
+                    from[i].nl_family != AF_NETLINK)
+                    src_nl = 0;
+                if (from[i].nl_pid != 0)
+                    src_pid0 = 0;
+                struct nlmsghdr *mh = (struct nlmsghdr *)mbuf[i];
+                size_t mlen = mvec[i].msg_len;
+                for (; NLMSG_OK(mh, mlen); mh = NLMSG_NEXT(mh, mlen))
+                    mmsgs++;
+            }
+        }
+        close(mfd);
+    }
+    printf("mmsg: got>0=%d msgs>0=%d src_nl=%d src_pid0=%d\n", mgot > 0,
+           mmsgs > 0, src_nl, src_pid0);
+
+    /* --- the SIOCGIF* family, the same questions over an AF_INET socket ---
+     * `ifconfig` and getifaddrs's oldest fallback ask this way, and the answers
+     * have to describe the same interfaces the dump above did — a guest told it
+     * has only loopback must not be shown the host's whole interface list here.
+     * Only properties that hold in both views are printed, so an emulated run
+     * and a raw one are directly comparable. */
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        printf("ifconf: FAILED\n");
+        return 0;
+    }
+    struct ifconf ifc;
+    memset(&ifc, 0, sizeof ifc);
+    int size_ok = (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len > 0);
+    int need = ifc.ifc_len;
+    char ibuf[8192];
+    int nif = 0, saw_lo = 0, lo_addr = 0;
+    ifc.ifc_len = (int)sizeof ibuf;
+    ifc.ifc_buf = ibuf;
+    if (ioctl(s, SIOCGIFCONF, &ifc) == 0) {
+        nif = (int)(ifc.ifc_len / sizeof(struct ifreq));
+        struct ifreq *r = (struct ifreq *)ibuf;
+        for (int i = 0; i < nif; i++) {
+            if (strcmp(r[i].ifr_name, "lo"))
+                continue;
+            saw_lo = 1;
+            struct sockaddr_in *sin = (struct sockaddr_in *)&r[i].ifr_addr;
+            lo_addr = (sin->sin_family == AF_INET &&
+                       sin->sin_addr.s_addr == htonl(0x7f000001));
+        }
+    }
+    printf("ifconf: size_ok=%d entries>0=%d lo=%d lo_addr=%d\n", size_ok,
+           nif > 0, saw_lo, lo_addr);
+
+    /* Two edges of one rule: SIOCGIFCONF writes whole ifreqs and touches
+     * nothing else. A buffer 20 bytes short of a whole number of entries is
+     * what shows it — the bytes in that remainder are left exactly as the
+     * caller had them, where an emulation validating the buffer by WRITING to
+     * it wipes them. (A buffer longer than the list needs would not: that one
+     * is clamped to the length the entries take before anything looks at it.)
+     * And a negative ifc_len is not an error but a length no entry fits in, so
+     * the call succeeds reporting zero. */
+    int tail_ok = 0, neg_ok = 0;
+    if (need >= (int)sizeof(struct ifreq) && need <= (int)sizeof ibuf) {
+        int part = need - 20;
+        memset(ibuf, '#', sizeof ibuf);
+        ifc.ifc_len = part;
+        ifc.ifc_buf = ibuf;
+        if (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len <= part) {
+            tail_ok = 1;
+            for (int i = ifc.ifc_len; i < part; i++)
+                if (ibuf[i] != '#')
+                    tail_ok = 0;
+        }
+    }
+    ifc.ifc_len = -8;
+    ifc.ifc_buf = ibuf;
+    neg_ok = (ioctl(s, SIOCGIFCONF, &ifc) == 0 && ifc.ifc_len == 0);
+    printf("ifconf_edge: tail=%d neg=%d\n", tail_ok, neg_ok);
+    /* The exact count differs between the host's view and a synthesized one, so
+     * it gets its own line: only the leg that pins the degraded (loopback-only)
+     * view asserts it. */
+    printf("ifcount: %d\n", nif);
+
+    struct ifreq r;
+    memset(&r, 0, sizeof r);
+    strcpy(r.ifr_name, "lo");
+    int idx = ioctl(s, SIOCGIFINDEX, &r) == 0 ? r.ifr_ifindex : -1;
+    memset(&r.ifr_ifru, 0, sizeof r.ifr_ifru);
+    strcpy(r.ifr_name, "lo");
+    int flags = ioctl(s, SIOCGIFFLAGS, &r) == 0 ? r.ifr_flags : 0;
+    memset(&r.ifr_ifru, 0, sizeof r.ifr_ifru);
+    strcpy(r.ifr_name, "lo");
+    int mtu = ioctl(s, SIOCGIFMTU, &r) == 0 ? r.ifr_mtu : -1;
+    memset(&r.ifr_ifru, 0, sizeof r.ifr_ifru);
+    strcpy(r.ifr_name, "lo");
+    unsigned mask = 0;
+    if (ioctl(s, SIOCGIFNETMASK, &r) == 0)
+        mask = ((struct sockaddr_in *)&r.ifr_netmask)->sin_addr.s_addr;
+    /* SIOCGIFNAME goes the other way: index in, name out. */
+    memset(&r, 0, sizeof r);
+    r.ifr_ifindex = idx;
+    int byidx = (ioctl(s, SIOCGIFNAME, &r) == 0 && !strcmp(r.ifr_name, "lo"));
+    printf("ifget: lo idx=%d up=%d loopback=%d mtu=%d mask8=%d byidx=%d\n", idx,
+           (flags & IFF_UP) != 0, (flags & IFF_LOOPBACK) != 0, mtu,
+           mask == htonl(0xff000000), byidx);
+
+    memset(&r, 0, sizeof r);
+    strcpy(r.ifr_name, "cngnope0");
+    errno = 0;
+    int nodev = (ioctl(s, SIOCGIFFLAGS, &r) < 0 && errno == ENODEV);
+    printf("ifget: nodev=%d\n", nodev);
+    close(s);
+    return 0;
+}

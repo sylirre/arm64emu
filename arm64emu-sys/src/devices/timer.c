@@ -1,0 +1,129 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* ARM architected generic timer.
+ *
+ * By default the counter is driven by the host monotonic clock (natural
+ * wall-clock guest time). Set AE_RTCLOCK=0 for the deterministic mode, where the
+ * counter is driven by the retired-instruction count instead: one CNTFRQ tick per
+ * executed instruction, plus a fast-forward accumulated while the CPU is halted in
+ * WFI (see machine_wait_for_event). That makes the timer fully deterministic -- the
+ * timer IRQ lands at the identical instruction boundary on every run -- so
+ * timing-dependent boot failures become reproducible. The test gates run this way. */
+#include "../devices.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#define ull unsigned long long
+
+static u64 host_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+}
+
+/* Strong definition; overrides the weak fallback in sysreg.c. */
+u64 gt_count(CPU *c, bool virt) {
+    u64 ticks;
+    if (g_rtclock) {
+        u64 now = host_ns();
+        if (c->cntpct_base == 0) c->cntpct_base = now;
+        unsigned __int128 d = (unsigned __int128)(now - c->cntpct_base) * c->cntfrq;
+        ticks = (u64)(d / 1000000000ULL);
+    } else {
+        ticks = c->icount + c->timer_skip;   /* deterministic: 1 tick / instruction */
+    }
+    return virt ? ticks - (u64)c->cntvoff : ticks;
+}
+
+static bool fires(u64 ctl, u64 count, u64 cval) {
+    return (ctl & 1) && !(ctl & 2) && (count >= cval);   /* ENABLE && !IMASK && reached */
+}
+
+/* Next count (phys domain) at which an armed, unmasked timer fires; ~0 if
+ * none. The virtual cval is shifted by cntvoff into the phys domain (a wrap
+ * of that sum only makes the deadline conservative — an early re-evaluation,
+ * never a missed one... cntvoff is 0 without EL2 anyway). */
+static u64 deadline_count(CPU *c) {
+    u64 best = ~0ULL;
+    if ((c->cntp_ctl & 1) && !(c->cntp_ctl & 2))
+        best = c->cntp_cval;
+    if ((c->cntv_ctl & 1) && !(c->cntv_ctl & 2)) {
+        u64 d = c->cntv_cval + (u64)c->cntvoff;
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+void timer_update(Machine *m) {
+    CPU *c = &m->cpu;
+    u64 pc = gt_count(c, false), vc = gt_count(c, true);
+    int pf = fires(c->cntp_ctl, pc, c->cntp_cval);
+    int vf = fires(c->cntv_ctl, vc, c->cntv_cval);
+    if (g_dbg) {
+        static int last_p = -1, last_v = -1;
+        if (pf != last_p) { fprintf(stderr, "[timer] phys line=%d ctl=%llu cval=%llu cnt=%llu\n",
+                            pf, (ull)c->cntp_ctl, (ull)c->cntp_cval, (ull)pc); last_p = pf; }
+        if (vf != last_v) { fprintf(stderr, "[timer] virt line=%d ctl=%llu cval=%llu cnt=%llu\n",
+                            vf, (ull)c->cntv_ctl, (ull)c->cntv_cval, (ull)vc); last_v = vf; }
+    }
+    gic_set_irq(m->gic, INTID_TIMER_PHYS, pf);
+    gic_set_irq(m->gic, INTID_TIMER_VIRT, vf);
+    /* Refresh the cached deadline. While a line stays asserted the deadline
+     * is already reached, so timer_check keeps re-running the full update
+     * each tick (today's behavior) until the guest reprograms the timer. */
+    if (m->timer) m->timer->deadline = deadline_count(c);
+}
+
+/* The per-tick path: a single compare against the cached deadline. The cache
+ * cannot go stale: every CNT* register write funnels through timer_update
+ * (sysreg.c do_msr re-runs it on any CRn==14 write), and nothing else changes
+ * the fire condition — the count only moves forward. Fires at the same tick
+ * boundary the periodic re-evaluation did, so deterministic runs and the
+ * interpreter-vs-jit/pd consistency checkpoints are unchanged. */
+void timer_check(Machine *m) {
+    if (gt_count(&m->cpu, false) >= m->timer->deadline) timer_update(m);
+}
+
+u64 timer_next_deadline_ns(Machine *m) {
+    CPU *c = &m->cpu;
+    u64 best = ~0ULL;
+    u64 pc = gt_count(c, false), vc = gt_count(c, true);
+    if ((c->cntp_ctl & 1) && !(c->cntp_ctl & 2)) {
+        if (c->cntp_cval <= pc) return 0;
+        unsigned __int128 dt = (unsigned __int128)(c->cntp_cval - pc) * 1000000000ULL / c->cntfrq;
+        if ((u64)dt < best) best = (u64)dt;
+    }
+    if ((c->cntv_ctl & 1) && !(c->cntv_ctl & 2)) {
+        if (c->cntv_cval <= vc) return 0;
+        unsigned __int128 dt = (unsigned __int128)(c->cntv_cval - vc) * 1000000000ULL / c->cntfrq;
+        if ((u64)dt < best) best = (u64)dt;
+    }
+    return best;
+}
+
+/* Deterministic-mode counterpart: ticks (= instructions) until the next armed,
+ * unmasked timer fires; 0 if already due, ~0 if none armed. Used to fast-forward
+ * the virtual clock across a WFI idle so the timer fires at a fixed icount. */
+u64 timer_next_deadline_ticks(Machine *m) {
+    CPU *c = &m->cpu;
+    u64 best = ~0ULL;
+    u64 pc = gt_count(c, false), vc = gt_count(c, true);
+    if ((c->cntp_ctl & 1) && !(c->cntp_ctl & 2)) {
+        u64 d = (c->cntp_cval <= pc) ? 0 : (c->cntp_cval - pc);
+        if (d < best) best = d;
+    }
+    if ((c->cntv_ctl & 1) && !(c->cntv_ctl & 2)) {
+        u64 d = (c->cntv_cval <= vc) ? 0 : (c->cntv_cval - vc);
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+ARMTimer *gtimer_create(Machine *m) {
+    ARMTimer *t = calloc(1, sizeof(*t));
+    t->cpu = &m->cpu;
+    t->gic = m->gic;
+    m->cpu.cntpct_base = host_ns();
+    m->timer = t;
+    return t;
+}
