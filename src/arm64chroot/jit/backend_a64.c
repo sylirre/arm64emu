@@ -1659,12 +1659,6 @@ static u32 enc_stlr(unsigned szl, unsigned rt, unsigned rn) {
 static u32 enc_eor(unsigned rd, unsigned rn, unsigned rm) {   /* 64-bit */
     return 0xCA000000u | (rm << 16) | (rn << 5) | rd;
 }
-static u32 enc_ldrb_off(unsigned rt, unsigned rn, unsigned off) {
-    return 0x39400000u | (off << 10) | (rn << 5) | rt;
-}
-static u32 enc_strb_off(unsigned rt, unsigned rn, unsigned off) {
-    return 0x39000000u | (off << 10) | (rn << 5) | rt;
-}
 
 #define OFF_EXCL_VALID ((unsigned)offsetof(CPU, excl_valid))
 #define OFF_EXCL_ADDR  ((unsigned)offsetof(CPU, excl_addr))
@@ -1724,11 +1718,11 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
             ei(e, enc_str(3, 2, 28, OFF_EXCL_SIZE));
             ei(e, enc_str(3, 16, 28, OFF_EXCL_VAL));
             ei(e, enc_movz(0, 2, 1, 0));
-            ei(e, enc_strb_off(2, 28, OFF_EXCL_VALID));
+            ei(e, enc_str(2, 2, 28, OFF_EXCL_VALID));
             if (AT_ACQ(o->aux)) ei(e, 0xD50339BFu);   /* dmb ishld */
             break;
         case AT_STX: {
-            ei(e, enc_ldrb_off(16, 28, OFF_EXCL_VALID));
+            ei(e, enc_ldr(2, 16, 28, OFF_EXCL_VALID));
             u8 *f1 = cbz_fwd(e, 0, 16);
             ei(e, enc_ldr(3, 16, 28, OFF_EXCL_ADDR));
             ei(e, enc_eor(16, 16, 1));
@@ -1748,7 +1742,7 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
             fwd_here(e, f1); fwd_here(e, f2); fwd_here(e, f3); fwd_here(e, f4);
             ei(e, enc_movz(1, 16, 1, 0));         /* status 1 */
             fwd_here(e, join);
-            ei(e, enc_strb_off(31, 28, OFF_EXCL_VALID));   /* strb wzr */
+            ei(e, enc_str(2, 31, 28, OFF_EXCL_VALID));    /* str wzr */
             break;
         }
         case AT_LDAR:

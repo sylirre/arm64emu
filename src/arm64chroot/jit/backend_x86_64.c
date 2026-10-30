@@ -1100,10 +1100,10 @@ static void st_imm_r14(Emit *e, s32 disp, u32 imm) {
     e8(e, (u8)(0x80 | (R14 & 7)));
     e32(e, (u32)disp); e32(e, imm);
 }
-static void st_imm8_r14(Emit *e, s32 disp, u8 imm) {   /* mov byte [r14+d],i */
-    e8(e, 0x41); e8(e, 0xC6);
+static void st_imm32_r14(Emit *e, s32 disp, u32 imm) {  /* mov dword [r14+d],i */
+    e8(e, 0x41); e8(e, 0xC7);
     e8(e, (u8)(0x80 | (R14 & 7)));
-    e32(e, (u32)disp); e8(e, imm);
+    e32(e, (u32)disp); e32(e, imm);
 }
 /* Zero-extending lane load [r14+disp] -> rax, and the sized store back. */
 static void ld_lane_rax(Emit *e, unsigned size, s32 disp) {
@@ -3300,11 +3300,11 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
             st64(e, RSI, R14, OFF_EXCL_ADDR);
             st_imm_r14(e, OFF_EXCL_SIZE, sz);
             st64(e, RAX, R14, OFF_EXCL_VAL);
-            st_imm8_r14(e, OFF_EXCL_VALID, 1);
+            st_imm32_r14(e, OFF_EXCL_VALID, 1);
             break;                               /* x86 loads are acquire */
         case AT_STX: {
             /* monitor check; on any mismatch status=1 without a store */
-            e8(e, 0x41); e8(e, 0x80);            /* cmp byte [r14+..], 0 */
+            e8(e, 0x41); e8(e, 0x83);            /* cmp dword [r14+..], 0 */
             e8(e, (u8)(0xB8 | (R14 & 7)));
             e32(e, (u32)OFF_EXCL_VALID); e8(e, 0);
             u8 *f1 = jcc_fwd(e, CC_E);
@@ -3323,7 +3323,7 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
             fwd_here(e, f1); fwd_here(e, f2); fwd_here(e, f3);
             mov_ri(e, 0, RAX, 1);
             fwd_here(e, join);
-            st_imm8_r14(e, OFF_EXCL_VALID, 0);   /* cleared on both paths */
+            st_imm32_r14(e, OFF_EXCL_VALID, 0);  /* cleared on both paths */
             break;
         }
         case AT_LDAR:                            /* mov = acquire on TSO */
