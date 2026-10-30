@@ -244,10 +244,18 @@ oracle_run0() {   # oracle_run0 <argv0> <binary> [args...]
 # gets executed at all — and demanding qemu-aarch64-static there (Termux has
 # proot but not qemu-static) silently drops every Alpine-backed block: the
 # shell, fake-id, bind, procview, mount, chroot and job-control tests.
+#
+# Elsewhere any qemu-aarch64 serves: proot runs a dynamically linked one as well
+# as a static one. The static build is preferred where it is installed, but it
+# is not required -- Ubuntu 26.04 no longer has a qemu-user-static package (the
+# name is only a virtual one there), so a plain qemu-user install is all a
+# current runner gets.
 if a64_host_arm64; then
     PROOT_QEMU=
-else
+elif command -v qemu-aarch64-static >/dev/null 2>&1; then
     PROOT_QEMU=qemu-aarch64-static
+else
+    PROOT_QEMU=qemu-aarch64
 fi
 
 oracle_proot_ok() {

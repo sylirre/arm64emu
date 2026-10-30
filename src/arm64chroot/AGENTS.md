@@ -27,7 +27,7 @@ decides what each provides. Packages required either way:
 On an x86_64 host (the primary development one), additionally:
 
 * aarch64-linux-gnu-gcc (aarch64-linux-gnu-gcc-13) — builds the guest programs
-* qemu-aarch64, qemu-aarch64-static — the differential oracle
+* qemu-aarch64 — the differential oracle, and proot's interpreter for the Alpine test rootfs (qemu-aarch64-static is preferred there when installed)
 * gcc-multilib — the `make test-arm64chroot32` ILP32-host build
 
 On an AArch64 host the system `cc` already builds guest programs and the CPU
