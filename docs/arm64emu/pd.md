@@ -55,12 +55,12 @@ byte-identical against the plain interpreter (`--no-pd`) at 1M/4M/16M/64M/300M v
 `tests/run_pd_consist.sh` (`make test-pd`), across the full asm suite run as the
 default engine, by the full-boot log gate (`make test-pd-full`), and by the
 cross-engine fuzzer (`make fuzz-engines`) — see `docs/parity.md`. These gates pin
-the deterministic clock (`AE_RTCLOCK=0`); the runtime default is the host wall
-clock (`AE_RTCLOCK=1`).
+the deterministic clock (`ARM64EMU_RTCLOCK=0`); the runtime default is the host wall
+clock (`ARM64EMU_RTCLOCK=1`).
 Like `--jit`, the only accepted deviation is tick-cadence: timer-IRQ delivery
 points can shift printk timestamps deep in a long boot (console *content* stays
 identical). Forced off (falls back to the plain interpreter) when a per-instruction debug
 facility is active (`--trace`/`--reg-trace`/watchpoints), which expects one
-`exec_a64` per step. `AEPD_MAX=N` dispatches only PD ops ≤ N natively
+`exec_a64` per step. `ARM64EMU_PD_MAX=N` dispatches only PD ops ≤ N natively
 (0 = pure interpreter) — the predecoded-tier bisection knob, analogous to
-`AEJIT_PDMAX`.
+`ARM64EMU_JIT_PDMAX`.

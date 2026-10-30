@@ -435,9 +435,9 @@ ifeq ($(ARM64EMU_HOST64),8)
 # out of the default predecoded tier).
 test-arm64emu:
 	@$(MAKE) --no-print-directory $(BUILD)/arm64emu
-	@EMU_FLAGS=--no-pd tests/arm64emu/run_tests.sh
+	@ARM64EMU_EMU_FLAGS=--no-pd tests/arm64emu/run_tests.sh
 
-# The predecoded tier, the default engine (so no EMU_FLAGS), then its
+# The predecoded tier, the default engine (so no ARM64EMU_EMU_FLAGS), then its
 # consistency against the plain interpreter.
 test-arm64emu-pd:
 	@$(MAKE) --no-print-directory $(BUILD)/arm64emu
@@ -448,7 +448,7 @@ test-arm64emu-pd:
 # deterministic firmware+Linux boot (byte-identical state checkpoints).
 test-arm64emu-jit:
 	@$(MAKE) --no-print-directory $(BUILD)/arm64emu
-	@EMU_FLAGS=--jit tests/arm64emu/run_tests.sh
+	@ARM64EMU_EMU_FLAGS=--jit tests/arm64emu/run_tests.sh
 	@tests/arm64emu/run_jit_consist.sh
 
 # The suites plus the full-boot log gate (docs/arm64emu/jit.md: mandatory for
@@ -462,12 +462,12 @@ test-arm64emu-pd-full: test-arm64emu-pd
 # else builds that configuration, which is exactly why it rots unnoticed.
 test-arm64emu-embed:
 	@$(MAKE) --no-print-directory $(BUILD)/arm64emu-embed
-	@AE_EMU=$(BUILD)/arm64emu-embed tests/arm64emu/run_tests.sh
+	@ARM64EMU_EMU=$(BUILD)/arm64emu-embed tests/arm64emu/run_tests.sh
 
 # Cross-engine differential fuzzing: random blocks over the JIT's inlined
 # surface, interpreter vs the predecoded tier vs --jit (+ SLOWMEM/NOFUSE/NOVRA
 # variants), byte-identical HLT line and full register dump required per seed.
-# AE_SEEDS overrides the seed count (default 200); see docs/arm64emu/parity.md.
+# ARM64EMU_SEEDS overrides the seed count (default 200); see docs/arm64emu/parity.md.
 fuzz-arm64emu:
 	@$(MAKE) --no-print-directory $(BUILD)/arm64emu
 	@tests/arm64emu/run_fuzz_engines.sh
@@ -484,9 +484,9 @@ test-arm64emu-jit-a64:
 	    && [ -e $(ARM64EMU_A64_SYSROOT)/lib/libc.a ] \
 	    || { echo "SKIP: qemu-aarch64 / clang / aarch64 cross libc missing"; exit 0; }; \
 	$(MAKE) --no-print-directory $(BUILD)/arm64emu-a64 && \
-	AE_RUNNER=qemu-aarch64 AE_EMU=$(CURDIR)/$(BUILD)/arm64emu-a64 EMU_FLAGS=--jit \
+	ARM64EMU_RUNNER=qemu-aarch64 ARM64EMU_EMU=$(CURDIR)/$(BUILD)/arm64emu-a64 ARM64EMU_EMU_FLAGS=--jit \
 	    tests/arm64emu/run_tests.sh && \
-	AE_RUNNER=qemu-aarch64 AE_EMU=$(CURDIR)/$(BUILD)/arm64emu-a64 AE_POINTS=4000000 \
+	ARM64EMU_RUNNER=qemu-aarch64 ARM64EMU_EMU=$(CURDIR)/$(BUILD)/arm64emu-a64 ARM64EMU_POINTS=4000000 \
 	    tests/arm64emu/run_jit_consist.sh
 
 # ---- arm64chroot ----

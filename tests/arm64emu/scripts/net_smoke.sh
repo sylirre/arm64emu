@@ -13,16 +13,16 @@
 #   phase "udp_echo"  --netfwd udp: datagram in, reply out the rule socket
 #
 # Requirements (see tests/arm64emu/net/mk_guest_initrd.sh):
-#   AE_KERNEL      aarch64 EFI-stub kernel   (default: ~/Image.gz)
-#   AE_SRC_INITRD  Alpine initramfs to harvest the guest userland from
-#   AE_BIOS        firmware                  (default: QEMU_EFI.fd path)
+#   ARM64EMU_KERNEL      aarch64 EFI-stub kernel   (default: ~/Image.gz)
+#   ARM64EMU_SRC_INITRD  Alpine initramfs to harvest the guest userland from
+#   ARM64EMU_BIOS        firmware                  (default: QEMU_EFI.fd path)
 set -u
 cd "$(dirname "$0")/../../.."
 
 EMU=./build/arm64emu
-EMU_FLAGS=${EMU_FLAGS:-}
-BIOS=${AE_BIOS:-/usr/share/qemu-efi-aarch64/QEMU_EFI.fd}
-KERNEL=${AE_KERNEL:-$HOME/Image.gz}
+ARM64EMU_EMU_FLAGS=${ARM64EMU_EMU_FLAGS:-}
+BIOS=${ARM64EMU_BIOS:-/usr/share/qemu-efi-aarch64/QEMU_EFI.fd}
+KERNEL=${ARM64EMU_KERNEL:-$HOME/Image.gz}
 IRD=build/tests/arm64emu/net-test.ird
 HTTP_PORT=${HTTP_PORT:-8099}
 UP_PORT=${UP_PORT:-8098}
@@ -52,7 +52,7 @@ curl -sf "http://127.0.0.1:$HTTP_PORT/hello.txt" >/dev/null 2>&1 || \
 
 boot() {  # boot PHASE AEARG [extra emulator args...] -> log on stdout
     local phase=$1 aearg=$2; shift 2
-    timeout 420 "$EMU" $EMU_FLAGS --bios "$BIOS" --kernel "$KERNEL" --initrd "$IRD" \
+    timeout 420 "$EMU" $ARM64EMU_EMU_FLAGS --bios "$BIOS" --kernel "$KERNEL" --initrd "$IRD" \
         --net --append "aetest=$phase aearg=$aearg" "$@" </dev/null 2>&1
 }
 

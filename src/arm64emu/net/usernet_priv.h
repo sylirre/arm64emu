@@ -156,11 +156,11 @@ struct UserNet {
     int64_t  dns_check_ms;
     bool     dns_warned;
 
-    /* stats (printed at exit with AENET_STATS=1) */
+    /* stats (printed at exit with ARM64EMU_NET_STATS=1) */
     uint64_t st_in_frames, st_out_ok, st_out_refused, st_out_drop;
     uint64_t st_tcp_conns, st_tcp_rtx;
 
-    FILE *pcap;                          /* AENET_PCAP=<file>, else NULL */
+    FILE *pcap;                          /* ARM64EMU_NET_PCAP=<file>, else NULL */
 };
 
 /* ---- big-endian field access ---- */

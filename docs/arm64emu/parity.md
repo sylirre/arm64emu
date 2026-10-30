@@ -114,24 +114,24 @@ lazily by `fpsr_sync` (`src/exec_fpsimd.c`) only when the guest reads FPSR.
   inlining floating point; on any other host `--jit` leaves floating point to
   the interpreter while FZ or FZ16 is set.
 - **Debug facilities force the interpreter** (`--trace`, `--reg-trace`, watchpoints,
-  AE* per-instruction hooks).
+  ARM64EMU_* per-instruction hooks).
 
 ## Verification matrix
 
 | Gate | Command | What it proves |
 |------|---------|----------------|
 | asm suite ×3 | `make test` / `make test-pd` / `make test-jit` | m1–m34 pass (`x0=0`) under every engine; values oracle-validated once via qemu-aarch64 (`-DUSERMODE` dual-mode files: m13, m19–m22, m34) |
-| consistency checkpoints | inside `test-pd` / `test-jit` | deterministic firmware+Linux boot (harness pins `AE_RTCLOCK=0`; runtime default is the host clock), byte-identical serial + final CPU state at 1M/4M/16M/64M/300M |
+| consistency checkpoints | inside `test-pd` / `test-jit` | deterministic firmware+Linux boot (harness pins `ARM64EMU_RTCLOCK=0`; runtime default is the host clock), byte-identical serial + final CPU state at 1M/4M/16M/64M/300M |
 | full-boot log gate | `make test-jit-full` / `make test-pd-full` (`tests/run_bootlog_gate.sh`) | 1.6B-insn boot log identical after timestamp normalization — covers the whole boot, not just the UEFI phase the checkpoints sit in; **mandatory for frontend changes** |
 | cross-engine fuzzing | `make fuzz-engines` (`tests/run_fuzz_engines.sh` + `tests/scripts/fuzz_gen.c`) | random blocks over the inlined surface, interpreter (`--no-pd`) vs the predecoded tier vs `--jit` vs `--jit`+SLOWMEM/NOFUSE/NOVRA; phase 1 compares the HLT line natively-executed, phase 2 stops at the exact pre-HLT icount and compares the full register dump |
-| a64 backend | `make test-jit-a64` (and `AE_RUNNER=qemu-aarch64 AE_EMU=./arm64emu-a64 tests/run_fuzz_engines.sh`) | the second backend stays executable and byte-identical under qemu-user |
+| a64 backend | `make test-jit-a64` (and `ARM64EMU_RUNNER=qemu-aarch64 ARM64EMU_EMU=./arm64emu-a64 tests/run_fuzz_engines.sh`) | the second backend stays executable and byte-identical under qemu-user |
 | regression pins | `tests/asm/m23_jitpar.S` | the fuzzer-found bugs below stay fixed, engine-agnostic |
 
-Bisection knobs: `AEJIT_PDMAX` / `AEJIT_SLOWMEM` / `AEJIT_NOFUSE` /
-`AEJIT_NOVRA` / `AEJIT_DUMP` (docs/jit.md) and `AEPD_MAX=N` for the predecoded tier
+Bisection knobs: `ARM64EMU_JIT_PDMAX` / `ARM64EMU_JIT_SLOWMEM` / `ARM64EMU_JIT_NOFUSE` /
+`ARM64EMU_JIT_NOVRA` / `ARM64EMU_JIT_DUMP` (docs/jit.md) and `ARM64EMU_PD_MAX=N` for the predecoded tier
 (dispatch only PD ops ≤ N natively; 0 = pure interpreter).
 
-Every harness bounds each emulator run with `timeout` (`AE_TIMEOUT`, seconds:
+Every harness bounds each emulator run with `timeout` (`ARM64EMU_TIMEOUT`, seconds:
 60 for the asm suite and the fuzzer, 900 for the checkpoints, 1800 for the
 boot-log gate) and pins `</dev/null`. Both matter because a gate that stops
 retiring instructions cannot be caught by `--max-insn` — that limit is only

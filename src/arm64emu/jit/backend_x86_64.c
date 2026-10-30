@@ -851,7 +851,7 @@ fast:
 
 static int fuse_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("AEJIT_NOFUSE") == NULL;
+    if (v < 0) v = getenv("ARM64EMU_JIT_NOFUSE") == NULL;
     return v;
 }
 
@@ -1161,12 +1161,12 @@ static void st_lane_rax(Emit *e, unsigned size, s32 disp) {
 
 /* Baseline is SSE2 (x86-64); some vector ops need SSSE3/SSE4.1/SSE4.2 (any
  * Intel/AMD core since ~2008) — probed once, helper fallback without them.
- * Debug: AEJIT_SSE=2 forces the baseline answers, proving every gated
+ * Debug: ARM64EMU_JIT_SSE=2 forces the baseline answers, proving every gated
  * recipe's decline/fallback path on a modern host. */
 static int sse_forced_baseline(void) {
     static int v = -1;
     if (v < 0) {
-        const char *s = getenv("AEJIT_SSE");
+        const char *s = getenv("ARM64EMU_JIT_SSE");
         v = (s && atoi(s) == 2);
     }
     return v;
@@ -1188,7 +1188,7 @@ static int cpu_has_sse42(void) {
 }
 /* F16C: half<->single vector convert (vcvtph2ps / vcvtps2ph). The gate for the
  * whole FP16 surface — without it every half encoding stays an interpreter
- * helper. AEJIT_SSE=2 forces it off, exercising that fallback. */
+ * helper. ARM64EMU_JIT_SSE=2 forces it off, exercising that fallback. */
 static int cpu_has_f16c(void) {
     static int v = -1;
     if (v < 0) v = __builtin_cpu_supports("f16c");
@@ -1254,7 +1254,7 @@ static void emit_const128(BE *be, u64 lo, u64 hi, int xreg) {
  * Block-local LRU cache of guest V registers in xmm5-15; xmm0-4 remain the
  * recipes' fixed scratch. Recipes fetch operands with vop_src (a movdqa
  * from the cached register, or the old movdqu from c->v[] under
- * AEJIT_NOVRA) and commit full-vector results with vop_dst; lane/GPR-
+ * ARM64EMU_JIT_NOVRA) and commit full-vector results with vop_dst; lane/GPR-
  * crossing recipes instead spill the named registers and run their
  * memory-based code unchanged. All xmm registers are caller-saved, so
  * helper-calling slow paths store the dirty set before the call (dirty
@@ -1264,7 +1264,7 @@ static void emit_const128(BE *be, u64 lo, u64 hi, int xreg) {
 
 static int vra_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("AEJIT_NOVRA") == NULL;
+    if (v < 0) v = getenv("ARM64EMU_JIT_NOVRA") == NULL;
     return v;
 }
 static void vld_q(BE *be, int hx, unsigned vn) { /* movdqu hx, c->v[vn] */

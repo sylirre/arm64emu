@@ -682,7 +682,7 @@ fast:
 
 static int fuse_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("AEJIT_NOFUSE") == NULL;
+    if (v < 0) v = getenv("ARM64EMU_JIT_NOFUSE") == NULL;
     return v;
 }
 
@@ -823,13 +823,13 @@ fast:
 /* FEAT_FP16 (native half-precision arith/convert) probe. Gates the FP16
  * classes: without it, half encodings stay interpreter helpers. Both HWCAP
  * bits (scalar FPHP + SIMD ASIMDHP) come together on real FEAT_FP16 cores.
- * AEJIT_NOFP16 forces it off, exercising the helper fallback. */
+ * ARM64EMU_JIT_NOFP16 forces it off, exercising the helper fallback. */
 static int cpu_has_fp16(void) {
     static int v = -1;
     if (v < 0) {
         unsigned long hw = getauxval(AT_HWCAP);
         v = ((hw & (HWCAP_FPHP | HWCAP_ASIMDHP)) == (HWCAP_FPHP | HWCAP_ASIMDHP))
-            && getenv("AEJIT_NOFP16") == NULL;
+            && getenv("ARM64EMU_JIT_NOFP16") == NULL;
     }
     return v;
 }
@@ -891,7 +891,7 @@ static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
 /* ---- guest V-register cache ----
  * Block-local LRU cache of guest V registers in host v18-v29. The replay
  * path fetches operands with vop_src (a 16B register move from the cached
- * copy, or the old LDR Q under AEJIT_NOVRA) and commits the replayed
+ * copy, or the old LDR Q under ARM64EMU_JIT_NOVRA) and commits the replayed
  * result from v2 with vop_dst; the GPR-composed recipes (MOVI/FMOVI/
  * FMOVG) spill the named registers and run unchanged. All pool registers
  * are caller-saved, so helper-calling slow paths store the dirty set and
@@ -902,7 +902,7 @@ static u32 enc_stq(unsigned qt, unsigned rn, unsigned off) {   /* STR Qt */
 
 static int vra_enabled(void) {
     static int v = -1;
-    if (v < 0) v = getenv("AEJIT_NOVRA") == NULL;
+    if (v < 0) v = getenv("ARM64EMU_JIT_NOVRA") == NULL;
     return v;
 }
 static u32 enc_vmov16(unsigned vd, unsigned vn) {   /* mov vd.16b, vn.16b */

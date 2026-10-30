@@ -799,13 +799,13 @@ StepResult pd_step(CPU *c, u64 slice, u64 max_insn) {
         [PD_STPDPOST] = &&L_STPD,
     };
 #pragma GCC diagnostic pop
-    /* Debug bisection knob (the -pd analogue of AEJIT_PDMAX): AEPD_MAX=N keeps
+    /* Debug bisection knob (the -pd analogue of ARM64EMU_JIT_PDMAX): ARM64EMU_PD_MAX=N keeps
      * only PD ops <= N on their native handlers; everything above runs through
-     * exec_a64 (L_GENERIC). AEPD_MAX=0 is the pure-interpreter floor. Applied
+     * exec_a64 (L_GENERIC). ARM64EMU_PD_MAX=0 is the pure-interpreter floor. Applied
      * once to the dispatch table — the per-instruction path is untouched. */
     static int pd_gate_done;
     if (UNLIKELY(!pd_gate_done)) {
-        const char *s = getenv("AEPD_MAX");
+        const char *s = getenv("ARM64EMU_PD_MAX");
         if (s) {
             int m = atoi(s);
             for (int i = (m < 0 ? 0 : m + 1); i < 256; i++)

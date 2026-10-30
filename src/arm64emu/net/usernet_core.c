@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* usernet core: API entry points, Ethernet/ARP/IPv4 handling, ICMP echo,
- * frame emission, poll driver, pcap capture (AENET_PCAP=<file>) and stats
- * (AENET_STATS=1). Protocol proxies live in usernet_udp.c / usernet_tcp.c. */
+ * frame emission, poll driver, pcap capture (ARM64EMU_NET_PCAP=<file>) and stats
+ * (ARM64EMU_NET_STATS=1). Protocol proxies live in usernet_udp.c / usernet_tcp.c. */
 #include "usernet_priv.h"
 #include <errno.h>
 #include <netinet/in.h>
@@ -45,10 +45,10 @@ static void pcap_frame(UserNet *un, const uint8_t *frame, size_t len) {
 }
 
 static void pcap_open(UserNet *un) {
-    const char *path = getenv("AENET_PCAP");
+    const char *path = getenv("ARM64EMU_NET_PCAP");
     if (!path || !*path) return;
     un->pcap = fopen(path, "wb");
-    if (!un->pcap) { perror("[usernet] AENET_PCAP fopen"); return; }
+    if (!un->pcap) { perror("[usernet] ARM64EMU_NET_PCAP fopen"); return; }
     /* layout: magic, major|minor<<16, thiszone, sigfigs, snaplen, network */
     uint32_t hdr[6] = { 0xa1b2c3d4, 2 | (4 << 16), 0, 0, 65535, 1 };
     fwrite(hdr, sizeof(hdr), 1, un->pcap);
@@ -396,7 +396,7 @@ UserNet *usernet_new(usernet_output_fn output, void *opaque,
     memcpy(un->guest_mac, guest_mac, 6);
     un->now_ms = un_now_ms();
     pcap_open(un);
-    if (getenv("AENET_STATS")) {
+    if (getenv("ARM64EMU_NET_STATS")) {
         un_stats_instance = un;
         atexit(un_stats_dump);
     }

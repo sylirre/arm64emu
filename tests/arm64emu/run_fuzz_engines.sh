@@ -8,24 +8,24 @@
 # configuration must produce byte-identical output (serial + cpu_dump +
 # HLT line). A run that never reaches HLT (maxinsn hit) is a generator bug.
 #
-# Env: AE_SEEDS (default 200), AE_NINSNS (0 = seed-derived size sweep),
-#      AE_EMU / AE_RUNNER as in run_tests.sh, CC for the generator build,
-#      AE_FUZZ_KEEP=dir to keep failing images (default build/tests/arm64emu/fuzz_failures),
-#      AE_TIMEOUT the per-run wall-clock ceiling (seconds).
+# Env: ARM64EMU_SEEDS (default 200), ARM64EMU_NINSNS (0 = seed-derived size sweep),
+#      ARM64EMU_EMU / ARM64EMU_RUNNER as in run_tests.sh, CC for the generator build,
+#      ARM64EMU_FUZZ_KEEP=dir to keep failing images (default build/tests/arm64emu/fuzz_failures),
+#      ARM64EMU_TIMEOUT the per-run wall-clock ceiling (seconds).
 set -u
-# The runtime default is the host wall clock (AE_RTCLOCK=1); pin the deterministic
+# The runtime default is the host wall clock (ARM64EMU_RTCLOCK=1); pin the deterministic
 # instruction-count clock so every engine config is byte-identical even when a
 # fuzzed block reads CNTPCT/CNTVCT. Overridable for debugging.
-export AE_RTCLOCK="${AE_RTCLOCK:-0}"
+export ARM64EMU_RTCLOCK="${ARM64EMU_RTCLOCK:-0}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-EMU="${AE_EMU:-$ROOT/build/arm64emu}"
-SEEDS=${AE_SEEDS:-200}
-NINSNS=${AE_NINSNS:-0}
-KEEP="${AE_FUZZ_KEEP:-$ROOT/build/tests/arm64emu/fuzz_failures}"
+EMU="${ARM64EMU_EMU:-$ROOT/build/arm64emu}"
+SEEDS=${ARM64EMU_SEEDS:-200}
+NINSNS=${ARM64EMU_NINSNS:-0}
+KEEP="${ARM64EMU_FUZZ_KEEP:-$ROOT/build/tests/arm64emu/fuzz_failures}"
 # Ceiling per run: a fuzzed block is 200k instructions at most, so this only
 # fires on one that has stopped retiring. Without it such a seed wedges the
 # whole sweep with no output rather than reporting a mismatch.
-AE_TIMEOUT="${AE_TIMEOUT:-60}"
+ARM64EMU_TIMEOUT="${ARM64EMU_TIMEOUT:-60}"
 [ -x "$EMU" ] || { echo "build arm64emu first"; exit 1; }
 
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
@@ -39,11 +39,11 @@ run_cfg() { # $1=cfg $2=bin $3=outprefix
         interp)      flags=--no-pd ;;   # plain interpreter (opt out of the default tier)
         pd)          ;;                  # predecoded tier is the default engine
         jit)         flags=--jit ;;
-        jit_slowmem) flags=--jit; envs="AEJIT_SLOWMEM=1" ;;
-        jit_nofuse)  flags=--jit; envs="AEJIT_NOFUSE=1" ;;
-        jit_novra)   flags=--jit; envs="AEJIT_NOVRA=1" ;;
+        jit_slowmem) flags=--jit; envs="ARM64EMU_JIT_SLOWMEM=1" ;;
+        jit_nofuse)  flags=--jit; envs="ARM64EMU_JIT_NOFUSE=1" ;;
+        jit_novra)   flags=--jit; envs="ARM64EMU_JIT_NOVRA=1" ;;
     esac
-    timeout -k 5 "$AE_TIMEOUT" env $envs ${AE_RUNNER:-} "$EMU" $flags --bin "$2@0x40000000" \
+    timeout -k 5 "$ARM64EMU_TIMEOUT" env $envs ${ARM64EMU_RUNNER:-} "$EMU" $flags --bin "$2@0x40000000" \
         --max-insn "${MAXI_OVERRIDE:-200000}" \
         </dev/null >"$3.out" 2>"$3.err"
 }

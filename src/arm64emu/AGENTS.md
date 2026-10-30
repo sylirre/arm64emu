@@ -34,13 +34,13 @@ Makefile                  build (C11 + libc/POSIX + -lm only, no external deps)
 src/
   main.c                  entry point: CLI parsing, --help text (the option and
                           env-var reference), image loading, the run loop,
-                          signal-flush of diagnostics, AE* debug env vars
+                          signal-flush of diagnostics, ARM64EMU_* debug env vars
   types.h                 u8..u64 / bool / small helpers
   cpu.h                   CPU state struct, PSTATE bits, core interpreter API
   cpu.c                   reset, cpu_step (fetch/decode/execute driver),
                           condition codes, cpu_dump, and the diagnostics:
-                          SVC syscall trace, musl-heap tracker (AEHEAP),
-                          AECOV coverage-divergence finder, PC ring buffer,
+                          SVC syscall trace, musl-heap tracker (ARM64EMU_HEAP),
+                          ARM64EMU_COV coverage-divergence finder, PC ring buffer,
                           hot-PC profiler
   decode.c                A64 decoder/executor, part 1 — DP-immediate,
                           DP-register, branches/exceptions/system, the whole
@@ -80,7 +80,7 @@ src/
   devices/
     gicv2.c               GICv2 distributor + CPU interface (single CPU)
     timer.c               architected generic timer (host clock, or the
-                          deterministic instruction-count clock at AE_RTCLOCK=0)
+                          deterministic instruction-count clock at ARM64EMU_RTCLOCK=0)
     pl011.c               PL011 UART: TX -> stdout, RX <- stdin, RX/TX IRQs
     pl031.c               PL031 RTC (host wall clock or fixed epoch)
     psci.c                PSCI over the SMC/HVC conduit, incl. SYSTEM_RESET
@@ -104,7 +104,7 @@ src/
     jit.h                 public JIT interface (--jit, off by default)
     jit_priv.h            internals shared between runtime and backends
     jit.c                 JIT runtime: code cache, block tables, dispatch loop,
-                          SMC coherence, memory slow paths, AEJIT_* knobs
+                          SMC coherence, memory slow paths, ARM64EMU_JIT_* knobs
     ir.h                  the IR: op set, virtual registers, block layout
     frontend.c            basic-block discovery + PDEnt -> IR translation
                           (guest-shaped concerns are all resolved here)
@@ -118,8 +118,8 @@ src/
     usernet_tcp.c         terminating TCP proxy over host sockets
 
 tests/
-  run_tests.sh            builds and runs the asm suite (EMU_FLAGS picks the
-                          engine; AE_EMU/AE_RUNNER pick an alternate binary)
+  run_tests.sh            builds and runs the asm suite (ARM64EMU_EMU_FLAGS picks the
+                          engine; ARM64EMU_EMU/ARM64EMU_RUNNER pick an alternate binary)
   run_pd_consist.sh       predecoded tier vs interpreter: identical serial
                           output + CPU state at exact --max-insn checkpoints
   run_jit_consist.sh      same comparison for --jit

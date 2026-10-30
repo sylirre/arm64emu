@@ -3,7 +3,7 @@
 /* ARM architected generic timer.
  *
  * By default the counter is driven by the host monotonic clock (natural
- * wall-clock guest time). Set AE_RTCLOCK=0 for the deterministic mode, where the
+ * wall-clock guest time). Set ARM64EMU_RTCLOCK=0 for the deterministic mode, where the
  * counter is driven by the retired-instruction count instead: one CNTFRQ tick per
  * executed instruction, plus a fast-forward accumulated while the CPU is halted in
  * WFI (see machine_wait_for_event). That makes the timer fully deterministic -- the

@@ -21,7 +21,7 @@
  * Gated families fall through to IRO_CALL1/exec_a64, which is always
  * correct. fe_atomic is NOT the donor's (value-CAS) path — it was
  * rewritten for this emulator's address-match monitor; the gate remains
- * for AEJIT_PDMAX bisection. */
+ * for ARM64EMU_JIT_PDMAX bisection. */
 #define JIT_FE_ATOMICS    1
 #define JIT_FE_FPSIMD     1
 #define JIT_FE_LDST_EXTRA 1
@@ -29,13 +29,13 @@
 
 enum { FE_CONT, FE_END };
 
-/* Debug bisection knob: AEJIT_PDMAX=N translates only PD ops <= N
+/* Debug bisection knob: ARM64EMU_JIT_PDMAX=N translates only PD ops <= N
  * natively (branches always native); everything else goes through the
  * exec_a64 helper. Used to localize a codegen bug to one handler class. */
 static int fe_pdmax(void) {
     static int v = -2;
     if (v == -2) {
-        const char *s = getenv("AEJIT_PDMAX");
+        const char *s = getenv("ARM64EMU_JIT_PDMAX");
         v = s ? atoi(s) : -1;
     }
     return v;
@@ -1696,7 +1696,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
          * interpreter helper ---- */
         default: {
             /* The fe_* families decode raw words (no PD id), so each gets a
-             * pseudo-id above PD_NOPS_ for AEJIT_PDMAX bisection:
+             * pseudo-id above PD_NOPS_ for ARM64EMU_JIT_PDMAX bisection:
              *   +0 fe_atomic  +1 fe_fpsimd  +2 fe_ldst_extra  +3 fe_bitfield
              *   +4 fe_ld1     +5 RBIT idiom +6 ADC/SBC family */
             if (JIT_FE_ATOMICS && e->op == PD_GENERIC &&
@@ -1842,7 +1842,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                     return FE_END;
                 }
                 if ((insn & 0xFFFFF0FFu) == 0xD50340DFu && !g_dbg) {
-                    /* MSR DAIFSet, #imm (local_irq_disable). With AEDBG the
+                    /* MSR DAIFSet, #imm (local_irq_disable). With ARM64EMU_DBG the
                      * CALL1 path keeps sysreg.c's break-on-mask hook. */
                     ir_put(ir, IRO_CPULD, 0, VREG_TMP0, VREG_ZERO, 0, 0,
                            offsetof(CPU, daif), 0);
@@ -1885,7 +1885,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                      * icount mid-block excludes the natively-retired batch,
                      * and ir->ninsns here is exactly that batch, so the sum
                      * is the exact architectural count. In real-time mode
-                     * (AE_RTCLOCK=1, the default) the JIT stays on but this
+                     * (ARM64EMU_RTCLOCK=1, the default) the JIT stays on but this
                      * inline is skipped, so the read routes through the
                      * authoritative host-clock helper instead. */
                     unsigned op2 = (insn >> 5) & 7;

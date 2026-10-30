@@ -105,7 +105,7 @@ typedef struct JitEnv {
                                  * byte-shift masks; no RIP-relative pools) */
     u32 slowmem;                /* every mem op takes the helper path; wired
                                  * on until Stage 2b adapts the inline probe
-                                 * (then AEJIT_SLOWMEM=1 forces, bisection) */
+                                 * (then ARM64EMU_JIT_SLOWMEM=1 forces, bisection) */
     /* Sticky union of the FP modes (FPMODE_*) the guest has asked for; what
      * it costs the inline FP surface is ir.h's vop_fpcr_blocked. Sticky
      * rather than tracking the live bits because clearing them back would
@@ -177,7 +177,7 @@ typedef struct JitEnv {
                                  * flushes before the next dispatch. Nothing
                                  * sets it today (IC IVAU invalidates its one
                                  * page precisely). */
-    u64 ntrans;                 /* lifetime translations (AEJIT_STATS) */
+    u64 ntrans;                 /* lifetime translations (ARM64EMU_JIT_STATS) */
     u64 ndisp;                  /* lifetime dispatcher round trips */
 
     /* Self-modifying-code thrash guard: a direct-mapped count of how often

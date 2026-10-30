@@ -158,11 +158,11 @@ void machine_tick(Machine *m) {
      * and need none of the per-tick precision the timer/RTC compares above
      * get: run them on a much coarser instruction cadence.
      * machine_wait_for_event zeroes io_poll_due so WFI-idle input/net latency
-     * is unchanged. AEIOTICK overrides the cadence (insns; bisection knob). */
+     * is unchanged. ARM64EMU_IOTICK overrides the cadence (insns; bisection knob). */
     if (m->cpu.icount < m->io_poll_due) return;
     static u64 io_interval;
     if (!io_interval) {
-        const char *s = getenv("AEIOTICK");
+        const char *s = getenv("ARM64EMU_IOTICK");
         io_interval = s ? strtoull(s, 0, 0) : 65536;
         if (!io_interval) io_interval = 1;
     }
@@ -251,7 +251,7 @@ void machine_wait_for_event(Machine *m) {
     int nfd = host_wait_fds(m, pfd, (int)(sizeof pfd / sizeof *pfd));
 
     if (!g_rtclock) {
-        /* Deterministic timer (AE_RTCLOCK=0 opt-out): the counter only advances as instructions retire,
+        /* Deterministic timer (ARM64EMU_RTCLOCK=0 opt-out): the counter only advances as instructions retire,
          * so while halted in WFI it would never reach the next deadline. Jump the
          * virtual clock forward by exactly the ticks remaining to the nearest
          * armed timer, so the IRQ fires at a fixed, reproducible icount. */
@@ -278,7 +278,7 @@ void machine_wait_for_event(Machine *m) {
         return;
     }
 
-    /* Real-time mode (AE_RTCLOCK=1, the default): pace against the host monotonic clock. */
+    /* Real-time mode (ARM64EMU_RTCLOCK=1, the default): pace against the host monotonic clock. */
     u64 dl = timer_next_deadline_ns(m);
     int timeout_ms;
     if (dl == 0) timeout_ms = 0;

@@ -5,17 +5,17 @@
 #
 # The guest userland (busybox + musl loader + virtio/net kernel modules) is
 # harvested from a stock Alpine aarch64 initramfs matching the test kernel:
-#   AE_SRC_INITRD  path to that initramfs   (default: ~/initrd)
+#   ARM64EMU_SRC_INITRD  path to that initramfs   (default: ~/initrd)
 #   $1             output path              (default: build/net-test.ird)
 #
 # Modules pulled: virtio_mmio, failover, net_failover, virtio_net, af_packet
 # (af_packet because udhcpc needs AF_PACKET and Alpine builds it modular).
 set -eu
-SRC=${AE_SRC_INITRD:-$HOME/initrd}
+SRC=${ARM64EMU_SRC_INITRD:-$HOME/initrd}
 OUT=${1:-build/tests/arm64emu/net-test.ird}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-[ -f "$SRC" ] || { echo "source initramfs '$SRC' not found (set AE_SRC_INITRD)"; exit 1; }
+[ -f "$SRC" ] || { echo "source initramfs '$SRC' not found (set ARM64EMU_SRC_INITRD)"; exit 1; }
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT

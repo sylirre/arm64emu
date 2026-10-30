@@ -145,13 +145,13 @@ Note that host resize events make `virtio` mode as non-deterministic as any
 keyboard input; the default `pl011` path is untouched.
 
 Debug/bring-up env vars (all off by default, no runtime cost when unset):
-`AEDBG=N` device/IRQ + fw_cfg/flash logging, `AEPROF=1` hot-PC profiler,
-`AERING=1` recent-instruction ring buffer, `AETPC=0xADDR` dump CPU state at a PC,
-`AEWATCH=0xADDR` watch writes to an address, `AEIABORT=1` log instruction aborts,
-`AECOV=file` coverage-divergence finder (see below).
+`ARM64EMU_DBG=N` device/IRQ + fw_cfg/flash logging, `ARM64EMU_PROF=1` hot-PC profiler,
+`ARM64EMU_RING=1` recent-instruction ring buffer, `ARM64EMU_TPC=0xADDR` dump CPU state at a PC,
+`ARM64EMU_WATCH=0xADDR` watch writes to an address, `ARM64EMU_IABORT=1` log instruction aborts,
+`ARM64EMU_COV=file` coverage-divergence finder (see below).
 
 The generic timer and PL031 RTC follow the host wall clock by default. Set
-`AE_RTCLOCK=0` to switch both to a deterministic instruction-count clock and a
+`ARM64EMU_RTCLOCK=0` to switch both to a deterministic instruction-count clock and a
 fixed RTC epoch, giving a bit-for-bit reproducible boot — the mode the test gates
 (`make test`, `test-pd`, `test-jit`, `fuzz-engines`) pin for cross-engine
 comparison.
@@ -234,7 +234,7 @@ QEMU is used purely as a *development oracle* — never linked or required to ru
    device tree from guest memory, and capture `-d in_asm` coverage from the *same
    run* (so the DTB, including its random seed, matches). Reconstruct the full
    set of executed instruction addresses from the `OBJD-T` bytes.
-2. **Coverage-divergence finder** (`AECOV=qemu_cov.txt`): run `arm64emu` with the
+2. **Coverage-divergence finder** (`ARM64EMU_COV=qemu_cov.txt`): run `arm64emu` with the
    identical DTB and stop at the first PC it executes that QEMU never does — i.e.
    the exact point where control flow first leaves QEMU's path. This pinpointed
    each bug (a missing device register, a wrong DTB node, an unimplemented
@@ -285,7 +285,7 @@ validated under qemu-user emulation but untested on real hardware):
 **~370 MIPS (≈10×)** on the Linux-boot workload, >99.9% of instructions
 native in steady state. The interpreter stays the
 default and the reference — `make test-jit` requires byte-identical CPU
-state between the modes on a deterministic-clock boot (`AE_RTCLOCK=0`, which the
+state between the modes on a deterministic-clock boot (`ARM64EMU_RTCLOCK=0`, which the
 gate pins). Design, full-system
 coherence (SMC store-tracking, block/context keying, IRQ safepoints) and
 debug knobs: [docs/jit.md](docs/jit.md).

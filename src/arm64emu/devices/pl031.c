@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* PL031 real-time clock (minimal: host wall-clock seconds, or a fixed epoch in
- * deterministic mode). By default (AE_RTCLOCK=1) we return live host time. The
- * host clock is the last non-reproducible input into the guest, so AE_RTCLOCK=0
+ * deterministic mode). By default (ARM64EMU_RTCLOCK=1) we return live host time. The
+ * host clock is the last non-reproducible input into the guest, so ARM64EMU_RTCLOCK=0
  * (deterministic, !g_rtclock) returns a fixed base instead, keeping the whole
- * boot bit-for-bit reproducible. Matches the generic timer's AE_RTCLOCK gating. */
+ * boot bit-for-bit reproducible. Matches the generic timer's ARM64EMU_RTCLOCK gating. */
 #include "../devices.h"
 #include <stdlib.h>
 #include <string.h>

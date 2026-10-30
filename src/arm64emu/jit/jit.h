@@ -47,7 +47,7 @@ void jit_reset(void);
  * generated code exit at the next block entry. */
 void jit_request_exit(void);
 
-/* Flush the AEJIT_STATS report if enabled. No-op otherwise. */
+/* Flush the ARM64EMU_JIT_STATS report if enabled. No-op otherwise. */
 void jit_stats_flush(void);
 
 #endif /* A64_JIT_H */

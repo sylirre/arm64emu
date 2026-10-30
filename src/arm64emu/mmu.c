@@ -256,7 +256,7 @@ bool mmu_translate(CPU *c, u64 va, AccType acc, u64 *pa_out) {
  * without W) always reaches mmu_translate, whose deny-triggered re-walk
  * observes in-place RO->RW descriptor upgrades (the COW contract above), and
  * the refill then grants W. Watchpoint runs keep every access on the slow
- * path so the AEWATCH/AEVAW hooks in mem_write/phys_write still see them. */
+ * path so the ARM64EMU_WATCH/ARM64EMU_VAW hooks in mem_write/phys_write still see them. */
 static void dtlb_fill(CPU *c, u64 va, u64 pa) {
     if (g_watch || g_vawatch) return;
     Machine *m = c->m;

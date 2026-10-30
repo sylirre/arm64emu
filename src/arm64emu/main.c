@@ -37,7 +37,7 @@ static void on_signal(int sig) {
     tty_raw_disable();
     if (g_sig_cpu) { cpu_dump(g_sig_cpu); ring_dump(); }
     prof_dump();
-    jit_stats_flush();     /* _exit skips atexit; flush AEJIT_STATS if on */
+    jit_stats_flush();     /* _exit skips atexit; flush ARM64EMU_JIT_STATS if on */
     _exit(0);
 }
 
@@ -318,49 +318,49 @@ static void help(void) {
                         "arguments)."},
     };
     static const struct help_def env_tune[] = {
-        {"AEJIT_MB=N",  "JIT code-cache size in MiB. Default 32, max 128."},
-        {"AE_RTCLOCK=0", "Deterministic clock: drive the generic timer and the "
+        {"ARM64EMU_JIT_MB=N",  "JIT code-cache size in MiB. Default 32, max 128."},
+        {"ARM64EMU_RTCLOCK=0", "Deterministic clock: drive the generic timer and the "
                         "RTC from the retired-instruction count (reproducible "
                         "boots) instead of the host clock (the default)."},
-        {"AETICK=N",    "IRQ-poll granularity mask for the run loop. Default "
+        {"ARM64EMU_TICK=N",    "IRQ-poll granularity mask for the run loop. Default "
                         "0x3ff (poll every 1024 steps)."},
     };
     static const struct help_def env_diag[] = {
-        {"AEDBG=N",     "Targeted device/IRQ debug logging (GIC, timer, "
+        {"ARM64EMU_DBG=N",     "Targeted device/IRQ debug logging (GIC, timer, "
                         "fw_cfg, flash)."},
-        {"AEPROF=1",    "Hot-PC profiler; the ranking is dumped at exit or on "
+        {"ARM64EMU_PROF=1",    "Hot-PC profiler; the ranking is dumped at exit or on "
                         "SIGINT."},
-        {"AERING=1",    "Ring buffer of recent instructions, dumped on "
+        {"ARM64EMU_RING=1",    "Ring buffer of recent instructions, dumped on "
                         "abort/exit."},
-        {"AETPC=0xPC",  "Dump the CPU state each time the pc hits this "
+        {"ARM64EMU_TPC=0xPC",  "Dump the CPU state each time the pc hits this "
                         "address."},
-        {"AEWATCH=0xADDR", "Log writes touching the 8 bytes at physical "
+        {"ARM64EMU_WATCH=0xADDR", "Log writes touching the 8 bytes at physical "
                         "ADDR."},
-        {"AEVAW=0xVA",  "Log writes whose range covers this virtual address "
-                        "(implies AERING=1)."},
-        {"AEIABORT=1",  "Log instruction aborts."},
-        {"AESYS=1",     "Trace guest memory-management syscalls "
+        {"ARM64EMU_VAW=0xVA",  "Log writes whose range covers this virtual address "
+                        "(implies ARM64EMU_RING=1)."},
+        {"ARM64EMU_IABORT=1",  "Log instruction aborts."},
+        {"ARM64EMU_SYS=1",     "Trace guest memory-management syscalls "
                         "(mmap/brk/munmap/...)."},
-        {"AEHEAP=1",    "musl-heap double-alloc finder (implies AERING=1)."},
-        {"AEHEAP_AT=0xVA", "Log every alloc/free touching this virtual "
+        {"ARM64EMU_HEAP=1",    "musl-heap double-alloc finder (implies ARM64EMU_RING=1)."},
+        {"ARM64EMU_HEAP_AT=0xVA", "Log every alloc/free touching this virtual "
                         "address."},
-        {"AECOV=FILE",  "Coverage-divergence finder: compare executed PCs "
+        {"ARM64EMU_COV=FILE",  "Coverage-divergence finder: compare executed PCs "
                         "against a QEMU PC-set file."},
-        {"AEJIT_STATS=1|/path", "Rank instruction words still run via the "
+        {"ARM64EMU_JIT_STATS=1|/path", "Rank instruction words still run via the "
                         "exec_a64 helper, =/path dumps the ranking to a file "
                         "at exit."},
-        {"AEJIT_DUMP=PREFIX", "Write each translated block into a sparse "
+        {"ARM64EMU_JIT_DUMP=PREFIX", "Write each translated block into a sparse "
                         "code-cache image (PREFIX.code plus a .map)."},
-        {"AEJIT_PDMAX=N", "Translate only PD ops <= N natively (bisects a "
+        {"ARM64EMU_JIT_PDMAX=N", "Translate only PD ops <= N natively (bisects a "
                         "codegen bug to one instruction class)."},
-        {"AEJIT_SLOWMEM=1", "Force every JIT memory access through the slow "
+        {"ARM64EMU_JIT_SLOWMEM=1", "Force every JIT memory access through the slow "
                         "helpers."},
-        {"AEJIT_NOFUSE=1", "Disable instruction / D-TLB-probe fusion."},
-        {"AEJIT_NOVRA=1", "Disable the V-register cache."},
-        {"AEJIT_NOFP16=1", "Disable FP16 native codegen (AArch64 backend)."},
-        {"AEJIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
-        {"AEPD_MAX=N",  "Dispatch only PD ops <= N natively in the predecoded "
-                        "tier (0 = pure interpreter); the analogue of AEJIT_PDMAX."},
+        {"ARM64EMU_JIT_NOFUSE=1", "Disable instruction / D-TLB-probe fusion."},
+        {"ARM64EMU_JIT_NOVRA=1", "Disable the V-register cache."},
+        {"ARM64EMU_JIT_NOFP16=1", "Disable FP16 native codegen (AArch64 backend)."},
+        {"ARM64EMU_JIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
+        {"ARM64EMU_PD_MAX=N",  "Dispatch only PD ops <= N natively in the predecoded "
+                        "tier (0 = pure interpreter); the analogue of ARM64EMU_JIT_PDMAX."},
     };
     static const char *const examples[] = {
         "arm64emu --bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
@@ -736,24 +736,24 @@ int main(int argc, char **argv)
     /* Binding hvcN says the console exists; no need to also state the count. */
     if (n_hvc_bound > n_consoles) n_consoles = n_hvc_bound;
 
-    if (getenv("AEDBG")) g_dbg = atoi(getenv("AEDBG"));
-    if (getenv("AEPROF")) g_prof = atoi(getenv("AEPROF"));
-    if (getenv("AETPC")) g_tpc = strtoull(getenv("AETPC"), 0, 0);
-    if (getenv("AERING")) g_ring = atoi(getenv("AERING"));
-    if (getenv("AEWATCH")) g_watch = strtoull(getenv("AEWATCH"), 0, 0);
-    if (getenv("AEIABORT")) g_iabort_log = atoi(getenv("AEIABORT"));
-    if (getenv("AE_RTCLOCK")) g_rtclock = atoi(getenv("AE_RTCLOCK"));
-    if (getenv("AEVAW")) { g_vawatch = strtoull(getenv("AEVAW"), 0, 0); g_ring = 1; }
-    if (getenv("AESYS")) g_systrace = atoi(getenv("AESYS"));
-    if (getenv("AEHEAP")) { g_heaptrack = atoi(getenv("AEHEAP")); g_ring = 1; heaptrack_init(); }
-    if (getenv("AEHEAP_AT")) g_heap_at = strtoull(getenv("AEHEAP_AT"), 0, 0);
-    if (getenv("AECOV")) { g_ring = 1; cov_load(getenv("AECOV")); }
+    if (getenv("ARM64EMU_DBG")) g_dbg = atoi(getenv("ARM64EMU_DBG"));
+    if (getenv("ARM64EMU_PROF")) g_prof = atoi(getenv("ARM64EMU_PROF"));
+    if (getenv("ARM64EMU_TPC")) g_tpc = strtoull(getenv("ARM64EMU_TPC"), 0, 0);
+    if (getenv("ARM64EMU_RING")) g_ring = atoi(getenv("ARM64EMU_RING"));
+    if (getenv("ARM64EMU_WATCH")) g_watch = strtoull(getenv("ARM64EMU_WATCH"), 0, 0);
+    if (getenv("ARM64EMU_IABORT")) g_iabort_log = atoi(getenv("ARM64EMU_IABORT"));
+    if (getenv("ARM64EMU_RTCLOCK")) g_rtclock = atoi(getenv("ARM64EMU_RTCLOCK"));
+    if (getenv("ARM64EMU_VAW")) { g_vawatch = strtoull(getenv("ARM64EMU_VAW"), 0, 0); g_ring = 1; }
+    if (getenv("ARM64EMU_SYS")) g_systrace = atoi(getenv("ARM64EMU_SYS"));
+    if (getenv("ARM64EMU_HEAP")) { g_heaptrack = atoi(getenv("ARM64EMU_HEAP")); g_ring = 1; heaptrack_init(); }
+    if (getenv("ARM64EMU_HEAP_AT")) g_heap_at = strtoull(getenv("ARM64EMU_HEAP_AT"), 0, 0);
+    if (getenv("ARM64EMU_COV")) { g_ring = 1; cov_load(getenv("ARM64EMU_COV")); }
     /* Any per-instruction debug facility routes through the single hot-path guard.
-     * (g_ring is also set by AECOV, so the coverage finder is covered too.) */
+     * (g_ring is also set by ARM64EMU_COV, so the coverage finder is covered too.) */
     g_debug_hooks = g_trace | g_rtrace | g_prof | g_ring | (g_tpc != 0);
 
     /* The JIT batches instructions, so anything per-instruction forces the
-     * interpreter: debug hooks (trace/rtrace/prof/ring/tpc/AECOV) and the
+     * interpreter: debug hooks (trace/rtrace/prof/ring/tpc/ARM64EMU_COV) and the
      * memory watchpoints (which also disable the D-TLB fast path). */
     if (g_jit && (g_debug_hooks || g_watch || g_vawatch)) {
         fprintf(stderr, "[jit] disabled: per-instruction debug facility active\n");
@@ -847,8 +847,8 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
 
     unsigned long ticker = 0;
-    unsigned long tick_mask = 0x3ff;     /* AETICK: IRQ-poll granularity (debug) */
-    if (getenv("AETICK")) tick_mask = strtoul(getenv("AETICK"), 0, 0);
+    unsigned long tick_mask = 0x3ff;     /* ARM64EMU_TICK: IRQ-poll granularity (debug) */
+    if (getenv("ARM64EMU_TICK")) tick_mask = strtoul(getenv("ARM64EMU_TICK"), 0, 0);
     for (;;) {
         /* --jit / predecoded tier: one step covers up to a tick-slice of
          * instructions, so tick on every return; --no-pd (the plain

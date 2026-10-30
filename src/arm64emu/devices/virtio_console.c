@@ -102,7 +102,7 @@ static void con_sync_size(VirtIOConsole *v) {
     con_update_winsize(v);
     v->isr |= 2;                      /* VIRTIO_MMIO_INT_CONFIG */
     gic_set_irq(v->gic, v->irq, 1);
-    if (getenv("AEVCON"))
+    if (getenv("ARM64EMU_VCON"))
         fprintf(stderr, "[vcon] hvc%d initial size sync: %ux%u\n",
                 v->index, v->cols, v->rows);
 }

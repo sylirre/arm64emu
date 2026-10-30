@@ -8,7 +8,7 @@
  * the image is linked at 0x40000000 but loaded at flash 0x0, the vector table
  * base is taken with ADR (PC-relative) — never an absolute movz/literal.
  *
- * The gates pin AE_RTCLOCK=0 (deterministic clock: 1 tick/insn). Under it, WFI
+ * The gates pin ARM64EMU_RTCLOCK=0 (deterministic clock: 1 tick/insn). Under it, WFI
  * fast-forwards the virtual counter to the armed deadline (machine_wait_for_event
  * -> timer_next_deadline_ticks), so the IRQ lands at a fixed icount. Under the
  * real-time clock it instead paces on the host clock; either way the timer fires.

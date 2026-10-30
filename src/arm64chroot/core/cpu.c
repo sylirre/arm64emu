@@ -13,19 +13,19 @@ int g_singlestep = 0;
 int g_dbg = 0;
 int g_rtrace = 0;
 int g_prof = 0;
-u64 g_tpc = 0;       /* env AETPC: dump state whenever pc == this (debug) */
-int g_ring = 0;      /* env AERING: record a ring buffer of recent steps */
-u64 g_watch = 0;     /* env AEWATCH: log writes to [g_watch, g_watch+8) */
-int g_iabort_log = 0;/* env AEIABORT: log instruction aborts (debug) */
-int g_rtclock = 0;   /* env AE_RTCLOCK: host-clock timer (default = deterministic) */
-u64 g_vawatch = 0;   /* env AEVAW: log writes whose range covers this VA (debug) */
+u64 g_tpc = 0;       /* env ARM64EMU_TPC: dump state whenever pc == this (debug) */
+int g_ring = 0;      /* env ARM64EMU_RING: record a ring buffer of recent steps */
+u64 g_watch = 0;     /* env ARM64EMU_WATCH: log writes to [g_watch, g_watch+8) */
+int g_iabort_log = 0;/* env ARM64EMU_IABORT: log instruction aborts (debug) */
+int g_rtclock = 0;   /* env ARM64EMU_RTCLOCK: host-clock timer (default = deterministic) */
+u64 g_vawatch = 0;   /* env ARM64EMU_VAW: log writes whose range covers this VA (debug) */
 int g_systrace = 0;  /* unused in linux-user (the syscall layer has -strace) */
 
 /* Kept as a no-op: decode.c calls this before every SVC; the linux-user
  * syscall tracing lives in syscall.c (-strace). */
 void systrace_svc(CPU *c) { (void)c; }
 
-/* Coverage-divergence finder (env AECOV=file): a sorted set of PCs QEMU is known
+/* Coverage-divergence finder (env ARM64EMU_COV=file): a sorted set of PCs QEMU is known
  * to execute. The first PC our run executes that is NOT in this set marks where
  * we left QEMU's path — i.e. at/just after the first control-flow divergence. */
 static u64 *g_cov;
@@ -87,7 +87,7 @@ void ring_dump(void) {
     }
 }
 
-/* Lightweight hot-PC profiler (env AEPROF=1). A direct-mapped histogram that
+/* Lightweight hot-PC profiler (env ARM64EMU_PROF=1). A direct-mapped histogram that
  * tells whether the CPU is spinning in a tight loop vs. making broad progress.
  * Off by default; one predictable branch in the step loop when enabled. */
 #define PROF_SLOTS 65536

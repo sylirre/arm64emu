@@ -81,7 +81,7 @@ typedef struct CPU {
     u64 cntv_ctl, cntv_cval;
     u64 cntkctl_el1;
     s64 cntvoff;
-    u64 cntpct_base;   /* AE_RTCLOCK mode: host ns at which the counter == 0 */
+    u64 cntpct_base;   /* ARM64EMU_RTCLOCK mode: host ns at which the counter == 0 */
     u64 timer_skip;    /* deterministic mode: virtual ticks fast-forwarded over WFI idle */
 
     /* Exclusive monitor. excl_val[2] hold the values LDXR/LDXP loaded so STXR/
@@ -165,23 +165,23 @@ bool cond_holds(CPU *c, unsigned cond);
 /* Global trace flags (set from CLI). */
 extern int g_trace;        /* per-instruction trace */
 extern int g_singlestep;   /* unused placeholder for parity with QEMU */
-extern int g_dbg;          /* targeted device/IRQ debug (env AEDBG) */
+extern int g_dbg;          /* targeted device/IRQ debug (env ARM64EMU_DBG) */
 extern int g_rtrace;       /* compact register trace for differential debugging */
-extern int g_prof;         /* hot-PC profiler (env AEPROF) */
+extern int g_prof;         /* hot-PC profiler (env ARM64EMU_PROF) */
 void prof_dump(void);      /* print the hottest PCs (no-op unless g_prof) */
-extern u64 g_tpc;          /* env AETPC: dump CPU state when pc == this */
-extern int g_ring;         /* env AERING: ring-buffer recent steps */
+extern u64 g_tpc;          /* env ARM64EMU_TPC: dump CPU state when pc == this */
+extern int g_ring;         /* env ARM64EMU_RING: ring-buffer recent steps */
 void ring_dump(void);      /* print the recent-instruction ring buffer */
-extern u64 g_watch;        /* env AEWATCH: log writes to [g_watch, g_watch+8) */
+extern u64 g_watch;        /* env ARM64EMU_WATCH: log writes to [g_watch, g_watch+8) */
 extern int g_debug_hooks;  /* OR of all per-step debug facilities (perf guard) */
-extern int g_iabort_log;   /* env AEIABORT: log instruction aborts */
-extern int g_rtclock;      /* env AE_RTCLOCK: drive the generic timer from the host
+extern int g_iabort_log;   /* env ARM64EMU_IABORT: log instruction aborts */
+extern int g_rtclock;      /* env ARM64EMU_RTCLOCK: drive the generic timer from the host
                               clock instead of the deterministic instruction count */
-extern u64 g_vawatch;      /* env AEVAW: log writes whose range covers this VA */
-extern int g_systrace;     /* env AESYS: trace mm syscalls (mmap/brk/munmap/...) */
+extern u64 g_vawatch;      /* env ARM64EMU_VAW: log writes whose range covers this VA */
+extern int g_systrace;     /* env ARM64EMU_SYS: trace mm syscalls (mmap/brk/munmap/...) */
 void systrace_svc(CPU *c); /* record an in-flight mm syscall for return logging */
-extern int g_heaptrack;    /* env AEHEAP: musl malloc/free/realloc double-alloc finder */
-extern u64 g_heap_at;      /* env AEHEAP_AT: log every alloc/free touching this VA */
+extern int g_heaptrack;    /* env ARM64EMU_HEAP: musl malloc/free/realloc double-alloc finder */
+extern u64 g_heap_at;      /* env ARM64EMU_HEAP_AT: log every alloc/free touching this VA */
 void heaptrack_init(void); /* allocate the heap-tracker tables (call once at startup) */
 void heaptrack_report(void); /* print heap-tracker stats (call once at exit) */
 void heaptrack_query(CPU *c, u64 va); /* report which live block (if any) contains va */

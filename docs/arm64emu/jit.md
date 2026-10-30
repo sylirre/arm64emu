@@ -7,14 +7,14 @@ byte-identical consistency checkpoints under qemu-user emulation —
 The interpreter remains the default execution mode and the reference
 semantics: anything the translator does not handle inline executes by
 calling `exec_a64`, and `make test-jit` requires interpreter-vs-JIT
-byte-identical CPU state on a deterministic-clock boot (`AE_RTCLOCK=0`, which
+byte-identical CPU state on a deterministic-clock boot (`ARM64EMU_RTCLOCK=0`, which
 the gate pins; the runtime default is now the host wall clock).
 
 Measured on the firmware+Linux boot used by `tests/run_jit_consist.sh`:
 ~36 MIPS interpreted, ~370 MIPS with `--jit` (≈10×). Steady state runs
 >99.9% of instructions natively; the remaining helper residue
 (~0.04% over the full 1.6B-instruction boot) is IC IVAU, TLBI and cold
-sysreg moves — `AEJIT_STATS=1` classifies it as `system`, which is the
+sysreg moves — `ARM64EMU_JIT_STATS=1` classifies it as `system`, which is the
 profile to expect.
 
 Two things dominated that residue historically, and neither was where a
@@ -30,7 +30,7 @@ reader would have guessed:
   80% of an FP-heavy loop — closing them took that loop from ~21 to
   ~140 MIPS.
 
-The lesson for anyone reading `AEJIT_STATS` output: rank by what the target
+The lesson for anyone reading `ARM64EMU_JIT_STATS` output: rank by what the target
 *workload* runs, not by what looks unfinished.
 
 Ported from the arm64chroot user-mode emulator (same author; its CPU core
@@ -123,7 +123,7 @@ and the hot moves that cannot change translation state are inline:
 `TPIDR_EL0`/`TPIDRRO_EL0`/`TPIDR_EL1`, `SP_EL0` (only in blocks whose
 context says the live SP is a different bank — otherwise sp_el[0] may be
 cached in the backend's SP register), `DAIF` reads, `DAIFSet` (masking;
-under AEDBG it stays on the helper so sysreg.c's break-on-mask hook
+under ARM64EMU_DBG it stays on the helper so sysreg.c's break-on-mask hook
 fires), and `DCZID_EL0` (constant). `MSR DAIF`/`DAIFClr` are inline but
 still end the block: they may unmask, and the dispatcher must see
 pending IRQ lines at the same boundary the helper path gave. Every other `0xD5` system
@@ -170,24 +170,24 @@ decode.c remains authoritative for it.
   tail run to the block end (≤128 instructions) — architecturally
   permitted without IC IVAU+ISB, and unobservable for cross-page SMC
   (module loads, kernel alternatives, DMA), which is exact.
-- **Debug facilities force the interpreter**: `--trace`, `--reg-trace`, AEPROF,
-  AERING, AETPC, AECOV, AEWATCH, AEVAW (per-instruction hooks; the
+- **Debug facilities force the interpreter**: `--trace`, `--reg-trace`, ARM64EMU_PROF,
+  ARM64EMU_RING, ARM64EMU_TPC, ARM64EMU_COV, ARM64EMU_WATCH, ARM64EMU_VAW (per-instruction hooks; the
   watchpoints also need every access on the slow path). `--jit` prints a
   notice and clears itself.
 
 ## Knobs (debug/bisection, all off by default)
 
-- `AEJIT_MB=N` — code cache size (default 32, max 128).
-- `AEJIT_STATS=1|/path` — rank instruction words still executed via the
+- `ARM64EMU_JIT_MB=N` — code cache size (default 32, max 128).
+- `ARM64EMU_JIT_STATS=1|/path` — rank instruction words still executed via the
   exec_a64 helper (what to inline next), plus a summary line of lifetime
   flushes / translations / dispatcher round trips.
-- `AEJIT_DUMP=prefix` — sparse code-cache image + block map for objdump.
-- `AEJIT_PDMAX=N` — translate only PD ops ≤ N natively (bisect a codegen
+- `ARM64EMU_JIT_DUMP=prefix` — sparse code-cache image + block map for objdump.
+- `ARM64EMU_JIT_PDMAX=N` — translate only PD ops ≤ N natively (bisect a codegen
   bug to a handler class; branches stay native).
-- `AEJIT_SLOWMEM=1` — force every memory access through the helpers.
-- `AEJIT_NOFUSE=1` / `AEJIT_NOVRA=1` / `AEJIT_NOFP16=1` — disable memory-
+- `ARM64EMU_JIT_SLOWMEM=1` — force every memory access through the helpers.
+- `ARM64EMU_JIT_NOFUSE=1` / `ARM64EMU_JIT_NOVRA=1` / `ARM64EMU_JIT_NOFP16=1` — disable memory-
   run fusing / the V-register cache / FP16 inlining.
-- `AEJIT_SSE=2` (x86-64) — answer every capability probe at the SSE2
+- `ARM64EMU_JIT_SSE=2` (x86-64) — answer every capability probe at the SSE2
   baseline, so the FMA3 and SSE4.1 paths take their declines instead. Worth
   running the suite and the fuzzer under it: those fallbacks are otherwise
   only exercised on old hardware nobody tests on.
@@ -197,14 +197,14 @@ decode.c remains authoritative for it.
 `make test-jit` runs the m1–m12 suite under `--jit` (the SIMD/crypto
 batteries were built as QEMU differentials, so they double as the FP
 oracle) and `tests/run_jit_consist.sh`: the deterministic firmware+Linux
-boot (the harness pins `AE_RTCLOCK=0`) stopped at 1M/4M/16M/64M/300M
+boot (the harness pins `ARM64EMU_RTCLOCK=0`) stopped at 1M/4M/16M/64M/300M
 instructions, requiring byte-identical
 serial output *and* final CPU state between modes. Divergence playbook:
 binary-search `--max-insn` for the first divergent state (both modes are
-deterministic; beware hangs — use `timeout`), then `AEJIT_PDMAX` to
-isolate the instruction class, `AEJIT_SLOWMEM/NOFUSE/NOVRA` to isolate
-machinery, `AEJIT_DUMP` + objdump to read the block. The full gates also
-include `net_smoke.sh` under `EMU_FLAGS=--jit` and an Alpine ISO boot to
+deterministic; beware hangs — use `timeout`), then `ARM64EMU_JIT_PDMAX` to
+isolate the instruction class, `ARM64EMU_JIT_SLOWMEM/NOFUSE/NOVRA` to isolate
+machinery, `ARM64EMU_JIT_DUMP` + objdump to read the block. The full gates also
+include `net_smoke.sh` under `ARM64EMU_EMU_FLAGS=--jit` and an Alpine ISO boot to
 the login prompt.
 
 One gate is mandatory for any frontend change: the **full 1.6B-insn boot

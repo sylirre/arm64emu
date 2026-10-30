@@ -13,13 +13,13 @@ int g_singlestep = 0;
 int g_dbg = 0;
 int g_rtrace = 0;
 int g_prof = 0;
-u64 g_tpc = 0;       /* env AETPC: dump state whenever pc == this (debug) */
-int g_ring = 0;      /* env AERING: record a ring buffer of recent steps */
-u64 g_watch = 0;     /* env AEWATCH: log writes to [g_watch, g_watch+8) */
-int g_iabort_log = 0;/* env AEIABORT: log instruction aborts (debug) */
-int g_rtclock = 1;   /* env AE_RTCLOCK: host-clock timer (default); 0 = deterministic (debug) */
-u64 g_vawatch = 0;   /* env AEVAW: log writes whose range covers this VA (debug) */
-int g_systrace = 0;  /* env AESYS: trace mm syscalls (mmap/brk/munmap/...) (debug) */
+u64 g_tpc = 0;       /* env ARM64EMU_TPC: dump state whenever pc == this (debug) */
+int g_ring = 0;      /* env ARM64EMU_RING: record a ring buffer of recent steps */
+u64 g_watch = 0;     /* env ARM64EMU_WATCH: log writes to [g_watch, g_watch+8) */
+int g_iabort_log = 0;/* env ARM64EMU_IABORT: log instruction aborts (debug) */
+int g_rtclock = 1;   /* env ARM64EMU_RTCLOCK: host-clock timer (default); 0 = deterministic (debug) */
+u64 g_vawatch = 0;   /* env ARM64EMU_VAW: log writes whose range covers this VA (debug) */
+int g_systrace = 0;  /* env ARM64EMU_SYS: trace mm syscalls (mmap/brk/munmap/...) (debug) */
 
 /* One-shot record of an in-flight mm syscall, logged with its result when EL0
  * resumes. Lets us see musl's heap/mmap layout around the /init corruption. */
@@ -75,7 +75,7 @@ void systrace_svc(CPU *c) {
     }
 }
 
-/* ---- musl mallocng double-allocation detector (env AEHEAP=1) ----------------
+/* ---- musl mallocng double-allocation detector (env ARM64EMU_HEAP=1) ----------------
  * The line-438 execve EFAULT is heap corruption: in the /init shell, ash's
  * string-stack output block aliases the live `environ` array (both base
  * 0xffff9c9ca180), so ash's lexer writes "in\0" over environ[0]. This tracker
@@ -113,7 +113,7 @@ static long ht_live = 0;
 static struct { int active, is_realloc; u64 old, size, lr, sp, callpc, ic, ttbr, musl; } ht_call;
 static int ht_fires = 0;
 static long ht_nmalloc = 0, ht_nfree = 0, ht_nrealloc = 0;
-u64 g_heap_at = 0;          /* env AEHEAP_AT: log every alloc/free touching this VA */
+u64 g_heap_at = 0;          /* env ARM64EMU_HEAP_AT: log every alloc/free touching this VA */
 /* TTBR0 carries the ASID in the high bits; key on the table base only so an
  * ASID change for the same process does not split it into two identities. */
 static inline u64 ht_pgbase(u64 t) { return t & 0x0000FFFFFFFFF000ULL; }
@@ -261,7 +261,7 @@ void heaptrack_init(void) {
     for (unsigned i = 0; i < HT_BUCKETS; i++) ht_bucket[i] = -1;
 }
 
-/* Coverage-divergence finder (env AECOV=file): a sorted set of PCs QEMU is known
+/* Coverage-divergence finder (env ARM64EMU_COV=file): a sorted set of PCs QEMU is known
  * to execute. The first PC our run executes that is NOT in this set marks where
  * we left QEMU's path — i.e. at/just after the first control-flow divergence. */
 static u64 *g_cov;
@@ -311,7 +311,7 @@ void ring_dump(void) {
     }
 }
 
-/* Lightweight hot-PC profiler (env AEPROF=1). A direct-mapped histogram that
+/* Lightweight hot-PC profiler (env ARM64EMU_PROF=1). A direct-mapped histogram that
  * tells whether the CPU is spinning in a tight loop vs. making broad progress.
  * Off by default; one predictable branch in the step loop when enabled. */
 #define PROF_SLOTS 65536

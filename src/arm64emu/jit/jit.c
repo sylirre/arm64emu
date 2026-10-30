@@ -99,14 +99,14 @@ void jit_request_exit(void) {
     g_jit_env.interrupt = 1;        /* single store: async-signal-safe */
 }
 
-/* ---- optional helper-call profiler (AEJIT_STATS=1 or =/path) ----
+/* ---- optional helper-call profiler (ARM64EMU_JIT_STATS=1 or =/path) ----
  * Ranks the exact instruction words still executed through the exec_a64
  * helper, so inlining work can be aimed at what a workload actually runs. */
 #define JSTAT_SLOTS 4096
 typedef struct { u32 word; u32 pad_; u64 count; } JStat;
 static int g_jit_stats = -1;                 /* -1 until first jit_env_init */
 static int g_jstat_fd = -1;                  /* parked dup of stderr */
-static const char *g_jstat_path;             /* AEJIT_STATS=/file: append */
+static const char *g_jstat_path;             /* ARM64EMU_JIT_STATS=/file: append */
 static JStat g_jstat[JSTAT_SLOTS];
 static u64 g_jstat_lost;
 
@@ -180,7 +180,7 @@ void jit_stats_flush(void) {
     if (g_jit_stats > 0) jstat_dump();
 }
 
-/* ---- optional per-block code dump (AEJIT_DUMP=<prefix> or =1) ----
+/* ---- optional per-block code dump (ARM64EMU_JIT_DUMP=<prefix> or =1) ----
  * Sparse image of the code cache + one .map line per block; disassemble with
  *   objdump -D -b binary -m i386:x86-64 --start-address=0x<off> ... .code */
 static const char *g_jdump_prefix;           /* NULL = off */
@@ -248,7 +248,7 @@ static int bitmap_test(Machine *m, u64 pa_page) {
 /* ---- code cache ---- */
 
 static size_t jit_cache_size(void) {
-    const char *s = getenv("AEJIT_MB");
+    const char *s = getenv("ARM64EMU_JIT_MB");
     long mb = s ? atol(s) : 32;
     if (mb < 1) mb = 1;
     if (mb > 128) mb = 128;   /* AArch64 B imm26 (+-128 MiB) must span the cache */
@@ -349,9 +349,9 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     memset(env->jcache, 0xff, sizeof env->jcache);
     env->jc_gen = g_tlb_gen;
     env->jc_va_seq = g_tlbi_va_seq;
-    env->slowmem = getenv("AEJIT_SLOWMEM") != NULL;
+    env->slowmem = getenv("ARM64EMU_JIT_SLOWMEM") != NULL;
     if (g_jit_stats < 0) {
-        const char *s = getenv("AEJIT_STATS");
+        const char *s = getenv("ARM64EMU_JIT_STATS");
         g_jit_stats = s != NULL;
         if (g_jit_stats) {
             if (s[0] == '/') g_jstat_path = s;
@@ -361,7 +361,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
             }
             atexit(jstat_dump);
         }
-        const char *d = getenv("AEJIT_DUMP");
+        const char *d = getenv("ARM64EMU_JIT_DUMP");
         if (d) g_jdump_prefix = (d[0] && strcmp(d, "1") != 0)
                                     ? d : "aejit-dump";
     }
