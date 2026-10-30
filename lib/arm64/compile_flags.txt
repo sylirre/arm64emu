@@ -1,0 +1,7 @@
+-I.
+-I../../src/arm64chroot
+-I../../src/arm64chroot/core
+-std=gnu11
+-D_GNU_SOURCE
+-D_FILE_OFFSET_BITS=64
+-D_TIME_BITS=64

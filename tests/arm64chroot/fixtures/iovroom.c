@@ -1,0 +1,202 @@
+/* Vector I/O into memory the guest does not have.
+ *
+ * A kernel copies straight between the file and the caller's own pages: it
+ * stops at the first address the caller does not have, and what it reports
+ * then depends on the file.  A regular file (a device, a tty) reports the
+ * short transfer.  A pipe or a socket whose first buffer or packet the fault
+ * lands in rolls the copy back and answers EFAULT for the whole call -- with
+ * nothing consumed and nothing sent, except that a datagram read still costs
+ * the datagram (tests/arm64chroot/fixtures/rwfault.c has the later-buffer cases, which
+ * are short transfers).  Nothing addressable at all is EFAULT here, with the
+ * file untouched.
+ *
+ * The emulator cannot copy in place, so it measures the guest's page table
+ * before the call and hands the host the guest's own pages up to where they
+ * stop, and a fault from there on, for the host kernel to answer as it does.
+ * It used to do none of it: it allocated for everything the guest named (a
+ * gigabyte the guest did not own was a gigabyte the emulator had to find),
+ * ran the transfer, and only then discovered the destination was missing,
+ * losing the bytes it had already consumed.
+ *
+ * Every row's expected value was measured on a real kernel.  Self-checking:
+ * qemu-user validates each segment's whole range up front and answers EFAULT
+ * for all of them, including the two a kernel completes -- and drops a
+ * segment it cannot lock when it is the emulator's host, so it cannot be
+ * that either:
+ * NEEDS-HOST-SYSCALL: iov-fault
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+#define MSG "hello world"
+#define MSGLEN 11
+
+static char *good, *bad;
+
+/* What is still readable on `fd`, or -errno. */
+static long left(int fd) {
+    char b[64];
+    errno = 0;
+    long n = (long)read(fd, b, sizeof b);
+    return n < 0 ? -errno : n;
+}
+
+static int filled(void) {
+    int fd = (int)syscall(SYS_memfd_create, "iovroom", 0u);
+    if (fd < 0 || write(fd, MSG, MSGLEN) != MSGLEN) return -1;
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+
+/* `e` is errno captured the instant the call returned: the leftover probe
+ * that produces `l` runs a syscall of its own and would have overwritten it. */
+static void row(const char *name, long r, int e, long l) {
+    printf("%-18s %ld %d left=%ld\n", name, r, r < 0 ? e : 0, l);
+}
+
+int main(void) {
+    char *p = mmap(NULL, 0x3000, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 1;
+    munmap(p + 0x1000, 0x2000);          /* one page, then a hole */
+    good = p; bad = p + 0x1000;
+    memset(good, 'w', 0x1000);
+
+    struct iovec a[2];
+    int fd, e;
+    long r, l;
+
+    /* Nothing addressable: EFAULT, and the file must be untouched. */
+    fd = filled();
+    a[0].iov_base = bad; a[0].iov_len = 16;
+    errno = 0; r = syscall(SYS_readv, fd, a, 1); e = errno;
+    row("none-addressable", r, e, left(fd));
+    close(fd);
+
+    /* The same with a gigabyte named: still just EFAULT, and the emulator
+     * must not have gone looking for room for it. */
+    fd = filled();
+    a[0].iov_base = bad; a[0].iov_len = 1UL << 30;
+    errno = 0; r = syscall(SYS_readv, fd, a, 1); e = errno;
+    row("none-1gb", r, e, left(fd));
+    close(fd);
+
+    /* A file: the addressable prefix is transferred and reported. */
+    fd = filled();
+    memset(good, 0, 8);
+    a[0].iov_base = good; a[0].iov_len = 4;
+    a[1].iov_base = bad;  a[1].iov_len = 16;
+    errno = 0; r = syscall(SYS_readv, fd, a, 2); e = errno;
+    l = left(fd);
+    printf("%-18s %ld %d left=%ld got='%.4s'\n", "file-read", r,
+           r < 0 ? e : 0, l, good);
+    close(fd);
+
+    /* A file, one huge segment whose first eight bytes are all the guest has. */
+    fd = filled();
+    memset(good + 0xff8, 0, 8);
+    a[0].iov_base = good + 0xff8; a[0].iov_len = 1UL << 30;
+    errno = 0; r = syscall(SYS_readv, fd, a, 1); e = errno;
+    l = left(fd);
+    printf("%-18s %ld %d left=%ld got='%.8s'\n", "file-read-1gb", r,
+           r < 0 ? e : 0, l, good + 0xff8);
+    close(fd);
+
+    /* Lengths past MAX_RW_COUNT. A kernel does not refuse them: iovec_from_user
+     * turns down only a length that is negative as an ssize_t, and
+     * __import_iovec CLAMPS the running total to MAX_RW_COUNT, emptying
+     * whatever segments the clamp reached. So a vector naming more than any
+     * one call can transfer is a short transfer, not an error -- and here the
+     * guest's own memory makes it shorter still. The emulator used to refuse
+     * every one of these with EINVAL over a flat 1 GiB ceiling, where a
+     * read(2) of the same buffer on the same fd went straight through. */
+    fd = filled();
+    memset(good + 0xff8, 0, 8);
+    a[0].iov_base = good + 0xff8; a[0].iov_len = 2UL << 30;   /* > MAX_RW_COUNT */
+    errno = 0; r = syscall(SYS_readv, fd, a, 1); e = errno;
+    l = left(fd);
+    printf("%-18s %ld %d left=%ld got='%.8s'\n", "file-read-2gb", r,
+           r < 0 ? e : 0, l, good + 0xff8);
+    close(fd);
+
+    /* Two segments whose sum passes it: the first survives, the second is
+     * emptied by the clamp. */
+    fd = filled();
+    memset(good + 0xff8, 0, 8);
+    a[0].iov_base = good + 0xff8; a[0].iov_len = 1536UL << 20;
+    a[1].iov_base = good;         a[1].iov_len = 1536UL << 20;
+    errno = 0; r = syscall(SYS_readv, fd, a, 2); e = errno;
+    l = left(fd);
+    printf("%-18s %ld %d left=%ld got='%.8s'\n", "file-read-sum", r,
+           r < 0 ? e : 0, l, good + 0xff8);
+    close(fd);
+
+    /* ...and the one length a kernel really does refuse, with the file
+     * untouched. */
+    fd = filled();
+    a[0].iov_base = good; a[0].iov_len = 1UL << 63;
+    errno = 0; r = syscall(SYS_readv, fd, a, 1); e = errno;
+    row("neg-len", r, e, left(fd));
+    close(fd);
+
+    /* Writing to a file: the same short transfer. */
+    fd = (int)syscall(SYS_memfd_create, "iovroom", 0u);
+    memset(good, 'w', 8);
+    a[0].iov_base = good; a[0].iov_len = 4;
+    a[1].iov_base = bad;  a[1].iov_len = 16;
+    errno = 0; r = syscall(SYS_writev, fd, a, 2); e = errno;
+    lseek(fd, 0, SEEK_SET);
+    row("file-write", r, e, left(fd));
+    close(fd);
+
+    /* A pipe: EFAULT, nothing consumed. */
+    int pp[2];
+    if (pipe(pp)) return 1;
+    if (write(pp[1], MSG, MSGLEN) != MSGLEN) return 1;
+    a[0].iov_base = good; a[0].iov_len = 4;
+    a[1].iov_base = bad;  a[1].iov_len = 16;
+    errno = 0; r = syscall(SYS_readv, pp[0], a, 2); e = errno;
+    row("pipe-read", r, e, left(pp[0]));
+    /* ... and nothing sent. */
+    errno = 0; r = syscall(SYS_writev, pp[1], a, 2); e = errno;
+    close(pp[1]);
+    row("pipe-write", r, e, left(pp[0]));
+    close(pp[0]);
+
+    /* A stream socket: the same. */
+    int st[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, st)) return 1;
+    if (write(st[1], MSG, MSGLEN) != MSGLEN) return 1;
+    errno = 0; r = syscall(SYS_readv, st[0], a, 2); e = errno;
+    row("stream-read", r, e, left(st[0]));
+    errno = 0; r = syscall(SYS_writev, st[1], a, 2); e = errno;
+    close(st[1]);
+    row("stream-write", r, e, left(st[0]));
+    close(st[0]);
+
+    /* A datagram socket: EFAULT reading costs the datagram; EFAULT writing
+     * sends nothing (so the queue is empty and the read answers EAGAIN). */
+    int dg[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dg)) return 1;
+    if (write(dg[1], MSG, MSGLEN) != MSGLEN) return 1;
+    errno = 0; r = syscall(SYS_readv, dg[0], a, 2); e = errno;
+    long dl;
+    { char b[64]; errno = 0;
+      long n = (long)recv(dg[0], b, sizeof b, MSG_DONTWAIT);
+      dl = n < 0 ? -errno : n; }
+    row("dgram-read", r, e, dl);
+    errno = 0; r = syscall(SYS_writev, dg[1], a, 2); e = errno;
+    { char b[64]; errno = 0;
+      long n = (long)recv(dg[0], b, sizeof b, MSG_DONTWAIT);
+      dl = n < 0 ? -errno : n; }
+    row("dgram-write", r, e, dl);
+    return 0;
+}

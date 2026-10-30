@@ -1,0 +1,102 @@
+# arm64emu: build and run its suites whenever something it is built from
+# changes — its own sources and tests, the AArch64 emulation it shares with
+# arm64chroot (lib/arm64), or the build itself.
+#
+# The firmware + Linux boot gates (the *-consist and full-boot log stages of
+# test-arm64emu-pd / test-arm64emu-jit) want a kernel and initrd that are not
+# in the repository; without them they report SKIP and the asm suites carry
+# the run.
+
+name: arm64emu
+
+on:
+  push:
+    paths:
+      - 'src/arm64emu/**'
+      - 'lib/arm64/**'
+      - 'tests/arm64emu/**'
+      - 'Makefile'
+      - '.github/workflows/arm64emu.yml'
+  pull_request:
+    paths:
+      - 'src/arm64emu/**'
+      - 'lib/arm64/**'
+      - 'tests/arm64emu/**'
+      - 'Makefile'
+      - '.github/workflows/arm64emu.yml'
+  workflow_dispatch:
+
+# A push to a branch that also has an open PR fires BOTH a `push` and a
+# `pull_request` event; one group per branch collapses them (and any
+# superseded run) into a single live run:
+#   push         -> head_ref is empty, so ref_name ("my-branch") is used
+#   pull_request -> head_ref is the source branch ("my-branch")
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build + test (x86_64 host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # clang + llvm           -> the asm tests' assembler (--target=aarch64-elf)
+      #                           and llvm-objcopy for their flat images
+      # lld, libc6-dev-arm64-cross, qemu-user
+      #                        -> the static aarch64 build of the emulator that
+      #                           test-arm64emu-jit-a64 runs under qemu-user:
+      #                           the only place the AArch64 JIT backend runs
+      #                           on this runner
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm libc6-dev-arm64-cross qemu-user
+
+      - name: Build
+        run: make arm64emu
+
+      - name: Interpreter
+        run: make test-arm64emu
+
+      - name: Predecoded tier
+        run: make test-arm64emu-pd
+
+      - name: JIT
+        run: make test-arm64emu-jit
+
+      - name: Embedded configuration
+        run: make test-arm64emu-embed
+
+      - name: Cross-engine fuzzing
+        run: make fuzz-arm64emu
+
+      - name: AArch64 JIT backend (qemu-user)
+        run: make test-arm64emu-jit-a64
+
+  # On a real AArch64 machine the JIT's AArch64 backend runs natively; the
+  # system gcc already targets the guest, so nothing needs installing.
+  build-test-arm64:
+    name: build + test (aarch64 host)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: make arm64emu
+
+      - name: Interpreter
+        run: make test-arm64emu
+
+      - name: Predecoded tier
+        run: make test-arm64emu-pd
+
+      - name: JIT (aarch64 host)
+        run: make test-arm64emu-jit

@@ -1,0 +1,175 @@
+/* signalfd(2), checked against the qemu-aarch64 oracle. The emulator has no
+ * host signalfd to lean on -- it catches signals itself, so nothing is left
+ * pending host-side -- and answers reads from its own capture ring, so every
+ * observable of the interface is worth pinning down: the siginfo fields, that
+ * poll()/select() see the fd become readable, non-blocking EAGAIN, reading
+ * several queued signals in one call, mask replacement through a second
+ * signalfd4 on the same fd, and that an unread signal survives fork+exec
+ * bookkeeping (the fd stays a plain fd to everything else).
+ *
+ * Every signal used here is blocked first: an unblocked one would be
+ * dispositioned normally and, per the kernel, never reach the fd at all.
+ *
+ * Buffering: stdout is block-buffered when captured, so flush before fork(). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/signalfd.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGUSR2);
+    sigaddset(&set, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &set, &old) != 0) { printf("block=fail\n"); return 1; }
+
+    sigset_t just_chld_early;
+    sigemptyset(&just_chld_early);
+    sigaddset(&just_chld_early, SIGCHLD);
+
+    sigset_t just_usr;
+    sigemptyset(&just_usr);
+    sigaddset(&just_usr, SIGUSR1);
+    sigaddset(&just_usr, SIGUSR2);
+    int fd = signalfd(-1, &just_usr, SFD_NONBLOCK | SFD_CLOEXEC);
+    printf("fd_ok=%d\n", fd >= 0);
+
+    /* Nothing queued yet: non-blocking read reports EAGAIN. */
+    struct signalfd_siginfo si[4];
+    ssize_t n = read(fd, si, sizeof si[0]);
+    printf("empty=%zd %d\n", n, n < 0 && errno == EAGAIN);
+
+    /* A signal outside the fd's mask must not make it readable. (It stays
+     * pending for a sigwait to collect; the emulator only starts queueing a
+     * signal once something wants it, so drain it here rather than assume
+     * either behavior -- see docs/arm64chroot/syscalls.md.) */
+    raise(SIGCHLD);
+    struct pollfd pf = { fd, POLLIN, 0 };
+    printf("unmasked_poll=%d\n", poll(&pf, 1, 0));
+    struct timespec zero = { 0, 0 };
+    sigtimedwait(&just_chld_early, NULL, &zero);
+
+    /* Two queued signals, read in one call. */
+    raise(SIGUSR1);
+    raise(SIGUSR2);
+    printf("poll=%d revents=%d\n", poll(&pf, 1, 1000), pf.revents == POLLIN);
+
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(fd, &rf);
+    struct timeval tv = { 0, 0 };
+    printf("select=%d\n", select(fd + 1, &rf, NULL, NULL, &tv));
+
+    n = read(fd, si, sizeof si);
+    printf("read=%d\n", (int)(n / (ssize_t)sizeof si[0]));
+    for (int i = 0; i < (int)(n / (ssize_t)sizeof si[0]); i++)
+        printf("  sig=%d code=%d pid=%d\n", si[i].ssi_signo,
+               si[i].ssi_code, si[i].ssi_pid == (unsigned)getpid());
+
+    /* Drained again. */
+    printf("drained=%d\n", poll(&pf, 1, 0));
+
+    /* Replace the mask through the same fd, then let a real child death be
+     * what the fd reports -- blocking read this time (it was created
+     * non-blocking, so clear that first). */
+    printf("remask=%d\n", signalfd(fd, &just_chld_early, 0) == fd);
+    fflush(stdout);
+    pid_t kid = fork();
+    if (kid == 0) { _exit(7); }
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    n = read(fd, si, sizeof si[0]);
+    printf("kid sig=%d pid=%d status=%d code=%d\n", si[0].ssi_signo,
+           si[0].ssi_pid == (unsigned)kid, si[0].ssi_status,
+           si[0].ssi_code == CLD_EXITED);
+    int st = 0;
+    waitpid(kid, &st, 0);
+    printf("reaped=%d\n", WIFEXITED(st) && WEXITSTATUS(st) == 7);
+
+    /* dup(2) gives a second name for the same signalfd: the queued signals,
+     * the mask and the readiness are the file description's, not the fd
+     * number's, so either fd must see all of it. */
+    int fl2 = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl2 | O_NONBLOCK);
+    printf("remask2=%d\n", signalfd(fd, &just_usr, 0) == fd);
+    int dfd = dup(fd);
+    printf("dup_ok=%d\n", dfd >= 0 && dfd != fd);
+    raise(SIGUSR1);
+    n = read(dfd, si, sizeof si[0]);
+    printf("dup_read=%zd sig=%d\n", n, n > 0 ? (int)si[0].ssi_signo : -1);
+    /* A mask set through one fd applies to the other. */
+    printf("dup_remask=%d\n", signalfd(dfd, &just_chld_early, 0) == dfd);
+    raise(SIGUSR2);                       /* no longer covered: not readable */
+    struct pollfd pf2 = { fd, POLLIN, 0 };
+    printf("dup_masked_out=%d\n", poll(&pf2, 1, 0));
+    sigtimedwait(&just_usr, NULL, &zero);   /* drain it again */
+    close(dfd);
+    printf("after_close=%zd\n", read(fd, si, sizeof si[0]));
+
+    /* Two *independent* signalfds, which is not the dup case above: each has
+     * its own mask and its own readiness, and a signal only one of them covers
+     * must wake only that one. The emulator backs each with a host eventfd,
+     * and every anon_inode file shares a single inode -- so anything keyed on
+     * st_ino sees these two as one description and the second never becomes
+     * readable at all. */
+    sigset_t only1, only2;
+    sigemptyset(&only1); sigaddset(&only1, SIGUSR1);
+    sigemptyset(&only2); sigaddset(&only2, SIGUSR2);
+    int s1 = signalfd(-1, &only1, SFD_NONBLOCK);
+    int s2 = signalfd(-1, &only2, SFD_NONBLOCK);
+    printf("two_ok=%d\n", s1 >= 0 && s2 >= 0 && s1 != s2);
+    raise(SIGUSR2);                       /* covered by s2 only */
+    struct pollfd pf3[2] = { { s1, POLLIN, 0 }, { s2, POLLIN, 0 } };
+    printf("two_poll=%d s1=%d s2=%d\n", poll(pf3, 2, 1000),
+           (pf3[0].revents & POLLIN) != 0, (pf3[1].revents & POLLIN) != 0);
+    n = read(s2, si, sizeof si[0]);
+    printf("two_read=%zd sig=%d\n", n, n > 0 ? (int)si[0].ssi_signo : -1);
+    printf("two_other_empty=%d\n",
+           read(s1, si, sizeof si[0]) < 0 && errno == EAGAIN);
+    /* A mask change on one must not touch the other's. */
+    printf("two_remask=%d\n", signalfd(s1, &only2, 0) == s1);
+    raise(SIGUSR1);                       /* now covered by neither */
+    pf3[0].revents = pf3[1].revents = 0;
+    printf("two_none=%d\n", poll(pf3, 2, 0));
+    sigtimedwait(&only1, NULL, &zero);   /* drain */
+    close(s1);
+    close(s2);
+
+    /* A vectored read of no bytes at all. readv answers 0 before the file is
+     * consulted -- do_iter_read returns the moment the imported total is zero
+     * -- while read(2) has no such shortcut, so signalfd_read sees the zero
+     * itself and calls a buffer that cannot hold one record EINVAL. The queued
+     * signal must survive both and still be there to read afterwards. */
+    sigset_t only_u1;
+    sigemptyset(&only_u1);
+    sigaddset(&only_u1, SIGUSR1);
+    int zfd = signalfd(-1, &only_u1, SFD_NONBLOCK);
+    raise(SIGUSR1);
+    struct iovec ziov[2] = { { NULL, 0 }, { si, 0 } };
+    printf("zero_cnt0=%zd\n", readv(zfd, ziov, 0));
+    printf("zero_len0=%zd\n", readv(zfd, ziov + 1, 1));
+    printf("zero_two=%zd\n", readv(zfd, ziov, 2));
+    n = read(zfd, si, 0);
+    printf("zero_read=%zd einval=%d\n", n, n < 0 && errno == EINVAL);
+    struct iovec zreal = { si, sizeof si[0] };
+    n = readv(zfd, &zreal, 1);
+    printf("zero_kept=%zd sig=%d\n", n, n > 0 ? (int)si[0].ssi_signo : -1);
+    close(zfd);
+
+    /* Bad arguments. */
+    printf("badflags=%d\n", signalfd(-1, &just_usr, 1 << 30) < 0 && errno == EINVAL);
+    close(fd);
+    printf("done\n");
+    return 0;
+}

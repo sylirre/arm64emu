@@ -1,0 +1,16 @@
+# Everything the build makes lives here: the programs, their objects, the
+# programs the test suites build, and the test rootfs images and recordings
+# the suites provision (see Makefile).
+/build/
+
+# `bear -- make` output: absolute paths, so it belongs to one checkout only.
+# The committed compile_flags.txt files are the portable equivalent.
+/compile_commands.json
+
+# editors
+*.swp
+
+# Dev custom
+*.key
+TODO.txt
+TODO.md

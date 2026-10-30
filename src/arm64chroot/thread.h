@@ -1,0 +1,96 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Per-thread emulation state. With CLONE_VM guest threads, each guest thread
+ * runs on its own host thread with its own CPU and the fields below; the
+ * Machine (address space, fd table, signal dispositions) is shared. These live
+ * in thread-local storage so the copied core's `c->m->...` accesses that must
+ * be per-thread are routed here instead. */
+#ifndef A64_THREAD_H
+#define A64_THREAD_H
+
+#include "types.h"
+
+typedef struct {
+    bool valid;
+    u64  esr, far;
+} PendExc;
+
+typedef struct {
+    PendExc pend_exc;         /* recorded by exception.c, dispatched by loop.c */
+    u64 clear_child_tid;      /* CLONE_CHILD_CLEARTID address (futex on exit) */
+    u64 robust_head;          /* set_robust_list head, echoed by get_robust_list */
+    /* Guest blocked-signal set: a per-thread attribute (POSIX), inherited
+     * from the creator on clone. A process-wide set loses signals when
+     * threads block/restore concurrently -- musl wraps every raise() and
+     * pthread_exit() in block-all/restore, so a thread could exit with its
+     * own raise()d signal still deferred by a sibling's block. */
+    u64 sigmask;
+    u64 saved_sigmask;        /* rt_sigsuspend: mask to record in the frame */
+    int have_saved_sigmask;
+    /* Copies of the Machine's call-out counters (machine.h). stop_gen is
+     * compared once per run-loop iteration -- a mismatch means "go to the
+     * safepoint and find out why"; image_gen says which loaded program this
+     * thread belongs to, and a stale one means an execve replaced it. */
+    u32 stop_gen;
+    u32 image_gen;
+    /* The group stop (Machine.jc_gseq) this thread has taken part in: one
+     * later than this is still to be joined (signal.c, "group stop"). */
+    u32 jc_seen;
+    /* The arm64 tagged-address ABI (PR_SET_TAGGED_ADDR_CTRL): a thread's own,
+     * inherited by a clone and a fork, cleared by execve. With it, a pointer
+     * a syscall dereferences may carry a tag in its top byte; without it,
+     * one that does is EFAULT, as the kernel's access_ok answers. The check
+     * applies while `uaccess` says a syscall handler of this thread is
+     * running (syscall_dispatch) -- not to the emulator's own accesses, nor
+     * to a tracer's, which the kernel's GUP untags whatever the setting. */
+    u32 tagged_addr_ctrl;
+    u8  uaccess;
+    /* The access this thread is making grows no stack (mem.c, as_stack_grow):
+     * it stands for the kernel's GUP -- process_vm_readv/writev, a shared
+     * futex's key -- which has not expanded a stack since 6.1.37, or it is
+     * the emulator looking at guest memory for itself (the --strace-full
+     * decoder), which no kernel does at all. Everything else faults a stack
+     * down as the kernel's page-fault handler does: the guest's own
+     * accesses, a syscall's copies, a tracer's PEEK and POKE
+     * (access_remote_vm expands the stack itself). */
+    u8  nogrow;
+    /* mem_reachable answered "reachable" for a page in a stack's hole since
+     * this syscall's handler began: the transfer being measured has bytes a
+     * stack is to grow over, which xfer_begin (sys_file.c) has to know before
+     * the host moves anything. */
+    u8  xfer_hole;
+    /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
+     * internal wakeups -- syscall_restart_internal, src/arm64chroot/syscall.c). */
+    u64 sc_svc_pc, sc_orig_x0, sc_nr;
+    int sc_ret_eintr;
+    int sc_restarted;         /* this dispatch re-runs the SVC we rewound to */
+    u64 sc_wait_t0;           /* CLOCK_MONOTONIC ns this attempt began to wait
+                               * (syscall_wait_begin); 0 = not a timed wait */
+    u64 sc_waited_ns;         /* how long earlier attempts at this same call
+                               * already waited, so its timeout does not start
+                               * over every time we restart it */
+    int tid;                  /* thread id (main thread tid == pid) */
+    /* Alternate signal stack: per-thread, as POSIX sigaltstack(2) is a
+     * thread-local attribute. Storing it process-wide corrupts delivery under
+     * multithreading -- each Go M registers its own gsignal stack, so a shared
+     * field routes one thread's signal frame onto another thread's stack. */
+    u64 sig_altstack_sp, sig_altstack_size;
+    /* personality(2): a task attribute, so a thread's own. Inherited by a
+     * clone from its creator and by a fork child from the forking thread,
+     * kept across execve less what the exec clears (sys_personality). */
+    u32 personality;
+    u8  pers_pub;             /* this thread's value is published in the
+                               * broker for other processes' /proc views --
+                               * it differs from its process's base value
+                               * (proctab.c, "personality") */
+    u32 sig_altstack_flags;   /* the kernel's sas_ss_flags: the ss_flags word
+                               * as sigaltstack was given it (SS_AUTODISARM,
+                               * or a SS_ONSTACK/SS_DISABLE the caller passed),
+                               * SS_DISABLE after a reset; written raw into a
+                               * frame's uc_stack, and only its SS_AUTODISARM
+                               * bit reported back by sigaltstack */
+} ThreadState;
+
+extern __thread ThreadState g_tls;
+
+#endif /* A64_THREAD_H */

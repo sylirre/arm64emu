@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Sylirre
+# Build and run the assembly self-tests against the emulator.
+set -u
+# The runtime default is the host wall clock (AE_RTCLOCK=1); pin the deterministic
+# instruction-count clock here so the gates stay reproducible (m23_jitpar asserts
+# CNTVCT advances 1 tick/insn). Overridable for debugging.
+export AE_RTCLOCK="${AE_RTCLOCK:-0}"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# AE_EMU: alternate emulator binary; AE_RUNNER: launcher prefix (e.g.
+# qemu-aarch64 for the cross-built AArch64-backend binary).
+EMU="${AE_EMU:-$ROOT/build/arm64emu}"
+# Wall-clock ceiling per test. These images retire at most 100k instructions,
+# so seconds is already absurd — the point is that a test which stops retiring
+# altogether (a guest that halts, a runaway loop) becomes a FAIL instead of
+# wedging the suite forever with no output. AE_TIMEOUT raises it for a slow
+# AE_RUNNER (qemu-aarch64).
+AE_TIMEOUT="${AE_TIMEOUT:-60}"
+ASM="$ROOT/tests/arm64emu/asm"
+OUT="$(mktemp -d)"
+trap 'rm -rf "$OUT"' EXIT
+
+# Toolchain: prefer clang (cross by default), else aarch64-linux-gnu-gcc.
+CC_AS=""
+if command -v clang >/dev/null;             then CC_AS="clang --target=aarch64-elf"; fi
+if command -v aarch64-linux-gnu-gcc >/dev/null; then CC_AS="aarch64-linux-gnu-gcc"; fi
+OBJCOPY="$(command -v llvm-objcopy || command -v aarch64-linux-gnu-objcopy || command -v objcopy)"
+
+if [ -z "$CC_AS" ] || [ -z "$OBJCOPY" ]; then
+    echo "SKIP: no aarch64 assembler/objcopy available"; exit 0
+fi
+
+LOAD=0x40000000
+pass=0; fail=0
+for src in "$ASM"/*.S; do
+    name="$(basename "$src" .S)"
+    elf="$OUT/$name.elf"; bin="$OUT/$name.bin"
+    if ! $CC_AS -nostdlib -Wl,-Ttext=$LOAD -Wl,-e,_start "$src" -o "$elf" 2>"$OUT/err"; then
+        echo "FAIL $name (assemble)"; cat "$OUT/err"; fail=$((fail+1)); continue
+    fi
+    "$OBJCOPY" -O binary "$elf" "$bin"
+    # Run; capture the HLT line "x0=0x...". Most tests load as a flat --bin image;
+    # the virtio-console probe needs the platform (virtio devices exist only when
+    # platform_build runs), so run it as firmware with --console virtio instead.
+    # EMU_FLAGS: extra emulator flags (e.g. EMU_FLAGS=--jit for the JIT suite).
+    case "$name" in
+        *_vcon) run=(${AE_RUNNER:-} "$EMU" ${EMU_FLAGS:-} --bios "$bin" --console virtio --max-insn 100000) ;;
+        *_rtc)  run=(${AE_RUNNER:-} "$EMU" ${EMU_FLAGS:-} --bios "$bin" --max-insn 100000) ;;   # pl031 needs platform_build
+        *_gic|*_timer|*_irq|*_uart)
+                run=(${AE_RUNNER:-} "$EMU" ${EMU_FLAGS:-} --bios "$bin" --max-insn 100000) ;;   # gic/timer/uart need platform_build
+        # The DTB is placed only by platform_build, and the size the test looks
+        # for is this --memory (not the 1 GB the blob is compiled with).
+        *_dtbmem) run=(${AE_RUNNER:-} "$EMU" ${EMU_FLAGS:-} --bios "$bin" --memory 384 --max-insn 100000) ;;
+        *)      run=(${AE_RUNNER:-} "$EMU" ${EMU_FLAGS:-} --bin "$bin@$LOAD" --max-insn 100000) ;;
+    esac
+    # </dev/null like the boot harnesses: an idle stdin inherited from the
+    # caller (a pipe from a CI runner, `producer | make test`) is a wake source
+    # the UART RX poll of a --bios test will wait on.
+    out="$(timeout -k 5 "$AE_TIMEOUT" "${run[@]}" </dev/null 2>&1)"; rc=$?
+    res="$(printf '%s\n' "$out" | grep -oE 'x0=0x[0-9a-f]+' | head -1)"
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        echo "FAIL $name (no exit within ${AE_TIMEOUT}s)"; fail=$((fail+1))
+    elif [ "$res" = "x0=0x0" ]; then
+        echo "PASS $name"; pass=$((pass+1))
+    else
+        echo "FAIL $name ($res)"; fail=$((fail+1))
+    fi
+done
+echo "----"
+echo "passed=$pass failed=$fail"
+[ "$fail" -eq 0 ]
