@@ -93,8 +93,8 @@ if [ "$m22_ready" = 1 ]; then
     # ipc_diff <desc> <prog>: emulated vs the real kernel, stdout + rc.
     ipc_diff() {
         out_k=$(emu_t 90 "$IG/$2" 2>/dev/null); rc_k=$?
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        out_e=$(run_t 90 $GUEST_BINDS -R "$IG" "/$2" 2>/dev/null); rc_e=$?
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out_e=$(run_t 90 $CHROOTNG_GUEST_BINDS -R "$IG" "/$2" 2>/dev/null); rc_e=$?
         if [ "$out_k" = "$out_e" ] && [ "$rc_k" = "$rc_e" ]; then
             pass=$((pass + 1)); printf '  ok   %s\n' "$1"
         else
@@ -133,7 +133,7 @@ if [ "$m22_ready" = 1 ]; then
     if ! guest_cc "$IG/msg_order" tests/chroot-ng/guests/msg_order.c; then
         mo_ready=0
         skip "m22 msgsnd refusal order: the guest program does not build here"
-    elif [ -n "$QEMU" ]; then
+    elif [ -n "$CHROOTNG_QEMU" ]; then
         mo_ready=0
         for _c in ${HOSTCC:-} cc gcc clang; do
             have "$_c" || continue
@@ -208,7 +208,7 @@ rm -rf "$IG"
 # SEM_INFO/SEM_STAT and MSG_INFO/MSG_STAT exactly as the enumeration group in
 # `-t ipctest` does. This only has to show the tool runs against the emulated
 # namespace and reports it empty, the way it would against a kernel with none.
-M22_ALPINE="${M22_ALPINE:-$CNG_ALPINE}"
+M22_ALPINE="${M22_ALPINE:-$CHROOTNG_ALPINE}"
 if [ -n "$M22_ALPINE" ] && [ -x "$M22_ALPINE/bin/busybox" ]; then
     SR=$(mktemp -d); cp -a "$M22_ALPINE/." "$SR"
     out=$(run_t 60 -R "$SR" /bin/sh -c 'ipcs -s; ipcs -q; echo rc=$?' 2>/dev/null)

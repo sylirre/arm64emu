@@ -352,7 +352,7 @@ static void put_mounts(int fd, int fmt) {
 /* ---- loadavg / uptime / stat -------------------------------------------- */
 
 /* Try-host-first gate for /proc/stat: 1 when the host denies the file (Android
- * SELinux) or CNG_PROCSTAT_SYNTH forces the fallback in tests. Probed once. */
+ * SELinux) or CHROOTNG_PROCSTAT_SYNTH forces the fallback in tests. Probed once. */
 int cng_g_procstat_synth = 0;
 static int stat_blocked(void) {
     static int blocked = -1;
@@ -374,7 +374,7 @@ static int stat_blocked(void) {
  * guest that cannot read them is not hypothetical: bubblewrap reads them before
  * anything else and dies outright ("Can't read /proc/sys/kernel/overflowuid").
  * Probed once per file, so a policy that allowed one and not the other is
- * answered as it is. CNG_OVERFLOWID_SYNTH forces the fallback in tests. */
+ * answered as it is. CHROOTNG_OVERFLOWID_SYNTH forces the fallback in tests. */
 int cng_g_overflowid_synth = 0;
 static int overflowid_blocked(int is_gid) {
     static int blocked[2] = {-1, -1};
@@ -1885,7 +1885,7 @@ static int synth_name_of(int fd, char *out, size_t sz) {
  * a file whose process is gone (nobody can look up the real one any more),
  * synth_ino()'s for a name the host refuses. A process's entries are its
  * owner's, and every guest process runs as us. */
-/* CNG_PROC_DENY_STAT=1: answer every stat-family call on a synthesized name as
+/* CHROOTNG_PROC_DENY_STAT=1: answer every stat-family call on a synthesized name as
  * if the host had refused it, which is what Android does and a test host does
  * not. Settled before the first guest instruction, read-only after. */
 int cng_g_proc_deny_stat = 0;

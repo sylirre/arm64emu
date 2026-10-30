@@ -9,7 +9,7 @@
 # climb out of the rootfs.
 echo "== M17-17: -w/--work-dir =="
 
-M17W_ORACLE="${M17W_ORACLE:-$CNG_ORACLE}"
+M17W_ORACLE="${M17W_ORACLE:-$CHROOTNG_ORACLE}"
 
 GDIR=build/tests/chroot-ng
 mkdir -p "$GDIR"
@@ -147,8 +147,8 @@ fi
 if ! guest_xlate_ready "-w rootfs legs"; then
     :
 elif [ "$m17w_probe" = 1 ]; then
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    m17w_run() { run -R $GUEST_BINDS "$@"; }
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    m17w_run() { run -R $CHROOTNG_GUEST_BINDS "$@"; }
 
     out=$(m17w_run "$M17W" /probe 2>/dev/null)
     check_contains "rootfs: the default cwd is the guest root" "cwd=/" "$out"
@@ -204,10 +204,10 @@ else
     m17w_diff() {
         _d=$1
         shift
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        _got=$(run -R $GUEST_BINDS "$@" 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        _got=$(run -R $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
         # shellcheck disable=SC2086
-        _want=$("$M17W_ORACLE" $GUEST_BINDS "$@" 2>/dev/null)
+        _want=$("$M17W_ORACLE" $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
         if [ -n "$_want" ] && [ "$_got" = "$_want" ]; then
             pass=$((pass + 1)); printf '  ok   oracle parity: %s\n' "$_d"
         else

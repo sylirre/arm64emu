@@ -80,7 +80,7 @@ static const int probe_set[] = {
 };
 #define NPROBE ((int)(sizeof probe_set / sizeof probe_set[0]))
 
-/* What CNG_SETID_DENY takes as refused: the uid and gid setters bionic's
+/* What CHROOTNG_SETID_DENY takes as refused: the uid and gid setters bionic's
  * SECCOMP_BLOCKLIST_APP.TXT lists, which is all of them but setresuid. */
 int cng_g_setid_deny = 0;
 const int cng_setid_deny_nrs[] = {
@@ -90,7 +90,7 @@ const int cng_setid_deny_nrs[] = {
 const int cng_setid_deny_n =
     (int)(sizeof cng_setid_deny_nrs / sizeof cng_setid_deny_nrs[0]);
 
-/* What CNG_OPENAT2_DENY takes as refused: openat2 alone, which Android's
+/* What CHROOTNG_OPENAT2_DENY takes as refused: openat2 alone, which Android's
  * filter refuses from 13 on. */
 int cng_g_openat2_deny = 0;
 

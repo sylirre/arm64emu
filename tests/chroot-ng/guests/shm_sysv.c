@@ -5,7 +5,7 @@
  * this comparison. It prints only *semantic* outcomes — never shmids, attach
  * addresses or timestamps — so chroot-ng's broker-backed emulation (src/chroot-ng/monitor/
  * shm.c, no host SysV IPC at all) and the real kernel produce byte-identical
- * output. tests/chroot-ng/m12_shm.sh also re-runs it with CNG_SHM_FORCE_FILE=1 to cover
+ * output. tests/chroot-ng/m12_shm.sh also re-runs it with CHROOTNG_SHM_FORCE_FILE=1 to cover
  * the file-backed backing tier.
  *
  * Buffering note: stdout is block-buffered when captured (not a tty), so the

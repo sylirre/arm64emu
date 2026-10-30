@@ -47,8 +47,8 @@ NPD=$(mktemp -d)
 if guest_xlate_ready "per-task no_new_privs leg" &&
     guest_cc_report "$NPD/nnpthread" tests/chroot-ng/guests/nnpthread.c -lpthread; then
     np_k=$(emu "$NPD/nnpthread" 2>/dev/null)
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    np_g=$(run_t 60 -R $GUEST_BINDS "$NPD" /nnpthread 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    np_g=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$NPD" /nnpthread 2>/dev/null)
     np_kf=$(printf '%s\n' "$np_k" | grep -v '^spawned_by_unset=')
     np_gf=$(printf '%s\n' "$np_g" | grep -v '^spawned_by_unset=')
     if [ -z "$np_k" ]; then

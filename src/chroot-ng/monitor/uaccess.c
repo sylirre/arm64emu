@@ -204,10 +204,10 @@ int cng_uaccess_probe_setup(void) {
     int v = __atomic_load_n(&g_pvm, __ATOMIC_ACQUIRE);
     if (v >= 0)
         return v;
-    /* CNG_UACCESS_MEMFD=1 forces the fallback, so the descriptor path can be
+    /* CHROOTNG_UACCESS_MEMFD=1 forces the fallback, so the descriptor path can be
      * exercised on a host that does have the pair — otherwise it would only
      * ever run under an emulator, which is where it is least worth trusting. */
-    if (cng_broker_env("CNG_UACCESS_MEMFD")) {
+    if (cng_broker_env("CHROOTNG_UACCESS_MEMFD")) {
         __atomic_store_n(&g_pvm, 0, __ATOMIC_RELEASE);
         return 0;
     }

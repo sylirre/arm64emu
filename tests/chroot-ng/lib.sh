@@ -15,29 +15,29 @@
 #
 # What the milestone scripts get from here:
 #
-#   run / run_t          run $BIN (chroot-ng), optionally under a timeout
+#   run / run_t          run $CHROOTNG_BIN (chroot-ng), optionally under a timeout
 #   emu / emu_t          run any other AArch64 program the same way
 #   guest_cc OUT SRC     build a tests/chroot-ng/guests/*.c program; rc 2 = no toolchain
-#   GUEST_BINDS          -b args a dynamic guest needs inside a fresh rootfs
+#   CHROOTNG_GUEST_BINDS          -b args a dynamic guest needs inside a fresh rootfs
 #   GUEST_LD_DESC        human name of the link mode in use
-#   CNG_SECCOMP_LIVE     1 when the in-process monitor really traps syscalls
-#   CNG_EXECMEM          1 when anon RW->RX memory is permitted
-#   CNG_GUEST_XLATE      1 when a compiled guest's own path syscalls get
+#   CHROOTNG_SECCOMP_LIVE     1 when the in-process monitor really traps syscalls
+#   CHROOTNG_EXECMEM          1 when anon RW->RX memory is permitted
+#   CHROOTNG_GUEST_XLATE      1 when a compiled guest's own path syscalls get
 #                        translated here (see guest_xlate_ready)
-#   CNG_ALPINE/_DEBIAN/_ORACLE  rootfs + differential-oracle locations
+#   CHROOTNG_ALPINE/_DEBIAN/_ORACLE  rootfs + differential-oracle locations
 #   cng_rootfs NAME fetch  provision a pinned rootfs image on demand
 #   skip MSG             uniform, counted "  skip <msg>" reporting
 #   elf_type / elf_machine / elf_has_interp   ELF facts without file(1)
 #
-# Overridable from the environment: BIN, QEMU (set empty to force direct
-# execution), GUESTCC, GUESTLD, GUEST_BINDS, CNG_ROOTFS_DIR, CNG_ROOTFS_FETCH,
-# CNG_ALPINE, CNG_DEBIAN, CNG_ORACLE, CNG_SYSROOT. See tests/chroot-ng/README.md.
+# Overridable from the environment: CHROOTNG_BIN, CHROOTNG_QEMU (set empty to force direct
+# execution), CHROOTNG_GUESTCC, CHROOTNG_GUESTLD, CHROOTNG_GUEST_BINDS, CHROOTNG_ROOTFS_DIR, CHROOTNG_ROOTFS_FETCH,
+# CHROOTNG_ALPINE, CHROOTNG_DEBIAN, CHROOTNG_ORACLE, CHROOTNG_SYSROOT. See tests/chroot-ng/README.md.
 
 pass=${pass:-0}
 fail=${fail:-0}
 skipped=${skipped:-0}
 
-BIN="${BIN:-build/chroot-ng}"
+CHROOTNG_BIN="${CHROOTNG_BIN:-build/chroot-ng}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -54,12 +54,12 @@ skip() {
 }
 
 # ---- running AArch64 programs ---------------------------------------------
-# On an AArch64 host $QEMU is empty and everything runs directly; elsewhere the
+# On an AArch64 host $CHROOTNG_QEMU is empty and everything runs directly; elsewhere the
 # emulator prefixes the command line. Kept as functions rather than a variable
-# so an empty $QEMU never becomes an empty argv[0].
+# so an empty $CHROOTNG_QEMU never becomes an empty argv[0].
 
 emu() {
-    if [ -n "$QEMU" ]; then "$QEMU" "$@"; else "$@"; fi
+    if [ -n "$CHROOTNG_QEMU" ]; then "$CHROOTNG_QEMU" "$@"; else "$@"; fi
 }
 
 # emu_t SECS CMD... — as emu, but bounded: a test that blocks (a netlink dump
@@ -69,7 +69,7 @@ emu_t() {
     _t=$1
     shift
     if [ -z "$TIMEOUT" ]; then emu "$@"
-    elif [ -n "$QEMU" ]; then "$TIMEOUT" "$_t" "$QEMU" "$@"
+    elif [ -n "$CHROOTNG_QEMU" ]; then "$TIMEOUT" "$_t" "$CHROOTNG_QEMU" "$@"
     else "$TIMEOUT" "$_t" "$@"
     fi
 }
@@ -82,11 +82,11 @@ emu_t() {
 # environment is the one it was given), so the reference is run without it.
 kref() { env -u LD_PRELOAD "$@"; }
 
-run() { emu "$BIN" "$@"; }
+run() { emu "$CHROOTNG_BIN" "$@"; }
 run_t() {
     _t=$1
     shift
-    emu_t "$_t" "$BIN" "$@"
+    emu_t "$_t" "$CHROOTNG_BIN" "$@"
 }
 
 # ---- ELF facts, without file(1) (absent on a bare Termux) ------------------
@@ -128,32 +128,32 @@ elf_has_interp() {
 cng_detect_host() {
     HOST_ARCH=$(uname -m 2>/dev/null || echo unknown)
     case "$HOST_ARCH" in
-    aarch64 | arm64) CNG_NATIVE=1 ;;
-    *) CNG_NATIVE=0 ;;
+    aarch64 | arm64) CHROOTNG_NATIVE=1 ;;
+    *) CHROOTNG_NATIVE=0 ;;
     esac
 
-    CNG_TERMUX=0
+    CHROOTNG_TERMUX=0
     if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux/files/usr ]; then
-        CNG_TERMUX=1
+        CHROOTNG_TERMUX=1
     fi
     case "${PREFIX:-}" in
-    */com.termux/*) CNG_TERMUX=1 ;;
+    */com.termux/*) CHROOTNG_TERMUX=1 ;;
     esac
 
-    # QEMU: an explicit setting always wins, INCLUDING an empty one — that is how
+    # CHROOTNG_QEMU: an explicit setting always wins, INCLUDING an empty one — that is how
     # to force direct execution on a cross host that runs AArch64 binaries some
     # other way (a binfmt_misc handler), or to override the auto-picked build.
-    CNG_EMU_MISSING=0
-    if [ "${QEMU+x}" != x ]; then
-        QEMU=
-        if [ "$CNG_NATIVE" = 0 ]; then
+    CHROOTNG_EMU_MISSING=0
+    if [ "${CHROOTNG_QEMU+x}" != x ]; then
+        CHROOTNG_QEMU=
+        if [ "$CHROOTNG_NATIVE" = 0 ]; then
             for _q in qemu-aarch64-static qemu-aarch64; do
                 if have "$_q"; then
-                    QEMU=$_q
+                    CHROOTNG_QEMU=$_q
                     break
                 fi
             done
-            [ -n "$QEMU" ] || CNG_EMU_MISSING=1
+            [ -n "$CHROOTNG_QEMU" ] || CHROOTNG_EMU_MISSING=1
         fi
     fi
 
@@ -170,70 +170,70 @@ cng_detect_host() {
 cng_detect_guestcc() {
     # Every one of these has to be defined before the first early return: the
     # milestone scripts run under `set -u` and read them whether or not a
-    # toolchain turned up. Note the explicitness of GUESTLD is captured before it
+    # toolchain turned up. Note the explicitness of CHROOTNG_GUESTLD is captured before it
     # is defaulted, since "set to empty" means "dynamic, no fallback".
-    if [ "${GUESTLD+x}" = x ]; then _ld_explicit=1; else _ld_explicit=0; fi
-    GUESTLD=${GUESTLD-}
+    if [ "${CHROOTNG_GUESTLD+x}" = x ]; then _ld_explicit=1; else _ld_explicit=0; fi
+    CHROOTNG_GUESTLD=${CHROOTNG_GUESTLD-}
     GUEST_STATIC=0
-    GUEST_BINDS=${GUEST_BINDS:-}
+    CHROOTNG_GUEST_BINDS=${CHROOTNG_GUEST_BINDS:-}
     GUEST_LD_DESC=none
-    GUEST_CC_LOG=$CNG_TMP/guest_cc.log
+    GUEST_CC_LOG=$CHROOTNG_TMP/guest_cc.log
 
-    if [ -n "${GUESTCC:-}" ]; then
-        have "$GUESTCC" || {
-            GUESTCC=
+    if [ -n "${CHROOTNG_GUESTCC:-}" ]; then
+        have "$CHROOTNG_GUESTCC" || {
+            CHROOTNG_GUESTCC=
             return 1
         }
     else
         # A native compiler is only a candidate on an AArch64 host; on x86_64 an
         # unprefixed gcc would happily build an x86 binary and every guest test
         # would then fail for the wrong reason.
-        if [ "$CNG_NATIVE" = 1 ]; then
+        if [ "$CHROOTNG_NATIVE" = 1 ]; then
             set -- aarch64-linux-gnu-gcc-13 aarch64-linux-gnu-gcc cc gcc clang
         else
             set -- aarch64-linux-gnu-gcc-13 aarch64-linux-gnu-gcc-12 \
                 aarch64-linux-gnu-gcc aarch64-linux-musl-gcc
         fi
-        GUESTCC=
+        CHROOTNG_GUESTCC=
         for _c in "$@"; do
             if have "$_c"; then
-                GUESTCC=$_c
+                CHROOTNG_GUESTCC=$_c
                 break
             fi
         done
-        [ -n "$GUESTCC" ] || return 1
+        [ -n "$CHROOTNG_GUESTCC" ] || return 1
     fi
 
-    printf 'int main(void){return 7;}\n' >"$CNG_TMP/ldprobe.c"
+    printf 'int main(void){return 7;}\n' >"$CHROOTNG_TMP/ldprobe.c"
     # Most of the suite needs a self-contained guest it can drop into a synthetic
     # rootfs, so prefer static-PIE, then plain static, and only fall back to
     # dynamic (Termux/bionic, where there is no libc.a to link against). An
-    # explicit GUESTLD is honoured exactly, with no fallback.
+    # explicit CHROOTNG_GUESTLD is honoured exactly, with no fallback.
     if [ "$_ld_explicit" = 1 ]; then
-        cng_try_guest_ld "$GUESTLD" && return 0
-        GUESTCC=
-        GUESTLD=
+        cng_try_guest_ld "$CHROOTNG_GUESTLD" && return 0
+        CHROOTNG_GUESTCC=
+        CHROOTNG_GUESTLD=
         return 1
     fi
     for _m in -static-pie -static ""; do
         cng_try_guest_ld "$_m" && return 0
     done
-    GUESTCC=
-    GUESTLD=
+    CHROOTNG_GUESTCC=
+    CHROOTNG_GUESTLD=
     return 1
 }
 
-# cng_try_guest_ld MODE — can $GUESTCC build an AArch64 binary this way, and does
-# the result actually run here? Sets GUESTLD/GUEST_STATIC/GUEST_LD_DESC on yes.
+# cng_try_guest_ld MODE — can $CHROOTNG_GUESTCC build an AArch64 binary this way, and does
+# the result actually run here? Sets CHROOTNG_GUESTLD/GUEST_STATIC/GUEST_LD_DESC on yes.
 cng_try_guest_ld() {
-    rm -f "$CNG_TMP/ldprobe"
+    rm -f "$CHROOTNG_TMP/ldprobe"
     # shellcheck disable=SC2086  # $1 is a single flag or deliberately empty
-    $GUESTCC $1 -O0 -o "$CNG_TMP/ldprobe" "$CNG_TMP/ldprobe.c" \
+    $CHROOTNG_GUESTCC $1 -O0 -o "$CHROOTNG_TMP/ldprobe" "$CHROOTNG_TMP/ldprobe.c" \
         2>"$GUEST_CC_LOG" || return 1
-    elf_is_aarch64 "$CNG_TMP/ldprobe" || return 1
-    emu_t 30 "$CNG_TMP/ldprobe" >/dev/null 2>&1
+    elf_is_aarch64 "$CHROOTNG_TMP/ldprobe" || return 1
+    emu_t 30 "$CHROOTNG_TMP/ldprobe" >/dev/null 2>&1
     [ $? = 7 ] || return 1
-    GUESTLD=$1
+    CHROOTNG_GUESTLD=$1
     case "$1" in
     "")
         GUEST_STATIC=0
@@ -257,15 +257,15 @@ cng_try_guest_ld() {
 # start it — chroot-ng reports "cannot load interpreter <rootfs>/lib/ld-...".
 # Expose the host directories the loader needs at the same guest paths. (Only for
 # rootfs the suite builds itself — never for a real Alpine/Debian tree, which
-# ships its own.) Preset GUEST_BINDS in the environment for an unusual layout.
+# ships its own.) Preset CHROOTNG_GUEST_BINDS in the environment for an unusual layout.
 #
 # Bionic's linker reads nothing under /lib, and binding it anyway is not
 # harmless: an Android ramdisk may carry a /lib of its own (/lib/modules on
 # Android 8), and the bind then hides the test rootfs's /lib — M19's
 # lib/apk/exec among it. So an Android host binds Android's directories only.
 cng_guest_binds() {
-    [ -z "${GUEST_BINDS:-}" ] || return 0
-    GUEST_BINDS=
+    [ -z "${CHROOTNG_GUEST_BINDS:-}" ] || return 0
+    CHROOTNG_GUEST_BINDS=
     if [ -e /system/bin/linker64 ]; then
         set -- /system /apex /linkerconfig /vendor
     else
@@ -273,13 +273,13 @@ cng_guest_binds() {
     fi
     for _d in "$@" ${PREFIX:+"$PREFIX"}; do
         [ -d "$_d" ] || continue
-        GUEST_BINDS="$GUEST_BINDS -b $_d:$_d"
+        CHROOTNG_GUEST_BINDS="$CHROOTNG_GUEST_BINDS -b $_d:$_d"
     done
 }
 
 # cng_outside_binds DIR — where a scratch tree may be put in front of the
 # arm64chroot oracle. The oracle spells a guest path with the longest HOST prefix
-# it finds, and a rootfs that sits inside a directory $GUEST_BINDS exposes is then
+# it finds, and a rootfs that sits inside a directory $CHROOTNG_GUEST_BINDS exposes is then
 # spelled as the bind: Termux's $TMPDIR is inside $PREFIX, which is bound for the
 # linker, so the oracle's getcwd answered "/data/data/.../tmp.X/a/b" for a guest
 # whose cwd is /a/b — chroot-ng answers /a/b there, as the kernel's chroot would,
@@ -292,7 +292,7 @@ cng_outside_binds() {
         return 0
     }
     _in=0
-    for _w in $GUEST_BINDS; do
+    for _w in $CHROOTNG_GUEST_BINDS; do
         [ "$_w" = -b ] && continue
         case "$_real/" in "${_w#*:}"/*) _in=1 ;; esac
     done
@@ -316,8 +316,8 @@ cng_outside_binds() {
 cng_dyn_binds() {
     GUEST_DYN_BINDS=
     GUEST_DYN_L=
-    if [ "$CNG_NATIVE" = 1 ]; then _sr=${CNG_SYSROOT-}; else
-        _sr=${CNG_SYSROOT-/usr/aarch64-linux-gnu}
+    if [ "$CHROOTNG_NATIVE" = 1 ]; then _sr=${CHROOTNG_SYSROOT-}; else
+        _sr=${CHROOTNG_SYSROOT-/usr/aarch64-linux-gnu}
     fi
     if [ -n "$_sr" ]; then
         GUEST_DYN_L="-L $_sr"
@@ -339,23 +339,23 @@ cng_dyn_binds() {
 #   rc 1   build failed (diagnostics in $GUEST_CC_LOG) — a real failure
 #   rc 2   no usable guest toolchain on this host — the caller should skip
 guest_cc() {
-    [ -n "$GUESTCC" ] || return 2
+    [ -n "$CHROOTNG_GUESTCC" ] || return 2
     _out=$1
     _src=$2
     shift 2
-    # shellcheck disable=SC2086  # $GUESTLD is a flag or deliberately empty
-    $GUESTCC $GUESTLD -O2 -o "$_out" "$_src" "$@" 2>"$GUEST_CC_LOG"
+    # shellcheck disable=SC2086  # $CHROOTNG_GUESTLD is a flag or deliberately empty
+    $CHROOTNG_GUESTCC $CHROOTNG_GUESTLD -O2 -o "$_out" "$_src" "$@" 2>"$GUEST_CC_LOG"
 }
 
 # guest_xlate_ready WHAT — can this host observe a compiled guest's OWN path
 # syscalls being translated at all? Emits the reason and returns 1 if not, so a
 # milestone that depends on it says which of the two prerequisites is missing.
 guest_xlate_ready() {
-    if [ -z "$GUESTCC" ]; then
+    if [ -z "$CHROOTNG_GUESTCC" ]; then
         skip "$1: no AArch64 guest toolchain"
         return 1
     fi
-    if [ "$CNG_GUEST_XLATE" = 0 ]; then
+    if [ "$CHROOTNG_GUEST_XLATE" = 0 ]; then
         skip "$1: seccomp inert here and the guest links dynamically, so neither tier reaches libc's svc sites"
         return 1
     fi
@@ -386,21 +386,21 @@ guest_cc_report() {
 # inferring it from uname.
 
 cng_probe_caps() {
-    CNG_SECCOMP_LIVE=0
-    CNG_EXECMEM=0
-    CNG_PROBE_OUT=$(run --probe / 2>&1)
-    case "$CNG_PROBE_OUT" in
-    *"filter RET_ERRNO    WORKS"*) CNG_SECCOMP_LIVE=1 ;;
+    CHROOTNG_SECCOMP_LIVE=0
+    CHROOTNG_EXECMEM=0
+    CHROOTNG_PROBE_OUT=$(run --probe / 2>&1)
+    case "$CHROOTNG_PROBE_OUT" in
+    *"filter RET_ERRNO    WORKS"*) CHROOTNG_SECCOMP_LIVE=1 ;;
     esac
-    case "$CNG_PROBE_OUT" in
-    *"RESULT    OK"*) CNG_EXECMEM=1 ;;
+    case "$CHROOTNG_PROBE_OUT" in
+    *"RESULT    OK"*) CHROOTNG_EXECMEM=1 ;;
     esac
 }
 
 # ---- guest rootfs images + the differential oracle ------------------------
 # Several milestones need a real AArch64 userland (Alpine busybox, Debian glibc)
 # and M10 needs the arm64chroot oracle. The userlands are pinned images the
-# suite provisions itself under $CNG_ROOTFS_DIR (default build/cache/chroot-ng/rootfs):
+# suite provisions itself under $CHROOTNG_ROOTFS_DIR (default build/cache/chroot-ng/rootfs):
 # Alpine at startup, since seven milestones use it, and Debian only when M10
 # reaches its one leg, which needs the oracle as well. The oracle is another
 # project and cannot be fetched, so it is searched for. A milestone left
@@ -459,11 +459,11 @@ cng_rootfs_fetch() {
 
 cng_sha256() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
-# cng_rootfs_lock NAME — runs sharing $CNG_ROOTFS_DIR take turns provisioning.
+# cng_rootfs_lock NAME — runs sharing $CHROOTNG_ROOTFS_DIR take turns provisioning.
 # mkdir is the one atomic test-and-set every host has; a lock whose owner has
 # died is taken over. Released by removing the directory.
 cng_rootfs_lock() {
-    _lk=$CNG_ROOTFS_DIR/.$1.lock
+    _lk=$CHROOTNG_ROOTFS_DIR/.$1.lock
     _n=0
     until mkdir "$_lk" 2>/dev/null; do
         _p=$(cat "$_lk/pid" 2>/dev/null)
@@ -479,132 +479,132 @@ cng_rootfs_lock() {
     echo $$ >"$_lk/pid"
 }
 
-# cng_rootfs NAME [fetch] — CNG_ROOTFS is set to $CNG_ROOTFS_DIR/NAME when that
-# tree is usable, otherwise emptied with the reason in CNG_ROOTFS_WHY. A tree is
+# cng_rootfs NAME [fetch] — CHROOTNG_ROOTFS is set to $CHROOTNG_ROOTFS_DIR/NAME when that
+# tree is usable, otherwise emptied with the reason in CHROOTNG_ROOTFS_WHY. A tree is
 # usable once it has its marker and is stamped with the pinned hash, or carries
 # no stamp at all: one staged by hand is used as it is and never touched. With
 # "fetch", a missing or stale tree is provisioned.
 cng_rootfs() {
-    CNG_ROOTFS=
-    CNG_ROOTFS_WHY=
+    CHROOTNG_ROOTFS=
+    CHROOTNG_ROOTFS_WHY=
     cng_rootfs_pin "$1" || return 1
-    _rf_dir=$CNG_ROOTFS_DIR/$1
-    _rf_stamp=$CNG_ROOTFS_DIR/.$1.sha256
+    _rf_dir=$CHROOTNG_ROOTFS_DIR/$1
+    _rf_stamp=$CHROOTNG_ROOTFS_DIR/.$1.sha256
     cng_rootfs_usable && return 0
     if [ "${2:-}" != fetch ]; then
-        CNG_ROOTFS_WHY="not provisioned yet"
+        CHROOTNG_ROOTFS_WHY="not provisioned yet"
         return 1
     fi
-    if ! mkdir -p "$CNG_ROOTFS_DIR/downloads" || ! cng_rootfs_lock "$1"; then
-        CNG_ROOTFS_WHY="cannot lock $CNG_ROOTFS_DIR for provisioning"
+    if ! mkdir -p "$CHROOTNG_ROOTFS_DIR/downloads" || ! cng_rootfs_lock "$1"; then
+        CHROOTNG_ROOTFS_WHY="cannot lock $CHROOTNG_ROOTFS_DIR for provisioning"
         return 1
     fi
     cng_rootfs_provision "$1"
     _rc=$?
-    rm -rf "$CNG_ROOTFS_DIR/.$1.lock"
+    rm -rf "$CHROOTNG_ROOTFS_DIR/.$1.lock"
     return $_rc
 }
 
 cng_rootfs_usable() {
     [ -x "$_rf_dir/$_rf_marker" ] || return 1
     [ ! -e "$_rf_stamp" ] || [ "$(cat "$_rf_stamp")" = "$_rf_sha" ] || return 1
-    CNG_ROOTFS=$_rf_dir
+    CHROOTNG_ROOTFS=$_rf_dir
 }
 
 # cng_rootfs_provision NAME — under the lock. The tarball in downloads/ is
-# downloaded first when absent (never with CNG_ROOTFS_FETCH=0) and checked
+# downloaded first when absent (never with CHROOTNG_ROOTFS_FETCH=0) and checked
 # against the pin either way. It is unpacked beside the tree and renamed into
 # place, so a run that dies midway leaves nothing half-written under the name.
 cng_rootfs_provision() {
     cng_rootfs_usable && return 0 # another run got there first
     if [ -e "$_rf_dir" ] && [ ! -e "$_rf_stamp" ]; then
-        CNG_ROOTFS_WHY="$_rf_dir has no $_rf_marker and was not provisioned here"
+        CHROOTNG_ROOTFS_WHY="$_rf_dir has no $_rf_marker and was not provisioned here"
         return 1
     fi
     if ! have sha256sum; then
-        CNG_ROOTFS_WHY="no sha256sum to check $_rf_file with"
+        CHROOTNG_ROOTFS_WHY="no sha256sum to check $_rf_file with"
         return 1
     fi
-    _tb=$CNG_ROOTFS_DIR/downloads/$_rf_file
+    _tb=$CHROOTNG_ROOTFS_DIR/downloads/$_rf_file
     if [ "$(cng_sha256 "$_tb")" != "$_rf_sha" ]; then
-        if [ "${CNG_ROOTFS_FETCH:-1}" = 0 ]; then
-            CNG_ROOTFS_WHY="no $_rf_file matching its pin in downloads/, and CNG_ROOTFS_FETCH=0"
+        if [ "${CHROOTNG_ROOTFS_FETCH:-1}" = 0 ]; then
+            CHROOTNG_ROOTFS_WHY="no $_rf_file matching its pin in downloads/, and CHROOTNG_ROOTFS_FETCH=0"
             return 1
         fi
         echo "  fetching $_rf_file" >&2
         if ! cng_rootfs_fetch "$1" "$_tb.part"; then
             rm -f "$_tb.part"
-            CNG_ROOTFS_WHY="cannot download $_rf_url"
+            CHROOTNG_ROOTFS_WHY="cannot download $_rf_url"
             return 1
         fi
         if [ "$(cng_sha256 "$_tb.part")" != "$_rf_sha" ]; then
             rm -f "$_tb.part"
-            CNG_ROOTFS_WHY="$_rf_file does not match its pinned sha256"
+            CHROOTNG_ROOTFS_WHY="$_rf_file does not match its pinned sha256"
             return 1
         fi
         if ! mv -f "$_tb.part" "$_tb"; then
-            CNG_ROOTFS_WHY="cannot store $_tb"
+            CHROOTNG_ROOTFS_WHY="cannot store $_tb"
             return 1
         fi
     fi
-    _new=$CNG_ROOTFS_DIR/.$1.new
+    _new=$CHROOTNG_ROOTFS_DIR/.$1.new
     rm -rf "$_new"
     if ! mkdir "$_new" || ! (cd "$_new" && gzip -dc "$_tb" | tar -xof -) ||
         [ ! -x "$_new/$_rf_marker" ]; then
         rm -rf "$_new"
-        CNG_ROOTFS_WHY="cannot unpack $_rf_file"
+        CHROOTNG_ROOTFS_WHY="cannot unpack $_rf_file"
         return 1
     fi
     # Only a tree stamped as provisioned here gets this far to be replaced.
     rm -rf "$_rf_dir"
     if [ -e "$_rf_dir" ]; then
         rm -rf "$_new"
-        CNG_ROOTFS_WHY="cannot remove the stale $_rf_dir"
+        CHROOTNG_ROOTFS_WHY="cannot remove the stale $_rf_dir"
         return 1
     fi
     if ! echo "$_rf_sha" >"$_rf_stamp" || ! mv "$_new" "$_rf_dir"; then
         rm -rf "$_new"
-        CNG_ROOTFS_WHY="cannot move the unpacked tree to $_rf_dir"
+        CHROOTNG_ROOTFS_WHY="cannot move the unpacked tree to $_rf_dir"
         return 1
     fi
-    CNG_ROOTFS=$_rf_dir
+    CHROOTNG_ROOTFS=$_rf_dir
 }
 
 cng_detect_images() {
     # Absolute, since the provisioning and the milestones change directory.
-    CNG_ROOTFS_DIR="${CNG_ROOTFS_DIR:-build/cache/chroot-ng/rootfs}"
-    case "$CNG_ROOTFS_DIR" in
+    CHROOTNG_ROOTFS_DIR="${CHROOTNG_ROOTFS_DIR:-build/cache/chroot-ng/rootfs}"
+    case "$CHROOTNG_ROOTFS_DIR" in
     /*) : ;;
-    *) CNG_ROOTFS_DIR=$PWD/$CNG_ROOTFS_DIR ;;
+    *) CHROOTNG_ROOTFS_DIR=$PWD/$CHROOTNG_ROOTFS_DIR ;;
     esac
-    CNG_ALPINE="${CNG_ALPINE:-}"
-    CNG_ALPINE_WHY=
-    if [ -z "$CNG_ALPINE" ]; then
+    CHROOTNG_ALPINE="${CHROOTNG_ALPINE:-}"
+    CHROOTNG_ALPINE_WHY=
+    if [ -z "$CHROOTNG_ALPINE" ]; then
         cng_rootfs alpine fetch
-        CNG_ALPINE=$CNG_ROOTFS
-        CNG_ALPINE_WHY=$CNG_ROOTFS_WHY
+        CHROOTNG_ALPINE=$CHROOTNG_ROOTFS
+        CHROOTNG_ALPINE_WHY=$CHROOTNG_ROOTFS_WHY
     fi
     # Only looked for here: M10 provisions it when it reaches the Debian leg.
-    CNG_DEBIAN="${CNG_DEBIAN:-}"
-    CNG_DEBIAN_WHY=
-    if [ -z "$CNG_DEBIAN" ]; then
+    CHROOTNG_DEBIAN="${CHROOTNG_DEBIAN:-}"
+    CHROOTNG_DEBIAN_WHY=
+    if [ -z "$CHROOTNG_DEBIAN" ]; then
         cng_rootfs debian
-        CNG_DEBIAN=$CNG_ROOTFS
-        CNG_DEBIAN_WHY=$CNG_ROOTFS_WHY
+        CHROOTNG_DEBIAN=$CHROOTNG_ROOTFS
+        CHROOTNG_DEBIAN_WHY=$CHROOTNG_ROOTFS_WHY
     fi
 
     # The oracle is a host-native emulator, not an AArch64 program: usable only
     # where its own machine matches this host. It is the arm64chroot this
     # repository builds (`make arm64chroot`; `make test-chroot-ng` builds it).
-    CNG_ORACLE="${CNG_ORACLE:-}"
-    if [ -z "$CNG_ORACLE" ] && [ -x "$PWD/build/arm64chroot" ]; then
-        CNG_ORACLE=$PWD/build/arm64chroot
+    CHROOTNG_ORACLE="${CHROOTNG_ORACLE:-}"
+    if [ -z "$CHROOTNG_ORACLE" ] && [ -x "$PWD/build/arm64chroot" ]; then
+        CHROOTNG_ORACLE=$PWD/build/arm64chroot
     fi
-    if [ -n "$CNG_ORACLE" ]; then
-        _m=$(elf_machine "$CNG_ORACLE")
+    if [ -n "$CHROOTNG_ORACLE" ]; then
+        _m=$(elf_machine "$CHROOTNG_ORACLE")
         case "$HOST_ARCH:$_m" in
         x86_64:62 | aarch64:183 | arm64:183) : ;;
-        *) CNG_ORACLE= ;;
+        *) CHROOTNG_ORACLE= ;;
         esac
     fi
 }
@@ -612,7 +612,7 @@ cng_detect_images() {
 # ---- init ------------------------------------------------------------------
 
 cng_platform_init() {
-    CNG_TMP=$(mktemp -d)
+    CHROOTNG_TMP=$(mktemp -d)
     cng_detect_host
     cng_detect_guestcc || :
     cng_probe_caps
@@ -623,27 +623,27 @@ cng_platform_init() {
     # left, and that reaches the svc sites in the objects the loader maps — not
     # the libc.so a dynamic guest's ld.so maps afterwards. So the legs that assert
     # translation from inside a compiled guest need one of the two.
-    CNG_GUEST_XLATE=0
-    if [ "$CNG_SECCOMP_LIVE" = 1 ] || [ "$GUEST_STATIC" = 1 ]; then
-        CNG_GUEST_XLATE=1
+    CHROOTNG_GUEST_XLATE=0
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ] || [ "$GUEST_STATIC" = 1 ]; then
+        CHROOTNG_GUEST_XLATE=1
     fi
 }
 
 cng_platform_banner() {
     printf '== platform ==\n'
     printf '  host          %s%s\n' "$HOST_ARCH" \
-        "$([ "$CNG_TERMUX" = 1 ] && echo ' (Termux/Android)')"
+        "$([ "$CHROOTNG_TERMUX" = 1 ] && echo ' (Termux/Android)')"
     printf '  exec          %s\n' \
-        "$([ -n "$QEMU" ] && echo "$QEMU" || echo 'native (no emulator)')"
+        "$([ -n "$CHROOTNG_QEMU" ] && echo "$CHROOTNG_QEMU" || echo 'native (no emulator)')"
     printf '  seccomp tier  %s\n' \
-        "$([ "$CNG_SECCOMP_LIVE" = 1 ] && echo 'live' ||
+        "$([ "$CHROOTNG_SECCOMP_LIVE" = 1 ] && echo 'live' ||
             echo 'inert (-R rewriting carries translation)')"
     printf '  execmem       %s\n' \
-        "$([ "$CNG_EXECMEM" = 1 ] && echo 'permitted' || echo 'DENIED')"
+        "$([ "$CHROOTNG_EXECMEM" = 1 ] && echo 'permitted' || echo 'DENIED')"
     printf '  guest cc      %s\n' \
-        "$([ -n "$GUESTCC" ] && echo "$GUESTCC ($GUEST_LD_DESC)" ||
+        "$([ -n "$CHROOTNG_GUESTCC" ] && echo "$CHROOTNG_GUESTCC ($GUEST_LD_DESC)" ||
             echo 'none — guest-binary legs will skip')"
-    printf '  alpine rootfs %s\n' "${CNG_ALPINE:-none ($CNG_ALPINE_WHY)}"
-    printf '  debian rootfs %s\n' "${CNG_DEBIAN:-none ($CNG_DEBIAN_WHY)}"
-    printf '  l2s oracle    %s\n' "${CNG_ORACLE:-none}"
+    printf '  alpine rootfs %s\n' "${CHROOTNG_ALPINE:-none ($CHROOTNG_ALPINE_WHY)}"
+    printf '  debian rootfs %s\n' "${CHROOTNG_DEBIAN:-none ($CHROOTNG_DEBIAN_WHY)}"
+    printf '  l2s oracle    %s\n' "${CHROOTNG_ORACLE:-none}"
 }

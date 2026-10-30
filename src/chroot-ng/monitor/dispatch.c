@@ -201,7 +201,7 @@ static long ro_refusal(const char *host, int atflags) {
  * Android's seccomp filter, or a credential change we can't perform). Shared
  * with the SIGSYS gate-net. Async-signal-safe.
  *
- * CNG_DEBUG only: it is a note, not an error — the guest gets the emulated
+ * CHROOTNG_DEBUG only: it is a note, not an error — the guest gets the emulated
  * answer either way — and it goes to the guest's own stderr, which is the
  * program's output as far as a pipe, a terminal or a package manager's log
  * can tell. On Android, whose filter refuses numbers a libc reaches for
@@ -227,7 +227,7 @@ char **cng_g_host_envp = 0;
  * A magnitude test would not do: the args of a *failing* syscall include plain
  * scalars (a uid, an offset, a length) that are large enough to look like
  * pointers, and dereferencing one reads a wild address — a SIGSEGV inside the
- * handler, with SIGSEGV masked, kills the guest outright. CNG_DEBUG must never
+ * handler, with SIGSEGV masked, kills the guest outright. CHROOTNG_DEBUG must never
  * change behaviour. Neither would asking the kernel first (a faccessat that
  * answers EFAULT for what is not a string): that leaves the printing itself
  * walking guest memory a syscall later, and the guest is free to unmap it in
@@ -3528,7 +3528,7 @@ static int pid_hidden(long pid) {
 }
 
 /* The signal family under the view (see the kill case). The registry is what
- * tells a guest from a host process, so with none (CNG_PROCREG_NONE, a host
+ * tells a guest from a host process, so with none (CHROOTNG_PROCREG_NONE, a host
  * that could map nothing) every other pid would read as hidden — a shell could
  * not signal its own job — and they run native there, untrapped. */
 static int sig_view(void) {
@@ -5423,7 +5423,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * guest's own would have — and dropped under fake root, whose
          * capability it is. */
         int flagged = (fl & CNG_AT_EMPTY_PATH) && !empty && !cng_fake_root();
-        int force = cng_g_l2s && cng_g_l2s_force; /* CNG_L2S_FORCE: exercise
+        int force = cng_g_l2s && cng_g_l2s_force; /* CHROOTNG_L2S_FORCE: exercise
                                                     * the fallback directly */
         char srch[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
         long r;

@@ -22,9 +22,9 @@
 #ifndef CNG_EXECMAP_H
 #define CNG_EXECMAP_H
 
-/* CNG_MMAP_FORCE_ANON=1: take the anonymous route without asking the kernel
+/* CHROOTNG_MMAP_FORCE_ANON=1: take the anonymous route without asking the kernel
  * first, so the path can be exercised on a host that has no noexec mount to
- * offer. Same testing convention as CNG_SHM_FORCE_FILE / CNG_PROCREG_NONE. */
+ * offer. Same testing convention as CHROOTNG_SHM_FORCE_FILE / CHROOTNG_PROCREG_NONE. */
 extern int cng_g_execmap_force;
 
 /* Serve one mmap(2) whose prot has PROT_EXEC and whose flags do not have

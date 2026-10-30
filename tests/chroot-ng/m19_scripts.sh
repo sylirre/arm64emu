@@ -23,7 +23,7 @@
 # rootfs named directly, the reverse map matches and the bug is invisible.
 echo "== M19: package-manager scripts =="
 
-M19_ORACLE="${M19_ORACLE:-$CNG_ORACLE}"
+M19_ORACLE="${M19_ORACLE:-$CHROOTNG_ORACLE}"
 
 GDIR=build/tests/chroot-ng
 mkdir -p "$GDIR"
@@ -75,8 +75,8 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/chroot-ng/guests/scriptprobe.c; t
     cp "$GDIR/scriptprobe" "$M19/real/scriptprobe"
     cp "$GDIR/scriptprobe" "$M19/real/lib/apk/exec/scriptprobe"
 
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    m19_run() { run -R $GUEST_BINDS "$@"; }
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    m19_run() { run -R $CHROOTNG_GUEST_BINDS "$@"; }
 
     # --- the empty pathname -------------------------------------------------
     out=$(m19_run "$M19/real" /scriptprobe 2>/dev/null)
@@ -180,9 +180,9 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/chroot-ng/guests/scriptprobe.c; t
             _d=$1
             shift
             # shellcheck disable=SC2086
-            _got=$(run -R $GUEST_BINDS "$@" 2>/dev/null)
+            _got=$(run -R $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
             # shellcheck disable=SC2086
-            _want=$("$M19_ORACLE" $GUEST_BINDS "$@" 2>/dev/null)
+            _want=$("$M19_ORACLE" $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
             if [ -n "$_want" ] && [ "$_got" = "$_want" ]; then
                 pass=$((pass + 1)); printf '  ok   oracle parity: %s\n' "$_d"
             else

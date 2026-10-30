@@ -9,7 +9,7 @@
  * a descriptor that is no terminal. The monitor serves it from the commands the
  * policy allows (src/chroot-ng/monitor/tty.c); the answers must be the kernel's whichever
  * way they were reached, so this runs over the host as it is and over
- * CNG_TIOCGSID_DENY=1, which refuses it before the host is asked.
+ * CHROOTNG_TIOCGSID_DENY=1, which refuses it before the host is asked.
  *
  * What is asked, over a real pty: before anything controls it, the slave and
  * the master are ENOTTY (no session); a child that setsid()s and takes the pty

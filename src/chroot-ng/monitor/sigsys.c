@@ -780,11 +780,11 @@ static int scr_tid_live(long tid) {
     return CNG_SYS(__NR_tgkill, sys_getpid(), tid, 0, 0, 0, 0) == 0;
 }
 
-/* CNG_SCRATCH_NONE=1: answer as a process whose table has no slot to give —
+/* CHROOTNG_SCRATCH_NONE=1: answer as a process whose table has no slot to give —
  * 256 live threads already holding one, or an mmap the host refused. A working
  * host does not reach that on its own, and what happens when it does is the
  * whole question here, so it is settled once at monitor install rather than
- * read per dispatch. Same testing convention as CNG_PROCREG_NONE. */
+ * read per dispatch. Same testing convention as CHROOTNG_PROCREG_NONE. */
 static int cng_g_scratch_none;
 
 /* Find this thread's scratch slot (allocating one on first use). Returns the
@@ -1457,7 +1457,7 @@ int cng_install_monitor(struct cng_fs *fs) {
      * demand (the ptrace roles) must not do so before this point: a
      * SECCOMP_RET_TRAP with no handler for the signal kills the process. */
     cng_g_sigsys_ready = 1;
-    cng_g_scratch_none = cng_broker_env("CNG_SCRATCH_NONE") != 0;
+    cng_g_scratch_none = cng_broker_env("CHROOTNG_SCRATCH_NONE") != 0;
     /* The ptrace kick signal is answered by every guest process, whether or not
      * it ever traces anything: it is how a tracer reaches a running task
      * (PTRACE_ATTACH), and how a process is told its child asked to be traced. */

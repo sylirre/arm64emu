@@ -79,7 +79,7 @@ rm -rf "$O2R"
 # filter — chroot-ng emulates it, and there is no kernel to diff against. The
 # answers below stand in: the kernel's own, measured natively (6.8 on AArch64)
 # and stable from 5.6 on. Where the host CAN issue it, the emulation is diffed
-# against the live kernel instead, with CNG_OPENAT2_DENY taking it as refused.
+# against the live kernel instead, with CHROOTNG_OPENAT2_DENY taking it as refused.
 O2_KERNEL='plain=ok
 symlink=ok
 nosym_link=-40
@@ -154,29 +154,29 @@ else
         skip "openat2 differential: the reference run produced nothing"
         ;;
     *openat2=unsupported*)
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        got=$(run -R $GUEST_BINDS "$O2D" /openat2 /d 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        got=$(run -R $CHROOTNG_GUEST_BINDS "$O2D" /openat2 /d 2>/dev/null)
         check "openat2 is emulated where it cannot be issued, with the kernel's answers" \
             "$O2_KERNEL" "$got"
         o2_cases "$O2_KERNEL" "$got" "emulated: "
         ;;
     *)
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        got=$(run -R $GUEST_BINDS "$O2D" /openat2 /d 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        got=$(run -R $CHROOTNG_GUEST_BINDS "$O2D" /openat2 /d 2>/dev/null)
         check "every openat2 resolve case matches the host kernel" "$want" "$got"
         o2_cases "$want" "$got" ""
         # ...and the emulation against this same kernel, on both tiers where
         # the filter is live: the seccomp one is what a device runs.
         for _tier in -R plain; do
-            _label="openat2 emulated (CNG_OPENAT2_DENY, $_tier) matches the host kernel"
-            if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            _label="openat2 emulated (CHROOTNG_OPENAT2_DENY, $_tier) matches the host kernel"
+            if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
                 skip "$_label: the filter is inert here"
                 continue
             fi
             _opt=""
             [ "$_tier" = -R ] && _opt=-R
-            # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
-            got=$(CNG_OPENAT2_DENY=1 run $_opt $GUEST_BINDS "$O2D" /openat2 /d \
+            # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
+            got=$(CHROOTNG_OPENAT2_DENY=1 run $_opt $CHROOTNG_GUEST_BINDS "$O2D" /openat2 /d \
                 2>/dev/null)
             check "$_label" "$want" "$got"
             o2_cases "$want" "$got" "emulated ($_tier): "
@@ -185,18 +185,18 @@ else
     esac
     # A number the host refuses is emulated without a word on the guest's
     # stderr, which is the program's output to whoever reads it: the one-shot
-    # "not permitted here" note is CNG_DEBUG's. It used to be printed on every
+    # "not permitted here" note is CHROOTNG_DEBUG's. It used to be printed on every
     # run, into the middle of whatever the guest wrote, on Android.
     if [ -n "$want" ]; then
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        err=$(CNG_OPENAT2_DENY=1 run -R $GUEST_BINDS "$O2D" /openat2 /d \
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        err=$(CHROOTNG_OPENAT2_DENY=1 run -R $CHROOTNG_GUEST_BINDS "$O2D" /openat2 /d \
             2>&1 >/dev/null)
         check_absent "an emulated syscall is not announced on the guest's stderr" \
             "not permitted here" "$err"
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        err=$(CNG_DEBUG=1 CNG_OPENAT2_DENY=1 run -R $GUEST_BINDS "$O2D" \
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        err=$(CHROOTNG_DEBUG=1 CHROOTNG_OPENAT2_DENY=1 run -R $CHROOTNG_GUEST_BINDS "$O2D" \
             /openat2 /d 2>&1 >/dev/null)
-        check_contains "...and CNG_DEBUG=1 does announce it" \
+        check_contains "...and CHROOTNG_DEBUG=1 does announce it" \
             "[cng] syscall 437 not permitted here -> emulated" "$err"
     fi
 fi

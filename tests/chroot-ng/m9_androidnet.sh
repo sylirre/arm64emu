@@ -41,7 +41,7 @@ case "$blocktest_out" in
 esac
 
 # ...and in a guest, on every tier this host has, once as the host serves the
-# setters and once with CNG_SETID_DENY=1, which takes them as Android does. The
+# setters and once with CHROOTNG_SETID_DENY=1, which takes them as Android does. The
 # text is what a kernel prints (the x86_64 host's own, and qemu-user's
 # pass-through), libc's setxid broadcast to a second thread included.
 SETID_DIR=$(mktemp -d)
@@ -69,7 +69,7 @@ done"
 if guest_xlate_ready "uid/gid setters in a guest" &&
     guest_cc_report "$SETID_DIR/setid" tests/chroot-ng/guests/setid.c -pthread; then
     for _tier in -R plain; do
-        if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+        if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
             skip "uid/gid setters in a guest, seccomp tier: the filter is inert here"
             continue
         fi
@@ -79,10 +79,10 @@ if guest_xlate_ready "uid/gid setters in a guest" &&
             _label="uid/gid setters in a guest answer as a kernel does ($_tier)"
             [ "$_deny" = 1 ] &&
                 _label="uid/gid setters in a guest, refused as Android refuses them ($_tier)"
-            # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
+            # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
             _got=$(
-                [ "$_deny" = 1 ] && export CNG_SETID_DENY=1
-                run_t 60 $_opt $GUEST_BINDS "$SETID_DIR" /setid 2>/dev/null
+                [ "$_deny" = 1 ] && export CHROOTNG_SETID_DENY=1
+                run_t 60 $_opt $CHROOTNG_GUEST_BINDS "$SETID_DIR" /setid 2>/dev/null
             )
             case "$_got" in
             SKIP:*)
@@ -106,14 +106,14 @@ if guest_xlate_ready "uid/gid setters in a guest" &&
     if guest_cc_report "$SETID_DIR/ambtrap" tests/chroot-ng/guests/ambtrap.c; then
         for _tier in -R plain; do
             _label="uid/gid setters in a guest, under a filter that refuses them ($_tier)"
-            if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
                 skip "$_label: the filter is inert here"
                 continue
             fi
             _opt=""
             [ "$_tier" = -R ] && _opt=-R
-            # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
-            _got=$(emu_t 60 "$SETID_DIR/ambtrap" "$BIN" $_opt $GUEST_BINDS \
+            # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
+            _got=$(emu_t 60 "$SETID_DIR/ambtrap" "$CHROOTNG_BIN" $_opt $CHROOTNG_GUEST_BINDS \
                 "$SETID_DIR" /setid 2>/dev/null)
             case "$_got" in
             SKIP:*)

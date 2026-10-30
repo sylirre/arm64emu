@@ -35,7 +35,7 @@
  * itself; the first refusal that the classic command then proves to be about
  * termios2 (it worked on the same descriptor) is remembered, and the
  * remaining calls go straight to the fallback instead of being denied -- and
- * logged by the policy -- every time. CNG_TERMIOS2_DENY=1 forces the tier on
+ * logged by the policy -- every time. CHROOTNG_TERMIOS2_DENY=1 forces the tier on
  * any host.
  *
  * ---- TCSETSF: tcsetattr(TCSAFLUSH) ----
@@ -49,7 +49,7 @@
  * to wait for, and it is served as TCFLSH(TCIFLUSH) and then TCSETSW, on a
  * descriptor that TCGETS has shown to be a terminal (see the end). The host
  * is asked first, and the refusal remembered once the pair has proved it is
- * about TCSETSF; CNG_TCSETSF_DENY=1 forces the tier on any host.
+ * about TCSETSF; CHROOTNG_TCSETSF_DENY=1 forces the tier on any host.
  *
  * ---- TIOCGSID: the session a terminal belongs to ----
  *
@@ -71,7 +71,7 @@
  * The ids are the host's, as getsid(2) and TIOCGPGRP report them -- there is
  * no pid namespace here. As with termios2 above, the first refusal that the
  * allowed commands prove to be about TIOCGSID is remembered, and
- * CNG_TIOCGSID_DENY=1 forces the tier on any host.
+ * CHROOTNG_TIOCGSID_DENY=1 forces the tier on any host.
  *
  * ---- A descriptor that is no terminal ----
  *

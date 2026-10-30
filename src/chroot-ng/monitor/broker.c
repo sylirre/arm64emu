@@ -219,11 +219,11 @@ static int broker_hello_check(int sock, const struct broker_ns *ns) {
  * attribute to a process is one whose attachments, undo rows and death reclaim
  * we cannot get right. */
 static int peer_pid(int sock) {
-    /* CNG_BROKER_NO_PEERCRED=1: answer as a host whose kernel will not say who
+    /* CHROOTNG_BROKER_NO_PEERCRED=1: answer as a host whose kernel will not say who
      * is there. Nothing on a working host reaches that, and it is the direction
      * that used to be open, so there is no other way to exercise the refusal.
-     * Same testing convention as CNG_SHM_FORCE_FILE and CNG_PROCREG_NONE. */
-    if (cng_broker_env("CNG_BROKER_NO_PEERCRED"))
+     * Same testing convention as CHROOTNG_SHM_FORCE_FILE and CHROOTNG_PROCREG_NONE. */
+    if (cng_broker_env("CHROOTNG_BROKER_NO_PEERCRED"))
         return -1;
     unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid, uid, gid */
     unsigned len = sizeof uc;
@@ -708,7 +708,7 @@ static long shm_ashmem(u64 len) {
 
 /* Create a segment's backing: ashmem where the host has it, an anonymous memfd
  * elsewhere (both Android-safe), or — where memfd_create is unavailable, or
- * CNG_SHM_FORCE_FILE forces it for a test — a file in the first writable dir.
+ * CHROOTNG_SHM_FORCE_FILE forces it for a test — a file in the first writable dir.
  * `path_out` gets the file path (to unlink on free) or "". The file's name says
  * nothing about the segment: see the note below. Returns the fd, or -1 (no
  * backing: the caller fails the syscall rather than handing back memory nobody
@@ -716,7 +716,7 @@ static long shm_ashmem(u64 len) {
 static int shm_make_backing(u64 size, char *path_out, size_t path_sz) {
     path_out[0] = '\0';
     long fd = -1;
-    if (!cng_broker_env("CNG_SHM_FORCE_FILE")) {
+    if (!cng_broker_env("CHROOTNG_SHM_FORCE_FILE")) {
         /* Sized here, page-rounded like the other tiers below: ashmem has no
          * truncate, and an mmap may not exceed the size it was given. */
         fd = shm_ashmem(cng_page_up(size));

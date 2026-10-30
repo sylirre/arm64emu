@@ -19,7 +19,7 @@ int cng_g_l2s_force = 0;
 #define L2S_PREFIX     ".l2s."
 #define L2S_PREFIX_LEN 5
 
-/* Failure-path diagnostics (CNG_DEBUG=1). */
+/* Failure-path diagnostics (CHROOTNG_DEBUG=1). */
 #define L2S_LOG(...)                                                          \
     do {                                                                      \
         if (cng_g_debug)                                                      \

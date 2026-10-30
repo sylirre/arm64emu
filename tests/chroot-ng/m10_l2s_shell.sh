@@ -3,7 +3,7 @@
 # Differential against arm64chroot running REAL hardlinks: the oracle binary
 # has l2s compiled out and this host's filesystem allows link(2), so the same
 # shell script runs once with genuine hardlinks (oracle) and once with the
-# emulation forced on (CNG_L2S_FORCE routes every linkat through l2s). Stdout
+# emulation forced on (CHROOTNG_L2S_FORCE routes every linkat through l2s). Stdout
 # and exit status must match byte-for-byte — any visible difference means the
 # emulation is distinguishable from real hardlinks in a guest shell.
 #
@@ -17,12 +17,12 @@
 # tests/chroot-ng/lib.sh; M10_ORACLE/M10_ALPINE/M10_DEBIAN still override per-milestone.
 echo "== M10: l2s shell (differential vs arm64chroot real hardlinks) =="
 
-M10_ORACLE="${M10_ORACLE:-$CNG_ORACLE}"
-M10_ALPINE="${M10_ALPINE:-$CNG_ALPINE}"
-M10_DEBIAN="${M10_DEBIAN:-$CNG_DEBIAN}"
+M10_ORACLE="${M10_ORACLE:-$CHROOTNG_ORACLE}"
+M10_ALPINE="${M10_ALPINE:-$CHROOTNG_ALPINE}"
+M10_DEBIAN="${M10_DEBIAN:-$CHROOTNG_DEBIAN}"
 
-CNG_L2S_FORCE=1
-export CNG_L2S_FORCE   # chroot-ng only; the oracle ignores it
+CHROOTNG_L2S_FORCE=1
+export CHROOTNG_L2S_FORCE   # chroot-ng only; the oracle ignores it
 
 m10_ready=0
 if [ -n "$M10_ORACLE" ] && [ -x "$M10_ORACLE" ] &&
@@ -142,7 +142,7 @@ if [ "$m10_ready" -eq 1 ]; then
     # ...and the emulator says so itself: an update it had to run unlocked is
     # logged, and there must be none.
     REM=$(mktemp -d); cp -a "$M10_ALPINE/." "$REM"
-    err=$(CNG_DEBUG=1 run -R -l "$REM" /bin/sh -c \
+    err=$(CHROOTNG_DEBUG=1 run -R -l "$REM" /bin/sh -c \
         'cd /tmp; echo hi>a; chmod 000 a; ln a b; ln b c; rm b; rm c' 2>&1 >/dev/null)
     check_absent "m10 the marker update of an unreadable group was locked" \
         "unlocked update" "$err"
@@ -278,10 +278,10 @@ fi
 # absolute targets stale until the first stat heals them — a listing must
 # say what that stat will.
 if [ "$m10_ready" -eq 1 ] && guest_xlate_ready "l2s raw-dirent leg" &&
-    guest_cc_report "$CNG_TMP/dents" tests/chroot-ng/guests/dents.c; then
+    guest_cc_report "$CHROOTNG_TMP/dents" tests/chroot-ng/guests/dents.c; then
     RO=$(mktemp -d); REM=$(mktemp -d)
     cp -a "$M10_ALPINE/." "$RO"; cp -a "$M10_ALPINE/." "$REM"
-    cp "$CNG_TMP/dents" "$RO/bin/dents"; cp "$CNG_TMP/dents" "$REM/bin/dents"
+    cp "$CHROOTNG_TMP/dents" "$RO/bin/dents"; cp "$CHROOTNG_TMP/dents" "$REM/bin/dents"
     s1='cd /tmp; mkdir d d/sub; cd d; echo hi>a; ln a b; ln -s a s; ln a sub/c;
         /bin/dents . | sort; /bin/dents sub | sort'
     s2='cd /tmp/d; /bin/dents . | sort; /bin/dents sub | sort; stat -c %h a b sub/c'
@@ -310,12 +310,12 @@ fi
 # and a reader per round: with real hardlinks every count is 0, so the kernel's
 # answer is known and no oracle is needed.
 if guest_xlate_ready "l2s first-link race leg" &&
-    guest_cc_report "$CNG_TMP/l2srace" tests/chroot-ng/guests/l2srace.c; then
+    guest_cc_report "$CHROOTNG_TMP/l2srace" tests/chroot-ng/guests/l2srace.c; then
     R=$(mktemp -d)
     mkdir -p "$R/bin" "$R/w"
-    cp "$CNG_TMP/l2srace" "$R/bin/l2srace"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 300 $GUEST_BINDS -R -l "$R" /bin/l2srace /w 30 2>/dev/null)
+    cp "$CHROOTNG_TMP/l2srace" "$R/bin/l2srace"
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 300 $CHROOTNG_GUEST_BINDS -R -l "$R" /bin/l2srace /w 30 2>/dev/null)
     check_contains "m10 first links at once: none fails or loses the file, no reader sees it go" \
         "linkfail=0 miss=0 lost=0 nlinkbad=0 inobad=0" "$out"
     rm -rf "$R"
@@ -329,12 +329,12 @@ fi
 # one link+unlink takes; with real hardlinks every call succeeds and the group
 # ends with its two names, so no oracle is needed. A hang is the bug.
 if guest_xlate_ready "l2s link from a signal handler leg" &&
-    guest_cc_report "$CNG_TMP/l2ssig" tests/chroot-ng/guests/l2ssig.c; then
+    guest_cc_report "$CHROOTNG_TMP/l2ssig" tests/chroot-ng/guests/l2ssig.c; then
     R=$(mktemp -d)
     mkdir -p "$R/bin" "$R/w"
-    cp "$CNG_TMP/l2ssig" "$R/bin/l2ssig"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 120 $GUEST_BINDS -R -l "$R" /bin/l2ssig /w 2>/dev/null)
+    cp "$CHROOTNG_TMP/l2ssig" "$R/bin/l2ssig"
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 120 $CHROOTNG_GUEST_BINDS -R -l "$R" /bin/l2ssig /w 2>/dev/null)
     check_contains "m10 a link from a handler that interrupted another" \
         "l2ssig: handled>0=1 bad=0 nlink=2" "$out"
     rm -rf "$R"
@@ -347,12 +347,12 @@ fi
 # Children that wait without exec'ing are forked under a loop of links; with
 # real hardlinks no pair is held up.
 if guest_xlate_ready "l2s link beside a fork leg" &&
-    guest_cc_report "$CNG_TMP/l2sfork" tests/chroot-ng/guests/l2sfork.c -pthread; then
+    guest_cc_report "$CHROOTNG_TMP/l2sfork" tests/chroot-ng/guests/l2sfork.c -pthread; then
     R=$(mktemp -d)
     mkdir -p "$R/bin" "$R/w"
-    cp "$CNG_TMP/l2sfork" "$R/bin/l2sfork"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 120 $GUEST_BINDS -R -l "$R" /bin/l2sfork /w 2>/dev/null)
+    cp "$CHROOTNG_TMP/l2sfork" "$R/bin/l2sfork"
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 120 $CHROOTNG_GUEST_BINDS -R -l "$R" /bin/l2sfork /w 2>/dev/null)
     check_contains "m10 a fork while the lock is held does not keep it" \
         "l2sfork: stalled=0 bad=0" "$out"
     rm -rf "$R"
@@ -367,8 +367,8 @@ fi
 m10_deb_why=
 if [ "$m10_ready" -eq 1 ] && [ -z "$M10_DEBIAN" ]; then
     cng_rootfs debian fetch
-    M10_DEBIAN=$CNG_ROOTFS
-    m10_deb_why=$CNG_ROOTFS_WHY
+    M10_DEBIAN=$CHROOTNG_ROOTFS
+    m10_deb_why=$CHROOTNG_ROOTFS_WHY
 fi
 if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]; then
     RD=$(mktemp -d)
@@ -401,4 +401,4 @@ elif [ "$m10_ready" -eq 1 ]; then
     skip "debian leg: no debian rootfs${m10_deb_why:+ ($m10_deb_why)}"
 fi
 
-unset CNG_L2S_FORCE
+unset CHROOTNG_L2S_FORCE

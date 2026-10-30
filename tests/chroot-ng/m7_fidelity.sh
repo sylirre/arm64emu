@@ -246,8 +246,8 @@ if ! guest_xlate_ready "auxv fidelity legs"; then
     :
 elif guest_cc_report "$AXD/auxprobe" tests/chroot-ng/guests/auxprobe.c; then
     mkdir -p "$AXD/rootfs/bin"; cp "$AXD/auxprobe" "$AXD/rootfs/bin/"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    auxrun() { run -R $GUEST_BINDS "$@"; }
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    auxrun() { run -R $CHROOTNG_GUEST_BINDS "$@"; }
     out=$(auxrun -u 0:0 "$AXD/rootfs" /bin/auxprobe 2>/dev/null)
     check_contains "auxv identity agrees with the fake id" \
         "AT_UID=0 AT_EUID=0 getuid=0 geteuid=0" "$out"
@@ -277,8 +277,8 @@ if ! guest_xlate_ready "SO_PEERCRED legs"; then
     :
 elif guest_cc_report "$PCD/peercred" tests/chroot-ng/guests/peercred.c; then
     mkdir -p "$PCD/rootfs/bin"; cp "$PCD/peercred" "$PCD/rootfs/bin/"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 60 -R $GUEST_BINDS -u 0:0 "$PCD/rootfs" /bin/peercred 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS -u 0:0 "$PCD/rootfs" /bin/peercred 2>/dev/null)
     check_contains "a peer's ids are remapped to the fake identity" \
         "len=12 -> got=12 pid_ok=1 uid=0 gid=0 self=0:0" "$out"
     check_contains "...a long length is cut to the struct and reported cut" \
@@ -289,7 +289,7 @@ elif guest_cc_report "$PCD/peercred" tests/chroot-ng/guests/peercred.c; then
     check_contains "...and a negative one is the kernel's EINVAL" \
         "len=-1 -> errno=22" "$out"
     # Without a fake identity nothing is trapped and the real ids come back.
-    out=$(run_t 60 -R $GUEST_BINDS "$PCD/rootfs" /bin/peercred 2>/dev/null)
+    out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$PCD/rootfs" /bin/peercred 2>/dev/null)
     check_contains "without a fake identity the real pair is reported" \
         "len=12 -> got=12 pid_ok=1 uid=$(id -u) gid=$(id -g) self=$(id -u):$(id -g)" \
         "$out"
@@ -312,8 +312,8 @@ rm -rf "$PCD"
 SCD=$(mktemp -d)
 scm_rows() { # tier-desc, -R or "", id spec or "", self uid, self gid
     _d=$1 _t=$2 _u=$3 _su=$4 _sg=$5
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 60 $_t $GUEST_BINDS $_u "$SCD/rootfs" /bin/scmcred 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 $_t $CHROOTNG_GUEST_BINDS $_u "$SCD/rootfs" /bin/scmcred 2>/dev/null)
     _me="uid=$_su gid=$_sg self=$_su:$_sg"
     check_contains "$_d: an own claim goes out and comes back as the identity" \
         "own pid_ok=1 $_me" "$out"
@@ -326,7 +326,7 @@ scm_rows() { # tier-desc, -R or "", id spec or "", self uid, self gid
         "mmsg got=2 uid=$_su gid=$_sg uid=$_su gid=$_sg self=$_su:$_sg" "$out"
     check_contains "$_d: a receive cut inside the record remaps the uid it has" \
         "short pid_ok=1 uid=$_su" "$out"
-    [ -n "$QEMU" ] || check_contains "$_d: ...and reports the cut" \
+    [ -n "$CHROOTNG_QEMU" ] || check_contains "$_d: ...and reports the cut" \
         "short pid_ok=1 uid=$_su ctrunc self=$_su:$_sg" "$out"
     check_contains "$_d: an id of -1 is the kernel's EINVAL" "uid-1 send=22" "$out"
     check_contains "$_d: ...and so is a record of the wrong length" \
@@ -340,7 +340,7 @@ if ! guest_xlate_ready "SCM_CREDENTIALS legs"; then
 elif guest_cc_report "$SCD/scmcred" tests/chroot-ng/guests/scmcred.c; then
     mkdir -p "$SCD/rootfs/bin"; cp "$SCD/scmcred" "$SCD/rootfs/bin/"
     tiers=-R
-    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    [ "$CHROOTNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
     for tier in $tiers; do
         t=$tier; [ "$t" = none ] && t=
         scm_rows "fake root ($tier)" "$t" "-u 0:0" 0 0
@@ -400,13 +400,13 @@ elif guest_cc_report "$PRD/peerid" tests/chroot-ng/guests/peerid.c; then
     mkdir -p "$PRD/rootfs/bin" "$PRD/rootfs/tmp"
     cp "$PRD/peerid" "$PRD/rootfs/bin/"
     tiers=-R
-    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    [ "$CHROOTNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
     for tier in $tiers; do
         t=$tier; [ "$t" = none ] && t=
         for pair in 1234:1234 0:1234 1234:0; do
             _s=${pair%:*} _c=${pair#*:}
-            # shellcheck disable=SC2086  # $t and $GUEST_BINDS split on purpose
-            out=$(run_t 60 $t $GUEST_BINDS -u 0:0 "$PRD/rootfs" /bin/peerid \
+            # shellcheck disable=SC2086  # $t and $CHROOTNG_GUEST_BINDS split on purpose
+            out=$(run_t 60 $t $CHROOTNG_GUEST_BINDS -u 0:0 "$PRD/rootfs" /bin/peerid \
                 "$_s" "$_c" 2>/dev/null)
             _d="server $_s, client $_c ($tier)"
             check_contains "$_d: the server is told the client's ids" \
@@ -471,8 +471,8 @@ CPD=$(mktemp -d)
 cap_rows() { # description, tier, guest args...
     _cd=$1 _ct=$2
     shift 2
-    # shellcheck disable=SC2086  # $_ct and $GUEST_BINDS split on purpose
-    out=$(run_t 60 $_ct $GUEST_BINDS -u 0:0 "$CPD/rootfs" /bin/capset "$@" \
+    # shellcheck disable=SC2086  # $_ct and $CHROOTNG_GUEST_BINDS split on purpose
+    out=$(run_t 60 $_ct $CHROOTNG_GUEST_BINDS -u 0:0 "$CPD/rootfs" /bin/capset "$@" \
         2>/dev/null)
     check_contains "$_cd: a set that asks for nothing is a drop, and allowed" \
         "none=0 errno=0" "$out"
@@ -497,7 +497,7 @@ elif guest_cc_report "$CPD/capset" tests/chroot-ng/guests/capset.c -pthread; the
     mkdir -p "$CPD/rootfs/bin"
     cp "$CPD/capset" "$CPD/rootfs/bin/"
     tiers=-R
-    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    [ "$CHROOTNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
     for tier in $tiers; do
         t=$tier; [ "$t" = none ] && t=
         cap_rows "capset as fake root ($tier)" "$t"
@@ -534,11 +534,11 @@ if ! guest_xlate_ready "memfd reopen legs"; then
 elif guest_cc_report "$MRD/memfdro" tests/chroot-ng/guests/memfdro.c; then
     mkdir -p "$MRD/rootfs/bin"; cp "$MRD/memfdro" "$MRD/rootfs/bin/"
     tiers=-R
-    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    [ "$CHROOTNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
     for tier in $tiers; do
         t=$tier; [ "$t" = none ] && t=
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-        out=$(run_t 60 $t $GUEST_BINDS "$MRD/rootfs" /bin/memfdro 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        out=$(run_t 60 $t $CHROOTNG_GUEST_BINDS "$MRD/rootfs" /bin/memfdro 2>/dev/null)
         case "$out" in
         *"ro open=0 "*)
             check_contains "memfd ($tier): a read-only reopen is read-only" \
@@ -579,8 +579,8 @@ elif guest_cc_report "$EXG/exeprobe" tests/chroot-ng/guests/exeprobe.c; then
     mkdir -p "$EXD/rootfs/bin"
     cp "$EXG/exeprobe" "$EXD/rootfs/bin/"
     ln -s exeprobe "$EXD/rootfs/bin/exelink"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    exerun() { run -R $GUEST_BINDS "$@"; }
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    exerun() { run -R $CHROOTNG_GUEST_BINDS "$@"; }
 
     out=$(exerun "$EXD/rootfs" /bin/exeprobe 2>/dev/null); rc=$?
     check "the initial program reports its own exe link" 0 $rc
@@ -630,14 +630,14 @@ if ! guest_xlate_ready "view-race legs"; then
     :
 elif guest_cc "$VRD/viewrace" tests/chroot-ng/guests/viewrace.c -pthread; then
     mkdir -p "$VRD/root/bin"; cp "$VRD/viewrace" "$VRD/root/bin/viewrace"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 120 -R $GUEST_BINDS "$VRD/root" /bin/viewrace cwd 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 120 -R $CHROOTNG_GUEST_BINDS "$VRD/root" /bin/viewrace cwd 2>/dev/null)
     check_contains "a getcwd racing a chdir sees one directory or the other" \
         "viewrace cwd: writer=ok torn=0" "$out"
     # Every setter is a glibc setxid broadcast, a signal to the sibling and a
     # handshake with it: a minute on an emulated AArch64 machine.
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 300 -R $GUEST_BINDS -u "$VRD/root" /bin/viewrace groups 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 300 -R $CHROOTNG_GUEST_BINDS -u "$VRD/root" /bin/viewrace groups 2>/dev/null)
     check_contains "a getgroups racing a setgroups sees one list or the other" \
         "viewrace groups: writer=ok torn=0" "$out"
 else
@@ -662,8 +662,8 @@ if ! guest_xlate_ready "buffer-leak legs"; then
 elif guest_cc "$LKD/leakrace" tests/chroot-ng/guests/leakrace.c -pthread; then
     mkdir -p "$LKD/root/bin" "$LKD/root/d"; cp "$LKD/leakrace" "$LKD/root/bin/"
     echo hi > "$LKD/root/d/f"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    lkrun() { run_t 120 -R $GUEST_BINDS "$@"; }
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    lkrun() { run_t 120 -R $CHROOTNG_GUEST_BINDS "$@"; }
     # The needle is the temp directory's own name: part of every host path
     # under the rootfs, and no guest path.
     out=$(lkrun "$LKD/root" /bin/leakrace readlink /d/f "$(basename "$LKD")" \

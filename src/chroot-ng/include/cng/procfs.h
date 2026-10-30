@@ -53,16 +53,16 @@
  * final before cng_install_seccomp runs. */
 extern int cng_g_synth_fd_base;
 
-/* CNG_PROCSTAT_SYNTH=1: serve the synthesized /proc/stat even where the host
+/* CHROOTNG_PROCSTAT_SYNTH=1: serve the synthesized /proc/stat even where the host
  * file is readable. Android denies it to apps (which is what the synthesis is
  * for); test hosts do not, so this is how the fallback gets exercised. */
 extern int cng_g_procstat_synth;
 
-/* CNG_OVERFLOWID_SYNTH=1: serve the synthesized /proc/sys/kernel/overflow{u,g}id
+/* CHROOTNG_OVERFLOWID_SYNTH=1: serve the synthesized /proc/sys/kernel/overflow{u,g}id
  * even where the host files are readable (Android denies them to apps). */
 extern int cng_g_overflowid_synth;
 
-/* CNG_MM_MAP_DENY=1: take PR_SET_MM_MAP as refused, which Android's kernels do
+/* CHROOTNG_MM_MAP_DENY=1: take PR_SET_MM_MAP as refused, which Android's kernels do
  * and a desktop one does not, so the kernel's own record of argv and environ
  * stays the chroot-ng invocation and cmdline/environ are read out of guest
  * memory by procfs.c instead. This is how that path gets exercised off a
@@ -132,7 +132,7 @@ int cng_procfs_owner_statx(long dirfd, const char *path, void *statx);
  * a name the guest can read and has been served in full fail with EACCES, where
  * the file the guest was promised answers them. `cng_procfs_refused(r)` says
  * whether the host's answer `r` to a stat/access call is one to replace
- * (EACCES, or a success where CNG_PROC_DENY_STAT says it should have been
+ * (EACCES, or a success where CHROOTNG_PROC_DENY_STAT says it should have been
  * one). Then, for the canonical guest name `canon` (or the O_PATH fd, whose
  * name is read off its link), the cng_procfs_synth_* calls put the attributes
  * of a /proc regular file into the buffer — the same ones cng_procfs_fix_fd
@@ -151,12 +151,12 @@ int cng_procfs_synth_fd_statx(int fd, unsigned flags, unsigned mask,
                               void *statx);
 int cng_procfs_synth_access(const char *canon, int mode, int follow);
 
-/* CNG_PROC_DENY_STAT=1: make every stat-family call on a synthesized name
+/* CHROOTNG_PROC_DENY_STAT=1: make every stat-family call on a synthesized name
  * behave as if the host had refused it, which Android does and a test host does
  * not. This is how the fallback above gets exercised off a device. */
 extern int cng_g_proc_deny_stat;
 
-/* CNG_PROCFS_REOPEN_DENY=1: take the read-only reopen of a synthesized view's
+/* CHROOTNG_PROCFS_REOPEN_DENY=1: take the read-only reopen of a synthesized view's
  * memfd as refused, which Android's policy does and a test host does not, so
  * the view is served from a file of ours instead (procfs.c, store_on). */
 extern int cng_g_procfs_reopen_deny;

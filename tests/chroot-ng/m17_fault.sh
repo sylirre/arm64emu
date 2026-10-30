@@ -26,7 +26,7 @@ case "$out" in
     # the same answer — so the forced-fallback run repeats the whole set.
     check_contains "the probe names the mechanism it used" "faulttest probe " \
         "$out"
-    memfd_out=$(CNG_UACCESS_MEMFD=1 run_t 30 -t faulttest 2>&1)
+    memfd_out=$(CHROOTNG_UACCESS_MEMFD=1 run_t 30 -t faulttest 2>&1)
     check "faulttest rc with the memfd fallback forced" 0 $?
     check_contains "the knob really forces the fallback" \
         "mech=memfd" "$memfd_out"
@@ -34,13 +34,13 @@ case "$out" in
     check_absent "no case faulted" "FAIL" "$out"
     # The last of these is the same wild path as "execve path", with the trace
     # turned on: the entry line printed the guest's own pointer with %s, so
-    # CNG_DEBUG=1 turned that -EFAULT into a SIGSEGV inside the handler, where
-    # it is masked and fatal. CNG_DEBUG must never change what the guest gets.
+    # CHROOTNG_DEBUG=1 turned that -EFAULT into a SIGSEGV inside the handler, where
+    # it is masked and fatal. CHROOTNG_DEBUG must never change what the guest gets.
     for _c in rt_sigaction rt_sigprocmask getcwd getresuid getresgid \
         setgroups getgroups capget shmctl sendmsg uname readlinkat \
         "openat path" \
         "renameat path2" "execve path" "execve argv" "execve argv string" \
-        "execve path (CNG_DEBUG)"; do
+        "execve path (CHROOTNG_DEBUG)"; do
         check_contains "$_c answers EFAULT" "faulttest $_c=-14 want=-14 -> OK" \
             "$out"
     done
@@ -158,8 +158,8 @@ if guest_xlate_ready "NULL-pathname leg" &&
     # emulation still answers it (M97), and a kernel that has the call faults
     # a NULL name before anything else: EFAULT is the answer to hold it to.
     nul_k=$(printf '%s\n' "$nul_k" | sed 's/^openat2=unavailable$/openat2=14/')
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    nul_g=$(run_t 60 -R $GUEST_BINDS "$NULD" /nullpath 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    nul_g=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$NULD" /nullpath 2>/dev/null)
     if [ -z "$nul_k" ]; then
         skip "NULL-pathname differential: the reference run produced nothing"
     elif [ "$nul_k" = "$nul_g" ]; then

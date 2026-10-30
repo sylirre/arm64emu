@@ -176,9 +176,9 @@ void cng_dev_shm_init(void) {
     if (cng_g_no_dev)
         return;
     canon_dev_dir(g_pts_host, sizeof g_pts_host);
-    /* CNG_DEVSHM_FORCE_TMP=1 takes the stand-in even where /dev/shm exists,
+    /* CHROOTNG_DEVSHM_FORCE_TMP=1 takes the stand-in even where /dev/shm exists,
      * which is the only way a host that has one can exercise this at all. */
-    if (!cng_broker_env("CNG_DEVSHM_FORCE_TMP") && is_dir("/dev/shm")) {
+    if (!cng_broker_env("CHROOTNG_DEVSHM_FORCE_TMP") && is_dir("/dev/shm")) {
         canon_dev_dir(g_shm_host, sizeof g_shm_host);
         return;
     }
@@ -207,9 +207,9 @@ int cng_private_tmp_dir(const char *stem, char *out, size_t sz, char *why,
                 {"XDG_RUNTIME_DIR", cng_broker_env("XDG_RUNTIME_DIR")},
                 {0, "/data/local/tmp"},
                 {0, "/tmp"}};
-    /* CNG_TMP_ENV_ONLY=1 passes over the fixed candidates, which is the only
+    /* CHROOTNG_TMP_ENV_ONLY=1 passes over the fixed candidates, which is the only
      * way a host whose /tmp would serve can see what a device sees. */
-    int env_only = cng_broker_env("CNG_TMP_ENV_ONLY") != 0;
+    int env_only = cng_broker_env("CHROOTNG_TMP_ENV_ONLY") != 0;
     size_t wn = 0;
     if (why && whysz)
         why[0] = '\0';

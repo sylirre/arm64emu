@@ -59,7 +59,7 @@
  * silently substituting symlinks + hidden backing files for its hardlinks. */
 extern int cng_g_l2s;
 
-/* CNG_L2S_FORCE=1 in the environment: route every linkat through the emulation
+/* CHROOTNG_L2S_FORCE=1 in the environment: route every linkat through the emulation
  * without trying the real hardlink first. Test aid for hosts whose filesystem
  * happily allows link(2) (mirrors arm64chroot's A64_L2S_FORCE). */
 extern int cng_g_l2s_force;

@@ -104,13 +104,13 @@ esac
 # previous build fails the first three and dies in the race (SIGSEGV at the
 # svc word: the patcher's own load, in a handler with every signal masked).
 LZ=$(mktemp -d)
-if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
     skip "lazy patching through real traps: the seccomp tier is inert here"
-elif [ "$CNG_EXECMEM" != 1 ]; then
+elif [ "$CHROOTNG_EXECMEM" != 1 ]; then
     skip "lazy patching through real traps: no anonymous executable memory"
 elif guest_cc_report "$LZ/lazystale" tests/chroot-ng/guests/lazystale.c -pthread; then
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    out=$(run_t 120 -R $GUEST_BINDS "$LZ" /lazystale 2>&1); rc=$?
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 120 -R $CHROOTNG_GUEST_BINDS "$LZ" /lazystale 2>&1); rc=$?
     check "a guest that moves its own text under the lazy patcher survives" 0 $rc
     check_contains "...and every site behaves as the kernel's would" \
         "lazystale: jit=1 shared=1 full=1 race=1 patched>0=1" "$out"
@@ -120,8 +120,8 @@ rm -rf "$LZ"
 ROOT=$(mktemp -d)
 mkdir -p "$ROOT/bin" "$ROOT/etc"
 printf 'GREETING-VIA-REWRITE' > "$ROOT/etc/greeting"
-# shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-m8run() { run $GUEST_BINDS "$@"; }
+# shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+m8run() { run $CHROOTNG_GUEST_BINDS "$@"; }
 
 if ! guest_xlate_ready "rewrite-translated guest legs"; then
     :
@@ -141,7 +141,7 @@ elif guest_cc_report "$ROOT/bin/readfile" tests/chroot-ng/guests/readfile.c; the
     # failed with rc 3, and a guest that wrote would have written there). Either
     # way this is the control that proves the rewrite leg above was not passing
     # for some unrelated reason.
-    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
         out=$(m8run "$ROOT" /bin/readfile 2>/dev/null); rc=$?
         check "without -R the seccomp tier translates instead" 0 $rc
         check_contains "seccomp-translated openat reached the rootfs" \
@@ -156,7 +156,7 @@ elif guest_cc_report "$ROOT/bin/readfile" tests/chroot-ng/guests/readfile.c; the
     fi
     # ...and with -R the filter's absence is a warning, since the rewritten
     # sites carry the translation; the warning names what they cannot reach.
-    if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+    if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
         out=$(m8run -R "$ROOT" /bin/readfile 2>&1); rc=$?
         check "with -R and the filter inert: the guest runs" 0 $rc
         check_contains "...behind a warning that says what stays untranslated" \
@@ -196,8 +196,8 @@ fi
 if guest_xlate_ready "waits-under-rewrite leg" &&
     guest_cc_report "$ROOT/bin/waitintr" tests/chroot-ng/guests/waitintr.c -lpthread; then
     want=$(emu_t 60 "$ROOT/bin/waitintr" 2>/dev/null)
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 90 $GUEST_BINDS -R "$ROOT" /bin/waitintr 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 90 $CHROOTNG_GUEST_BINDS -R "$ROOT" /bin/waitintr 2>/dev/null)
     if [ -z "$want" ]; then
         skip "waits under -R: the reference run produced nothing"
     elif [ "$want" = "$out" ]; then
@@ -271,10 +271,10 @@ rm -rf "$ROOT"
 # vaddr: on the usual static-PIE guest each image gets its own base and the bug
 # is invisible.
 XR=$(mktemp -d); mkdir -p "$XR/bin"
-if [ -n "$GUESTCC" ] &&
-    $GUESTCC -static -no-pie -O2 -o "$XR/bin/hello" tests/chroot-ng/guests/hello.c \
+if [ -n "$CHROOTNG_GUESTCC" ] &&
+    $CHROOTNG_GUESTCC -static -no-pie -O2 -o "$XR/bin/hello" tests/chroot-ng/guests/hello.c \
         2>"$GUEST_CC_LOG" &&
-    $GUESTCC -static -no-pie -O2 -o "$XR/bin/execer" tests/chroot-ng/guests/execer.c \
+    $CHROOTNG_GUESTCC -static -no-pie -O2 -o "$XR/bin/execer" tests/chroot-ng/guests/execer.c \
         2>>"$GUEST_CC_LOG"; then
     check "exec chain: both programs are fixed-address ET_EXEC" EXEC \
         "$(elf_type "$XR/bin/execer")"
@@ -286,9 +286,9 @@ if [ -n "$GUESTCC" ] &&
     # this bug: execer passes the environ it inherited (the environment chroot-ng
     # built from -E), which lives on the original stack and no image load
     # touches. This one is a check on the copy itself.
-    out=$(run -R -E CNG_TEST=collide "$XR" /bin/execer 2>/dev/null)
+    out=$(run -R -E CHROOTNG_TEST=collide "$XR" /bin/execer 2>/dev/null)
     check_contains "the environment still reaches the exec'd program" \
-        "CNG_TEST=collide" "$out"
+        "CHROOTNG_TEST=collide" "$out"
 else
     skip "fixed-vaddr exec-collision leg: no -static -no-pie AArch64 toolchain"
 fi
@@ -310,8 +310,8 @@ printf 'guest\n' > "$SSR/etc/hostname"
 if guest_xlate_ready "small-stack syscall leg" &&
     guest_cc_report "$SSR/smallstack" tests/chroot-ng/guests/smallstack.c; then
     for _k in 8 16 64; do
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        out=$(run_t 60 -R $GUEST_BINDS "$SSR" /smallstack $_k 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$SSR" /smallstack $_k 2>/dev/null)
         check "a syscall on a ${_k} KiB guest stack writes nothing below it" \
             "clobbered=0" "$out"
     done
@@ -320,12 +320,12 @@ if guest_xlate_ready "small-stack syscall leg" &&
     # thread that is on the slot already (a nested trap, which a guest with its
     # own sigaltstack reaches from inside its own signal handler). All three used
     # to fall back to the interrupted stack, which is not a fallback but the very
-    # failure the legs above measure. CNG_SCRATCH_NONE forces the case, since a
+    # failure the legs above measure. CHROOTNG_SCRATCH_NONE forces the case, since a
     # working host does not reach it on its own: before the fix this clobbers
     # 1970 bytes at 8 KiB, 220 at 64 KiB, and dies outright at 16.
     for _k in 8 16 64; do
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        out=$(CNG_SCRATCH_NONE=1 run_t 60 -R $GUEST_BINDS "$SSR" /smallstack $_k \
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(CHROOTNG_SCRATCH_NONE=1 run_t 60 -R $CHROOTNG_GUEST_BINDS "$SSR" /smallstack $_k \
             2>/dev/null)
         check "...and still nothing with no scratch slot to be had (${_k} KiB)" \
             "clobbered=0" "$out"
@@ -346,8 +346,8 @@ UMD=$(mktemp -d)
 if guest_xlate_ready "stack-teardown leg" &&
     guest_cc_report "$UMD/unmapself" tests/chroot-ng/guests/unmapself.c; then
     for _v in musl bionic; do
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        out=$(run_t 60 -R $GUEST_BINDS "$UMD" /unmapself $_v 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$UMD" /unmapself $_v 2>/dev/null)
         check_contains "threads freeing their own stack survive -R ($_v's sequence)" \
             "survived=20" "$out"
     done

@@ -71,10 +71,10 @@ dac_cases() {
         else
             echo "  FAIL $2${_l%%[= ]*} (want: $_l)"
         fi
-    done >"$CNG_TMP/dac_cases"
-    pass=$((pass + $(grep -c '^  ok' "$CNG_TMP/dac_cases")))
-    fail=$((fail + $(grep -c '^  FAIL' "$CNG_TMP/dac_cases")))
-    cat "$CNG_TMP/dac_cases"
+    done >"$CHROOTNG_TMP/dac_cases"
+    pass=$((pass + $(grep -c '^  ok' "$CHROOTNG_TMP/dac_cases")))
+    fail=$((fail + $(grep -c '^  FAIL' "$CHROOTNG_TMP/dac_cases")))
+    cat "$CHROOTNG_TMP/dac_cases"
 }
 
 DRD=$(mktemp -d)
@@ -86,7 +86,7 @@ if guest_xlate_ready "fake-root DAC differential" &&
     # steps in, so the forced run below is what exercises that lend there.
     for _run in -R plain l2s; do
         _label="fake root ($_run) is let through as root is"
-        if [ "$_run" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+        if [ "$_run" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
             skip "$_label: the filter is inert here"
             continue
         fi
@@ -94,18 +94,18 @@ if guest_xlate_ready "fake-root DAC differential" &&
         cp "$DRD/dacroot" "$_r/"
         case $_run in
         -R)
-            # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-            got=$(run_t 120 -R -l -u 0:0 $GUEST_BINDS "$_r" /dacroot / \
+            # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+            got=$(run_t 120 -R -l -u 0:0 $CHROOTNG_GUEST_BINDS "$_r" /dacroot / \
                 2>/dev/null)
             ;;
         plain)
             # shellcheck disable=SC2086
-            got=$(run_t 120 -l -u 0:0 $GUEST_BINDS "$_r" /dacroot / \
+            got=$(run_t 120 -l -u 0:0 $CHROOTNG_GUEST_BINDS "$_r" /dacroot / \
                 2>/dev/null)
             ;;
         l2s)
             # shellcheck disable=SC2086
-            got=$(CNG_L2S_FORCE=1 run_t 120 -R -l -u 0:0 $GUEST_BINDS "$_r" \
+            got=$(CHROOTNG_L2S_FORCE=1 run_t 120 -R -l -u 0:0 $CHROOTNG_GUEST_BINDS "$_r" \
                 /dacroot / 2>/dev/null)
             ;;
         esac
@@ -129,13 +129,13 @@ rm -rf "$DRD"
 # runs as root and fills it afterwards; the old fake root was refused every
 # file in it ("can't open 'top/ro/a': Permission denied"). The archive is made
 # by the guest too, so nothing depends on the host's own tar.
-M28_ALPINE="${M28_ALPINE:-$CNG_ALPINE}"
+M28_ALPINE="${M28_ALPINE:-$CHROOTNG_ALPINE}"
 if [ -z "$M28_ALPINE" ] || [ ! -x "$M28_ALPINE/bin/busybox" ]; then
     skip "tar into read-only directories: no alpine rootfs"
 else
     for _tier in -R plain; do
         _label="tar under fake root ($_tier)"
-        if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+        if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
             skip "$_label: the filter is inert here"
             continue
         fi

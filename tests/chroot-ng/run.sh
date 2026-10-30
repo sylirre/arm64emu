@@ -9,7 +9,7 @@ set -u
 cd "$(dirname "$0")/../.." || exit 1
 . tests/chroot-ng/lib.sh
 
-if [ ! -x "$BIN" ]; then
+if [ ! -x "$CHROOTNG_BIN" ]; then
     echo "build first: make" >&2
     exit 1
 fi
@@ -51,11 +51,11 @@ check_absent() { # desc, needle, haystack
 }
 
 cng_platform_init
-trap 'rm -rf "$CNG_TMP"' EXIT INT TERM
+trap 'rm -rf "$CHROOTNG_TMP"' EXIT INT TERM
 cng_platform_banner
-if [ "$CNG_EMU_MISSING" = 1 ]; then
+if [ "$CHROOTNG_EMU_MISSING" = 1 ]; then
     echo "no qemu-aarch64 emulator found on a $HOST_ARCH host: install" \
-        "qemu-user-static, or set QEMU= if AArch64 binaries run here anyway" >&2
+        "qemu-user-static, or set CHROOTNG_QEMU= if AArch64 binaries run here anyway" >&2
     exit 1
 fi
 echo

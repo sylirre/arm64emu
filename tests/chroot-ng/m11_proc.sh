@@ -9,7 +9,7 @@
 # rows and mount IDs), so the assertions are structural instead.
 echo "== M11: /proc emulation =="
 
-M11_ALPINE="${M11_ALPINE:-$CNG_ALPINE}"
+M11_ALPINE="${M11_ALPINE:-$CHROOTNG_ALPINE}"
 
 # The bind source is a directory we make, not a host path like /usr: Android has
 # no /usr at all, and all proctest wants is a bind whose guest mount point must
@@ -45,15 +45,15 @@ check_contains "cmdline is the guest argv, not the chroot-ng invocation" \
 # and it can be missing (no memfd) or full; the fallback used to be the host
 # file, which for a guest process is the chroot-ng invocation that started it.
 # We are the process being described, so the live stack answers on its own.
-# CNG_PROCREG_NONE=1 is the only way to reach the degraded tier on a working
-# host (same convention as CNG_SHM_FORCE_FILE).
+# CHROOTNG_PROCREG_NONE=1 is the only way to reach the degraded tier on a working
+# host (same convention as CHROOTNG_SHM_FORCE_FILE).
 sout=$(run -t selfproc 2>&1)
 check "selfproc with the registry" 0 $?
 check_contains "our own cmdline is the guest's argv" \
     "selfproc /proc/self/cmdline: 22 bytes [/bin/guestprog] -> OK" "$sout"
 check_contains "our own environ is the guest's" \
     "selfproc /proc/self/environ: 13 bytes [GUESTVAR=yes] -> OK" "$sout"
-sout=$(CNG_PROCREG_NONE=1 run -t selfproc 2>&1)
+sout=$(CHROOTNG_PROCREG_NONE=1 run -t selfproc 2>&1)
 check "selfproc with no registry at all" 0 $?
 check_contains "the registry really was unavailable" \
     "selfproc registry=0: 0 failure(s)" "$sout"
@@ -129,12 +129,12 @@ case "$out" in
         "$out"
     ;;
 esac
-# The same driver with that reopen taken as refused (CNG_PROCFS_REOPEN_DENY),
+# The same driver with that reopen taken as refused (CHROOTNG_PROCFS_REOPEN_DENY),
 # which is what reaches the files off a device: every check holds as it does
 # from a memfd — content, refresh, identity, the fd link's name — and nothing
 # is left in the directory once the views are closed.
 PTS=$(mktemp -d)
-out=$(TMPDIR="$PTS" CNG_PROCFS_REOPEN_DENY=1 run -t proctest -r "$PT" -b "$PTB":/usr 2>&1); rc=$?
+out=$(TMPDIR="$PTS" CHROOTNG_PROCFS_REOPEN_DENY=1 run -t proctest -r "$PT" -b "$PTB":/usr 2>&1); rc=$?
 check "proctest overall, views from files of ours" 0 "$rc"
 check_contains "...read-only for real, with the guest's status flags" \
     "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
@@ -249,8 +249,8 @@ if guest_xlate_ready "maps over-long-line legs" &&
     done
     if mkdir -p "$ML_ROOT$ml_deep" 2>/dev/null &&
         printf 'x' > "$ML_ROOT$ml_deep/blob" 2>/dev/null; then
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        out=$(run_t 60 -R $GUEST_BINDS "$ML_ROOT" /mapslong "$ml_deep/blob" \
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$ML_ROOT" /mapslong "$ml_deep/blob" \
             "$ML_MARK" 2>&1)
         check_contains "maps a long host path survives whole" \
             "lines=1 hostleak=0 mapped=1 malformed=0" "$out"
@@ -274,8 +274,8 @@ if guest_xlate_ready "maps over-long-line legs" &&
     done
     if mkdir -p "$ML_ROOT$ml_wide" 2>/dev/null &&
         printf 'x' > "$ML_ROOT$ml_wide/blob" 2>/dev/null; then
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        out=$(run_t 60 -R $GUEST_BINDS "$ML_ROOT" /mapslong "$ml_wide/blob" \
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$ML_ROOT" /mapslong "$ml_wide/blob" \
             "$ML_MARK" 2>&1)
         # mapped=0 by construction: the guest names the path in raw bytes and
         # maps prints it escaped, so the row cannot be found by that spelling.
@@ -298,8 +298,8 @@ rm -rf "$ML_DIR"
 PR_ROOT=$(mktemp -d)
 if guest_xlate_ready "refresh-tracking race leg" &&
     guest_cc "$PR_ROOT/procrace" tests/chroot-ng/guests/procrace.c -pthread; then
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    out=$(run_t 120 -R $GUEST_BINDS "$PR_ROOT" /procrace 2>&1)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 120 -R $CHROOTNG_GUEST_BINDS "$PR_ROOT" /procrace 2>&1)
     check_contains "a rewind refreshes however readers race the open" \
         "procrace: samples>0=1 lost=0" "$out"
 else
@@ -316,8 +316,8 @@ rm -rf "$PR_ROOT"
 MS_ROOT=$(mktemp -d)
 if guest_xlate_ready "mount table from a signal handler leg" &&
     guest_cc_report "$MS_ROOT/mntsig" tests/chroot-ng/guests/mntsig.c; then
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    out=$(run_t 60 -R $GUEST_BINDS "$MS_ROOT" /mntsig 2>&1)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$MS_ROOT" /mntsig 2>&1)
     check_contains "a mount table opened from a handler that interrupted another" \
         "mntsig: handled>0=1 bad=0" "$out"
 fi
@@ -333,8 +333,8 @@ PN_ROOT=$(mktemp -d)
 if guest_xlate_ready "leading-zero /proc name leg" &&
     guest_cc_report "$PN_ROOT/procnum" tests/chroot-ng/guests/procnum.c; then
     pn_base=$(emu_t 60 "$PN_ROOT/procnum" 2>/dev/null)
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    pn_got=$(run_t 60 -R $GUEST_BINDS "$PN_ROOT" /procnum 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    pn_got=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$PN_ROOT" /procnum 2>/dev/null)
     case "$pn_base" in
     *"fd plain open: ok"*"exec pid-zero-exe: errno=2"*)
         if [ "$pn_got" = "$pn_base" ]; then
@@ -343,9 +343,9 @@ if guest_xlate_ready "leading-zero /proc name leg" &&
         else
             fail=$((fail + 1))
             echo "  FAIL a /proc number with a leading zero names what the kernel's does"
-            printf '%s\n' "$pn_base" >"$CNG_TMP/pn.want"
-            printf '%s\n' "$pn_got" >"$CNG_TMP/pn.got"
-            diff "$CNG_TMP/pn.want" "$CNG_TMP/pn.got" | sed 's/^/    /'
+            printf '%s\n' "$pn_base" >"$CHROOTNG_TMP/pn.want"
+            printf '%s\n' "$pn_got" >"$CHROOTNG_TMP/pn.got"
+            diff "$CHROOTNG_TMP/pn.want" "$CHROOTNG_TMP/pn.got" | sed 's/^/    /'
         fi
         ;;
     *)
@@ -360,10 +360,10 @@ rm -rf "$PN_ROOT"
 # refuses an app every one of them, and the open was served from memory regardless, so `cat` worked where
 # `stat` and `test -r` of the same name failed. The guest checks the shape every
 # form must agree on, which holds wherever the host answers or refuses the call
-# itself: on a device the refusal is real, and elsewhere CNG_PROC_DENY_STAT=1
+# itself: on a device the refusal is real, and elsewhere CHROOTNG_PROC_DENY_STAT=1
 # makes the second run take the same path (/proc/stat and the overflow{u,g}id
-# sysctls, readable here, join it with CNG_PROCSTAT_SYNTH and
-# CNG_OVERFLOWID_SYNTH). Where the host has no statx at all the guest leaves
+# sysctls, readable here, join it with CHROOTNG_PROCSTAT_SYNTH and
+# CHROOTNG_OVERFLOWID_SYNTH). Where the host has no statx at all the guest leaves
 # that form out and says so on a last line, which is taken off and noted.
 PS_ROOT=$(mktemp -d)
 ps_nostatx() {
@@ -385,8 +385,8 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
 /proc/stat: ok
 /proc/sys/kernel/overflowuid: ok
 /proc/sys/kernel/overflowgid: ok"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    ps_got=$(run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    ps_got=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
     ps_nostatx
     if [ "$ps_got" = "$ps_want" ]; then
         pass=$((pass + 1))
@@ -397,8 +397,8 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
         printf '%s\n' "$ps_got" | sed 's/^/    /'
     fi
     # shellcheck disable=SC2086
-    ps_got=$(CNG_PROC_DENY_STAT=1 CNG_PROCSTAT_SYNTH=1 CNG_OVERFLOWID_SYNTH=1 \
-        run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    ps_got=$(CHROOTNG_PROC_DENY_STAT=1 CHROOTNG_PROCSTAT_SYNTH=1 CHROOTNG_OVERFLOWID_SYNTH=1 \
+        run_t 60 -R $CHROOTNG_GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
     ps_nostatx
     if [ "$ps_got" = "$ps_want" ]; then
         pass=$((pass + 1))
@@ -417,7 +417,7 @@ rm -rf "$PS_ROOT"
 # exec-time copies, so every one of those read back as the command line the
 # process started with. Now the kernel's own record is pointed at the guest's
 # strings where it takes PR_SET_MM_MAP (a desktop kernel: "record: kernel"),
-# and where it does not (Android, or CNG_MM_MAP_DENY=1) the ranges are read
+# and where it does not (Android, or CHROOTNG_MM_MAP_DENY=1) the ranges are read
 # out of the guest's memory under the kernel's rules — ours directly, a child's
 # with process_vm_readv. The guest checks its own files and a forked child's
 # against those rules, which a native host first confirms against the kernel
@@ -429,9 +429,9 @@ pt_check() { # desc, want, got
         pass=$((pass + 1)); echo "  ok   $1"
     else
         fail=$((fail + 1)); echo "  FAIL $1"
-        printf '%s\n' "$2" >"$CNG_TMP/pt.want"
-        printf '%s\n' "$3" >"$CNG_TMP/pt.got"
-        diff "$CNG_TMP/pt.want" "$CNG_TMP/pt.got" | sed 's/^/    /'
+        printf '%s\n' "$2" >"$CHROOTNG_TMP/pt.want"
+        printf '%s\n' "$3" >"$CHROOTNG_TMP/pt.got"
+        diff "$CHROOTNG_TMP/pt.want" "$CHROOTNG_TMP/pt.got" | sed 's/^/    /'
     fi
 }
 if guest_xlate_ready "live cmdline/environ leg" &&
@@ -445,7 +445,7 @@ title: ok
 overflow: ok
 overflow environ: ok"
     pt_record=ours
-    if [ -n "$QEMU" ]; then
+    if [ -n "$CHROOTNG_QEMU" ]; then
         pt_legs=$(printf '%s\n' "$pt_legs" | grep -v '^kid ')
         pt_cut() { grep -v -e '^kid ' -e '^mm_map: '; }
         skip "a child's live cmdline/environ: qemu-user has no process_vm_readv"
@@ -470,13 +470,13 @@ overflow environ: ok"
             "record: kernel
 $pt_kwant" "$(printf '%s\n' "$pt_got" | pt_cut)"
     fi
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    pt_got=$(run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    pt_got=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$PT_ROOT" /proctitle 2>/dev/null)
     pt_check "cmdline and environ are the guest's live strings" \
         "record: $pt_record
 $pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
     # shellcheck disable=SC2086
-    pt_got=$(CNG_MM_MAP_DENY=1 run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle \
+    pt_got=$(CHROOTNG_MM_MAP_DENY=1 run_t 60 -R $CHROOTNG_GUEST_BINDS "$PT_ROOT" /proctitle \
         2>/dev/null)
     pt_check "...and read out of guest memory where the kernel's record stays ours" \
         "record: ours
@@ -572,7 +572,7 @@ if [ "$m11_ready" -eq 1 ]; then
     # Android denies them. Forced here, the guest gets the kernel's default;
     # unforced, a readable host file is the answer, and the debug trace shows
     # which one served the open.
-    got=$(CNG_OVERFLOWID_SYNTH=1 CNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
+    got=$(CHROOTNG_OVERFLOWID_SYNTH=1 CHROOTNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
         'echo $(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)' 2>&1)
     case $got in
     *"procfs /proc/sys/kernel/overflowuid -> fd"*"procfs /proc/sys/kernel/overflowgid -> fd"*"65534 65534")
@@ -583,7 +583,7 @@ if [ "$m11_ready" -eq 1 ]; then
     esac
     if [ -r /proc/sys/kernel/overflowuid ] && [ -r /proc/sys/kernel/overflowgid ]; then
         want="$(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)"
-        got=$(CNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
+        got=$(CHROOTNG_DEBUG=1 run -R "$M11_ALPINE" /bin/busybox sh -c \
             'echo $(cat /proc/sys/kernel/overflowuid) $(cat /proc/sys/kernel/overflowgid)' 2>&1)
         case $got in
         *"procfs /proc/sys/kernel/overflow"*)
@@ -708,10 +708,10 @@ rm -rf "$M11TMP"
 # proves the file is its own after opening it — O_NOFOLLOW, then a regular file,
 # owned by us, with no group or other permission — and declines anything else
 # rather than ftruncating it and mapping it shared. Driven through
-# CNG_PROCREG_FORCE_FILE, since that tier is otherwise reached only on a host
+# CHROOTNG_PROCREG_FORCE_FILE, since that tier is otherwise reached only on a host
 # without memfd_create.
 SHT=$(mktemp -d)
-out=$(CNG_PROCREG_FORCE_FILE=1 run -t sharedtest "$SHT" 2>&1); rc=$?
+out=$(CHROOTNG_PROCREG_FORCE_FILE=1 run -t sharedtest "$SHT" 2>&1); rc=$?
 check "sharedtest overall" 0 "$rc"
 check_contains "a symlink on the registry name is declined, and its target kept" \
     "sharedtest symlinked registry declined=1 victim_intact=1 -> OK" "$out"

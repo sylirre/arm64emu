@@ -15,7 +15,7 @@
  * request queued, and the host netlink sockets left over are counted once
  * they are done. A relay socket belongs to its request now, so there must be
  * none; the old scheme leaves its one relay, and more whenever the race
- * struck ("leaked" counts those). Emulated by force (CNG_NETLINK_FORCE_BLOCK),
+ * struck ("leaked" counts those). Emulated by force (CHROOTNG_NETLINK_FORCE_BLOCK),
  * so the guest's own socket is an AF_UNIX stand-in and every AF_NETLINK
  * socket in the table is the monitor's. */
 #include <errno.h>

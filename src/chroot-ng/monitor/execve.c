@@ -1230,15 +1230,15 @@ static int range_overlap(const struct exec_range *a, const struct exec_range *b)
  * answer rather than a count of ours, and it is two syscalls. A directory we
  * cannot read answers "no", which costs the reclaim and not correctness. */
 static int exec_single_threaded(void) {
-    /* CNG_EXEC_RECLAIM_FORCE=1: take the answer as yes. It is meant for
+    /* CHROOTNG_EXEC_RECLAIM_FORCE=1: take the answer as yes. It is meant for
      * qemu-user, which runs a thread of its own (call_rcu) beside the guest's
      * one and so never reads as single-threaded from inside — the emulator's
      * thread touches no guest mapping, but nothing here can tell it from a
      * guest's. Everything the reclaim then does is exercised as it is on a
-     * device. Same testing convention as CNG_SCRATCH_NONE and CNG_PROCREG_NONE;
+     * device. Same testing convention as CHROOTNG_SCRATCH_NONE and CHROOTNG_PROCREG_NONE;
      * setting it against a genuinely multithreaded guest unmaps memory those
      * threads are running on. */
-    if (cng_broker_env("CNG_EXEC_RECLAIM_FORCE"))
+    if (cng_broker_env("CHROOTNG_EXEC_RECLAIM_FORCE"))
         return 1;
     long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/task",
                          CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
@@ -1858,7 +1858,7 @@ static long execve_plan(struct exec_job *j, int dirfd, const char *path,
          * stderr, and it named `host` — the one thing the whole path layer
          * exists to keep from the guest, since it spells out where the rootfs
          * lives on the device. It also put text no real execve produces into a
-         * stream package managers capture and log. Both belong under CNG_DEBUG
+         * stream package managers capture and log. Both belong under CHROOTNG_DEBUG
          * with the rest of the exec tracing. */
         if (cng_g_debug)
             cng_dprintf(2, "[cng] exec %s (%s): load failed rc=%d\n", path,
@@ -2092,7 +2092,7 @@ static long execve_commit(struct exec_job *j, unsigned long *out_sp,
 }
 
 /* A guest string for the debug log, taken into `buf` rather than printed where
- * it lies. CNG_DEBUG must never change what the guest gets, and %s on a guest
+ * it lies. CHROOTNG_DEBUG must never change what the guest gets, and %s on a guest
  * pointer does exactly that: the print walks memory the guest owns, so a wild
  * path — the very -EFAULT case the line below is tracing — faulted inside the
  * SIGSYS handler, where every signal but SIGSYS is masked and the fault is the

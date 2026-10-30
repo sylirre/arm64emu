@@ -17,28 +17,28 @@
 struct cng_bresp;
 struct cng_pollfd;
 
-/* CNG_NETLINK_FORCE_BLOCK=1: pretend the host denies rtnetlink, so the
+/* CHROOTNG_NETLINK_FORCE_BLOCK=1: pretend the host denies rtnetlink, so the
  * emulation can be exercised on a host where it actually works (mirrors
- * CNG_SHM_FORCE_FILE). */
+ * CHROOTNG_SHM_FORCE_FILE). */
 extern int cng_nl_force_block;
 
-/* CNG_NETLINK_NO_RELAY=1: additionally pretend the host refuses us a netlink
+/* CHROOTNG_NETLINK_NO_RELAY=1: additionally pretend the host refuses us a netlink
  * socket for relaying, so the degradation path (a loopback-only dump, as the
  * oracle presents when getifaddrs fails) can be exercised on a host where the
  * relay actually works. */
 extern int cng_nl_no_relay;
 
-/* CNG_NETLINK_DENY_GETLINK=1: pretend the host refuses RTM_GETLINK sends on
+/* CHROOTNG_NETLINK_DENY_GETLINK=1: pretend the host refuses RTM_GETLINK sends on
  * the relay socket — Android's nlmsg_readpriv restriction, which denies app
  * domains the link dump in every request form while the address dump relays
  * fine — so the synthesized link dump can be exercised on a host whose relay
- * works. Implies CNG_NETLINK_FORCE_BLOCK. */
+ * works. Implies CHROOTNG_NETLINK_FORCE_BLOCK. */
 extern int cng_nl_deny_getlink;
 
-/* CNG_NETLINK_DENY_AUDIT=1: pretend the host refuses a NETLINK_AUDIT socket the
+/* CHROOTNG_NETLINK_DENY_AUDIT=1: pretend the host refuses a NETLINK_AUDIT socket the
  * way Android's SELinux policy does (EACCES), so the answer that refusal is
  * turned into can be exercised on a host that grants the socket. Independent of
- * the rtnetlink knobs above — it does not imply CNG_NETLINK_FORCE_BLOCK. */
+ * the rtnetlink knobs above — it does not imply CHROOTNG_NETLINK_FORCE_BLOCK. */
 extern int cng_nl_deny_audit;
 
 /* 1 if `fd` is one of our emulated netlink sockets. */
@@ -120,8 +120,8 @@ int cng_nl_ioctl(int fd, unsigned long req, void *arg, long *out);
 /* CNG_REQ_NLSOCK's cng_breq.arg: the test aids the registering process runs
  * with, which are its own and not the daemon's (one --shared-proc daemon may
  * serve invocations started with different ones). */
-#define CNG_NL_F_NO_RELAY     1 /* CNG_NETLINK_NO_RELAY */
-#define CNG_NL_F_DENY_GETLINK 2 /* CNG_NETLINK_DENY_GETLINK */
+#define CNG_NL_F_NO_RELAY     1 /* CHROOTNG_NETLINK_NO_RELAY */
+#define CNG_NL_F_DENY_GETLINK 2 /* CHROOTNG_NETLINK_DENY_GETLINK */
 
 /* CNG_REQ_NLSOCK: take `fd`, the daemon's end of a new pair, for a socket
  * whose replies carry `port`. Returns its id (> 0), or a negative errno with

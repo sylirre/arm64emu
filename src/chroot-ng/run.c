@@ -198,6 +198,16 @@ static int set_workdir(struct cng_fs *fs, const char *wd) {
     return 0;
 }
 
+/* Is the environment entry `e` the switch `name` turned on: NAME=<value> with a
+ * value that is neither empty nor "0"? An empty value is off, as it is for
+ * cng_broker_env's switches: `NAME= chroot-ng ...` is how a shell clears a
+ * variable for one command. */
+static int env_switch_on(const char *e, const char *name) {
+    size_t n = strlen(name);
+    return !strncmp(e, name, n) && e[n] == '=' && e[n + 1] != '\0' &&
+           e[n + 1] != '0';
+}
+
 int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
             const char *const *bind_g, const char *const *bind_h,
             const int *bind_ro, int nb, char *const *env_set, int ne,
@@ -233,67 +243,54 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * lookup below both do. */
     cng_dev_shm_init();
 
-    /* CNG_DEBUG=1 in the environment enables verbose syscall-error logging;
-     * CNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid
+    /* CHROOTNG_DEBUG=1 in the environment enables verbose syscall-error logging;
+     * CHROOTNG_L2S_FORCE=1 routes every linkat through the -l emulation (test aid
      * for hosts whose filesystem allows real hardlinks). */
     for (char **e = envp; e && *e; e++) {
-        /* An empty value is off, as it is for the two knobs below and for
-         * cng_broker_env, which every other CNG_* switch goes through. Without
-         * the test, `CNG_DEBUG= chroot-ng ...` — how a shell clears a variable
-         * for one command — turned verbose logging ON, onto the guest's own
-         * stderr, which is a stream package managers capture and log. */
-        if (!strncmp(*e, "CNG_DEBUG=", 10) && (*e)[10] != '\0' &&
-            (*e)[10] != '0')
+        /* An empty value is off (env_switch_on). Without that test,
+         * `CHROOTNG_DEBUG= chroot-ng ...` turned verbose logging ON, onto the
+         * guest's own stderr, which is a stream package managers capture and
+         * log. */
+        if (env_switch_on(*e, "CHROOTNG_DEBUG"))
             cng_g_debug = 1;
-        if (!strncmp(*e, "CNG_L2S_FORCE=", 14) && (*e)[14] != '\0' &&
-            (*e)[14] != '0')
+        if (env_switch_on(*e, "CHROOTNG_L2S_FORCE"))
             cng_g_l2s_force = 1;
-        /* CNG_PROCSTAT_SYNTH=1 forces the synthesized /proc/stat even where the
+        /* CHROOTNG_PROCSTAT_SYNTH=1 forces the synthesized /proc/stat even where the
          * host file is readable (Android denies it; test hosts do not). */
-        if (!strncmp(*e, "CNG_PROCSTAT_SYNTH=", 19) && (*e)[19] != '\0' &&
-            (*e)[19] != '0')
+        if (env_switch_on(*e, "CHROOTNG_PROCSTAT_SYNTH"))
             cng_g_procstat_synth = 1;
-        /* CNG_OVERFLOWID_SYNTH=1 does the same for /proc/sys/kernel/overflow{u,g}id. */
-        if (!strncmp(*e, "CNG_OVERFLOWID_SYNTH=", 21) && (*e)[21] != '\0' &&
-            (*e)[21] != '0')
+        /* CHROOTNG_OVERFLOWID_SYNTH=1 does the same for /proc/sys/kernel/overflow{u,g}id. */
+        if (env_switch_on(*e, "CHROOTNG_OVERFLOWID_SYNTH"))
             cng_g_overflowid_synth = 1;
-        /* CNG_PROC_DENY_STAT=1 makes stat/access of a synthesized /proc name
+        /* CHROOTNG_PROC_DENY_STAT=1 makes stat/access of a synthesized /proc name
          * answer as the host does on Android, where SELinux refuses them. */
-        if (!strncmp(*e, "CNG_PROC_DENY_STAT=", 19) && (*e)[19] != '\0' &&
-            (*e)[19] != '0')
+        if (env_switch_on(*e, "CHROOTNG_PROC_DENY_STAT"))
             cng_g_proc_deny_stat = 1;
-        /* CNG_PROCFS_REOPEN_DENY=1 takes the memfd reopen that makes a
+        /* CHROOTNG_PROCFS_REOPEN_DENY=1 takes the memfd reopen that makes a
          * synthesized view read-only as refused, as Android's policy does. */
-        if (!strncmp(*e, "CNG_PROCFS_REOPEN_DENY=", 23) && (*e)[23] != '\0' &&
-            (*e)[23] != '0')
+        if (env_switch_on(*e, "CHROOTNG_PROCFS_REOPEN_DENY"))
             cng_g_procfs_reopen_deny = 1;
-        /* CNG_TERMIOS2_DENY=1 refuses the termios2 ioctls with EACCES before
+        /* CHROOTNG_TERMIOS2_DENY=1 refuses the termios2 ioctls with EACCES before
          * the host is asked, as Android's SELinux policy does. */
-        if (!strncmp(*e, "CNG_TERMIOS2_DENY=", 18) && (*e)[18] != '\0' &&
-            (*e)[18] != '0')
+        if (env_switch_on(*e, "CHROOTNG_TERMIOS2_DENY"))
             cng_g_termios2_deny = 1;
-        /* CNG_TIOCGSID_DENY=1 does the same for TIOCGSID. */
-        if (!strncmp(*e, "CNG_TIOCGSID_DENY=", 18) && (*e)[18] != '\0' &&
-            (*e)[18] != '0')
+        /* CHROOTNG_TIOCGSID_DENY=1 does the same for TIOCGSID. */
+        if (env_switch_on(*e, "CHROOTNG_TIOCGSID_DENY"))
             cng_g_tiocgsid_deny = 1;
-        /* CNG_TCSETSF_DENY=1 does the same for TCSETSF. */
-        if (!strncmp(*e, "CNG_TCSETSF_DENY=", 17) && (*e)[17] != '\0' &&
-            (*e)[17] != '0')
+        /* CHROOTNG_TCSETSF_DENY=1 does the same for TCSETSF. */
+        if (env_switch_on(*e, "CHROOTNG_TCSETSF_DENY"))
             cng_g_tcsetsf_deny = 1;
-        /* CNG_SETID_DENY=1 takes the uid and gid setters as refused by an
+        /* CHROOTNG_SETID_DENY=1 takes the uid and gid setters as refused by an
          * ambient filter, as Android's refuses them (cred.c). */
-        if (!strncmp(*e, "CNG_SETID_DENY=", 15) && (*e)[15] != '\0' &&
-            (*e)[15] != '0')
+        if (env_switch_on(*e, "CHROOTNG_SETID_DENY"))
             cng_g_setid_deny = 1;
-        /* CNG_OPENAT2_DENY=1 does the same for openat2, which a guest then
+        /* CHROOTNG_OPENAT2_DENY=1 does the same for openat2, which a guest then
          * gets emulated. */
-        if (!strncmp(*e, "CNG_OPENAT2_DENY=", 17) && (*e)[17] != '\0' &&
-            (*e)[17] != '0')
+        if (env_switch_on(*e, "CHROOTNG_OPENAT2_DENY"))
             cng_g_openat2_deny = 1;
-        /* CNG_MM_MAP_DENY=1 takes PR_SET_MM_MAP as refused, as Android's
+        /* CHROOTNG_MM_MAP_DENY=1 takes PR_SET_MM_MAP as refused, as Android's
          * kernels refuse it, so cmdline/environ come from guest memory. */
-        if (!strncmp(*e, "CNG_MM_MAP_DENY=", 16) && (*e)[16] != '\0' &&
-            (*e)[16] != '0')
+        if (env_switch_on(*e, "CHROOTNG_MM_MAP_DENY"))
             cng_g_mm_map_deny = 1;
     }
     /* Stamp the build: this tree is copied to test devices by hand, so a trace
@@ -371,25 +368,25 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     if (workdir && set_workdir(&g_fs, workdir) < 0)
         return 1;
 
-    if (cng_broker_env("CNG_NETLINK_FORCE_BLOCK"))
+    if (cng_broker_env("CHROOTNG_NETLINK_FORCE_BLOCK"))
         cng_nl_force_block = 1;
-    if (cng_broker_env("CNG_NETLINK_NO_RELAY")) {
+    if (cng_broker_env("CHROOTNG_NETLINK_NO_RELAY")) {
         cng_nl_force_block = 1;
         cng_nl_no_relay = 1;
     }
-    if (cng_broker_env("CNG_NETLINK_DENY_GETLINK")) {
+    if (cng_broker_env("CHROOTNG_NETLINK_DENY_GETLINK")) {
         cng_nl_force_block = 1;
         cng_nl_deny_getlink = 1;
     }
     /* Stands alone: the audit refusal has nothing to do with the rtnetlink
      * emulation, so forcing one must not force the other. */
-    if (cng_broker_env("CNG_NETLINK_DENY_AUDIT"))
+    if (cng_broker_env("CHROOTNG_NETLINK_DENY_AUDIT"))
         cng_nl_deny_audit = 1;
 
     /* No host here has a true noexec mount to offer, so the one path that only
      * such a mount reaches has a knob of its own: take the anonymous route for
      * every executable file mapping without asking the kernel first. */
-    if (cng_broker_env("CNG_MMAP_FORCE_ANON"))
+    if (cng_broker_env("CHROOTNG_MMAP_FORCE_ANON"))
         cng_g_execmap_force = 1;
 
     /* Resolve the program itself through the map (following symlinks) to find

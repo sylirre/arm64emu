@@ -10,7 +10,7 @@
 # which are pure resolution overlays with no dirent either.
 echo "== M14: /dev zone + dirent injection =="
 
-M14_ALPINE="${M14_ALPINE:-$CNG_ALPINE}"
+M14_ALPINE="${M14_ALPINE:-$CHROOTNG_ALPINE}"
 
 if [ -z "$M14_ALPINE" ] || [ ! -x "$M14_ALPINE/bin/busybox" ]; then
     skip "/dev zone scenarios: no alpine rootfs"
@@ -191,7 +191,7 @@ else
     # it too: the guest's objects land in a per-uid directory under $TMPDIR and
     # nowhere near the host's own /dev/shm.
     M14T=$(mktemp -d)
-    got=$(TMPDIR="$M14T" CNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" \
+    got=$(TMPDIR="$M14T" CHROOTNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" \
         /bin/busybox sh -c \
         'echo STANDIN-PAYLOAD > /dev/shm/m14standin && cat /dev/shm/m14standin
          grep -q " /dev/shm tmpfs " /proc/mounts && echo row-kept' 2>/dev/null)
@@ -233,7 +233,7 @@ else
     m14_uid=$(id -u)
     m14_squat() { # desc, TMPDIR to use, dir the object must not reach
         M14X=$(mktemp -d)
-        got=$(TMPDIR="$2" XDG_RUNTIME_DIR="$M14X" CNG_DEVSHM_FORCE_TMP=1 \
+        got=$(TMPDIR="$2" XDG_RUNTIME_DIR="$M14X" CHROOTNG_DEVSHM_FORCE_TMP=1 \
             run -R "$M14_ALPINE" /bin/busybox sh -c \
             'echo SQUAT > /dev/shm/m14squat && cat /dev/shm/m14squat' \
             2>/dev/null)
@@ -269,13 +269,13 @@ else
     # whose $TMPDIR is the 0771 files directory the framework makes, which is
     # how AndroidTerm's guests lost theirs while Termux's, under a 1777
     # $PREFIX/tmp, kept it. A warning names each candidate and why it was
-    # passed over. CNG_TMP_ENV_ONLY drops /data/local/tmp and /tmp, which on
+    # passed over. CHROOTNG_TMP_ENV_ONLY drops /data/local/tmp and /tmp, which on
     # a device are the shell user's and here would serve.
     m14_tmpdir() { # mode of the $TMPDIR to hand over
         M14T=$(mktemp -d)
         chmod "$1" "$M14T"
-        got=$(TMPDIR="$M14T" XDG_RUNTIME_DIR= CNG_TMP_ENV_ONLY=1 \
-            CNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" /bin/busybox sh -c \
+        got=$(TMPDIR="$M14T" XDG_RUNTIME_DIR= CHROOTNG_TMP_ENV_ONLY=1 \
+            CHROOTNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" /bin/busybox sh -c \
             '[ -e /dev/shm ] && echo has-shm || echo no-shm' 2>&1)
     }
     m14_tmpdir 0771
@@ -368,8 +368,8 @@ printf x >"$M14DB/marker"
 if ! guest_xlate_ready "dirfd-relative overlay legs"; then
     :
 elif guest_cc_report "$M14D/atoverlay" tests/chroot-ng/guests/atoverlay.c; then
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run -R $GUEST_BINDS -b "$M14DB":/hostdir "$M14D" /atoverlay \
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run -R $CHROOTNG_GUEST_BINDS -b "$M14DB":/hostdir "$M14D" /atoverlay \
         2>/dev/null)
     check_contains "m14 openat(dirfd(/dev), \"zero\") resolves" "dev-openat=ok" \
         "$out"

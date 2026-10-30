@@ -69,8 +69,8 @@ printf 'HOST-LEAK' > "$FVO/file"
 if ! guest_xlate_ready "descriptor legs"; then
     :
 elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 60 -R $GUEST_BINDS "$FVR" /fdescape 7<"$FVO" 8<"$FVO/file" 2>&1)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$FVR" /fdescape 7<"$FVO" 8<"$FVO/file" 2>&1)
     check_contains "a leaked directory fd is closed before the guest runs" \
         "inherited-dirfd=Bad file descriptor" "$out"
     check_contains "a leaked file fd stays, for the I/O it carries" \
@@ -79,7 +79,7 @@ elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
     # by /dev/null rather than left closed: a program is entitled to find 0,
     # 1 and 2 open, and its next open must not land on one of them.
     # shellcheck disable=SC2086
-    out0=$(run_t 60 -R $GUEST_BINDS "$FVR" /fdescape <"$FVO" 2>&1)
+    out0=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$FVR" /fdescape <"$FVO" 2>&1)
     check_contains "stdin on an outside directory becomes /dev/null" \
         "stdin=/dev/null" "$out0"
     for _leg in proc-dotdot procself-dotdot devpts-dotdot; do
@@ -118,7 +118,7 @@ elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
         python3 -c 'import socket; socket.send_fds' 2>/dev/null; then
         rm -f "$FVR/sock"
         # shellcheck disable=SC2086
-        run_t 60 -R $GUEST_BINDS "$FVR" /fdimport /sock >"$FVO/import.out" \
+        run_t 60 -R $CHROOTNG_GUEST_BINDS "$FVR" /fdimport /sock >"$FVO/import.out" \
             2>/dev/null &
         _bg=$!
         _n=0
@@ -240,7 +240,7 @@ if guest_xlate_ready "signals to hidden processes" &&
     guest_cc_report "$SVD/sigholder" tests/chroot-ng/guests/sigholder.c &&
     guest_cc_report "$SVD/sigview" tests/chroot-ng/guests/sigview.c -pthread; then
     for _tier in -R plain; do
-        if [ "$_tier" = plain ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+        if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
             skip "signals to hidden processes, seccomp tier: the filter is inert here"
             continue
         fi
@@ -253,8 +253,8 @@ if guest_xlate_ready "signals to hidden processes" &&
             sv_stop
             continue
         fi
-        # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
-        _got=$(run $_opt $GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" 2>/dev/null)
+        # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
+        _got=$(run $_opt $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" 2>/dev/null)
         sv_stop
         _label="a signal reaches no process the view hides, alone or by group ($_tier)"
         if [ "$(printf '%s\n' "$_got" | sed 1d)" = "$SV_WANT" ]; then
@@ -279,7 +279,7 @@ if guest_xlate_ready "signals to hidden processes" &&
     # left out of it, since there it would reach every process of the user.
     sv_start
     # shellcheck disable=SC2086
-    _got=$(run -R --no-proc $GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
+    _got=$(run -R --no-proc $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
     sv_stop
     check_contains "--no-proc: a host process is signalled as on the host" \
         "kill-hidden=0" "$_got"
@@ -288,12 +288,12 @@ if guest_xlate_ready "signals to hidden processes" &&
         [ -n "$_u" ] && [ "$_u" != 0 ] && _u=some
         check "--no-proc: holder $_h sees the signals that reach it" some "$_u"
     done
-    # Without a registry (CNG_PROCREG_NONE: a host that could map none) the
+    # Without a registry (CHROOTNG_PROCREG_NONE: a host that could map none) the
     # view cannot tell a guest from a host process, and the signal family runs
     # native rather than refuse every pid but the caller's.
     sv_start
     # shellcheck disable=SC2086
-    _got=$(CNG_PROCREG_NONE=1 run -R $GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
+    _got=$(CHROOTNG_PROCREG_NONE=1 run -R $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
     sv_stop
     check_contains "no registry: a guest still signals its own child" \
         "kill-child=0" "$_got"

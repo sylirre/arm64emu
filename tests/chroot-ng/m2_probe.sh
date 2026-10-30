@@ -7,7 +7,7 @@ out=$(run --probe / 2>&1); rc=$?
 # The verdict is "BLOCKED" — and the exit status 1 — exactly when a hard
 # prerequisite fails, and execmem is the one that can legitimately fail on a
 # device (SELinux denying anonymous RW->RX to the app domain).
-if [ "$CNG_EXECMEM" = 1 ]; then
+if [ "$CHROOTNG_EXECMEM" = 1 ]; then
     check "probe rc (execmem permitted)" 0 $rc
     check_contains "execmem executed thunk" "RESULT    OK" "$out"
     check_contains "verdict is viable" "LIKELY VIABLE" "$out"
@@ -24,7 +24,7 @@ check_contains "verdict present" "verdict:" "$out"
 # The seccomp functional test: a real AArch64 kernel must report the filter
 # working, and under qemu-user it must report itself inert rather than silently
 # claiming success.
-if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
     check_contains "seccomp RET_ERRNO works on this kernel" \
         "filter RET_ERRNO    WORKS" "$out"
 else

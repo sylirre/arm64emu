@@ -7,7 +7,7 @@
  * from it where termios2 is refused too (src/chroot-ng/monitor/tty.c). The monitor
  * serves it from TCFLSH and TCSETSW when the host will not, and the answers
  * must be a kernel's either way: this runs over the host as it is and over
- * CNG_TCSETSF_DENY=1, which refuses it before the host is asked.
+ * CHROOTNG_TCSETSF_DENY=1, which refuses it before the host is asked.
  *
  * What is asked, over a real pty: a line waiting on the slave is gone after a
  * TCSETSF and the change has been made (VMIN/VTIME read back), the same line

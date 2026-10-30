@@ -389,7 +389,7 @@ static int fix_pid(unsigned char *buf, long len, unsigned pid) {
 
 /* An unbound netlink socket for relaying. Unbound is the whole point: the
  * SELinux denial on Android is on bind(2), not on the query. `no_relay` is the
- * CNG_NETLINK_NO_RELAY test aid of whoever the relay is for — the daemon's
+ * CHROOTNG_NETLINK_NO_RELAY test aid of whoever the relay is for — the daemon's
  * caller, not the daemon (see CNG_NL_F_NO_RELAY). */
 static long open_hostfd(int no_relay) {
     if (no_relay)
@@ -882,7 +882,7 @@ struct nl_peer {
     unsigned port; /* what replies carry as nlmsg_pid: the opener's pid */
     int flags;     /* CNG_NL_F_*: its opener's test aids */
     /* What it has been served since the last sync asked: a trace for the
-     * guest's CNG_DEBUG, the daemon's own stderr being /dev/null. */
+     * guest's CHROOTNG_DEBUG, the daemon's own stderr being /dev/null. */
     unsigned served, relayed, synthesized;
 };
 

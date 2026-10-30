@@ -11,7 +11,7 @@
 #include "cng/path.h"
 #include "cng/ucontext.h"
 
-/* The version, printed by --version and by the CNG_DEBUG startup banner (which
+/* The version, printed by --version and by the CHROOTNG_DEBUG startup banner (which
  * also stamps the build time: this tree is copied to devices by hand, so "am I
  * running the build I just made?" is a question every device-side trace has to
  * answer), is the repository's: its VERSION file, which the Makefile passes in
@@ -342,10 +342,10 @@ extern void (*cng_g_fork_child_probe)(void);
  * since its clone, with the child already going (-t proctest). */
 extern void (*cng_g_fork_parent_probe)(long kid);
 
-/* One-shot-per-number diagnostic for a syscall we emulate away (CNG_DEBUG). */
+/* One-shot-per-number diagnostic for a syscall we emulate away (CHROOTNG_DEBUG). */
 void cng_note_blocked(int nr);
 
-/* Verbose diagnostic (set by CNG_DEBUG=1): log intercepted syscalls whose
+/* Verbose diagnostic (set by CHROOTNG_DEBUG=1): log intercepted syscalls whose
  * result is an error other than ENOENT, with the path where available. */
 extern int cng_g_debug;
 
@@ -529,14 +529,14 @@ long cng_user_strcopyin(char *dst, const char *src, unsigned long cap);
 #define CNG_NR_MAX 512
 extern unsigned char cng_blocked[CNG_NR_MAX];
 void cng_probe_blocked(void);
-/* CNG_SETID_DENY=1: take the uid and gid setters Android's app filter refuses
+/* CHROOTNG_SETID_DENY=1: take the uid and gid setters Android's app filter refuses
  * as refused here too — marked blocked after the probe, and trapped by our own
  * filter so they reach the dispatcher as that filter's trap would deliver them
  * (cred.c). */
 extern int cng_g_setid_deny;
 extern const int cng_setid_deny_nrs[];
 extern const int cng_setid_deny_n;
-/* CNG_OPENAT2_DENY=1: take openat2 as refused by an ambient filter, as
+/* CHROOTNG_OPENAT2_DENY=1: take openat2 as refused by an ambient filter, as
  * Android's refuses it — marked blocked after the probe, so chroot-ng never
  * issues it on its own behalf and a guest's openat2 is emulated (dispatch.c).
  * Our own filter traps the number already: it is a path syscall. */

@@ -11,10 +11,10 @@ echo "== M4: ul_exec loader (dynamic) =="
 GDIR=build/tests/chroot-ng
 mkdir -p "$GDIR"
 
-if [ "$CNG_NATIVE" = 1 ]; then
-    M4_SYSROOT=${CNG_SYSROOT-}
+if [ "$CHROOTNG_NATIVE" = 1 ]; then
+    M4_SYSROOT=${CHROOTNG_SYSROOT-}
 else
-    M4_SYSROOT=${CNG_SYSROOT-/usr/aarch64-linux-gnu}
+    M4_SYSROOT=${CHROOTNG_SYSROOT-/usr/aarch64-linux-gnu}
 fi
 M4_LDSO=
 for c in "$M4_SYSROOT/lib/ld-linux-aarch64.so.1" \
@@ -24,11 +24,11 @@ for c in "$M4_SYSROOT/lib/ld-linux-aarch64.so.1" \
     if [ -e "$c" ]; then M4_LDSO=$c; break; fi
 done
 
-if [ -z "$GUESTCC" ]; then
+if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "dynamic tests: no AArch64 guest toolchain"
 elif [ -z "$M4_LDSO" ]; then
     skip "dynamic tests: no AArch64 ELF interpreter under '${M4_SYSROOT:-/}'"
-elif ! $GUESTCC -O2 -o "$GDIR/hello_dyn" tests/chroot-ng/guests/hello.c \
+elif ! $CHROOTNG_GUESTCC -O2 -o "$GDIR/hello_dyn" tests/chroot-ng/guests/hello.c \
     2>"$GUEST_CC_LOG"; then
     fail=$((fail + 1)); printf '  FAIL could not build dynamic guest\n'
     sed 's/^/    /' "$GUEST_CC_LOG"
@@ -42,16 +42,16 @@ else
     # stack the loader built, and that environment is not inherited from the host
     # (M17-16) — so the host's copy of either variable would never arrive.
     if [ -n "$M4_SYSROOT" ]; then
-        out=$(run -L "$M4_SYSROOT" -E CNG_TEST=dyn \
+        out=$(run -L "$M4_SYSROOT" -E CHROOTNG_TEST=dyn \
             -E LD_LIBRARY_PATH="$M4_SYSROOT/lib" \
             / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
     else
-        out=$(run -E CNG_TEST=dyn / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
+        out=$(run -E CHROOTNG_TEST=dyn / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
     fi
     check "dynamic exit code (42)" 42 $rc
     check_contains "ld.so bootstrapped main (argc)" "guest: argc=3" "$out"
     check_contains "dynamic argv forwarded" "guest: argv1=XX" "$out"
-    check_contains "dynamic env forwarded" "guest: CNG_TEST=dyn" "$out"
+    check_contains "dynamic env forwarded" "guest: CHROOTNG_TEST=dyn" "$out"
 
     # -L is a prefix the interpreter's own name is joined onto, and the join
     # truncated at PATH_MAX. A cut path is a different path — one that may

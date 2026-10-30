@@ -25,7 +25,7 @@ tty_check() {
     _why=${5:-}
     for _tier in -R plain; do
         if [ "$_tier" = plain ]; then
-            if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
                 skip "$_desc, seccomp tier: the filter is inert here"
                 continue
             fi
@@ -40,14 +40,14 @@ tty_check() {
                 skip "$_label: $_why"
                 continue
             fi
-            # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
+            # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
             _got=$(
                 if [ "$_deny" = 1 ]; then
                     for _k in $_knob; do
                         export "$_k=1"
                     done
                 fi
-                run_t 60 $_opt $GUEST_BINDS "$TTY_DIR" "/$_guest" 2>/dev/null
+                run_t 60 $_opt $CHROOTNG_GUEST_BINDS "$TTY_DIR" "/$_guest" 2>/dev/null
             )
             case "$_got" in
             SKIP:*)
@@ -80,7 +80,7 @@ tty_check() {
 if guest_xlate_ready "termios2 ioctls" &&
     guest_cc_report "$TTY_DIR/termios2" tests/chroot-ng/guests/termios2.c; then
     tty_check "termios2 ioctls agree with a kernel's" termios2 \
-        "CNG_TERMIOS2_DENY CNG_TCSETSF_DENY" \
+        "CHROOTNG_TERMIOS2_DENY CHROOTNG_TCSETSF_DENY" \
 "get2=0 errno=0 whole=1 tail=1 prefix=1
 set2=0 errno=0 readback=1
 setsw2=0 errno=0 readback=1
@@ -104,7 +104,7 @@ fi
 # what serves it must still tell a kernel's ENOTTY.
 if guest_xlate_ready "TCSETSF" &&
     guest_cc_report "$TTY_DIR/tcsetsf" tests/chroot-ng/guests/tcsetsf.c; then
-    tty_check "TCSETSF agrees with a kernel's" tcsetsf CNG_TCSETSF_DENY \
+    tty_check "TCSETSF agrees with a kernel's" tcsetsf CHROOTNG_TCSETSF_DENY \
 "setsf=0 errno=0 readback=1 typed=1 left=-11
 setsw=0 typed=1 left=6
 setsf_fault=-1 errno=14
@@ -131,7 +131,7 @@ if guest_xlate_ready "TIOCGSID" &&
     _why=""
     [ "$_host" = broken ] &&
         _why="the host answers TIOCGSID with success and no session (qemu-user)"
-    tty_check "TIOCGSID agrees with a kernel's" tiocgsid CNG_TIOCGSID_DENY \
+    tty_check "TIOCGSID agrees with a kernel's" tiocgsid CHROOTNG_TIOCGSID_DENY \
 "slave_nosess=-1 errno=25
 master_nosess=-1 errno=25
 slave_foreign=-1 errno=25

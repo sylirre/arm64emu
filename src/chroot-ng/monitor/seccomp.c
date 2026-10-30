@@ -368,7 +368,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     if (cng_g_fake_id)
         for (int i = 0; i < NID; i++)
             nr[nsys++] = id_syscalls[i];
-    /* CNG_SETID_DENY without the id set: the setters it takes as refused are
+    /* CHROOTNG_SETID_DENY without the id set: the setters it takes as refused are
      * trapped, which is how Android's filter hands them over — as a SIGSYS
      * for the dispatcher to answer (cred.c). Fewer than the id set, and only
      * in its place, so the bound above holds. */

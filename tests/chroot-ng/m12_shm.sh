@@ -2,7 +2,7 @@
 #
 # Three layers. First the dispatcher-level self-test (-t shmtest), which needs
 # no seccomp and so runs anywhere, over both backing tiers (memfd, and the
-# file-backed fallback forced with CNG_SHM_FORCE_FILE=1). Then a differential
+# file-backed fallback forced with CHROOTNG_SHM_FORCE_FILE=1). Then a differential
 # leg: the same guest binaries run once under chroot-ng's emulation and once with
 # no emulation at all, where they get the host kernel's REAL SysV shm — stdout
 # must match byte for byte, which is the strongest statement available that the
@@ -83,13 +83,13 @@ check_contains "bad ids, zero size and a stray address are refused" \
 # size probe is ashmem's ioctl, so on Termux the backing has to be ashmem.
 check_contains "a libandroid-shmem client attaches a guest segment" \
     "shmtest a libandroid-shmem client attaches a guest segment shape=1 keys=1 shared=1 uncounted=1 removed=1 gone=1 unknown=1 -> OK" "$out"
-if [ "$CNG_TERMUX" = 1 ]; then m12_ashmem=1; else m12_ashmem=0; fi
+if [ "$CHROOTNG_TERMUX" = 1 ]; then m12_ashmem=1; else m12_ashmem=0; fi
 check_contains "segments are ashmem where /dev/ashmem opens ($m12_ashmem here)" \
     "shmtest segment backing is ashmem where /dev/ashmem opens: ashmem=$m12_ashmem -> OK" "$out"
 
 # The file-backed tier: what the broker falls back to where memfd_create is
 # unavailable (pre-3.17 kernel, or a seccomp filter blocking it).
-out=$(CNG_SHM_FORCE_FILE=1 run -t shmtest 2>&1); rc=$?
+out=$(CHROOTNG_SHM_FORCE_FILE=1 run -t shmtest 2>&1); rc=$?
 check "shmtest over the file-backed backing tier" 0 "$rc"
 check_contains "file-backed segments still share across a fork" \
     "shmtest fork share=1 nattch-after-exit=1 -> OK" "$out"
@@ -112,8 +112,8 @@ check_contains "the backing file's name is unguessable and exclusively created" 
 # and the app domain gets no IPC), so there the differential legs sit out and the
 # dispatcher self-test above is what covers the emulation.
 SG=$(mktemp -d)
-# shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-m12run() { run $GUEST_BINDS "$@"; }
+# shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+m12run() { run $CHROOTNG_GUEST_BINDS "$@"; }
 
 # --- what the guest can see of the broker's own startup ---------------------
 # The daemon is started by a double fork from whichever guest process makes the
@@ -128,8 +128,8 @@ if ! guest_xlate_ready "broker spawn visibility"; then
 elif ! guest_cc_report "$SG/brokerchld" tests/chroot-ng/guests/brokerchld.c; then
     :
 else
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    bc_out=$(run_t 60 $GUEST_BINDS -R "$SG" /brokerchld 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    bc_out=$(run_t 60 $CHROOTNG_GUEST_BINDS -R "$SG" /brokerchld 2>/dev/null)
     # The control: this run can see a SIGCHLD and reap a child at all.
     check_contains "m12 a guest's own child is still its own" \
         "own: chld=1 reaped=1 status=3" "$bc_out"
@@ -167,8 +167,8 @@ posix: read POSIX-SHM-OK
 posix: after-unlink gone
 posix: done"
     M12T=$(mktemp -d)
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    m12_got=$(TMPDIR="$M12T" CNG_DEVSHM_FORCE_TMP=1 run_t 60 $GUEST_BINDS -R \
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    m12_got=$(TMPDIR="$M12T" CHROOTNG_DEVSHM_FORCE_TMP=1 run_t 60 $CHROOTNG_GUEST_BINDS -R \
         "$SG" /shm_posix 2>/dev/null); m12_rc=$?
     check "m12 a POSIX shm round trip on the /dev/shm stand-in exits 0" 0 "$m12_rc"
     if [ "$m12_got" = "$m12_want" ]; then
@@ -204,7 +204,7 @@ fi
 # against Termux's libandroid-shmem attaches what the guest made, reads it, and
 # writes back. Termux only, where that library is; -t shmtest speaks the
 # protocol itself everywhere else.
-if [ "$CNG_TERMUX" != 1 ]; then
+if [ "$CHROOTNG_TERMUX" != 1 ]; then
     skip "m12 libandroid-shmem attach: not a Termux host"
 elif ! guest_xlate_ready "libandroid-shmem attach"; then
     :
@@ -216,8 +216,8 @@ then
 else
     AD=$SG/ashv
     mkdir -p "$AD"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-    run_t 60 $GUEST_BINDS -R "$SG" /shm_ashv /ashv >"$AD/guest.out" 2>&1 &
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    run_t 60 $CHROOTNG_GUEST_BINDS -R "$SG" /shm_ashv /ashv >"$AD/guest.out" 2>&1 &
     AJ=$!
     _n=0
     until [ -s "$AD/id" ] || [ $_n -ge 300 ]; do
@@ -263,8 +263,8 @@ if [ "$m12_ready" = 1 ]; then
     # shm_diff <desc> <prog>: emulated vs the real kernel, stdout + rc.
     shm_diff() {
         out_k=$(emu_t 60 "$SG/$2" 2>/dev/null); rc_k=$?
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        out_e=$(run_t 60 $GUEST_BINDS -R "$SG" "/$2" 2>/dev/null); rc_e=$?
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out_e=$(run_t 60 $CHROOTNG_GUEST_BINDS -R "$SG" "/$2" 2>/dev/null); rc_e=$?
         if [ "$out_k" = "$out_e" ] && [ "$rc_k" = "$rc_e" ]; then
             pass=$((pass + 1)); printf '  ok   %s\n' "$1"
         else
@@ -295,7 +295,7 @@ if [ "$m12_ready" = 1 ]; then
             skip "m12 $2: the guest program does not build here"
             return
         fi
-        if [ -n "$QEMU" ]; then
+        if [ -n "$CHROOTNG_QEMU" ]; then
             _oracle=
             for _c in ${HOSTCC:-} cc gcc clang; do
                 have "$_c" || continue
@@ -315,8 +315,8 @@ if [ "$m12_ready" = 1 ]; then
         else
             _k=$("$_oracle" 2>/dev/null)
         fi
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
-        _e=$(run_t "$4" $GUEST_BINDS -R "$SG" "/$2" 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        _e=$(run_t "$4" $CHROOTNG_GUEST_BINDS -R "$SG" "/$2" 2>/dev/null)
         if [ "$_k" = "$_e" ]; then
             pass=$((pass + 1))
             printf '  ok   %s\n' "$1"
@@ -357,12 +357,12 @@ if [ "$m12_ready" = 1 ]; then
     # ...and again over the file-backed tier, which must be indistinguishable
     # from the memfd one (only the broker's backing differs).
     out_k=$m12_kbase
-    out_e=$(CNG_SHM_FORCE_FILE=1 m12run -R "$SG" /shm_sysv 2>/dev/null)
+    out_e=$(CHROOTNG_SHM_FORCE_FILE=1 m12run -R "$SG" /shm_sysv 2>/dev/null)
     check_contains "m12 file-backed shm_sysv still matches" "$out_k" "$out_e"
 
     # The guest's calls really are being emulated, not passed to the host: the
-    # dispatcher traces every one under CNG_DEBUG.
-    n=$(CNG_DEBUG=1 m12run -R "$SG" /shm_sysv 2>&1 | grep -c 'sysv-shm')
+    # dispatcher traces every one under CHROOTNG_DEBUG.
+    n=$(CHROOTNG_DEBUG=1 m12run -R "$SG" /shm_sysv 2>&1 | grep -c 'sysv-shm')
     if [ "$n" -ge 8 ]; then
         pass=$((pass + 1)); printf '  ok   %s\n' "m12 the guest's shm syscalls reach the emulation ($n)"
     else
@@ -393,7 +393,7 @@ rm -rf "$SG"
 # ipcs(1) is what a user reaches for; busybox's applet drives SHM_INFO/SHM_STAT
 # exactly as shm_stat.c does, so this only has to show the tool runs and reports
 # an empty namespace the way it would against a kernel with no segments.
-M12_ALPINE="${M12_ALPINE:-$CNG_ALPINE}"
+M12_ALPINE="${M12_ALPINE:-$CHROOTNG_ALPINE}"
 if [ -n "$M12_ALPINE" ] && [ -x "$M12_ALPINE/bin/busybox" ]; then
     SR=$(mktemp -d); cp -a "$M12_ALPINE/." "$SR"
     out=$(run -R "$SR" /bin/sh -c 'ipcs -m; echo rc=$?' 2>/dev/null)

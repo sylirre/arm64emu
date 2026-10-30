@@ -28,18 +28,18 @@ int cng_tty_request(unsigned req);
  * 0 or the result the host gave, or -errno. */
 long cng_tty_ioctl(long fd, unsigned req, long argp);
 
-/* CNG_TERMIOS2_DENY=1: refuse the termios2 ioctls (TCGETS2, TCSETS2, ...) with
+/* CHROOTNG_TERMIOS2_DENY=1: refuse the termios2 ioctls (TCGETS2, TCSETS2, ...) with
  * EACCES before the host is asked, as Android's policy does, so they are
  * served from TCGETS/TCSETS. Settled before the first guest instruction,
  * read-only after. */
 extern int cng_g_termios2_deny;
 
-/* CNG_TIOCGSID_DENY=1: the same for TIOCGSID (tcgetsid), which the policy
+/* CHROOTNG_TIOCGSID_DENY=1: the same for TIOCGSID (tcgetsid), which the policy
  * refuses on a pty slave and on a pipe; it is then served from TCGETS,
  * TIOCGPGRP and getsid. */
 extern int cng_g_tiocgsid_deny;
 
-/* CNG_TCSETSF_DENY=1: the same for TCSETSF (tcsetattr(TCSAFLUSH)), which
+/* CHROOTNG_TCSETSF_DENY=1: the same for TCSETSF (tcsetattr(TCSAFLUSH)), which
  * Android 8's policy refuses on a pty; it is then served from TCFLSH and
  * TCSETSW, and so is the TCSETSF2 that falls back to it. */
 extern int cng_g_tcsetsf_deny;

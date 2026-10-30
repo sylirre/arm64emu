@@ -443,20 +443,20 @@ static int open_shared_file(const char *key, unsigned long size) {
 void cng_procreg_init(const char *shared_key) {
     if (g_tab)
         return;
-    /* CNG_PROCREG_NONE=1: behave as if the table could not be mapped at all.
+    /* CHROOTNG_PROCREG_NONE=1: behave as if the table could not be mapped at all.
      * That degraded tier is what every /proc answer has to survive — a host
      * without memfd, a full table — and a working host never reaches it on its
      * own, so there is no other way to exercise it. Same testing convention as
-     * CNG_SHM_FORCE_FILE and CNG_NETLINK_FORCE_BLOCK. */
-    if (cng_broker_env("CNG_PROCREG_NONE"))
+     * CHROOTNG_SHM_FORCE_FILE and CHROOTNG_NETLINK_FORCE_BLOCK. */
+    if (cng_broker_env("CHROOTNG_PROCREG_NONE"))
         return;
     unsigned long sz = cng_procreg_table_size();
     if (shared_key && *shared_key) {
-        /* CNG_PROCREG_FORCE_FILE=1: skip the broker so the named-file tier is
+        /* CHROOTNG_PROCREG_FORCE_FILE=1: skip the broker so the named-file tier is
          * the one exercised. It is otherwise only reached on a host without
          * memfd_create — nothing a dev host or a device offers — and it is the
          * tier that has to prove it will not adopt somebody else's file. */
-        if (!cng_broker_env("CNG_PROCREG_FORCE_FILE") &&
+        if (!cng_broker_env("CHROOTNG_PROCREG_FORCE_FILE") &&
             open_broker(shared_key, sz)) {
             cng_g_procreg_backing = CNG_PROCREG_B_BROKER;
             return;

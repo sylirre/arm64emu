@@ -10,8 +10,8 @@
 # reaches a library's code.
 #
 # No host here has a true noexec mount to offer, so the path is forced with
-# CNG_MMAP_FORCE_ANON=1: take the anonymous route without asking the kernel
-# first. Same testing convention as CNG_SHM_FORCE_FILE / CNG_PROCREG_NONE.
+# CHROOTNG_MMAP_FORCE_ANON=1: take the anonymous route without asking the kernel
+# first. Same testing convention as CHROOTNG_SHM_FORCE_FILE / CHROOTNG_PROCREG_NONE.
 echo "== M23: mmap(PROT_EXEC) served from anonymous memory =="
 
 # The filter half: mmap must trap for exactly this shape of request and for
@@ -52,9 +52,9 @@ cng_dyn_binds
 
 # A DYNAMIC guest, deliberately: the harness's own link mode is static-PIE on
 # most hosts, and a static guest never maps a library at all.
-if [ -z "$GUESTCC" ]; then
+if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "execmap legs: no AArch64 guest toolchain"
-elif ! $GUESTCC -O2 -o "$XMR/bin/readfile" tests/chroot-ng/guests/readfile.c \
+elif ! $CHROOTNG_GUESTCC -O2 -o "$XMR/bin/readfile" tests/chroot-ng/guests/readfile.c \
     2>"$GUEST_CC_LOG"; then
     fail=$((fail + 1)); printf '  FAIL could not build a dynamic guest\n'
     sed 's/^/    /' "$GUEST_CC_LOG"
@@ -64,7 +64,7 @@ else
     # shellcheck disable=SC2086  # both are deliberately split arg lists
     xmrun() { run $GUEST_DYN_L $GUEST_DYN_BINDS "$@"; }
 
-    out=$(CNG_MMAP_FORCE_ANON=1 xmrun -R "$XMR" /bin/readfile 2>/dev/null); rc=$?
+    out=$(CHROOTNG_MMAP_FORCE_ANON=1 xmrun -R "$XMR" /bin/readfile 2>/dev/null); rc=$?
     check "a dynamic guest starts with every library mapped from a copy" 0 $rc
     # The guest's open() is libc's, in a library chroot-ng never loaded itself.
     # Reaching the rootfs means the copy carried the code AND that its svc sites
@@ -77,7 +77,7 @@ else
     # guest's open reaches the untranslated host path and fails, while on a real
     # kernel the SIGSYS tier translates it as it always did. Either way this
     # proves the leg above was not passing for some unrelated reason.
-    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
         out=$(xmrun -R "$XMR" /bin/readfile 2>/dev/null); rc=$?
         check "unforced, the seccomp tier translates the same open" 0 $rc
         check_contains "seccomp-translated openat reached the rootfs" \
@@ -91,16 +91,16 @@ else
     # the same guest must be indistinguishable from the first — nothing about it
     # is stateful, and a leaked trampoline pool or a half-protected page would
     # show up as a difference here.
-    a=$(CNG_MMAP_FORCE_ANON=1 xmrun -R "$XMR" /bin/readfile 2>/dev/null)
-    b=$(CNG_MMAP_FORCE_ANON=1 xmrun -R "$XMR" /bin/readfile 2>/dev/null)
+    a=$(CHROOTNG_MMAP_FORCE_ANON=1 xmrun -R "$XMR" /bin/readfile 2>/dev/null)
+    b=$(CHROOTNG_MMAP_FORCE_ANON=1 xmrun -R "$XMR" /bin/readfile 2>/dev/null)
     check "the same guest run twice answers the same" "$a" "$b"
 
     # The other tier: with no -R the hook is reached through the filter instead,
     # which is the arrangement a device actually runs. It needs a live filter to
     # mean anything — with none, nothing intercepts mmap (or ld.so's opens), so
     # there is no leg here to run rather than one that fails.
-    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
-        CNG_MMAP_FORCE_ANON=1 xmrun "$XMR" /bin/readfile >/dev/null 2>&1
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
+        CHROOTNG_MMAP_FORCE_ANON=1 xmrun "$XMR" /bin/readfile >/dev/null 2>&1
         check "the copy is served on the seccomp tier, with no -R at all" 0 $?
     else
         skip "execmap without -R: nothing intercepts mmap here (filter inert)"
@@ -126,8 +126,8 @@ check_contains "...and so does a fixed move without it" \
     "bpftest mremap a fixed move runs native: ALLOW -> OK" "$out"
 DUM=$(mktemp -d)
 dum_rows() { # tier-desc, extra flags
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 60 $2 $GUEST_BINDS "$DUM/rootfs" /bin/dontunmap 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 $2 $CHROOTNG_GUEST_BINDS "$DUM/rootfs" /bin/dontunmap 2>/dev/null)
     case "$out" in
     *"anon r=0 "*)
         check_contains "DONTUNMAP ($1): anonymous memory moves and leaves zero-fill" \
@@ -147,7 +147,7 @@ if ! guest_xlate_ready "DONTUNMAP legs"; then
 elif guest_cc_report "$DUM/dontunmap" tests/chroot-ng/guests/dontunmap.c; then
     mkdir -p "$DUM/rootfs/bin"; cp "$DUM/dontunmap" "$DUM/rootfs/bin/"
     dum_rows "-R" -R
-    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
         dum_rows "seccomp" ""
         dum_rows "-F" -F
     fi

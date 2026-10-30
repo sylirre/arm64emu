@@ -222,10 +222,10 @@ kernel 3.18 (Galaxy S7).
     backing instead of `ELOOP` (real guest symlinks still `ELOOP`). `-l` is
     active from startup (the on-disk state survives sessions) and installs the
     monitor by itself; `fstat` + `getdents64` are trapped only under `-l`
-    (`l2s_syscalls[]` in seccomp.c). `CNG_L2S_FORCE=1` routes every `linkat`
+    (`l2s_syscalls[]` in seccomp.c). `CHROOTNG_L2S_FORCE=1` routes every `linkat`
     through the emulation (test aid mirroring arm64chroot's `A64_L2S_FORCE`).
   - Acceptance: `tests/m10_l2s_shell.sh` runs 13 shell scenarios in an Alpine
-    rootfs under `chroot-ng -R -l` + `CNG_L2S_FORCE=1` and compares stdout +
+    rootfs under `chroot-ng -R -l` + `CHROOTNG_L2S_FORCE=1` and compares stdout +
     exit status **byte-for-byte** against stock arm64chroot creating REAL
     hardlinks from the same scripts: ln basics (nlink/inode equality),
     cross-dir ln, `ls -a` hiding, readlink refusal, write-through, cross-dir
@@ -379,7 +379,7 @@ kernel 3.18 (Galaxy S7).
   `/proc` mounted, where a real chroot would report ENOENT. (`readlink`ing one
   used to report the host path; M11 maps it back to the guest view.)
 
-- [x] **CNG_DEBUG must not change behaviour (wild read in the error log)**
+- [x] **CHROOTNG_DEBUG must not change behaviour (wild read in the error log)**
   `dbg_path` picked the path to log by testing whether `a0`/`a1` "looks like a
   string" — `> 0x1000`, then dereference. The args of a *failing* syscall are
   not all pointers: `ioctl`'s request (`TCGETS` = 0x5401), `truncate`'s length,
@@ -387,19 +387,19 @@ kernel 3.18 (Galaxy S7).
   the SIGSYS handler, where every signal but SIGSYS is masked, the resulting
   SIGSEGV is unblockable-fatal: the guest died. Reproduced 5/5 with a real
   `apk del` under `-R` (which dispatches *every* syscall, so `ioctl` reaches it)
-  and 0/5 with `CNG_DEBUG` off — i.e. only debug runs were affected, which are
+  and 0/5 with `CHROOTNG_DEBUG` off — i.e. only debug runs were affected, which are
   exactly the runs used to chase device bugs. The candidate is now validated
   through the kernel (`faccessat` copies the path in from user space first, so
   EFAULT/ENAMETOOLONG mean "not a readable string"), skipped if Android blocks
   `faccessat`. `-t dtest dbgpath` drives a failing `truncate` with a
   pointer-sized length under debug and asserts the dispatch survives (SIGSEGV
   before the fix).
-  - Every silent `-ENOENT` in `execve_core` now traces under `CNG_DEBUG`
+  - Every silent `-ENOENT` in `execve_core` now traces under `CHROOTNG_DEBUG`
     (l2s-hidden / unresolved / open errno / bad shebang / interp unresolved),
     plus the resolved host path on success — an exec failure on a device says
     which stage produced it. A failed open now returns its **real** errno
     (EACCES, ELOOP, ...) instead of a blanket ENOENT, as the kernel does.
-  - `--version` and a `CNG_DEBUG` startup banner stamp the build time: this tree
+  - `--version` and a `CHROOTNG_DEBUG` startup banner stamp the build time: this tree
     reaches devices by hand-copy, so traces must identify their build. 147/147.
 
 - [x] **exec a file the guest may execute but not read (apk scripts, part 2)**
@@ -925,7 +925,7 @@ kernel 3.18 (Galaxy S7).
   - Tested **differentially**: the same guest (`tests/guests/netif.c`, exercising
     `getifaddrs` plus a raw iproute2-style `RTM_GETLINK` dump) runs once straight
     under qemu against the real kernel and once under chroot-ng with
-    `CNG_NETLINK_FORCE_BLOCK=1`, and the two must agree byte for byte. That is the
+    `CHROOTNG_NETLINK_FORCE_BLOCK=1`, and the two must agree byte for byte. That is the
     only way to check this on a devbox, where the emulated path never engages on
     its own. The suite also asserts the reverse — that with rtnetlink working the
     emulation stays entirely out of the way (no emulated fd is created).
@@ -1023,7 +1023,7 @@ kernel 3.18 (Galaxy S7).
     glibc's: it asserts the terminator's length, that the source address is
     `nl_pid == 0`, that `nlmsg_pid` equals the port id from `getsockname`, that
     the sequence number matches, and that nothing was silently skipped — the
-    checks whose absence let this ship. `CNG_NETLINK_NO_RELAY=1` exercises the
+    checks whose absence let this ship. `CHROOTNG_NETLINK_NO_RELAY=1` exercises the
     relay-less degradation path on a working host, asserting an empty dump is
     still well-formed rather than a terminator a client rejects.
   - The M15/M16 guest invocations are wrapped in `timeout` now: a dump that
@@ -1115,8 +1115,8 @@ kernel 3.18 (Galaxy S7).
     then poll()s with no trapped call in between would sleep (no known client
     does this — busybox recv's, everything else sendmsg's); a guest that never
     reads ~200 KB of replies has the tail dropped rather than deadlocking the
-    monitor (logged under CNG_DEBUG).
-  - **Tests:** `CNG_NETLINK_DENY_GETLINK` simulates the Android split on a
+    monitor (logged under CHROOTNG_DEBUG).
+  - **Tests:** `CHROOTNG_NETLINK_DENY_GETLINK` simulates the Android split on a
     working host (implies FORCE_BLOCK); nldone gained a `named>0` field
     (IFLA_IFNAME is what `ip addr` prints names from); the no-relay leg now
     expects the loopback-only dump (oracle parity, was: empty); and an
@@ -1472,9 +1472,9 @@ kernel 3.18 (Galaxy S7).
     describe the process doing the asking. Only *another* process's identity
     still requires the registry.
   - **Tests:** new `-t selfproc` and 7 legs in `m11_proc.sh`, run twice — once
-    normally and once with a new `CNG_PROCREG_NONE=1`, which makes the registry
+    normally and once with a new `CHROOTNG_PROCREG_NONE=1`, which makes the registry
     unavailable so the degraded tier is reachable at all on a working host (the
-    same testing convention as `CNG_SHM_FORCE_FILE`). Suite: 464 passed, 0
+    same testing convention as `CHROOTNG_SHM_FORCE_FILE`). Suite: 464 passed, 0
     failed.
 
 - [x] **M16b — the `SIOCGIF*` ioctls answer from the same enumeration as the dumps**
@@ -1551,8 +1551,8 @@ kernel 3.18 (Galaxy S7).
     the same run are untouched); and where the host grants the socket the guest
     sees exactly what an unemulated run saw. The host split is M16's — a devbox
     asserts passthrough, a device asserts the unforced rescue.
-    `CNG_NETLINK_DENY_AUDIT=1` synthesizes the refusal (it does **not** imply
-    `CNG_NETLINK_FORCE_BLOCK`; the two subjects are unrelated). Suite: 521
+    `CHROOTNG_NETLINK_DENY_AUDIT=1` synthesizes the refusal (it does **not** imply
+    `CHROOTNG_NETLINK_FORCE_BLOCK`; the two subjects are unrelated). Suite: 521
     passed, 0 failed, 1 skipped.
   - Not reachable end-to-end on a cross host: `useradd` is dynamically linked
     and its `socket()` lives in `libaudit.so.1`, which the guest's `ld.so` maps
@@ -1908,14 +1908,14 @@ kernel 3.18 (Galaxy S7).
     the kernel puts one; a pool nothing could reach is handed straight back.
   - Validated by `tests/m23_execmap.sh`: the BPF band (four shapes of `mmap`,
     through the interpreter), and a deliberately **dynamic** guest run with
-    `CNG_MMAP_FORCE_ANON=1` — it starts with every library served from a copy,
+    `CHROOTNG_MMAP_FORCE_ANON=1` — it starts with every library served from a copy,
     and its own libc `openat` lands in the rootfs. That last one is the case
     `guest_xlate_ready` used to skip as unreachable ("seccomp inert here and the
     guest links dynamically, so neither tier reaches libc's svc sites"). The
     control is the same run unforced, which on a cross host is not translated.
-  - `CNG_MMAP_FORCE_ANON=1` takes the anonymous route without asking the kernel
+  - `CHROOTNG_MMAP_FORCE_ANON=1` takes the anonymous route without asking the kernel
     first, since no dev host has a true noexec mount to offer. Same testing
-    convention as `CNG_SHM_FORCE_FILE` / `CNG_PROCREG_NONE`.
+    convention as `CHROOTNG_SHM_FORCE_FILE` / `CHROOTNG_PROCREG_NONE`.
   - Filter is 158 of 256 instructions.
 
 - [x] **M24 — `openat2`'s `open_how.resolve` describes OUR resolution**
@@ -2004,7 +2004,7 @@ kernel 3.18 (Galaxy S7).
     against a control that shows the tier does engage) and a `shmtest` leg that
     weighs every backing file in the shared directory against the shape it must
     now have — asserted in both directions, since the memfd tier must leave no
-    file at all. `CNG_PROCREG_FORCE_FILE=1` reaches the registry's file tier,
+    file at all. `CHROOTNG_PROCREG_FORCE_FILE=1` reaches the registry's file tier,
     which is otherwise only used on a host without `memfd_create`.
   - Not covered by the suite: the peer-credential *refusal*, which needs a
     second uid to produce. What the suite does hold is the other direction —
@@ -2226,12 +2226,12 @@ kernel 3.18 (Galaxy S7).
   yields nothing.
   Measured end to end against the previous build, on an Alpine guest whose
   libraries all arrive through the mmap hook's anonymous copy
-  (`CNG_MMAP_FORCE_ANON=1`, `/usr/bin/node`): before, `libstdc++.so.6.0.32` and
+  (`CHROOTNG_MMAP_FORCE_ANON=1`, `/usr/bin/node`): before, `libstdc++.so.6.0.32` and
   `libicuuc.so.74.2` each had exactly one "site" rewritten, and in both it was
   the `.gcc_except_table` word; after, all fourteen libraries report none, and
   the real objects keep every site they had — a static-PIE glibc guest still
   rewrites its 101, and `ld-musl-aarch64.so.1` its 477 (478 candidates, less
-  the sigreturn restorer the M8 guard already skipped). `CNG_DEBUG=1` now says
+  the sigreturn restorer the M8 guard already skipped). `CHROOTNG_DEBUG=1` now says
   both numbers per object: `rewrote N svc site(s), ranges=M`, where `ranges=0`
   is the headerless fallback. 813/813 tests.
 
@@ -2388,7 +2388,7 @@ kernel 3.18 (Galaxy S7).
   mount table's claim and the node agree, and a compiled glibc guest does a full
   `shm_open` → `ftruncate` → `mmap` → reopen-by-name → read-back → `shm_unlink`
   round trip against the stand-in (M12, `tests/guests/shm_posix.c`). All of it
-  runs on a host that has a real `/dev/shm` too, through `CNG_DEVSHM_FORCE_TMP`,
+  runs on a host that has a real `/dev/shm` too, through `CHROOTNG_DEVSHM_FORCE_TMP`,
   and the last leg checks the objects landed under `$TMPDIR` and *not* in the
   host's own `/dev/shm`. The compiled leg skips on Termux, bionic having no
   `shm_open` at all — Android uses ashmem — which is the same reason the guests
@@ -2911,7 +2911,7 @@ kernel 3.18 (Galaxy S7).
     always linked from; an `ENOENT` there is the flag's or the destination's
     and never a hardlink denial to paper over, so the "ENOENT is only
     believable when the source is absent" reading stays on the path route.
-    `CNG_L2S_FORCE` still routes every `linkat` through the emulation.
+    `CHROOTNG_L2S_FORCE` still routes every `linkat` through the emulation.
   - `tests/guests/emptypath.c` gained `link_badflag` and `link_named_flag`;
     `m5b` runs it once more under `-u 0:0` for root's answers, and `m17`'s
     flagged-NULL needle is the oracle's own line.
@@ -3134,7 +3134,7 @@ kernel 3.18 (Galaxy S7).
   alone" (fails on the previous build: the original's names dangle).
 
 - [x] **M61 — the /dev/shm stand-in adopted whatever sat on its name**
-  Where the host has no `/dev/shm` (Android), or `CNG_DEVSHM_FORCE_TMP=1` is
+  Where the host has no `/dev/shm` (Android), or `CHROOTNG_DEVSHM_FORCE_TMP=1` is
   set, the guest's `/dev/shm` is a per-uid directory of ours,
   `<candidate>/chroot-ng-shm.v1.<uid>`, with `/tmp` the last candidate — a
   name anyone can predict in a directory every user shares. `mkdirat`'s
@@ -3164,9 +3164,9 @@ kernel 3.18 (Galaxy S7).
     launch that ends up with no stand-in now warns on the way in, naming
     each candidate and why it was passed over (`shm_parent_safe` became
     `tmp_parent_unsafe`, which returns the reason), and says how to fix
-    `$TMPDIR`. `CNG_DEVSHM_FORCE_TMP` now leaves the guest no `/dev/shm`
+    `$TMPDIR`. `CHROOTNG_DEVSHM_FORCE_TMP` now leaves the guest no `/dev/shm`
     when the stand-in fails, as a device does, instead of falling back to
-    the host's, and `CNG_TMP_ENV_ONLY=1` drops the two fixed candidates so
+    the host's, and `CHROOTNG_TMP_ENV_ONLY=1` drops the two fixed candidates so
     a host whose `/tmp` would serve can take that path. m14 legs: a 0771
     `$TMPDIR` leaves no `/dev/shm` and warns with its reason, a 1777 one
     holds the stand-in and warns about nothing.
@@ -3480,7 +3480,7 @@ kernel 3.18 (Galaxy S7).
     descriptor and from the `O_PATH` one; the descriptor's stat used the
     memfd's, a different number for every open, once the host had refused
     the name. A process that is gone keeps the memfd's.
-  - `CNG_PROC_DENY_STAT=1` answers every such call as if the host had refused
+  - `CHROOTNG_PROC_DENY_STAT=1` answers every such call as if the host had refused
     it, so a host that allows them (the dev machine, CI) takes the same
     path. `tests/guests/procstat.c` in m11 puts every form to each of the four
     files and checks one shape and one identity across them, with and
@@ -3507,12 +3507,12 @@ kernel 3.18 (Galaxy S7).
     against a `/proc` dirfd (`sys/kernel/overflowuid` relative to it), and
     it did not know these two: an `openat`, `fstatat` or `faccessat` that
     way skipped synthesis whatever the absolute spelling did.
-  - `CNG_OVERFLOWID_SYNTH=1` forces the fallback where the host can read
+  - `CHROOTNG_OVERFLOWID_SYNTH=1` forces the fallback where the host can read
     the files (listed in `--help`). `-t proctest` forces it and checks the
     content and the memfd behind it; `tests/guests/procstat.c` now covers
     both names (0644, and a dirfd-relative open as well as stat) with and
     without the stat refusal forced; m11 reads them from a guest shell with
-    the fallback forced, and checks with `CNG_DEBUG=1` that a readable host
+    the fallback forced, and checks with `CHROOTNG_DEBUG=1` that a readable host
     file is not shadowed.
 
 - [x] **M76 — the JVM died at startup: an executable `mprotect` beside a stack**
@@ -3546,7 +3546,7 @@ kernel 3.18 (Galaxy S7).
     main-thread RWX probe failed too.
   - Not covered: `pkey_mprotect` (same hook, nothing issues it with
     `PROT_EXEC`), and the calls made where no scratch slot can be had
-    (`CNG_SCRATCH_NONE`, 256 live threads), which run on the guest's own stack
+    (`CHROOTNG_SCRATCH_NONE`, 256 live threads), which run on the guest's own stack
     as they always did.
   - Tests: `-t bpftest` has the mprotect cases (trap with `PROT_EXEC`, native
     without, the gate's own re-issue allowed); `-t stackswtest` checks the
@@ -3618,7 +3618,7 @@ kernel 3.18 (Galaxy S7).
   - The first refusal that the classic command proves to be about termios2
     (it worked on the same descriptor) is remembered, so the policy is not
     asked — and does not log a denial — on every call.
-  - `CNG_TERMIOS2_DENY=1` refuses the four before the host is asked, as the
+  - `CHROOTNG_TERMIOS2_DENY=1` refuses the four before the host is asked, as the
     policy does (listed in `--help`), so a host that serves them takes the
     same path.
   - Not ported: arm64chroot's first commit, which only added the four to its
@@ -3694,7 +3694,7 @@ kernel 3.18 (Galaxy S7).
     `getsid(2)` and `TIOCGPGRP` already report them: there is no pid
     namespace here.
   - The first refusal that the allowed commands prove to be about `TIOCGSID`
-    is remembered, as in M78, and `CNG_TIOCGSID_DENY=1` forces the tier on
+    is remembered, as in M78, and `CHROOTNG_TIOCGSID_DENY=1` forces the tier on
     any host (listed in `--help`).
   - Not covered: `TIOCGPGRP` on a pipe is still the host's `EACCES` where a
     kernel says `ENOTTY`.
@@ -3832,7 +3832,7 @@ kernel 3.18 (Galaxy S7).
     that differ, and an app's process has neither — is EPERM, since the one
     call that could make it is the one refused (said once on stderr, like any
     other refusal). No setter is translated into an allowed one.
-  - `CNG_SETID_DENY=1` takes the eight as refused on any host: marked after the
+  - `CHROOTNG_SETID_DENY=1` takes the eight as refused on any host: marked after the
     probe and trapped by our own filter, as Android's would deliver them.
   - Tests: `-t blocktest`'s `setid` rows (each through a trap and through `-R`,
     refused and as measured; the previous build answers -38 to all 64), and
@@ -3877,7 +3877,7 @@ kernel 3.18 (Galaxy S7).
     like any other (owner's choice). A guest can no longer signal a host
     launcher, as in Xorg's SIGUSR1 to xinit.
   - The family runs native under `--no-proc` and without a registry
-    (`CNG_PROCREG_NONE`). Without one, every other pid would look hidden and
+    (`CHROOTNG_PROCREG_NONE`). Without one, every other pid would look hidden and
     a shell could not signal its own jobs. `pidfd_send_signal` stays native,
     because `pidfd_open` only gives a pidfd for a process the view shows.
   - Tests: `-t bpftest`'s `hidden-pid signals` row. In M25,
@@ -4153,7 +4153,7 @@ kernel 3.18 (Galaxy S7).
     through a description of ours now holds that description's flock across
     the clock and the write — non-blocking, with a bounded wait, since a guest
     may flock its own description and a fork can leave the child holding ours.
-  - `CNG_PROCFS_REOPEN_DENY=1` takes the reopen as refused anywhere.
+  - `CHROOTNG_PROCFS_REOPEN_DENY=1` takes the reopen as refused anywhere.
   - Test: m11 runs proctest a second time with the knob and a fresh $TMPDIR:
     every check holds, the fd is read-only for real, its link names the view,
     and the directory is empty afterwards. On the device the read-only check,
@@ -4236,7 +4236,7 @@ kernel 3.18 (Galaxy S7).
     now, NLM_F_CAPPED and all.
   - Test: `tests/guests/nlack.c` — getlink and getroute with and without
     NLM_F_ACK, and a dump asking for one, every message counted; in m16
-    relayed and with CNG_NETLINK_DENY_GETLINK (synthesized), against the
+    relayed and with CHROOTNG_NETLINK_DENY_GETLINK (synthesized), against the
     kernel where rtnetlink works. The previous build: `acks=0` on both gets.
     `nlack unmodelled` sends bubblewrap's RTM_NEWADDR, under the emulation
     only (unprivileged, a kernel answers EPERM and Android refuses the send);
@@ -4273,13 +4273,13 @@ kernel 3.18 (Galaxy S7).
     answers it: `EXDEV` for an absolute name under `BENEATH` before the
     descriptor is looked at, then `EBADF` / `ENOTDIR`, and `EACCES` for a
     directory from outside the view, as every other route refuses it.
-  - `CNG_OPENAT2_DENY=1` takes `openat2` as refused on any host.
+  - `CHROOTNG_OPENAT2_DENY=1` takes `openat2` as refused on any host.
   - Test: `tests/guests/openat2.c` gained 21 cases — the validation, the
     scope's own errors, and tar's opens (the parent with a trailing slash, a
     create under it, and a planted absolute or climbing symlink, both
     `EXDEV`) — and turns a filter's SIGSYS into the "unsupported" a kernel
     without the call gives. In m24 it is diffed against the live kernel
-    under `CNG_OPENAT2_DENY` on both tiers where the host has `openat2`, and
+    under `CHROOTNG_OPENAT2_DENY` on both tiers where the host has `openat2`, and
     against the kernel's answers recorded on 6.8 where it does not. The
     previous build answered the first `openat2` there with `ENOSYS`, so the
     run printed `openat2=unsupported` and none of the 42 cases. `-t o2test`'s
@@ -4353,7 +4353,7 @@ kernel 3.18 (Galaxy S7).
     levels of directories with no x bit with a symlink in one, four
     processes creating in one directory at once, and the modes everything
     was left with. m28 holds it to real root's output, recorded natively
-    with sudo on 6.8, on both tiers and with `CNG_L2S_FORCE`, and checks
+    with sudo on 6.8, on both tiers and with `CHROOTNG_L2S_FORCE`, and checks
     the modes from the host's side as well; the previous build failed 75 of
     the legs. busybox tar extracting a tree with 0555 directories in it,
     then `rm -r` of the result, is the reported scenario end to end. GNU
@@ -4449,7 +4449,7 @@ kernel 3.18 (Galaxy S7).
     opener's environment, where the kernel's reads empty. On the
     memory-reading path a cmdline fd carried across an exec also reads
     the opener's, not the new program's.
-  - `CNG_MM_MAP_DENY=1` takes the call as refused, so the memory-reading
+  - `CHROOTNG_MM_MAP_DENY=1` takes the call as refused, so the memory-reading
     path can be run on a host that allows it.
   - Test: `tests/guests/proctitle.c` re-execs itself with a known argv and
     environment and checks its own files and a forked child's: as exec'd,
@@ -4458,7 +4458,7 @@ kernel 3.18 (Galaxy S7).
     `record: kernel|ours` reports whether `/proc/self/stat`'s `arg_start`
     names its argv[0]. m11 runs it under the host kernel first (native
     hosts only: qemu-user fakes these files), then under `-R` with and
-    without `CNG_MM_MAP_DENY`. On the cross host a child's legs are not
+    without `CHROOTNG_MM_MAP_DENY`. On the cross host a child's legs are not
     asserted. The kernel reference agrees on the Termux device (Android
     15, where chroot-ng reads memory) and on the VM (where the kernel's
     record moves). A kernel before 4.18 leaves out the NUL that ends an
@@ -4902,7 +4902,7 @@ kernel 3.18 (Galaxy S7).
 - qemu-user does NOT emulate guest seccomp filters faithfully → M5's mechanism
   needs simulated-SIGSYS unit tests + real-hardware validation. Loader (M3/M4)
   and path logic are fully qemu-testable. On an AArch64 host the harness detects
-  the live filter (`CNG_SECCOMP_LIVE`) and flips the legs that depend on it —
+  the live filter (`CHROOTNG_SECCOMP_LIVE`) and flips the legs that depend on it —
   M8's no-`-R` control, for instance, expects chroot-ng to refuse to enter the
   guest under qemu (no filter and no `-R` means nothing intercepts; see M42)
   and a seccomp-translated open on a real kernel.

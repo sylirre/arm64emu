@@ -37,7 +37,7 @@ make test                  # run the test harness
 Override the compiler/emulator if needed:
 
 ```sh
-make CC=aarch64-linux-gnu-gcc-12 QEMU=qemu-aarch64
+make CC=aarch64-linux-gnu-gcc-12 CHROOTNG_QEMU=qemu-aarch64
 ```
 
 The test harness runs on all three hosts and adapts to each: it picks the
@@ -143,7 +143,7 @@ MTU of its HTTP/3 connections. Dumps are relayed through an **unbound** host
 netlink socket, which works because the denial is on `bind(2)`, not on the query.
 Where even the socket is refused, dumps degrade to an empty result so
 `getifaddrs` succeeds with no interfaces rather than failing outright. Nothing
-engages where rtnetlink already works; `CNG_NETLINK_FORCE_BLOCK=1` forces the
+engages where rtnetlink already works; `CHROOTNG_NETLINK_FORCE_BLOCK=1` forces the
 emulated path for testing.
 
 **The audit interface** is the other netlink protocol Android takes away, and it
@@ -157,7 +157,7 @@ is not one of the three, which is why `useradd`, `usermod`, `passwd`, `chage`,
 aborting"* inside a rootfs on a device. So a refused audit socket is reported as
 `EPROTONOSUPPORT` — what the kernel itself returns for a protocol nobody
 registered — and those tools proceed. A host that grants the socket is left
-alone; `CNG_NETLINK_DENY_AUDIT=1` forces the refusal for testing.
+alone; `CHROOTNG_NETLINK_DENY_AUDIT=1` forces the refusal for testing.
 
 **System V IPC** works too — shared memory, semaphores and message queues.
 Android denies the whole family outright, so chroot-ng serves it itself from a

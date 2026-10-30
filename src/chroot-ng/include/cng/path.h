@@ -74,7 +74,7 @@ void cng_dev_shm_init(void);
  * nobody else can rename it out of. Its host path, as the kernel spells it,
  * goes into `out`. 0, or -1 where no candidate will do, and then `why` (when
  * not 0) holds why each one was passed over, "; "-separated, for a warning.
- * CNG_TMP_ENV_ONLY=1 leaves out the two fixed candidates. The /dev/shm
+ * CHROOTNG_TMP_ENV_ONLY=1 leaves out the two fixed candidates. The /dev/shm
  * stand-in lives in one, and so do the read-only views of synthesized /proc
  * files on a host that will not reopen a memfd (procfs.c). */
 int cng_private_tmp_dir(const char *stem, char *out, size_t sz, char *why,

@@ -91,7 +91,7 @@ PT_ORACLE="$PT_DIR/pt_oracle"
 # The oracle: on a host that runs AArch64 binaries directly, the guest build
 # itself (no chroot-ng in the way); otherwise a host-native build.
 pt_oracle_build() {
-    if [ -z "$QEMU" ]; then
+    if [ -z "$CHROOTNG_QEMU" ]; then
         PT_ORACLE=$PT_GUEST
         return 0
     fi
@@ -143,8 +143,8 @@ pt_case() {
     fi
 }
 
-if [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "${GUESTLD:-}" != "-static-pie" ] &&
-    [ "${GUESTLD:-}" != "-static" ]; then
+if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "${CHROOTNG_GUESTLD:-}" != "-static-pie" ] &&
+    [ "${CHROOTNG_GUESTLD:-}" != "-static" ]; then
     skip "ptrace: the guest links dynamically and no filter is live, so the tracee's syscalls are not intercepted here"
 elif ! guest_cc_report "$PT_GUEST" tests/chroot-ng/guests/pt_probe.c; then
     :
@@ -275,7 +275,7 @@ else
     # answers ECHILD. qemu installs its own handler for every caught signal with
     # sa_flags = SA_SIGINFO and nothing else, so the flag never reaches the host
     # kernel and neither side of the comparison would mean anything.
-    if [ -z "$QEMU" ]; then
+    if [ -z "$CHROOTNG_QEMU" ]; then
         pt_case sigchldw
     else
         skip "ptrace sigchld SA_NOCLDWAIT: qemu-user drops the flag before the kernel sees it"
@@ -316,7 +316,7 @@ else
     # are the kernel's. The legs above run under -R, so without these that tier
     # had only the synthesized traps of -t ptracetest. Without a live filter
     # nothing traps and the legs would be native.
-    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
         PT_TIER="-b $PT_DIR:$PT_DIR"
         PT_TIER_NAME=" (SIGSYS tier)"
         for _sc in basic sysstop cancel poke signal deliver fork exec \
@@ -339,8 +339,8 @@ else
     # bound in so it can be loaded, and the trace must still read the guest's
     # own string rather than the translated host path.
     mkdir -p "$PT_DIR/rootfs"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 90 -R $GUEST_BINDS -b "$PT_DIR:$PT_DIR" "$PT_DIR/rootfs" \
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 90 -R $CHROOTNG_GUEST_BINDS -b "$PT_DIR:$PT_DIR" "$PT_DIR/rootfs" \
         "$PT_GUEST" patharg 2>/dev/null)
     check_contains "no host path reaches the trace under a rootfs" \
         "openat path /cng-probe-path" "$out"
@@ -357,7 +357,7 @@ else
     # ever consulted it. The guest's ptrace went to the host kernel and worked.
     # Only a live seccomp tier can show that: without one and without -R nothing
     # is intercepted at all, which is what the following leg asks instead.
-    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
         out=$(run_t 60 --no-ptrace / "$PT_GUEST" basic 2>&1)
         check_contains "--no-ptrace refuses over the SIGSYS tier too" \
             "bad first stop" "$out"
@@ -391,7 +391,7 @@ else
     out=$(run_t 60 --no-proc / "$PT_DIR/nnprivs" 2>/dev/null)
     check_contains "...nor does an option that only turns an emulation off" \
         "nnp=0" "$out"
-    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
         out=$(run_t 60 --no-ptrace / "$PT_DIR/nnprivs" 2>/dev/null)
         check_contains "--no-ptrace installs one: it has a ptrace to refuse" \
             "nnp=1" "$out"

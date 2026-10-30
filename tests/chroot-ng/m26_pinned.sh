@@ -10,8 +10,8 @@
 # followed (src/chroot-ng/monitor/pin.c).
 echo "== M26: pinned resolution =="
 
-# shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-m26run() { run_t 120 $GUEST_BINDS "$@"; }
+# shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+m26run() { run_t 120 $CHROOTNG_GUEST_BINDS "$@"; }
 M26D=$(mktemp -d)
 
 # The pin asked directly (-t pintest), on a tree under a rootfs of its own:

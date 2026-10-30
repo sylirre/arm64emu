@@ -15,7 +15,7 @@
  *
  * Eight threads each open, bind, name and close sockets in a loop; every
  * bind must succeed and every name must be a netlink one ("bad" counts the
- * ones that were not). Emulated by force (CNG_NETLINK_FORCE_BLOCK). */
+ * ones that were not). Emulated by force (CHROOTNG_NETLINK_FORCE_BLOCK). */
 #include <linux/netlink.h>
 #include <pthread.h>
 #include <stdio.h>

@@ -206,9 +206,9 @@ while [ $_i -lt 20 ]; do   # 20 * 201 = 4020 bytes: fits alone, not once prefixe
 done
 check_contains "a path the rootfs prefix pushes past PATH_MAX is refused" \
     "<overflow>" "$(run_t 20 -t xlate -r "$XL" "$_g" 2>&1)"
-run_t 20 -t dtest -r "$XL" open "$_g" >"$CNG_TMP/toolong.out" 2>&1
+run_t 20 -t dtest -r "$XL" open "$_g" >"$CHROOTNG_TMP/toolong.out" 2>&1
 check_contains "...and the syscall answers ENAMETOOLONG, not the wrong file" \
-    "open: errno 36" "$(cat "$CNG_TMP/toolong.out")"
+    "open: errno 36" "$(cat "$CHROOTNG_TMP/toolong.out")"
 rm -rf "$(dirname "$XL")"
 
 # The same rule one join earlier: a relative name appended to a cwd that already

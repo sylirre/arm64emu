@@ -11,14 +11,14 @@ check_contains "landed in redirected context" \
     "$(run -t jmptest 2>&1)"
 
 # shebang script exec: #!interp [arg] -> [interp, arg, script, orig-args...]
-# $GUEST_BINDS is empty for a self-contained (static) guest; where the toolchain
+# $CHROOTNG_GUEST_BINDS is empty for a self-contained (static) guest; where the toolchain
 # only links dynamically it exposes the ELF interpreter's own directories, which
 # a rootfs holding nothing but the test binary cannot otherwise provide.
 ER=$(mktemp -d)
 if guest_cc_report "$ER/hello" tests/chroot-ng/guests/hello.c; then
     printf '#!/hello sheb\n' > "$ER/script"
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    exectest() { run -t exectest $GUEST_BINDS -r "$ER" "$@"; }
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    exectest() { run -t exectest $CHROOTNG_GUEST_BINDS -r "$ER" "$@"; }
     out=$(exectest /script AA 2>&1); rc=$?
     check "shebang exec exit 42" 42 $rc
     check_contains "shebang interp is argv0"  "argv0=/hello" "$out"
@@ -219,7 +219,7 @@ if guest_cc_report "$ER/hello" tests/chroot-ng/guests/hello.c; then
     check_contains "the heap is wound back and every recorded timer deleted" \
         "execreset: brk_back=1 timers_created=" "$out"
     check_contains "...every one of them" "timers_gone=1" "$out"
-    if [ "$CNG_NATIVE" = 1 ]; then
+    if [ "$CHROOTNG_NATIVE" = 1 ]; then
         check_contains "...a hundred of them, past the old record's 64" \
             "timers_created=100" "$out"
         # The raw timer is found by the kernel's own list and nothing else, so
@@ -276,7 +276,7 @@ IF_NOINTERP=/cng-no-such-interp.so
 # The oracle: on a host that runs AArch64 directly the guest pair is its own
 # reference; otherwise the same two sources built host-native and linked alike.
 if_oracle_build() {
-    if [ -z "$QEMU" ]; then
+    if [ -z "$CHROOTNG_QEMU" ]; then
         IF_ORACLE=$IFD/interpfail
         IF_TARGET=$IFD/badinterp
         return 0
@@ -295,9 +295,9 @@ if_oracle_build() {
 }
 if_host_run() { if [ -n "$TIMEOUT" ]; then "$TIMEOUT" 60 env -u LD_PRELOAD "$@"; else kref "$@"; fi; }
 
-if [ -z "$GUESTCC" ]; then
+if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "failed-exec survival: no AArch64 guest toolchain"
-elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "$CHROOTNG_EXECMEM" != 1 ]; then
     skip "failed-exec survival: no filter is live and -R cannot rewrite without execmem"
 elif ! guest_cc "$IFD/interpfail" tests/chroot-ng/guests/interpfail.c -static -no-pie ||
     ! guest_cc "$IFD/badinterp" tests/chroot-ng/guests/hello.c -no-pie \
@@ -386,14 +386,14 @@ ee_args() { # the paths to hand the runner, rooted at $1
 ee_hostcc=""
 for _c in ${HOSTCC:-} cc gcc clang; do have "$_c" && { ee_hostcc=$_c; break; }; done
 
-if [ -z "$GUESTCC" ]; then
+if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "failed-exec errno: no AArch64 guest toolchain"
-elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "$CHROOTNG_EXECMEM" != 1 ]; then
     skip "failed-exec errno: no filter is live and -R cannot rewrite without execmem"
 elif [ -z "$ee_hostcc" ]; then
     skip "failed-exec errno: no host compiler for the differential oracle"
-# shellcheck disable=SC2086  # $GUESTLD is a flag or deliberately empty
-elif ! ee_build "$GUESTCC" "$EED" "" ; then
+# shellcheck disable=SC2086  # $CHROOTNG_GUESTLD is a flag or deliberately empty
+elif ! ee_build "$CHROOTNG_GUESTCC" "$EED" "" ; then
     skip "failed-exec errno: the guest toolchain links no dynamic victim here"
 elif ! ee_build "$ee_hostcc" "$EED/host" "$EED"; then
     skip "failed-exec errno: the host toolchain links no dynamic victim here"
@@ -435,7 +435,7 @@ if ! guest_xlate_ready "argv string bound"; then
     :
 elif ! guest_cc_report "$AMD/argmax" tests/chroot-ng/guests/argmax.c; then
     :
-elif [ "$CNG_SECCOMP_LIVE" != 1 ] && [ "$CNG_EXECMEM" != 1 ]; then
+elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "$CHROOTNG_EXECMEM" != 1 ]; then
     skip "argv string bound: no filter is live and -R cannot rewrite without execmem"
 else
     am_k=$(emu_t 90 "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
@@ -477,12 +477,12 @@ elif ! guest_cc_report "$ECD/execchain" tests/chroot-ng/guests/execchain.c; then
 elif elf_has_interp "$ECD/execchain"; then
     skip "exec-chain address space: the dynamic form of this leg is below, with the binds an ld.so needs"
 else
-    # CNG_EXEC_RECLAIM_FORCE: qemu-user runs a thread of its own (call_rcu)
+    # CHROOTNG_EXEC_RECLAIM_FORCE: qemu-user runs a thread of its own (call_rcu)
     # beside the guest's, so the process never reads as single-threaded from
     # inside it and the reclaim would sit out. On a host that runs AArch64
     # directly the flag changes nothing — there really is one thread.
     ec_k=$(emu_t 90 "$ECD/execchain" 8 2>/dev/null)
-    ec_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECD" /execchain 8 2>/dev/null)
+    ec_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECD" /execchain 8 2>/dev/null)
     case "$ec_k$ec_g" in
     *growth_kb=*growth_kb=*)
         ec_kn=${ec_k##*growth_kb=}
@@ -528,8 +528,8 @@ else
     mkdir -p "$TED/bin"; cp "$TED/threadexec" "$TED/bin/threadexec"
     for mode in leader nonleader; do
         te_k=$(cd "$TED/bin" && emu_t 60 ./threadexec $mode 2>/dev/null)
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-        te_g=$(run_t 90 -R $GUEST_BINDS "$TED" /bin/threadexec $mode 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        te_g=$(run_t 90 -R $CHROOTNG_GUEST_BINDS "$TED" /bin/threadexec $mode 2>/dev/null)
         if [ -n "$te_k" ] && [ "$te_k" = "$te_g" ]; then
             pass=$((pass + 1))
             printf '  ok   execve by the %s thread matches the kernel (%s)\n' "$mode" "$te_g"
@@ -546,8 +546,8 @@ else
     if guest_cc "$TED/maskwait" tests/chroot-ng/guests/maskwait.c -pthread; then
         cp "$TED/maskwait" "$TED/bin/maskwait"
         mw_k=$(emu_t 60 "$TED/maskwait" 2>/dev/null)
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-        mw_g=$(run_t 90 -R $GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        mw_g=$(run_t 90 -R $CHROOTNG_GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
         if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_g" ]; then
             pass=$((pass + 1))
             echo "  ok   the mask-taking waits answer as the kernel's, SIGSYS taken out"
@@ -566,11 +566,11 @@ else
         # the stub, each round a record lower on the guest's stack, until it
         # was gone (a SEGV on Android, a hang under a VM's TCG). The run needs
         # a live filter and no -R, or it never reaches the handler.
-        if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+        if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
             skip "masked waits on the SIGSYS tier: the seccomp filter is inert on this host"
         else
-            # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-            mw_s=$(run_t 90 $GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
+            # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+            mw_s=$(run_t 90 $CHROOTNG_GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
             if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_s" ]; then
                 pass=$((pass + 1))
                 echo "  ok   the mask-taking waits answer as the kernel's on the SIGSYS tier too"
@@ -599,7 +599,7 @@ else
         cp "$TED/blkcall" "$TED/bin/blkcall"
         mkdir -p "$TED/tmp"
         for bc_tier in -R ""; do
-            if [ -z "$bc_tier" ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            if [ -z "$bc_tier" ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
                 skip "blocking calls on the SIGSYS tier: the seccomp filter is inert on this host"
                 continue
             fi
@@ -607,7 +607,7 @@ else
             [ -n "$bc_tier" ] && bc_sp=-
             bc_k=$(emu_t 90 "$TED/blkcall" "$TED/tmp" "$bc_sp" 2>/dev/null)
             # shellcheck disable=SC2086  # deliberately split arg lists
-            bc_g=$(run_t 120 $bc_tier $GUEST_BINDS "$TED" /bin/blkcall /tmp \
+            bc_g=$(run_t 120 $bc_tier $CHROOTNG_GUEST_BINDS "$TED" /bin/blkcall /tmp \
                 "$bc_sp" 2>/dev/null)
             bc_t=${bc_tier:-the SIGSYS tier}
             if [ -n "$bc_k" ] && [ "$bc_k" = "$bc_g" ]; then
@@ -647,7 +647,7 @@ else
         # shellcheck disable=SC2086  # the shape is two words
         se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec $shape 2>/dev/null | grep '^report:')
         # shellcheck disable=SC2086
-        se_g=$(run_t 240 -R $GUEST_BINDS "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
+        se_g=$(run_t 240 -R $CHROOTNG_GUEST_BINDS "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
         if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
             pass=$((pass + 1))
             printf '  ok   execve reaches every sibling (%s) as the kernel does (%s)\n' "$shape" "$se_g"
@@ -667,14 +667,14 @@ else
     # a native program (dtstall.c), so a host that runs the guest's binaries
     # through qemu-user, whose host tracer would see the emulator's signals,
     # has no such run.
-    if [ -n "$QEMU" ]; then
+    if [ -n "$CHROOTNG_QEMU" ]; then
         skip "de_thread with each request held at delivery: a host tracer under qemu-user sees the emulator's signals, not the guest's"
     elif ! guest_cc "$SED/dtstall" tests/chroot-ng/guests/dtstall.c; then
         skip "de_thread with each request held at delivery: could not build tests/chroot-ng/guests/dtstall.c"
     else
         se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec chain 16 2>/dev/null | grep '^report:')
-        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-        se_g=$(emu_t 240 "$SED/dtstall" 2 "$BIN" -R $GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        se_g=$(emu_t 240 "$SED/dtstall" 2 "$CHROOTNG_BIN" -R $CHROOTNG_GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
         se_rc=$?
         case "$se_g" in
         SKIP:*)
@@ -713,7 +713,7 @@ elif elf_has_interp "$ECM/manymaps"; then
     skip "many-mapping exec chain: needs a static guest (the dynamic form's binds are covered below)"
 else
     em_k=$(emu_t 90 "$ECM/manymaps" 1500 6 2>/dev/null)
-    em_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECM" /manymaps 1500 6 2>/dev/null)
+    em_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECM" /manymaps 1500 6 2>/dev/null)
     case "$em_k$em_g" in
     *growth_kb=*growth_kb=*)
         em_kn=${em_k##*growth_kb=}
@@ -768,15 +768,15 @@ check_contains "growing table: every record found, half dropped" \
 # 0.2 s. Completing at all is most of this assertion; the bound is the rest.
 ECDD=$(mktemp -d)
 cng_dyn_binds
-if [ -z "$GUESTCC" ]; then
+if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "dynamic exec-chain address space: no AArch64 guest toolchain"
-elif [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
     # A dynamic guest's execve is libc's, in a library our loader never mapped,
     # so -R cannot have rewritten it and an inert filter leaves nothing to trap:
     # the call goes to the host kernel with the guest's own path and fails.
     # Same prerequisite M23's dynamic legs have.
     skip "dynamic exec-chain address space: filter inert here, so nothing reaches a dynamic guest's own execve"
-elif ! $GUESTCC -O2 -o "$ECDD/execchain" tests/chroot-ng/guests/execchain.c \
+elif ! $CHROOTNG_GUESTCC -O2 -o "$ECDD/execchain" tests/chroot-ng/guests/execchain.c \
     2>"$GUEST_CC_LOG"; then
     fail=$((fail + 1)); printf '  FAIL could not build a dynamic execchain\n'
     sed 's/^/    /' "$GUEST_CC_LOG"
@@ -784,7 +784,7 @@ elif ! elf_has_interp "$ECDD/execchain"; then
     skip "dynamic exec-chain address space: this toolchain links even -O2 guests statically"
 else
     # shellcheck disable=SC2086  # both are deliberately split arg lists
-    ecd_g=$(CNG_EXEC_RECLAIM_FORCE=1 run_t 200 $GUEST_DYN_L $GUEST_DYN_BINDS \
+    ecd_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 200 $GUEST_DYN_L $GUEST_DYN_BINDS \
         -R "$ECDD" /execchain 64 2>/dev/null)
     case "$ecd_g" in
     *growth_kb=*)

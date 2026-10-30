@@ -18,8 +18,8 @@ echo "== M15: AF_UNIX containment =="
 # Runs are wrapped in a timeout for the same reason as m16: a socket test that
 # blocks should fail one check, not wedge the suite. The held-socket runs below
 # sleep on purpose, so allow for that.
-# shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-m15run() { run_t 60 $GUEST_BINDS "$@"; }
+# shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+m15run() { run_t 60 $CHROOTNG_GUEST_BINDS "$@"; }
 M15D=$(mktemp -d)
 
 if ! guest_xlate_ready "AF_UNIX containment scenarios"; then
@@ -319,7 +319,7 @@ else
     if ! guest_cc "$M15D/uxtimeo" tests/chroot-ng/guests/uxtimeo.c; then
         ut_ready=0
         skip "m15 recvmmsg timeout: the guest program does not build here"
-    elif [ -n "$QEMU" ]; then
+    elif [ -n "$CHROOTNG_QEMU" ]; then
         ut_ready=0
         for _c in ${HOSTCC:-} cc gcc clang; do
             have "$_c" || continue

@@ -228,7 +228,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         sys_close((int)fd);
         return 0;
     }
-    /* CNG_DEBUG error logging must never dereference a syscall arg that is a
+    /* CHROOTNG_DEBUG error logging must never dereference a syscall arg that is a
      * scalar rather than a path: truncate's length here is large enough to look
      * like a pointer, and reading it killed the guest (SIGSEGV in the handler,
      * with SIGSEGV masked). The dispatch must survive and report EISDIR. */
@@ -2428,7 +2428,7 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
     static struct cng_fs fs;
     cng_fs_init(&fs, "/");
     cng_g_fs = &fs;
-    /* CNG_UACCESS_MEMFD is read through cng_broker_env, which walks this — so
+    /* CHROOTNG_UACCESS_MEMFD is read through cng_broker_env, which walks this — so
      * without it the knob that forces the descriptor-backed probe is silently
      * inert, and the forced run measures whatever the host would have picked
      * anyway. That went unnoticed because the host it runs on most is qemu,
@@ -2511,7 +2511,7 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
-    /* And the same case with the trace on. CNG_DEBUG must never change what the
+    /* And the same case with the trace on. CHROOTNG_DEBUG must never change what the
      * guest gets, but execve's entry line printed the guest's own path pointer
      * with %s — so the wild path right above, which answers -EFAULT with the
      * log off, walked unmapped memory inside the handler the moment the log was
@@ -2523,7 +2523,7 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
         long rd = cng_dispatch(__NR_execve, (long)bad, 0, 0, 0, 0, 0, 1);
         cng_g_debug = save;
         int ok = rd == -EFAULT;
-        cng_dprintf(1, "faulttest execve path (CNG_DEBUG)=%d want=%d -> %s\n",
+        cng_dprintf(1, "faulttest execve path (CHROOTNG_DEBUG)=%d want=%d -> %s\n",
                     (int)rd, (int)-EFAULT, ok ? "OK" : "FAIL");
         fails += !ok;
     }
@@ -2675,7 +2675,7 @@ int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * that within a few hundred iterations; a descriptor per process cannot
      * fail at all. Only the memfd tier stages anything, so where
      * process_vm_readv exists this passes for free — which is the other reason
-     * the suite runs the whole set again with CNG_UACCESS_MEMFD=1. */
+     * the suite runs the whole set again with CHROOTNG_UACCESS_MEMFD=1. */
     {
         /* The identity is what is asserted, not a race won: the child reports
          * whether the descriptor it stages through is a different file from
@@ -2907,7 +2907,7 @@ int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv) {
  * it is a convenience: when it is unavailable (never mapped, or full) the old
  * fallback was the host file, which for a guest process is the chroot-ng
  * invocation that started it — `/proc/self/cmdline` read back "chroot-ng -u
- * /rootfs /bin/sh". Run with CNG_PROCREG_NONE=1 the registry is gone and the
+ * /rootfs /bin/sh". Run with CHROOTNG_PROCREG_NONE=1 the registry is gone and the
  * answer must still be the guest's own argv, out of the live stack.
  *
  * The stack below is the layout cng_build_stack hands a guest: argc, argv,
@@ -7272,7 +7272,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
     /* The views from files of ours rather than memfds, as a host that will
      * not reopen a memfd makes them — taken from the environment, since the
      * same checks are run both ways. */
-    const char *rdeny = cng_broker_env("CNG_PROCFS_REOPEN_DENY");
+    const char *rdeny = cng_broker_env("CHROOTNG_PROCFS_REOPEN_DENY");
     cng_g_procfs_reopen_deny = rdeny && rdeny[0] != '0';
     cng_g_shared_proc = 1;
     cng_procfs_init();
@@ -7719,7 +7719,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
          * the real ones, which would otherwise pass through and prove nothing.
          * The fd's own link says which it was: the memfd's name, or the name
          * of the file of ours that stands in where the memfd stayed writable
-         * (CNG_PROCFS_REOPEN_DENY, Android). */
+         * (CHROOTNG_PROCFS_REOPEN_DENY, Android). */
         static const char *const ovf[] = {"/proc/sys/kernel/overflowuid",
                                           "/proc/sys/kernel/overflowgid"};
         for (int i = 0; i < 2; i++) {
@@ -7753,7 +7753,7 @@ int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv) {
      *
      *     The one way to a read-only description of a memfd is to reopen it
      *     through its own /proc link, and a host policy may refuse that —
-     *     Android's does (EACCES), and CNG_PROCFS_REOPEN_DENY says it does.
+     *     Android's does (EACCES), and CHROOTNG_PROCFS_REOPEN_DENY says it does.
      *     The view is then a file of ours, opened read-only for real, in a
      *     private directory under the temp directory. Only where neither can
      *     be had does the fd stay writable, as synth_seal says it does, and
@@ -9770,7 +9770,7 @@ int cng_cmd_ptracetest(int argc, char **argv, char **envp, unsigned long *auxv) 
  * one that ships) and a real broker daemon, which is the only way to see that
  * two processes share the memory and that nattch tracks them.
  *
- * The test script re-runs this with CNG_SHM_FORCE_FILE=1 to cover the
+ * The test script re-runs this with CHROOTNG_SHM_FORCE_FILE=1 to cover the
  * file-backed tier the broker falls back to where memfd_create is unavailable.
  */
 #define SHMT_SZ 8192
@@ -9905,7 +9905,7 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     (void)argc;
     (void)argv;
     (void)auxv;
-    cng_g_host_envp = envp; /* the broker's env lookups (CNG_SHM_FORCE_FILE, TMPDIR) */
+    cng_g_host_envp = envp; /* the broker's env lookups (CHROOTNG_SHM_FORCE_FILE, TMPDIR) */
     int fails = 0;
     int self = (int)sys_getpid();
     unsigned long pg = cng_page_size;
@@ -10210,7 +10210,7 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
     {
         int bad = 0;
         int found = shm_scan_files(&bad);
-        int forced = cng_broker_env("CNG_SHM_FORCE_FILE") != 0;
+        int forced = cng_broker_env("CHROOTNG_SHM_FORCE_FILE") != 0;
         int ok = found >= 0 && bad == 0 && (forced ? found > 0 : found == 0);
         cng_dprintf(1,
                     "shmtest backing files forced=%d found=%d malformed=%d"
@@ -10441,7 +10441,7 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                                 CNG_O_RDWR | CNG_O_CLOEXEC, 0);
         if (probe >= 0)
             sys_close((int)probe);
-        int want = probe >= 0 && !cng_broker_env("CNG_SHM_FORCE_FILE");
+        int want = probe >= 0 && !cng_broker_env("CHROOTNG_SHM_FORCE_FILE");
         ok = fd >= 0 && ashmem == want;
         cng_dprintf(1,
                     "shmtest segment backing is ashmem where /dev/ashmem opens:"
@@ -10546,7 +10546,7 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
      *     SO_PEERCRED is the only thing standing between an abstract name
      *     anybody can compute and a namespace of ours, so failing to read it has
      *     to close the connection rather than leave the check unmade. Nothing on
-     *     a working host reaches that, hence CNG_BROKER_NO_PEERCRED.
+     *     a working host reaches that, hence CHROOTNG_BROKER_NO_PEERCRED.
      *
      *     Both sides in one sequence, on a namespace of its own. The first call
      *     runs with the knob set: it finds nobody serving the name, starts a
@@ -10558,7 +10558,7 @@ int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv) {
      *     the second would have started a clean one and been served. */
     {
         static char *noc_env[2];
-        noc_env[0] = (char *)"CNG_BROKER_NO_PEERCRED=1";
+        noc_env[0] = (char *)"CHROOTNG_BROKER_NO_PEERCRED=1";
         noc_env[1] = 0;
         char **saved = cng_g_host_envp;
         cng_broker_seed_session(); /* a name nobody is bound to yet */

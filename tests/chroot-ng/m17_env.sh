@@ -48,7 +48,7 @@ check_contains "the --env cap is diagnosed" "too many --env entries" "$out"
 # variables that would do the most damage if they crossed over: HOME and
 # LD_LIBRARY_PATH point at host paths a guest has its own versions of.
 m17_env() {
-    TERM=cng-term COLORTERM=cng-color CNG_TEST=leak HOME=/host/home \
+    TERM=cng-term COLORTERM=cng-color CHROOTNG_TEST=leak HOME=/host/home \
         LD_LIBRARY_PATH=/host/lib run "$@" / "$GDIR/envdump" 2>&1
 }
 
@@ -59,7 +59,7 @@ if guest_cc_report "$GDIR/envdump" tests/chroot-ng/guests/envdump.c; then
         "env: COLORTERM=cng-color" "$out"
     check_contains "and nothing else is: the guest environment is those two" \
         "env count=2" "$out"
-    check_absent "no host variable leaks (canary)" "CNG_TEST=leak" "$out"
+    check_absent "no host variable leaks (canary)" "CHROOTNG_TEST=leak" "$out"
     check_absent "no host HOME leaks" "HOME=/host/home" "$out"
     check_absent "no host LD_LIBRARY_PATH leaks" "LD_LIBRARY_PATH" "$out"
 
@@ -97,7 +97,7 @@ fi
 # (the stack the loader built) and /proc/self/environ (the guest identity the
 # registry publishes — the kernel's own copy would describe the chroot-ng
 # invocation, i.e. the host environment this test says must not be visible).
-M17_ALPINE="${M17_ALPINE:-$CNG_ALPINE}"
+M17_ALPINE="${M17_ALPINE:-$CHROOTNG_ALPINE}"
 
 if [ -z "$M17_ALPINE" ] || [ ! -x "$M17_ALPINE/bin/busybox" ]; then
     skip "guest-environment rootfs scenarios: no alpine rootfs"
@@ -108,7 +108,7 @@ COLORTERM=cng-color"
 
     # m17_alpine ARGS... — a guest program under the same fixed host environment.
     m17_alpine() {
-        TERM=cng-term COLORTERM=cng-color CNG_TEST=leak HOME=/host/home \
+        TERM=cng-term COLORTERM=cng-color CHROOTNG_TEST=leak HOME=/host/home \
             run -R -E FOO=bar "$M17_ALPINE" "$@" 2>/dev/null
     }
 
@@ -139,7 +139,7 @@ COLORTERM=cng-color"
     check_contains "an exec'd program inherits the guest environment" \
         "FOO=bar" "$got"
     check_absent "and the exec derives nothing fresh from the host" \
-        "CNG_TEST=leak" "$got"
+        "CHROOTNG_TEST=leak" "$got"
 
     # No PATH is set, and nothing needs one: a shell supplies its own default,
     # which is why chroot-ng synthesizes nothing here.

@@ -154,7 +154,7 @@ check_contains "dispatch openat through /proc/self/cwd" \
     "read: HELLO-FROM-ROOTFS" \
     "$(run -t dtest -r "$ROOT" open /proc/self/cwd/etc/greeting 2>&1)"
 
-# CNG_DEBUG error logging must not read a scalar syscall arg as a path pointer:
+# CHROOTNG_DEBUG error logging must not read a scalar syscall arg as a path pointer:
 # truncate's length is large enough to look like one, and dereferencing it is a
 # wild read inside the handler (SIGSEGV masked there => the guest is killed).
 out=$(run -t dtest -r "$ROOT" dbgpath /etc 2>&1); rc=$?
@@ -163,19 +163,19 @@ check "debug logging survives a scalar syscall arg" 0 "$rc"
 check_contains "debug logging still reports the real error" \
     "dbgpath: survived rc=-21 -> OK" "$out"
 
-# ...and an EMPTY CNG_DEBUG is off, as it is for every other CNG_* switch (the
+# ...and an EMPTY CHROOTNG_DEBUG is off, as it is for every other CNG_* switch (the
 # two beside it in the same loop, and cng_broker_env, all require a non-empty
-# value). `CNG_DEBUG= chroot-ng ...` is how a shell clears a variable for one
+# value). `CHROOTNG_DEBUG= chroot-ng ...` is how a shell clears a variable for one
 # command; it used to turn verbose logging on instead, onto the guest's own
 # stderr -- a stream package managers capture.
 # The knob is read by cng_run, so a real (here: failing) guest launch is what
 # drives it; the banner it stamps is the cheapest thing to look for.
-check_contains "CNG_DEBUG=1 does log" "[cng] chroot-ng" \
-    "$(CNG_DEBUG=1 run "$ROOT" /nosuchprogram 2>&1)"
-check_absent "an empty CNG_DEBUG does not" "[cng] chroot-ng" \
-    "$(CNG_DEBUG= run "$ROOT" /nosuchprogram 2>&1)"
-check_absent "and CNG_DEBUG=0 does not" "[cng] chroot-ng" \
-    "$(CNG_DEBUG=0 run "$ROOT" /nosuchprogram 2>&1)"
+check_contains "CHROOTNG_DEBUG=1 does log" "[cng] chroot-ng" \
+    "$(CHROOTNG_DEBUG=1 run "$ROOT" /nosuchprogram 2>&1)"
+check_absent "an empty CHROOTNG_DEBUG does not" "[cng] chroot-ng" \
+    "$(CHROOTNG_DEBUG= run "$ROOT" /nosuchprogram 2>&1)"
+check_absent "and CHROOTNG_DEBUG=0 does not" "[cng] chroot-ng" \
+    "$(CHROOTNG_DEBUG=0 run "$ROOT" /nosuchprogram 2>&1)"
 
 # A name resolved relative to a real dirfd must be contained exactly like an
 # absolute one. It used to be passed to the kernel untouched, and the kernel has
@@ -215,8 +215,8 @@ elif guest_cc_report "$EPD/emptypath" tests/chroot-ng/guests/emptypath.c; then
     if have cc && cc -O1 -o "$EPD/ep_host" tests/chroot-ng/guests/emptypath.c 2>/dev/null; then
         ep_k=$(kref "$EPD/ep_host" "$EPD" 2>/dev/null)
     fi
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    ep_g=$(run_t 60 -R $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    ep_g=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
     # A kernel before 3.19 has no execveat and answers every exec_ line ENOSYS:
     # no reference for that half, which the emulation answers as the 6.1 it
     # advertises. The rest is still the kernel's to judge.
@@ -245,8 +245,8 @@ elif guest_cc_report "$EPD/emptypath" tests/chroot-ng/guests/emptypath.c; then
     # the descriptor links on every kernel — and the number still has to be
     # one: AT_FDCWD is the working directory (EPERM: no link to a directory),
     # a negative or closed number is EBADF, as root would have had them.
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    ep_r=$(run_t 60 -R -u 0:0 $GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    ep_r=$(run_t 60 -R -u 0:0 $CHROOTNG_GUEST_BINDS "$EPD" /emptypath 2>/dev/null)
     # ...and the link it makes is the host's to make: made where the filesystem
     # allows a hardlink (link_plain=0), and answered with the host's own errno
     # where it does not (Android's SELinux policy: EACCES). Either way it is a
@@ -285,8 +285,8 @@ elif guest_cc_report "$NHD/handleat" tests/chroot-ng/guests/handleat.c; then
         # (SIGSYS), and the shell reports that on ITS stderr: the group takes it.
         nh_k=$({ kref "$NHD/nh_host" "$NHD" || true; } 2>/dev/null)
     fi
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    nh_g=$(run_t 60 -R $GUEST_BINDS "$NHD" /handleat 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    nh_g=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$NHD" /handleat 2>/dev/null)
     if [ "$nh_built" = 0 ]; then
         skip "name_to_handle_at differential: no host compiler for the oracle"
     elif [ -z "$nh_k" ]; then
@@ -610,7 +610,7 @@ if guest_xlate_ready "executable mprotect beside a thread's stack" &&
     guest_cc_report "$EXD/execstack" tests/chroot-ng/guests/execstack.c -lpthread; then
     for _tier in -R plain; do
         if [ "$_tier" = plain ]; then
-            if [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+            if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
                 skip "executable mprotect beside a thread's stack, seccomp tier: the filter is inert here"
                 continue
             fi
@@ -618,12 +618,12 @@ if guest_xlate_ready "executable mprotect beside a thread's stack" &&
         else
             _opt="-R"
         fi
-        if [ "$CNG_EXECMEM" != 1 ]; then
+        if [ "$CHROOTNG_EXECMEM" != 1 ]; then
             skip "executable mprotect beside a thread's stack ($_tier): the host denies anonymous executable memory"
             continue
         fi
-        # shellcheck disable=SC2086  # $_opt and $GUEST_BINDS are split on purpose
-        out=$(run_t 60 $_opt $GUEST_BINDS "$EXD" /execstack 2>/dev/null)
+        # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
+        out=$(run_t 60 $_opt $CHROOTNG_GUEST_BINDS "$EXD" /execstack 2>/dev/null)
         check_contains "a page of its own can be made RWX ($_tier)" \
             "rwx_main=0" "$out"
         check_contains "a page beside a thread's stack can be made RWX ($_tier)" \
@@ -929,8 +929,8 @@ elif guest_cc_report "$TSD/trailslash" tests/chroot-ng/guests/trailslash.c; then
         2>/dev/null; then
         ts_k=$(kref "$TSD/ts_host" "$TSD" 2>/dev/null)
     fi
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
-    ts_g=$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash 2>/dev/null)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    ts_g=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$TSD" /trailslash 2>/dev/null)
     if [ -z "$ts_k" ]; then
         skip "trailing-slash differential: no host compiler for the oracle"
     elif [ "$ts_k" = "$ts_g" ]; then
@@ -951,10 +951,10 @@ elif guest_cc_report "$TSD/trailslash" tests/chroot-ng/guests/trailslash.c; then
     # final symlink whatever O_NOFOLLOW said, so leaving that link for the
     # kernel would have it follow an ABSOLUTE target from the host root -- out
     # of the rootfs. The walk follows it first, where the target is re-rooted.
-    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
     check_contains "a trailing slash on an absolute symlink stays in the rootfs" \
         "contain=rootfs" \
-        "$(run_t 60 -R $GUEST_BINDS "$TSD" /trailslash "" contain 2>/dev/null)"
+        "$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$TSD" /trailslash "" contain 2>/dev/null)"
 fi
 rm -rf "$TSD"
 

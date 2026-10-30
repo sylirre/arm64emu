@@ -10,7 +10,7 @@
  * its terminal for none (bash printed no prompt). The monitor serves them from
  * TCGETS/TCSETS when the host will not, and the answers must be a kernel's
  * whichever way they were reached: this runs over the host as it is and over
- * CNG_TERMIOS2_DENY=1, which refuses them before the host is asked.
+ * CHROOTNG_TERMIOS2_DENY=1, which refuses them before the host is asked.
  *
  * What is asked, over a real pty: the whole struct comes back and not a byte
  * past it (a canary after it), the first 36 bytes of it are what TCGETS
