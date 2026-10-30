@@ -16,7 +16,7 @@
 # ops <= N natively, the rest through exec_a64; 0 = pure interpreter) to
 # isolate the handler class. FP data-processing and system/exception ops are
 # always PD_GENERIC, so the suspects are the native integer, branch and
-# load/store handlers (see src/arm64emu/jit/predecode.c).
+# load/store handlers (see src/arm64emu/jit/pdrun.c).
 #
 # Env: ARM64EMU_BIOS, ARM64EMU_KERNEL, ARM64EMU_INITRD override the images;
 #      ARM64EMU_POINTS overrides the checkpoint list;

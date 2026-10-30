@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* IR frontend: basic-block discovery and PDEnt -> IR translation. This file
- * is a transcription of the predecode handler semantics (predecode.c) into
+ * is a transcription of the predecode handler semantics (pdrun.c) into
  * IR; the differential suite is the fidelity check. Everything guest-shaped
  * is resolved here — XZR vs SP encodings of register 31, 32-bit truncation,
  * pre-decoded immediates (SUBS immediates arrive pre-inverted, logical
@@ -52,7 +52,7 @@ static IROp *ir_put(IRBlock *ir, u8 op, u8 w, u8 dst, u8 a, u8 b, u8 cc,
     return o;
 }
 
-/* Register-31 resolution (which helper predecode.c used for each operand). */
+/* Register-31 resolution (which helper pdrun.c's handlers use for each operand). */
 static u8 rx(unsigned r)  { return r == 31 ? VREG_ZERO : (u8)r; }  /* reg_x  */
 static u8 rsp(unsigned r) { return (u8)r; }                        /* reg_xsp */
 
@@ -1421,7 +1421,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
         }
 
         /* Integer LDP: both register writes land only after BOTH reads
-         * succeed (predecode.c L_LDP64 is all-or-nothing), so read into IR
+         * succeed (pdrun.c L_LDP64 is all-or-nothing), so read into IR
          * temps and commit with MOVs. The address is computed once into TMP2
          * up front, which also resolves the rd==rn / rm==rn hazards. */
         case PD_LDP64: case PD_LDP64PRE: case PD_LDP64POST:

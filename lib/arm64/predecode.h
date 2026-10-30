@@ -1,45 +1,37 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* Operand pre-decode: a per-PC, per-thread cache of the decoded form of an
- * instruction — a dense opcode id plus pre-extracted operand fields — that
- * lets the run loop skip exec_a64's classification tree and field extraction
- * for hot instruction forms. Entries are a pure function of the instruction
- * word (PC-relative forms add c->cur_insn_pc at execute time), so comparing
- * the cached word against the freshly fetched one fully validates a hit: no
- * flush is needed for mmap/munmap/execve/self-modifying code.
+/* Operand pre-decode: classify one instruction word into a dense opcode id
+ * plus pre-extracted operand fields (a PDEnt). Entries are a pure function of
+ * the instruction word (PC-relative forms add c->cur_insn_pc at execute time).
+ * Two engines consume them in each emulator: the predecoded tier (each
+ * program's pdrun.c: a per-PC decode cache executed by direct-threaded
+ * dispatch), and the --jit translator, which consumes PDEnts instead of
+ * re-deriving fields from the raw word. Everything classified PD_GENERIC is
+ * executed by calling exec_a64, which stays the source of truth. The engines
+ * do not want quite the same classification — arm64emu's tier applies one
+ * extra demotion (pd_fill_tier), for SP-based memory ops it cannot
+ * alignment-check itself — so pd_fill stays pure classification and each
+ * engine adds what it needs on top.
  *
- * Anything the classifier does not recognize with certainty dispatches as
- * PD_GENERIC straight into exec_a64, which stays the source of truth. The
- * specialized handlers (predecode.c) are transcriptions of the corresponding
- * decode.c cases (which is copied from the system emulator and must not be
- * edited); the differential test suite checks their fidelity against qemu.
- *
- * Deliberately NOT a function-pointer table: the sibling emulator measured a
- * handler-pointer cache ~5-6% slower (indirect-call mispredicts + a large
- * table thrashing the data cache). Dense u8 opcode ids instead, dispatched by
- * direct-threaded computed goto (each handler fetches and dispatches its
- * successor, so every handler owns a branch-predictor slot). */
+ * Coverage rule: pd_fill must never classify an encoding decode.c does not
+ * implement (or implements differently) in the program that compiles it —
+ * such encodings stay PD_GENERIC so every engine reproduces the interpreter's
+ * exact behavior, including its quirks. Deviations between the programs are
+ * marked "coverage:". */
 #ifndef A64_PREDECODE_H
 #define A64_PREDECODE_H
 
 #include "cpu.h"
 
-/* Direct-mapped by (pc>>2), 16 B entries. Sized by measured miss rate on a
- * busybox-sh workload: 8 K entries missed 12.9%, 16 K 4.6%, 32 K 2.2%, 64 K
- * no better than 32 K. 16 K (256 KB/thread) is the size/benefit knee. */
-#define PD_BITS 14
-#define PD_SIZE (1u << PD_BITS)
-#define PD_MASK (PD_SIZE - 1)
-
 typedef struct {
-    u32 insn;      /* validation tag: live word must match; 0 only for UDF #0 */
+    u32 insn;      /* the classified word; also the decode cache's validation
+                    * tag (a live fetch whose word differs re-fills the entry,
+                    * so the cache is self-modifying- and address-space-safe;
+                    * 0 only for UDF #0) */
     u8  op;        /* dense opcode id, PD_GENERIC = 0 */
     u8  rd, rn, rm;/* raw 5-bit register fields (meaning varies per op) */
     u64 imm;       /* immediate/offset/mask/4th operand, pre-computed at fill */
 } PDEnt;
-
-extern __thread PDEnt g_pdcache[PD_SIZE];
-extern int g_predecode;            /* cleared by -nopd (diagnostic mode) */
 
 enum {
     PD_GENERIC = 0,   /* everything else: dispatch to exec_a64 */
@@ -119,7 +111,10 @@ enum {
     PD_STR64RO, PD_STR32RO, PD_STRBRO, PD_STRHRO,
     /* literal */
     PD_LDRLIT64, PD_LDRLIT32,
-    PD_LDRLITV,          /* SIMD&FP literal (rd = Vt, rm = byte count 4/8/16) */
+    PD_LDRLITV,          /* SIMD&FP literal (rd = Vt, rm = byte count 4/8/16).
+                          * The one V-register id outside the FP/SIMD block
+                          * below — fe_fp_insn() names it explicitly so the
+                          * CPACR_EL1.FPEN gate still catches it. */
 
     /* integer pairs (rm = Rt2, imm = scaled offset) */
     PD_LDP64, PD_LDP64PRE, PD_LDP64POST,
@@ -139,13 +134,8 @@ enum {
     PD_NOPS_
 };
 
-/* Run instructions back-to-back through the decode cache (direct-threaded
- * dispatch). Returns when the loop must intervene: recorded exception,
- * pending signal, stop/halt, or an instruction-fetch fault. */
-void pd_run(CPU *c);
-
 /* Classify one instruction word into a PDEnt (dense op id + pre-extracted
- * operands; PD_GENERIC when unrecognized). Also the JIT frontend's decoder. */
+ * operands; PD_GENERIC when unrecognized). Pure function of the word. */
 void pd_fill(PDEnt *e, u32 insn);
 
 #endif /* A64_PREDECODE_H */

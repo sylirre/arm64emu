@@ -4,7 +4,7 @@
  * IR_MAX_OPS_PER_INSN linear IR ops; the backends emit host code from them
  * with per-block register
  * allocation. The frontend (frontend.c) is a transcription of the predecode
- * handler semantics (predecode.c, itself checked against decode.c by the
+ * handler semantics (pdrun.c, itself checked against decode.c by the
  * differential suite) — XZR/SP resolution, width truncation, pre-decoded
  * immediates and writeback ordering are all resolved HERE, never in a
  * backend.

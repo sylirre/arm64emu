@@ -357,6 +357,7 @@ host-portability pitfalls.
 lib/arm64/      AArch64 emulation shared with arm64emu:
   types.h cpu.h fixed-width types; CPU state + core interpreter API
   decode.c      A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
+  predecode.{h,c}  the pre-decode classifier: word -> PDEnt (op id + operands)
   sysreg.{h,c}  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers, what EL0 may run
   esr.h         ESR exception classes + syndrome construction
   exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
@@ -375,8 +376,9 @@ src/arm64chroot/
   loop.c        run loop + exception dispatch + signal delivery point +
                 the thread call-out safepoint (stop_gen) + EL0's view of the
                 ID registers (the kernel's MRS emulation)
-  predecode.c   decoded-instruction cache: direct-threaded fast path over ~200
-                hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
+  pdrun.c       decoded-instruction cache: direct-threaded fast path over ~200
+                hot forms (classified by lib/arm64's predecode.c); PD_GENERIC
+                falls back to exec_a64 (the default engine)
   jit/          optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
     ir.h frontend.c   per-block decode -> linear IR -> liveness / flag fusion
     backend_a64.c backend_x86_64.c   register-allocating single-pass emitters

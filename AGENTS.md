@@ -35,7 +35,7 @@ build/                 everything the build makes (gitignored, see below)
 ```
 
 The parts of the emulation core that still differ between the two emulators
-(step driver, predecode, JIT) live in each emulator's tree for now and
+(step driver, the predecoded tier's executor, JIT) live in each emulator's tree for now and
 are kept diffable against each other; they move into `lib/` as they are
 unified. A file in `lib/` is compiled into every program that uses it, with
 that program's flags, so a change there must pass every such program's suites.

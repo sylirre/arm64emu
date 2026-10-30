@@ -12,7 +12,7 @@ The interpreter (`cpu_step` → `exec_a64`, `src/arm64emu/cpu.c` / `src/arm64emu
 transcriptions of it that fall back into it:
 
 - Predecoded tier (default): anything `pd_fill` leaves `PD_GENERIC` dispatches to
-  `L_GENERIC: exec_a64(c, insn)` (`src/arm64emu/jit/predecode.c`). The `NEXT` epilogue
+  `L_GENERIC: exec_a64(c, insn)` (`src/arm64emu/jit/pdrun.c`). The `NEXT` epilogue
   mirrors `cpu_step`'s tail exactly (icount, rare-event checks, fetch).
 - `--jit`: anything the frontend does not translate becomes
   `IRO_CALL1 → jit_exec1 → exec_a64` (`src/arm64emu/jit/jit.c`), which replicates

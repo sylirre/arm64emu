@@ -71,6 +71,7 @@ Makefile                             (repository root) `make arm64chroot` -> bui
 lib/arm64/                           Shared with arm64emu (compiled into both):
   types.h cpu.h                      Fixed-width types; CPU state + core interpreter API
   decode.c                           A64 decoder/executor (+ LSE atomics, host-atomic exclusives under ARM64_SMP)
+  predecode.h predecode.c            Pre-decode classifier: instruction word -> PDEnt (dense op id + operands), PD_GENERIC when uncertain; the tier's and the JIT frontend's decoder
   sysreg.h sysreg.c                  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers (sysreg_id_read), what EL0 may run
   esr.h                              ESR exception classes + syndrome construction
   exec_fpsimd.c                      FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
@@ -81,7 +82,7 @@ src/arm64chroot/
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
-  predecode.c predecode.h            Decoded-instruction cache: direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
+  pdrun.c pdrun.h                    Decoded-instruction cache: direct-threaded fast path over ~200 hot forms (classified by lib/arm64 predecode.c); PD_GENERIC falls back to exec_a64 (the default engine)
   jit/                               Optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
     jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends
     ir.h frontend.c                  Per-block decode -> linear IR -> liveness / flag fusion
@@ -122,7 +123,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the code and documentation (`docs/arm64chroot/`).
 * Keep in sync the file structure in design section of `docs/arm64chroot/README.md` and structure section of this file.
 * New implemented syscalls must also be defined in `src/arm64chroot/strace.c` argdefs, so they can be decoded by `--strace-full`.
-* The step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
+* The step driver (`cpu.c`), the predecoded tier's executor and the JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
 
 ## Testing
 

@@ -28,7 +28,7 @@
 #include "ptrace.h"
 #include "sys.h"
 
-extern int g_predecode;   /* predecode.c: decoded-instruction cache enable */
+extern int g_predecode;   /* pdrun.c: decoded-instruction cache enable */
 
 /* The version is the repository's, defined once in its VERSION file, which
  * the Makefile passes in. */

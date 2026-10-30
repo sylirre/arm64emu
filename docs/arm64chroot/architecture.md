@@ -106,7 +106,7 @@ something completely different.
 
 ## Control flow
 
-### One instruction (threaded fast path, `pd_run` in `src/arm64chroot/predecode.c`)
+### One instruction (threaded fast path, `pd_run` in `src/arm64chroot/pdrun.c`)
 
 1. `cur_insn_pc = pc`.
 2. `mem_ifetch(pc, &insn)` — fast path reads through a per-thread single-page
@@ -204,7 +204,8 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/arm64chroot/mmu.h`, `src/arm64chroot/mem.c` | Guest address space + the `mem_*` seam. |
 | `src/arm64chroot/exception.c` | Pending-exception recorder (the exception seam). |
 | `src/arm64chroot/loop.c` | Run loop + exception dispatch + signal delivery point; the kernel's EL0 `MRS` emulation of the ID registers. |
-| `src/arm64chroot/predecode.h`, `src/arm64chroot/predecode.c` | Decoded-instruction cache: classifier + direct-threaded dispatch of ~200 hot forms; `PD_GENERIC` falls back to `exec_a64`. |
+| `lib/arm64/predecode.h`, `lib/arm64/predecode.c` | The classifier: an instruction word -> `PDEnt` (dense op id + operands), `PD_GENERIC` for anything uncertain; also the JIT frontend's decoder. |
+| `src/arm64chroot/pdrun.h`, `src/arm64chroot/pdrun.c` | Decoded-instruction cache + direct-threaded dispatch of ~200 hot forms; `PD_GENERIC` falls back to `exec_a64`. |
 | `src/arm64chroot/elf.c` | ELF64 loader, `PT_INTERP`, initial stack/auxv/HWCAP, sigreturn trampoline page. |
 | `src/arm64chroot/path.c` | Rootfs containment resolver; `/proc` and `/dev` special-casing. |
 | `src/arm64chroot/syscall.c` + `src/arm64chroot/sys_*.c` | Syscall dispatcher and per-area handlers (~190). |

@@ -52,6 +52,10 @@ lib/arm64/                shared with arm64chroot (compiled into both):
                           exec_a64() is the top-level dispatch and the
                           correctness reference for all three engines.
                           ARM64_SYSTEM/ARM64_SMP pick each program's variants
+  predecode.h             PDEnt: dense opcode id + pre-extracted operands
+  predecode.c             the pre-decode classifier (mirrors decode.c; anything
+                          uncertain stays PD_GENERIC -> exec_a64), the
+                          predecoded tier's and the JIT frontend's decoder
   exec_fpsimd.c           A64 decoder/executor, part 2 — scalar FP, the full
                           Advanced-SIMD surface (three-same/-diff/-extra,
                           by-element, across-lanes, two-misc, shift-imm, copy,
@@ -110,10 +114,8 @@ src/arm64emu/
     fdt.h, fdt.c          minimal in-place FDT editing: sizes the /memory node
                           to --memory, in the built-in tree and in a --dtb file
   jit/                    accelerated engines (predecoded tier + --jit)
-    predecode.h           PDEnt: dense opcode id + pre-extracted operands
-    predecode.c           the pre-decode classifier (mirrors decode.c; anything
-                          uncertain stays PD_GENERIC -> exec_a64) AND
-                          pd_run/pd_step, the default computed-goto tier
+    pdrun.h, pdrun.c      pd_step, the default computed-goto tier over a
+                          decode cache of PDEnts (pinned to -O2)
     jit.h                 public JIT interface (--jit, off by default)
     jit_priv.h            internals shared between runtime and backends
     jit.c                 JIT runtime: code cache, block tables, dispatch loop,
@@ -199,7 +201,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the interpreter and JIT parts of emulator where possible.
 * Keep in sync the code and documentation (`docs/arm64emu/`).
 * Keep in sync the file structure in architecture section of `docs/arm64emu/README.md` and structure section of this file.
-* The step driver (`cpu.c`), the predecoded tier and the JIT have near-verbatim twins in arm64chroot (`src/arm64chroot/core/cpu.c`, `src/arm64chroot/predecode.c`, `src/arm64chroot/jit/`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
+* The step driver (`cpu.c`), the predecoded tier's executor and the JIT have near-verbatim twins in arm64chroot (`src/arm64chroot/core/cpu.c`, `src/arm64chroot/pdrun.c`, `src/arm64chroot/jit/`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
 
 ## Testing
 

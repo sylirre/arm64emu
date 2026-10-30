@@ -73,7 +73,7 @@ DEPFLAGS := -MMD -MP
 # predecoded tier's computed-goto dispatch TU regresses ~20% under it, and
 # -flto spellings aren't portable across gcc/clang — so the default stays plain
 # -O2 and `make ARM64EMU_OPT="-O3 -flto=8"` is the supported opt-in fast recipe.
-# The pin on predecode.c below keeps it at -O2 in that case (a no-op for the
+# The pin on jit/pdrun.c below keeps it at -O2 in that case (a no-op for the
 # default build). -mtune=native measured neutral; PGO not pursued (adds a
 # two-phase build for a workload-specific gain).
 ARM64EMU_OPT    ?= -O2
@@ -92,7 +92,7 @@ ARM64EMU_CFG     = $(call cfgstamp,arm64emu,$(CC) $(ARM64EMU_FLAGS))
 $(OBJDIR)/arm64emu/%.o: %.c $(ARM64EMU_CFG)
 	@mkdir -p $(@D)
 	$(CC) $(ARM64EMU_FLAGS) $(DEPFLAGS) -c -o $@ $<
-$(OBJDIR)/arm64emu/src/arm64emu/jit/predecode.o: override ARM64EMU_OPT := -O2
+$(OBJDIR)/arm64emu/src/arm64emu/jit/pdrun.o: override ARM64EMU_OPT := -O2
 
 ARM64EMU_VERSIONED := $(addprefix $(OBJDIR)/arm64emu/,src/arm64emu/main.o) \
                       $(addprefix $(OBJDIR)/arm64emu-embed/,src/arm64emu/main.o)
@@ -113,7 +113,7 @@ ARM64EMU_EMBED_CFG  = $(call cfgstamp,arm64emu-embed,$(CC) $(ARM64EMU_FLAGS) -DA
 $(OBJDIR)/arm64emu-embed/%.o: %.c $(ARM64EMU_EMBED_CFG)
 	@mkdir -p $(@D)
 	$(CC) $(ARM64EMU_FLAGS) -DANDROID_JNI $(DEPFLAGS) -c -o $@ $<
-$(OBJDIR)/arm64emu-embed/src/arm64emu/jit/predecode.o: override ARM64EMU_OPT := -O2
+$(OBJDIR)/arm64emu-embed/src/arm64emu/jit/pdrun.o: override ARM64EMU_OPT := -O2
 
 $(OBJDIR)/arm64emu-embed/stub.c:
 	@mkdir -p $(@D)
@@ -197,7 +197,7 @@ ARM64CHROOT_SRC := $(LIB_ARM64) \
     src/arm64chroot/jit/jit.c src/arm64chroot/jit/frontend.c \
     src/arm64chroot/jit/backend_x86_64.c src/arm64chroot/jit/backend_a64.c \
     src/arm64chroot/jit/backend_x86_32.c src/arm64chroot/jit/backend_arm32.c \
-    $(addprefix src/arm64chroot/,mem.c exception.c loop.c predecode.c elf.c path.c \
+    $(addprefix src/arm64chroot/,mem.c exception.c loop.c pdrun.c elf.c path.c \
       signal.c syscall.c strace.c sys_file.c sys_mm.c sys_ipc.c sys_proc.c \
       sys_sig.c sys_time.c sys_misc.c sys_net.c sys_netlink.c sys_procfs.c \
       sys_ptrace.c sys_seccomp.c proctab.c ptracetab.c main.c)
