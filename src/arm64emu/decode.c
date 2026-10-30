@@ -9,8 +9,8 @@
 #include "sysreg.h"
 #include <stdio.h>
 
-/* FP/SIMD group hook (M4). Weak so M1 links standalone. */
-void exec_fpsimd(CPU *c, u32 insn) __attribute__((weak));
+/* FP/SIMD group hook (M4), implemented in exec_fpsimd.c. */
+void exec_fpsimd(CPU *c, u32 insn);
 
 /* SCTLR_EL1.nTWI/nTWE: 0 traps an EL0 WFI/WFE that would wait. */
 #define SCTLR_nTWI (1ULL << 16)
@@ -371,10 +371,10 @@ static void dp_register(CPU *c, u32 insn) {
             case 0x1: r = a - n * m; break;                                   /* MSUB */
             case 0x2: r = a + (u64)((s64)(s32)(u32)n * (s64)(s32)(u32)m); break; /* SMADDL */
             case 0x3: r = a - (u64)((s64)(s32)(u32)n * (s64)(s32)(u32)m); break; /* SMSUBL */
-            case 0x4: { __int128 p = (__int128)(s64)n * (s64)m; r = (u64)(p >> 64); break; } /* SMULH */
+            case 0x4: r = (u64)smulh64((s64)n, (s64)m); break;                /* SMULH */
             case 0xa: r = a + (u64)((u64)(u32)n * (u64)(u32)m); break;        /* UMADDL */
             case 0xb: r = a - (u64)((u64)(u32)n * (u64)(u32)m); break;        /* UMSUBL */
-            case 0xc: { unsigned __int128 p = (unsigned __int128)n * m; r = (u64)(p >> 64); break; } /* UMULH */
+            case 0xc: r = umulh64(n, m); break;                               /* UMULH */
             default: undefined(c, insn); return;
         }
         set_x_sz(c, Rd, sf, r);
@@ -1410,11 +1410,7 @@ void exec_a64(CPU *c, u32 insn) {
         case 0x4: case 0x6: case 0xc: case 0xe: loads_stores(c, insn); break; /* x1x0 */
         case 0x5: case 0xd: dp_register(c, insn); break;      /* x101 */
         case 0x7: case 0xf:                                   /* x111 FP/SIMD */
-            if (!fp_access_ok(c)) break;
-            if (exec_fpsimd) { exec_fpsimd(c, insn); break; }
-            if (g_dbg) fprintf(stderr, "[fpsimd] unimpl 0x%08x at pc=0x%llx\n",
-                               insn, (unsigned long long)c->cur_insn_pc);
-            undefined(c, insn);
+            if (fp_access_ok(c)) exec_fpsimd(c, insn);
             break;
         default: undefined(c, insn); break;                   /* 00xx reserved */
     }
