@@ -594,10 +594,13 @@ cng_detect_images() {
     fi
 
     # The oracle is a host-native emulator, not an AArch64 program: usable only
-    # where its own machine matches this host.
+    # where its own machine matches this host. It is looked for beside this
+    # tree: the monorepo's arm64emu-user/ (`make -C ../arm64emu-user
+    # arm64chroot`), else an arm64chroot checkout next to a standalone one.
     CNG_ORACLE="${CNG_ORACLE:-}"
     if [ -z "$CNG_ORACLE" ]; then
-        for _o in ${HOME:+"$HOME/arm64chroot/arm64chroot"}; do
+        for _o in "${PWD%/*}/arm64emu-user/arm64chroot" \
+            "${PWD%/*}/arm64chroot/arm64chroot"; do
             [ -x "$_o" ] || continue
             CNG_ORACLE=$_o
             break

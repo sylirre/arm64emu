@@ -119,7 +119,7 @@ expected failure:
 | `CNG_ROOTFS_DIR` | where the `alpine/` and `debian/` rootfs images are provisioned (default `tests/.cache/rootfs`) |
 | `CNG_ROOTFS_FETCH` | `0` = never download a rootfs tarball; one already in `$CNG_ROOTFS_DIR/downloads/` is still unpacked |
 | `CNG_ALPINE`, `CNG_DEBIAN` | individual rootfs paths, used as they are instead of provisioning one |
-| `CNG_ORACLE` | `arm64chroot` binary for M10's real-hardlink differential. Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
+| `CNG_ORACLE` | `arm64chroot` binary for M10's real-hardlink differential. Unset = `../arm64emu-user/arm64chroot` (the monorepo sibling; `make -C ../arm64emu-user arm64chroot`), else `../arm64chroot/arm64chroot` beside a standalone checkout. Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
 | `CNG_SYSROOT` | sysroot holding the AArch64 ELF interpreter for M4 (cross host default `/usr/aarch64-linux-gnu`; empty on an AArch64 host, where it is on the system paths) |
 
 `cng_dyn_binds` sets `GUEST_DYN_BINDS`, the same list for a guest that is
