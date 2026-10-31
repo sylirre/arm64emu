@@ -12,7 +12,8 @@
  * masks to five bits. Self-checking: qemu-user hands getdents64 an EFAULT for
  * the partial buffer, drops O_LARGEFILE and has no seccomp; the expected block
  * is what this program prints built for the host and run on a real kernel
- * (O_LARGEFILE being the host arch's own bit there). */
+ * (O_LARGEFILE being the host arch's own bit there).
+ * WANTS-SCRATCH: the getdents64 rows list a directory of its own in $TMPDIR. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -64,7 +65,17 @@ int main(void) {
      * rows then read an EBADF back off an fd that was never opened) and one
      * that lives on a read-only filesystem there (EROFS for the fchownat a
      * writable directory answers). */
-    fd = open(".", O_RDONLY | O_DIRECTORY);
+    /* The directory read is a fresh, empty one of the program's own: its
+     * first records are "." and ".." (24 bytes each) on every filesystem,
+     * where a listing of "/" begins with whatever the host's directory order
+     * puts first, and a first name of 13 bytes or more does not fit 32 bytes
+     * (EFAULT, which is the kernel's answer too -- a CI runner's root began
+     * with one). */
+    char dtmpl[4096];
+    const char *td = getenv("TMPDIR");
+    snprintf(dtmpl, sizeof dtmpl, "%s/smallabi.XXXXXX", td && *td ? td : "/tmp");
+    char *dd = mkdtemp(dtmpl);
+    fd = open(dd ? dd : ".", O_RDONLY | O_DIRECTORY);
     char *m = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     munmap(m + 4096, 4096);
     errno = 0; long r = syscall(SYS_getdents64, fd, m + 4096 - 32, 8192);
@@ -75,6 +86,7 @@ int main(void) {
     errno = 0; r = syscall(SYS_getdents64, fd, m, 4096);
     printf("getdents_rest: r=%s errno=%d\n", r > 0 ? "some" : "none", E(r));
     close(fd);
+    if (dd) rmdir(dd);
 
     unsigned char sx[256];
     errno = 0; r = syscall(SYS_statx, AT_FDCWD, ".", 0x8000, 0x7ff, sx); printf("statx_badflag: %d\n", E(r));
