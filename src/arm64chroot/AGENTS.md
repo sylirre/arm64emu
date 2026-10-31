@@ -91,6 +91,7 @@ src/arm64chroot/
     jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c                             Rootfs containment resolver: the walk, plus the pin that hands each syscall a parent-directory fd + final component instead of a path string the host would re-resolve (no concurrent rename can redirect it); bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases
+  l2s.c                              --link2symlink: the host the shared engine (lib/link2symlink) runs on -- every host path it names mapped back to its guest name and pinned like a guest path
   syscall.c sys.h                    Dispatcher (x8=nr, x0..x5=args) + helpers shared by all sys_*.c
   strace.c strace.h                  --strace-full argument decoder: per-syscall arg-type table -> symbolic flags, quoted strings, struct pretty-printers, errno-named returns
   sys_file.c                         File & fd syscalls (every path arg via resolve_pin containment); xfer_begin/xfer_end, where every read/write/send/recv finds host memory for its bytes

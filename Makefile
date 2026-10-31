@@ -163,7 +163,8 @@ ARM64CHROOT_LTO ?=
 ARM64CHROOT_FLAGS = -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno \
                     -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 \
                     -Isrc/arm64chroot -Isrc/arm64chroot/core -Isrc/arm64chroot/jit \
-                    -Ilib/arm64 -Ilib/arm64/jit $(ARM64CHROOT_LTO) $(ARM64CHROOT_NOATOMICWARN) $(CFLAGS)
+                    -Ilib/arm64 -Ilib/arm64/jit -Ilib/link2symlink \
+                    $(ARM64CHROOT_LTO) $(ARM64CHROOT_NOATOMICWARN) $(CFLAGS)
 ARM64CHROOT_NOATOMICWARN := $(shell echo 'int main(){return 0;}' | $(CC) -Werror \
                     -Wno-atomic-alignment -x c - -o /dev/null 2>/dev/null \
                     && echo -Wno-atomic-alignment)
@@ -196,11 +197,11 @@ endif
 ARM64CHROOT_ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
                          -DA64_LINK2SYMLINK -DA64_L2S_FORCE
 
-ARM64CHROOT_SRC := $(LIB_ARM64) \
+ARM64CHROOT_SRC := $(LIB_ARM64) $(LIB_L2S) \
     src/arm64chroot/core/cpu.c \
     src/arm64chroot/jit/jit.c \
     src/arm64chroot/jit/backend_x86_32.c src/arm64chroot/jit/backend_arm32.c \
-    $(addprefix src/arm64chroot/,mem.c exception.c loop.c pdrun.c elf.c path.c \
+    $(addprefix src/arm64chroot/,mem.c exception.c loop.c pdrun.c elf.c path.c l2s.c \
       signal.c syscall.c strace.c sys_file.c sys_mm.c sys_ipc.c sys_proc.c \
       sys_sig.c sys_time.c sys_misc.c sys_net.c sys_netlink.c sys_procfs.c \
       sys_ptrace.c sys_seccomp.c proctab.c ptracetab.c main.c)

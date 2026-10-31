@@ -1243,18 +1243,22 @@ extern __thread int g_fdwin_depth;  /* windows this thread is inside */
 #define L2S_ENABLED 1
 #endif
 
+/* l2s.c: the host the link2symlink engine (lib/link2symlink) runs on, and
+ * two of its calls for the program's own use. l2s_host_pin pins a host path
+ * the engine named as a guest syscall's own path is pinned (path_unpin it,
+ * whatever the answer): its guest name -- the bind it lies under, or the
+ * rootfs -- walked to its directory; the host /proc zone is handed over as it
+ * is, and any other path is EACCES. l2s_host_stat stats one so: 0 or -errno,
+ * the last component followed only in the /proc zone and with `follow`. */
+struct stat;
+int l2s_host_pin(const char *host, PathPin *p);
+int l2s_host_stat(const char *host, struct stat *st, int follow);
+
 #ifdef L2S_ENABLED
-/* path.c: the guest path a link2symlink symlink TARGET names, when the target
- * is the form proot writes -- an absolute HOST path, into the l2s directory
- * under the rootfs, ending in a ".l2s." / ".proot.l2s." name. proot records
- * the rootfs's own host path in every link it makes, and resolves it by
- * stripping that prefix; a guest walk that re-rooted such a target would
- * apply the prefix a second time and miss. Returns a pointer into `tgt` (the
- * path below the rootfs, or `tgt` itself where the rootfs is "/"), or NULL
- * when `tgt` is not that form -- which is every ordinary symlink, so nothing
- * else's target is ever reinterpreted. The result still goes through the
- * resolver like any guest path: this removes a prefix, nothing more. */
-const char *l2s_unhost(const struct Machine *m, const char *tgt);
+/* sys_file.c: does the guest name (dirfd, gp) name the emulation's own files
+ * -- a data or marker basename anywhere, or the store "/.l2s" -- which do not
+ * exist for the guest (resolve_pin answers ENOENT for them)? */
+int l2s_guest_denied(struct Machine *m, int dirfd, const char *gp);
 #endif
 
 /* -link2symlink (sys_file.c): if `p` names one of the emulated-hardlink

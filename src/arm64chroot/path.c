@@ -20,6 +20,7 @@
 
 #include "machine.h"
 #include "guest_abi.h"
+#include "link2symlink.h"
 
 /* Append `comp` (no slashes) to canonical path `canon` in place. */
 static int canon_push(char *canon, const char *comp) {
@@ -669,29 +670,6 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt, int *delete
     }
     return 1;
 }
-
-#ifdef L2S_ENABLED
-/* Is this symlink target one of the emulated-hardlink schemes' own: proot's (an
- * absolute host path into an ".l2s." name) or ours (a bare ".l2s.<ino>" in the
- * same directory)? */
-static int l2s_member_target(const struct Machine *m, const char *tgt) {
-    if (l2s_unhost(m, tgt)) return 1;
-    if (strchr(tgt, '/') || strncmp(tgt, ".l2s.", 5) || !tgt[5]) return 0;
-    for (const char *p = tgt + 5; *p; p++)
-        if (*p < '0' || *p > '9') return 0;
-    return 1;
-}
-
-const char *l2s_unhost(const struct Machine *m, const char *tgt) {
-    if (tgt[0] != '/') return NULL;
-    const char *base = strrchr(tgt, '/') + 1;
-    if (strncmp(base, ".l2s.", 5) && strncmp(base, ".proot.l2s.", 11)) return NULL;
-    size_t rl = strlen(m->rootfs);
-    if (!rl) return tgt;                  /* the rootfs is "/": a guest path already */
-    if (strncmp(tgt, m->rootfs, rl) || tgt[rl] != '/') return NULL;   /* a whole component */
-    return tgt + rl;
-}
-#endif
 
 /* Strip the rootfs prefix from a host path in place, yielding the guest path.
  * Anonymous targets (pipe:[..]) and passthrough paths (/dev, /proc) don't
@@ -2035,17 +2013,19 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
             }
 #ifdef L2S_ENABLED
             else if (m->link2symlink && last && (flags & PATH_STOP_AT_L2S) &&
-                     l2s_member_target(m, tgt)) {
+                     l2s_link_text(tgt)) {
                 continue;     /* the hardlink's own name is where the walk ends */
-            } else if (m->link2symlink) {
-                /* A link proot's link2symlink made: an absolute HOST path into
-                 * the l2s directory, which re-rooting would prefix a second
-                 * time. Only that form is touched (l2s_unhost), and what
-                 * remains is walked like any guest path -- under the same
+            } else if (m->link2symlink && tgt[0] == '/') {
+                /* A name of a group -- ours, into the store, or proot's, into
+                 * its l2s directory -- carries an absolute HOST path, which
+                 * re-rooting would prefix a second time. Only those forms are
+                 * touched (l2s_untranslate_target): the guest's own name for
+                 * the file, walked like any guest path -- under the same
                  * containment, whatever the text said. */
-                const char *gp = l2s_unhost(m, tgt);
-                if (gp && gp != tgt) {
-                    memmove(tgt, gp, strlen(gp) + 1);
+                char gv[PATH_MAX];
+                if (l2s_untranslate_target(tgt, gv, sizeof gv)) {
+                    if (strlen(gv) + 1 > sizeof tgt) return -ENAMETOOLONG;
+                    strcpy(tgt, gv);
                     tn = (ssize_t)strlen(tgt);
                 }
             }

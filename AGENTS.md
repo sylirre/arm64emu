@@ -26,7 +26,7 @@ Makefile               the one build of everything (see "Building")
 VERSION                the version of all three programs
 lib/arm64/             AArch64 emulation shared by arm64emu and arm64chroot
 lib/arm64/jit/         the JIT translator (IR, frontend, x86-64 and AArch64 backends)
-lib/link2symlink/      hardlink emulation (--link2symlink), chroot-ng's and, next, arm64chroot's
+lib/link2symlink/      hardlink emulation (--link2symlink) shared by arm64chroot and chroot-ng
 src/<program>/         each program's own sources, and its AGENTS.md
 tests/<program>/       each program's test suite
 docs/<program>/        each program's documentation; README.md is its user guide

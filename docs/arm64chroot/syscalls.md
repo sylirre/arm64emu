@@ -684,126 +684,127 @@ is what a mount point or a zone-mapped node like `/dev/null` looks like.
 Anything else that cannot be pinned is **refused**, never handed to the host as
 a path.
 
-The emulated-hardlink scheme (`--link2symlink`, Android) works the same way: a
-group's backing file and its marker live beside the name that points at them —
-the "hardlink" symlink targets a bare same-directory basename, which is what
-makes it resolve identically for the guest and for us — so every operation it
-performs is a bare name in a pinned directory, and "are these two names in the
-same directory?" is answered by the descriptors' inode identity rather than by
-comparing path strings.
+**The emulated-hardlink scheme** (`--link2symlink`, Android) is
+`lib/link2symlink`, the engine chroot-ng's `-l` runs too (since 2.0; before it
+arm64chroot had a scheme of its own, whose groups are still read). A guest
+hardlink moves the file into the rootfs's store, `<rootfs>/.l2s`, as
+`.l2s.<ino>` (its host inode, kept by the rename), beside an empty marker
+`.l2s.<ino>.<count>` whose name is the live link count; every name of the
+group is a symlink holding the data file's absolute **host** path, so a group
+spans directories and survives the rename of any name or directory. Where the
+store cannot be had, or the file is on another filesystem (a bind: the rename
+answers `EXDEV`), the group is made the older way — data and marker beside the
+first name, the names bare same-directory symlinks (`.l2s.<ino>`), which is
+the layout arm64chroot 1.x wrote. A store path whose rootfs prefix went stale
+(the tree was moved or copied) is healed onto the current store.
 
-One asymmetry is left over that the walk cannot cover. A group member is a
-symlink to the host and a regular file to the guest, and resolving the final
-component hides that from every caller that follows it — but a caller that asks
-**not** to follow it is looking straight at the stand-in, whose mode is 0777 and
-whose inode holds none of the data. `l2s_deref_pin` rewrites such a pin to name
-the backing instead, which costs nothing in containment (the target is a bare
-basename in the directory the pin already holds open, since a group never
-spans two) and is what `faccessat2`'s `AT_SYMLINK_NOFOLLOW`, `open`'s
-`O_NOFOLLOW`, `utimensat`, `fchownat`, the `l*xattr` family,
-`inotify_add_watch`'s `IN_DONT_FOLLOW` and `execveat`'s `AT_SYMLINK_NOFOLLOW`
-all pass through. Without it each of those quietly worked on the link: `access`
-granted what the file forbade, `open` and `execveat` answered `ELOOP` for a name
-a real hardlink opens and runs, and the rest returned success having stamped,
-chowned or tagged an inode nothing can read back. The calls that operate on the
-name **as** a name — `unlink`, `rename`, `link`, `readlink` — deliberately do
-not deref: each keeps its own bookkeeping over the group. `open` looks the group
-up only after the host has already answered `ELOOP`, so the ordinary path pays
-nothing.
+The engine works on host path strings, and every one it hands back to the
+host goes through arm64chroot's side of it (`l2s.c`, `struct l2s_ops`): mapped
+back to the guest name it has — the bind it lies under, or the rootfs — and
+pinned as a guest syscall's own path is, its directory walked descriptor by
+descriptor and the call made on the last component without following it. A
+path in no place of the guest's is refused (`EACCES`); only the host `/proc`
+zone is handed over as it is, since a descriptor's magic link (an `O_TMPFILE`
+being published) is the one path meant to be followed. The link texts it
+reads are the guest's to write, so a link is the scheme's only where its
+target names a data file the emulation could have written — a bare
+same-directory name, or a canonical absolute path in a place of the guest's
+own (or a stale store path) — and that data file is there and is not a
+directory or a symlink; anything else is an ordinary symlink and behaves as
+one. The machinery is not there for the guest: a name that is a data or
+marker basename anywhere, or the store and what is under it, is `ENOENT` to
+every path call (`resolve_pin`, `l2s_guest_denied`) and to `execve`, listings
+leave them out, and a guest `symlinkat` whose target's last component is in
+that grammar is refused, since the scheme would take the link for one of its
+own. Every change of a group runs under an `flock` of the store directory —
+one lock per rootfs, nothing created for it — and the count errs high, never
+low (a name is added after the count is raised and removed before it is
+lowered), so a crash leaks a file where the other order would lose one.
 
 **proot's own groups.** A rootfs installed through proot (proot-distro's) holds
-its hardlinks in proot's scheme, not the one above, and the emulator reads and
-keeps those too (`sys_file.c`, "proot's link2symlink"; `l2s_unhost` in
-`path.c`). Every name of a group is a symlink holding an absolute **host** path
-to an *indirection* symlink in the l2s directory
-(`<rootfs>/.l2s/.l2s.<name>0001`), which names the *data file* beside it
+its hardlinks in proot's scheme, and the engine reads and keeps those too.
+Every name of a group is a symlink holding an absolute **host** path to an
+*indirection* symlink in the l2s directory (`<rootfs>/.l2s/.l2s.<name>0001`,
+the same directory as the store), which names the *data file* beside it
 (`….l2s.<name>0001.<CCCC>`), whose last four digits are the live link count: a
 name added or removed renames the data file and re-points the indirection,
-which is why members name the indirection. Because the names hold an absolute
-path, a group spans directories. proot resolves such a target by stripping the
-rootfs prefix; a guest walk that re-rooted it would apply the prefix twice, so
-the walker strips it — only from a host path into a `.l2s.` / `.proot.l2s.`
-name (`l2s_unhost`), never from an ordinary symlink. What is left is walked as
-any guest path, under the same containment. Exec, open and stat then work, and
-each name is *presented* as what a hardlink is:
+which is why members name the indirection. The member's text is taken back to
+its guest name and resolved as the guest's own would be, contained, so an l2s
+directory that is a bind or a symlink inside the rootfs is found the way the
+guest finds it; of the indirection's text only the basename is used, and it
+must be the indirection's own name plus `.<CCCC>`, beside it. A chain a killed
+process left cut (the data renamed, the indirection not yet re-pointed) is
+made whole by the next change, under the lock; a reader looks again a few
+times and then sees the dangling symlink proot shows. New groups are made in
+the store's scheme; a proot group is extended in proot's.
 
-* `lstat`/`statx` (no-follow) ask the data file, so a name is one regular file
-  with the group's `st_nlink` and inode; `fstat` of an open one takes the
-  count from the name, and `getdents` reports the entry as `DT_REG` (a symlink
-  whose text is a group's: `find -type f` and `ls -F` go by `d_type`, and
-  agree with `lstat`). `readlink` of a name is `EINVAL` (and of the visible
-  indirection, which carries the rootfs's host path, tells the guest the path
-  it can use); the no-follow calls (`open` `O_NOFOLLOW`, `utimensat`,
-  `fchownat`, `faccessat2`, `l*xattr`, `execveat`, inotify) go through
-  `l2s_deref_pin`, which for these groups *hands the caller's pin the
-  directory descriptor of the data file* — the group's directory is not the
-  name's, which is the difference from the scheme above.
-* `link` adds a name with the same text *after* raising the count (and with
-  `AT_SYMLINK_FOLLOW`, which reaches the data file, too); `unlink` removes the
-  name and *then* lowers it; `rename` over a name of a group lowers that group,
-  and `rename` of one name of a file onto another name of the *same* file does
-  nothing, as on a kernel. The last name removed deletes the data file and the
-  indirection. A new name of a group is `EMLINK` at 9999.
+The walker (`path.c`) follows a name of a group to its data file: an absolute
+host path in one of those forms is taken back to the guest's own name for the
+file (`l2s_untranslate_target`) — re-rooting it would apply the prefix twice —
+and walked as any guest path, under the same containment. Each name is then
+*presented* as what a hardlink is:
 
-How it is kept safe. The symlinks it reads are the guest's to write, so none
-of their text is ever opened as a path: the member's text, stripped, is
-resolved by the containment resolver, which pins the directory, and everything
-after is a bare name under that descriptor. A group is recognised only when the
-whole chain checks out — the member names a `.l2s.<name><NNNN>` symlink, *that*
-names `….<CCCC>` in the same directory (compared as text, and then read from the
-one pinned descriptor), and *that* is a regular file; anything else is an
-ordinary symlink and behaves as one. Every name the bookkeeping makes, renames
-or removes is a bare basename built from the validated indirection name. A
-write the guest could not make is not made for it: the count lives in the l2s
-directory, which can sit on a read-only bind while the names do not — a new
-name is then `EXDEV` (the file is on the bind, the new name is not: a link
-across mounts), and a removed name still succeeds with its count left alone
-(`host_ro`, as every other writer). The count errs high, never low (a
-name is added after the count is raised and removed before it is lowered), so a
-crash leaks a file where the other order would lose one.
-
-Two processes changing one group at once are the hard case, because a change
-is two renames. The count itself stays exact — every change is a rename from
-the *current* name of the data file, so exactly one of two racing renames wins
-and the other looks again — but the re-point that follows is a separate step,
-and one that lands late leaves the indirection on a name that is gone. Each
-change therefore ends by making the chain whole (`pr_settle`: it finds the one
-data file in the directory and re-points to it), so whichever finishes last
-leaves it consistent, and a call that is about to *change* the group does the
-same for a chain a killed process left cut. A reader that finds the chain cut
-looks a few times and then sees an ordinary symlink; a call that adds a name
-waits (and never takes "cannot tell" for "not a group" — it used to, and the
-name it made was one nothing counted). `tests/arm64chroot/l2s_proot.sh` stresses this with
-six processes on one group.
+* `stat`/`lstat`/`statx` (follow or not) answer the data file's stat with the
+  group's count as `st_nlink`, and `fstat` of an open name takes the count
+  from where the kernel says the file is. `getdents` reports a name with the
+  data file's type and inode (a record that can be a symlink: `DT_LNK`, or
+  `DT_UNKNOWN`), so `find -type f`, `ls -F` and `ls -i` agree with `lstat`.
+  `readlink` of a name is `EINVAL`; of a visible proot indirection it tells
+  the guest its own name for the file.
+* The calls that ask **not** to follow the last component — `open`
+  `O_NOFOLLOW`, `faccessat2` `AT_SYMLINK_NOFOLLOW`, `utimensat`, `fchownat`,
+  the `l*xattr` family, `inotify_add_watch` `IN_DONT_FOLLOW`, `execveat`
+  `AT_SYMLINK_NOFOLLOW` — go through `l2s_deref_pin`, which replaces the
+  caller's pin with one on the data file. Without it each quietly worked on
+  the link: `access` granted what the file forbade, `open` and `execveat`
+  answered `ELOOP` for a name a real hardlink opens and runs, and the rest
+  stamped, chowned or tagged an inode nothing can read back. `open` looks the
+  group up only after the host answered `ELOOP`, so the ordinary path pays
+  nothing; an ordinary symlink keeps that `ELOOP`.
+* The calls that work on the name **as** a name do their own bookkeeping.
+  `link` of a name, or of the data file a following walk reached, is the
+  engine's whatever the host would say (a host link would make a name the
+  count never had); `unlink` removes the name and *then* lowers the count;
+  `rename` over a name of a group lowers that group, `rename` of one name of a
+  file onto another name of the *same* file does nothing (as on a kernel), the
+  last name renamed away takes the data with it (a real hardlink's last name
+  carries its inode), and a name of the older layout leaving its data's
+  directory is re-pointed at the data's path. The last name removed deletes
+  the data and the marker (or the indirection). A proot group takes no more
+  than 9999 names (`EMLINK`).
+* A write the guest could not make is not made for it: a group's data can sit
+  on a read-only bind while its names do not — a new name is then `EXDEV`
+  (the file is on the bind, the new name is not: a link across mounts), and a
+  removed name still succeeds with its count left alone (`host_ro`, as every
+  other writer).
 
 A program run through a name sees the name, as it does through a hardlink:
 `/proc/self/exe` (and the mapping names) is where a kernel's walk ends, which
 for a hardlink is the hardlink's own name, so the exec makes a second walk
-that stops at a group member (`PATH_STOP_AT_L2S`, in `path.c`; display only,
-the image was opened through the first). rust-coreutils (Ubuntu 26.04) is a
-binary hardlinked once per applet, and refuses to run — "Security violation:
-Requested utility `ls` does not match executable name" — unless the last
-component of `/proc/self/exe` is the applet it was asked to be.
+that stops at a name of a group (`PATH_STOP_AT_L2S`, in `path.c`; display
+only, the image was opened through the first). rust-coreutils (Ubuntu 26.04)
+is a binary hardlinked once per applet, and refuses to run — "Security
+violation: Requested utility `ls` does not match executable name" — unless the
+last component of `/proc/self/exe` is the applet it was asked to be.
 
 Known limits, all shared with proot: a name added or removed *while* another
 process opens a different name of the same group can make that open fail with
-`ENOENT` for the length of the two renames; a group's count
-is a number in a file name, so a name made by anything that does not keep it
-(a host tool copying the symlink) is one the count does not know, and a group
-whose names outnumber its count loses the data when the count reaches zero.
-New groups are still made in the emulator's own scheme; only a proot group is
-extended.
+`ENOENT` for the length of the two renames; a group's count is a number in a
+file name, so a name made by anything that does not keep it (a host tool
+copying the symlink) is one the count does not know, and a group whose names
+outnumber its count loses the data when the count reaches zero; proot takes no
+lock, so proot and the emulator changing one proot group at the same moment
+can leave its count one off. A name in a read-only bind whose data an earlier
+session moved into the store (the bind was writable then) is writable through
+the store: arm64chroot judges a followed name by where its data is, where
+chroot-ng also asks about the name's own mount.
 
-Reading proot's groups surfaced two containment holes in the scheme above, now
-closed (tests: `l2s_proot` rows, which fail on the earlier emulator):
-`link(2)` of a symlink made a *copy of its target* with an `openat` the host
-resolved against **its** root — a symlink to `/etc/hostname` gave the guest the
-host's file — and moving a member whose backing name was a symlink did the
-same through `l2s_materialize`, while `l2s_stat` followed it for its size and
-mode. `link` of a symlink now makes a second symlink with the same text, a
-backing file is opened `O_NOFOLLOW` (only the absolute `/proc/self/fd/N` of an
-`O_TMPFILE` being published is followed, since following that is the point),
-and a backing that is not a regular file is not the scheme's.
+`tests/arm64chroot/l2s_proot.sh` lays proot's layouts down by hand — over
+real hardlinks for the differential row, and hostile ones (targets that climb
+out, sibling directories, loops, a read-only l2s directory, a backing that is
+a symlink to a host file, six processes on one group) whose canaries must be
+untouched — and `c/l2s_*` compare the scheme with real hardlinks on the same
+host.
 
 Four syscalls have no `*at` form and no no-follow flag at all. `chmod`,
 `truncate` and `statfs` pin the final component itself and reach it through

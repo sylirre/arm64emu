@@ -3602,6 +3602,11 @@ SYSDEF(execve) {
     char gpath[PATH_MAX];
     long n = copy_str_from_guest(c, gpath, a0, sizeof gpath);
     if (n < 0) return (u64)(s64)n;
+#ifdef L2S_ENABLED
+    /* --link2symlink: the emulation's own files are not there (resolve_pin). */
+    if (c->m->link2symlink && l2s_guest_denied(c->m, G_AT_FDCWD, gpath))
+        return (u64)(s64)-ENOENT;
+#endif
     (void)a3; (void)a4; (void)a5;
     /* The vectors stay in guest memory until do_execve has the image open:
      * that is where a kernel reads them (exec_vecs_take). */
@@ -3620,6 +3625,10 @@ SYSDEF(execveat) {
     char gpath[PATH_MAX];
     long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
     if (n < 0) return (u64)(s64)n;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink && l2s_guest_denied(c->m, (int)(s32)a0, gpath))
+        return (u64)(s64)-ENOENT;
+#endif
     char exec_path[PATH_MAX];
     if (!gpath[0]) {
         if (!(gf & G_AT_EMPTY_PATH)) return (u64)(s64)-ENOENT;

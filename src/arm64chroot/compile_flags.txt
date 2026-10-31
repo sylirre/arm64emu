@@ -3,6 +3,7 @@
 -Ijit
 -I../../lib/arm64
 -I../../lib/arm64/jit
+-I../../lib/link2symlink
 -std=gnu11
 -D_GNU_SOURCE
 -D_FILE_OFFSET_BITS=64

@@ -467,6 +467,10 @@ static inline int resolve_pin(CPU *c, int dirfd, u64 path_va, unsigned rflags,
                               PathPin *pin, char *canon_out) {
     char gpath[PATH_MAX];
     long n = copy_str_from_guest(c, gpath, path_va, sizeof gpath);
+#ifdef L2S_ENABLED
+    /* --link2symlink: the emulation's own files are not there for the guest. */
+    if (n >= 0 && c->m->link2symlink && l2s_guest_denied(c->m, dirfd, gpath)) n = -ENOENT;
+#endif
     if (n < 0) {
         pin->dfd = AT_FDCWD; pin->pinned = 0; pin->name = pin->host; pin->host[0] = 0;
         return (int)n;
