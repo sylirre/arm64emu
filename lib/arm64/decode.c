@@ -6,10 +6,10 @@
  * program's arm64_config.h: ARM64_SYSTEM (the EL1-only checks and traps,
  * which fold away in user mode) and ARM64_SMP (host-atomic LSE, exclusives,
  * LDAR/STLR and barriers where guest threads run concurrently). Guest memory
- * is reached through the program's mmu.h. */
+ * is reached through mem.h, whose slow paths the program defines. */
 #include "cpu.h"
 #include <string.h>
-#include "mmu.h"
+#include "mem.h"
 #include "esr.h"
 #include "sysreg.h"
 #include <stdio.h>
@@ -58,11 +58,12 @@ static inline bool fp_access_ok(CPU *c) { (void)c; return true; }
 
 /* The unprivileged loads and stores (LDTR/STTR, SETxT, CPYxRT/WT) at EL1
  * access memory with EL0's permissions: c->ldst_unpriv, which arm64emu's MMU
- * reads, is set across each such access. At EL0 they are the plain forms, and
+ * reads, is set across each such access, and the D-TLB tag context follows
+ * it (cpu_refresh_dtlb_ctx). At EL0 they are the plain forms, and
  * arm64chroot's guest is always at EL0, so there both fold away. */
 #if ARM64_SYSTEM
 #define unpriv_at_el1(c, t)   ((t) && (c)->el == 1)
-#define set_ldst_unpriv(c, v) ((c)->ldst_unpriv = (v))
+#define set_ldst_unpriv(c, v) ((c)->ldst_unpriv = (v), cpu_refresh_dtlb_ctx(c))
 #else
 #define unpriv_at_el1(c, t)   ((void)(c), (void)(t), false)
 #define set_ldst_unpriv(c, v) ((void)(c), (void)(v))

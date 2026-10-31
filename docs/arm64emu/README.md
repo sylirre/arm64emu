@@ -164,7 +164,8 @@ src/arm64emu/
   arm64_config.h  how lib/arm64 is built here (full system; embedded _exit)
   cpu.c         fetch/decode/execute driver, condition codes, dump,
                 hot-PC profiler / ring buffer / coverage-divergence finder
-  mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB + fetch cache
+  mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB, and the
+                slow paths of lib/arm64's mem.h (D-TLB and fetch-cache fills)
   exception.c   exception entry/return (VBAR vectors, ESR/FAR/ELR/SPSR, ERET)
   memory.c      physical bus: RAM + NOR-flash CFI command set + MMIO dispatch
   tty.c         raw-terminal serial console via termios
@@ -182,6 +183,9 @@ src/arm64emu/
 lib/arm64/      AArch64 emulation shared with arm64chroot:
   types.h       fixed-width types and small helpers
   cpu.h         CPU state, PSTATE bits, core interpreter API
+  mem.h         guest memory as the core reaches it: typed accesses, fetch and
+                mem_host_ptr inline over the CPU's translation caches (D-TLB,
+                fetch cache); the slow paths are the program's
   decode.c      A64 decoder: integer/branch/load-store, CRC32, AdvSIMD ld/st
   predecode.{h,c}  the pre-decode classifier (word -> PDEnt) both engines use
   jit/          the JIT translator: ir.h, frontend.c, backend_x86_64.c,

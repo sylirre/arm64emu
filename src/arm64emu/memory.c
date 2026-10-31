@@ -2,7 +2,7 @@
 /* Copyright 2026 Sylirre */
 /* Physical memory bus: RAM, flash, and MMIO device dispatch. */
 #include "machine.h"
-#include "mmu.h"     /* jit_invalidate_phys_range (SMC coherence hooks) */
+#include "mmu.h"     /* jit_invalidate_phys_range (SMC coherence hooks), mmu_cpu_init */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -13,7 +13,7 @@ void machine_init(Machine *m, u64 ram_size) {
     m->ram_base = RAM_BASE;
     m->ram_size = ram_size ? ram_size : RAM_SIZE_DEF;
     /* mmap, not calloc: host page pointers to RAM must be 4 KB-aligned because
-     * the D-TLB packs permission bits into their low bits (see mmu.h), and the
+     * the D-TLB packs permission bits into their low bits (see mem.h), and the
      * anonymous mapping gives lazily-zeroed pages for large guest RAM. */
     m->ram = mmap(NULL, m->ram_size, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -29,6 +29,7 @@ void machine_init(Machine *m, u64 ram_size) {
     }
     m->ndev = 0;
     m->cpu.m = m;
+    mmu_cpu_init(&m->cpu);     /* its translation caches (mmu.h) */
 }
 
 void machine_free(Machine *m) {

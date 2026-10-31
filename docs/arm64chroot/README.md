@@ -356,6 +356,9 @@ host-portability pitfalls.
 ```
 lib/arm64/      AArch64 emulation shared with arm64emu:
   types.h cpu.h fixed-width types; CPU state + core interpreter API
+  mem.h         guest memory as the core reaches it: typed accesses, fetch and
+                mem_host_ptr inline over the CPU's translation caches (D-TLB,
+                fetch cache); the slow paths are the program's
   decode.c      A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
   predecode.{h,c}  the pre-decode classifier: word -> PDEnt (op id + operands)
   jit/          the JIT translator: ir.h, frontend.c (per-block decode ->
@@ -370,11 +373,12 @@ src/arm64chroot/
                 diffable against it until the two are merged into lib/arm64:
     cpu.c       step driver, reset, condition codes, debug dump
   mmu.h mem.c   NEW guest address space: 2-level software page table
-                (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect,
-                copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's
-                backing handed to the host syscall, pinned). Portable to 32-bit
-                hosts: guest VAs never become host pointers except through the
-                table.
+                (guest 4 KB page -> host pointer | prot) behind lib/arm64's
+                mem.h (its slow paths, each thread's translation caches), guest
+                mmap/brk/mprotect, copy_to/from_guest, guest_lend (a large
+                transfer's backing handed to the host syscall, pinned). Portable
+                to 32-bit hosts: guest VAs never become host pointers except
+                through the table.
   exception.c   pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c        run loop + exception dispatch + signal delivery point +
                 the thread call-out safepoint (stop_gen) + EL0's view of the

@@ -9,20 +9,8 @@
 
 #include <stddef.h>
 #include "cpu.h"
-#include "mmu.h"     /* D-TLB layout (probe ABI), fetch cache */
+#include "mmu.h"     /* the CPU's translation caches (mem.h: the probe ABI) */
 #include "jit.h"
-
-#ifndef LIKELY
-#define LIKELY(x)   __builtin_expect(!!(x), 1)
-#define UNLIKELY(x) __builtin_expect(!!(x), 0)
-#endif
-#define GUEST_PAGE_SIZE 4096ULL
-
-/* Donor-compat alias: the backends' inline D-TLB probe indexes by entry
- * count. The probe emitters are adapted to mmu.h's DTlbEnt layout: tag =
- * VA page | env->dtlb_ctxgen (flush generation + MMU + EL0), pte = host
- * page | W(2) | R(1). Only the interpreter's slow path fills entries. */
-#define A64_DTLB_ENTRIES DTLB_SIZE
 
 /* Inline-exclusives emitter: compiled out (see backend_x86_64.c note). */
 
@@ -84,7 +72,9 @@ typedef struct JitEnv {
     u32 active;
     void *helper_exec1;         /* u32 (*)(CPU*, u64 pc, u32 insn) */
     void *helper_exec1_ic;      /* same, for IC IVAU (invalidates after) */
-    void *dtlb;                 /* this thread's D-TLB base (jit_dtlb_base) */
+    void *dtlb;                 /* the CPU's D-TLB (c->eng.dtlb); the inline
+                                 * probe takes the entry layout from mem.h and
+                                 * the index mask, at emit time, from c->eng */
     void *helper_ld;            /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_st;            /* u32 (*)(CPU*, u64 va, u64 val, u64 pc, u32) */
     void *helper_ldv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
@@ -126,7 +116,10 @@ typedef struct JitEnv {
                                  * page's VA->code binding, so the VA-keyed
                                  * jcache is purged on this counter too */
     u64 dtlb_ctxgen;            /* low 12 bits of the current dtlb_tag():
-                                 * (g_tlb_gen & 0x3ff) << 2 | MMU<<1 | EL0.
+                                 * c->eng.genbits | MMU<<1 | EL0, computed
+                                 * from the live state rather than taken from
+                                 * c->eng.tagctx, so that a missed tagctx
+                                 * refresh shows as the engines disagreeing.
                                  * Inline probes OR this into the VA page for
                                  * the tag compare; refreshed by the
                                  * dispatcher every iteration (gen/EL/MMU can

@@ -10,10 +10,6 @@
 #include "pdrun.h"
 #include "../mmu.h"
 
-#ifndef UNLIKELY
-#define UNLIKELY(x) __builtin_expect(!!(x), 0)
-#endif
-
 /* The predecoded tier's fill: pd_fill plus the one demotion that belongs to
  * executing straight out of a PDEnt.
  *

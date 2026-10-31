@@ -20,6 +20,7 @@ void cpu_unpack_spsr(CPU *c, u32 spsr) {
     unsigned m = spsr & 0xf;
     c->el = (m >> 2) & 3;
     c->sp_sel = m & 1u;
+    cpu_refresh_el_state(c);    /* what is cached of the EL's configuration */
 }
 
 __thread ThreadState g_tls;

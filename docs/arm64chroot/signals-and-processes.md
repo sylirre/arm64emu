@@ -1470,8 +1470,9 @@ fork.
 
 One host thread per guest thread over the shared `Machine`/address space:
 
-- each thread gets its own `CPU` and its own `__thread` state (`g_tls`,
-  `g_fcache`);
+- each thread gets its own `CPU` and its own `__thread` state (`g_tls`, and
+  the translation caches its CPU points at, which it attaches with
+  `as_cpu_attach` before it runs);
 - the guest tid **is** the host tid of the pthread carrying the thread — the
   thread analogue of the guest pid == host pid invariant. The tid is known only
   once the new thread runs, so `clone` parks on a startup handshake until

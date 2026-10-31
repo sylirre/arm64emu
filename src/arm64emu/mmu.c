@@ -22,12 +22,19 @@ typedef struct {
 } TLBEntry;
 static TLBEntry tlb[TLB_ENTRIES];
 
-/* Instruction-fetch fast-path caches, [el == 0] (single CPU, like the TLB). */
-FetchCache g_fcache[2];
-
-/* Data-access host-pointer D-TLB (layout contract in mmu.h). */
-DTlbEnt g_dtlb[DTLB_SIZE];
+/* The table of the CPU's host-pointer D-TLB (layout in mem.h). Single CPU,
+ * like the TLB. */
 u32 g_tlb_gen = 1;
+static DTlbEnt g_dtlb[DTLB_SIZE];
+
+void mmu_cpu_init(CPU *c) {
+    memset(&c->eng, 0, sizeof c->eng);
+    c->eng.dtlb = g_dtlb;
+    c->eng.dtlb_mask = DTLB_SIZE - 1;
+    c->eng.genbits = (u64)(g_tlb_gen & 0x3ff) << 2;
+    c->eng.fetch_el0 = c->el == 0;
+    cpu_refresh_dtlb_ctx(c);
+}
 const u8 *g_jit_code_bitmap;
 
 /* Union range of all block-mapped (2 MB/1 GB) translations cached since the
@@ -57,33 +64,36 @@ static void lp_record(u64 va, unsigned blk_shift) {
  * carry the generation in their tags). Boot flushes this on every TLBI and
  * TTBR/TCR/SCTLR write — ~1600 times per 4M instructions — so the previous
  * full memset of the 4096-entry TLB was ~14% of boot time. */
-void tlb_flush_all(void) {
+void tlb_flush_all(CPU *c) {
+    CpuEngine *e = &c->eng;
     ++g_tlb_gen;
     if ((g_tlb_gen & 0x3ff) == 0) {
         /* The D-TLB tag holds only 10 generation bits: purge on slice wrap so
          * an entry from 1024 flushes ago cannot alias the new generation. */
-        memset(g_dtlb, 0, sizeof(g_dtlb));
+        memset(e->dtlb, 0, (size_t)(e->dtlb_mask + 1) * sizeof *e->dtlb);
         if (g_tlb_gen == 0) {           /* full u32 wrap: purge the TLB too */
             memset(tlb, 0, sizeof(tlb));
             g_tlb_gen = 1;
         }
     }
+    e->genbits = (u64)(g_tlb_gen & 0x3ff) << 2;   /* the tags fills now carry */
+    cpu_refresh_dtlb_ctx(c);     /* ...and an SCTLR_EL1 write's M bit */
     lp_base = lp_mask = ~0ULL;   /* every fragment died with the generation */
-    g_fcache[0].host = g_fcache[1].host = NULL;   /* force a re-translate */
+    e->fetch[0].host = e->fetch[1].host = NULL;   /* force a re-translate */
 }
 
 u32 g_tlbi_va_seq;
 
-void tlb_flush_page(u64 va) {
-    if ((VA_NOTAG(va) & lp_mask) == lp_base) { tlb_flush_all(); return; }
+void tlb_flush_page(CPU *c, u64 va) {
+    if ((VA_NOTAG(va) & lp_mask) == lp_base) { tlb_flush_all(c); return; }
     /* One direct-mapped slot per structure can hold this page: clear by index,
      * no tag compare (a TBI-tagged fill of the same page carries a different
      * tag; evicting an unrelated collider is just a refill). A zeroed D-TLB
      * entry has no R/W bits, so it can never fast-path. */
     tlb[tlb_idx(va)].valid = 0;
-    DTlbEnt *de = &g_dtlb[(va >> 12) & (DTLB_SIZE - 1)];
+    DTlbEnt *de = dtlb_ent(c, va);
     de->tag = 0; de->pte = 0;
-    g_fcache[0].host = g_fcache[1].host = NULL;
+    c->eng.fetch[0].host = c->eng.fetch[1].host = NULL;
     ++g_tlbi_va_seq;
 }
 
@@ -273,12 +283,12 @@ static void dtlb_fill(CPU *c, u64 va, u64 pa) {
         u64 pfn = (pa_page - m->ram_base) >> 12;
         if (g_jit_code_bitmap[pfn >> 3] & (1u << (pfn & 7))) w = 0;
     }
-    DTlbEnt *de = dtlb_ent(va);
+    DTlbEnt *de = dtlb_ent(c, va);
     de->tag = dtlb_tag(c, va);
     de->pte = (u64)(uintptr_t)(m->ram + (pa_page - m->ram_base)) | r | w;
 }
 
-bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
+bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
     u64 off = va & 0xfffULL;
     if (off + size > 0x1000 && (c->sctlr[1] & 1)) {       /* spans two pages */
         unsigned first = 0x1000u - (unsigned)off;
@@ -289,15 +299,9 @@ bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
         return true;
     }
     /* off+size can exceed the page only with the MMU off (no split above);
-     * keep that on the bus path — the last RAM page must not memcpy past the
-     * host mapping, and a RAM->MMIO crossing is a single bus access there. */
-    DTlbEnt *de = dtlb_ent(va);
-    if (off + size <= 0x1000 && de->tag == dtlb_tag(c, va) && (de->pte & DTLB_R)) {
-        u64 v = 0;
-        __builtin_memcpy(&v, (const u8 *)(uintptr_t)(de->pte & ~0xfffULL) + off, size);
-        *out = v;
-        return true;
-    }
+     * that stays on the bus path -- the D-TLB hit (mem.h) never serves an
+     * access that crosses a page, so the last RAM page cannot be copied past
+     * the host mapping, and a RAM->MMIO crossing is a single bus access. */
     u64 pa;
     if (!mmu_translate(c, va, ACC_READ, &pa)) return false;
     u64 v = phys_read(c->m, pa, size);
@@ -307,7 +311,7 @@ bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
     return true;
 }
 
-bool mem_write(CPU *c, u64 va, unsigned size, u64 val) {
+bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
     if (__builtin_expect(g_vawatch != 0, 0) &&    /* #16: single hook guard */
         va < g_vawatch + 8 && va + size > g_vawatch) {
         static int vn = 0;
@@ -326,12 +330,7 @@ bool mem_write(CPU *c, u64 va, unsigned size, u64 val) {
         if (!mem_write(c, va + first, size - first, val >> (first * 8))) return false;
         return true;
     }
-    DTlbEnt *de = dtlb_ent(va);   /* no-cross guard: see mem_read */
-    if (off + size <= 0x1000 && de->tag == dtlb_tag(c, va) && (de->pte & DTLB_W)) {
-        __builtin_memcpy((u8 *)(uintptr_t)(de->pte & ~0xfffULL) + off, &val, size);
-        return true;
-    }
-    u64 pa;
+    u64 pa;                       /* page crossing with the MMU off: see mem_read_slow */
     if (!mmu_translate(c, va, ACC_WRITE, &pa)) return false;
     phys_write(c->m, pa, size, val);
     if (c->m->last_bus_status != BUS_OK) return raise_abort(c, va, ACC_WRITE, FSC_EXTERNAL);
@@ -417,11 +416,10 @@ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
     u8 *hp = host_page_ptr(c->m, pa & ~0xfffULL);
     if (hp) {
         /* Cache the page translation; bytes are still read live from *host. */
-        FetchCache *f = &g_fcache[c->el == 0];
+        FetchCache *f = &c->eng.fetch[0];   /* the current EL's */
         f->host = hp;
         f->page = va & ~0xfffULL;
         f->pa_page = pa & ~0xfffULL;
-        f->mmu  = (u8)(c->sctlr[1] & 1);
         __builtin_memcpy(insn_out, hp + (va & 0xfffULL), 4);
         return true;
     }
@@ -432,18 +430,11 @@ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
     return true;
 }
 
-/* One D-TLB probe + one 16-byte host copy when the access stays inside a
- * page. The fallback two-halves path is observably identical for the cases
- * the fast path skips (page-crossing, MMIO, watchpoint runs — the D-TLB is
- * empty then — and JIT code pages, whose W bit the D-TLB refuses): both
- * orders write/read the same bytes and fault at the same split VA. */
-bool mem_read128(CPU *c, u64 va, V128 *out) {
-    u64 off = va & 0xfffULL;
-    DTlbEnt *de = dtlb_ent(va);
-    if (off <= 0xff0 && de->tag == dtlb_tag(c, va) && (de->pte & DTLB_R)) {
-        __builtin_memcpy(out, (const u8 *)(uintptr_t)(de->pte & ~0xfffULL) + off, 16);
-        return true;
-    }
+/* What the 16-byte D-TLB hit (mem.h) leaves: two halves, observably the same
+ * for every case it skips (page-crossing, MMIO, watchpoint runs -- the D-TLB
+ * is empty then -- and JIT code pages, whose W bit the D-TLB refuses): both
+ * write/read the same bytes and fault at the same split VA. */
+bool mem_read128_slow(CPU *c, u64 va, V128 *out) {
     u64 lo, hi;
     if (!mem_read(c, va, 8, &lo)) return false;
     if (!mem_read(c, va + 8, 8, &hi)) return false;
@@ -451,14 +442,17 @@ bool mem_read128(CPU *c, u64 va, V128 *out) {
     return true;
 }
 
-bool mem_write128(CPU *c, u64 va, const V128 *val) {
-    u64 off = va & 0xfffULL;
-    DTlbEnt *de = dtlb_ent(va);
-    if (off <= 0xff0 && de->tag == dtlb_tag(c, va) && (de->pte & DTLB_W)) {
-        __builtin_memcpy((u8 *)(uintptr_t)(de->pte & ~0xfffULL) + off, val, 16);
-        return true;
-    }
+bool mem_write128_slow(CPU *c, u64 va, const V128 *val) {
     if (!mem_write(c, va, 8, val->d[0])) return false;
     if (!mem_write(c, va + 8, 8, val->d[1])) return false;
     return true;
+}
+
+/* One CPU, executing in program order: an access through mem_read/mem_write
+ * is as atomic as one through a host pointer, so a D-TLB miss is answered
+ * NULL rather than resolved (mem.h's contract allows it). The MOPS copies then
+ * run through the typed accesses until their pages are cached. */
+void *mem_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
+    (void)c; (void)va; (void)size; (void)acc;
+    return NULL;
 }

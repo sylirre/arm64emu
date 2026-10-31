@@ -64,6 +64,13 @@ typedef struct BE {
     u32 vlru[32];
 } BE;
 
+/* The D-TLB's index width (mem.h): the table belongs to the CPU this cache
+ * translates for, and is sized by the program (a power of two), so it is
+ * read as the code is emitted and becomes part of a bitmask immediate. */
+static unsigned dtlb_idxbits(const BE *be) {
+    return (unsigned)__builtin_ctzll(be->env->c->eng.dtlb_mask + 1);
+}
+
 /* ---- raw emission ---- */
 
 static void ei(Emit *e, u32 insn) {
@@ -605,40 +612,26 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
      * (TBI-tagged VAs mismatch the stripped stored tag the same way.) */
     if (sz > 1) {
         enc_addsub_imm(e, 0, 16, 1, sz - 1);      /* x16 = va + sz-1 */
-#if ARM64_SYSTEM
         ei(e, enc_andi64(16, 16, 52, 51));        /* page ADDRESS: & ~0xfff */
-#else
-        ei(e, enc_ubfm(1, 16, 16, 12, 63));       /* lsr x16, x16, #12 */
-#endif
     } else {
-#if ARM64_SYSTEM
         ei(e, enc_andi64(16, 1, 52, 51));
-#else
-        ei(e, enc_ubfm(1, 16, 1, 12, 63));        /* lsr x16, x1, #12 */
-#endif
     }
-#if ARM64_SYSTEM
     ei(e, enc_ldr(3, 2, 27,                       /* gen/MMU/EL0 tag bits */
                   (unsigned)offsetof(JitEnv, dtlb_ctxgen)));
     ei(e, enc_orr(1, 16, 16, 2));
-#endif
     ei(e, enc_ubfm(1, 17, 1, 8, 63));             /* lsr x17, x1, #8 */
     ei(e, enc_andi64(17, 17,                      /* and x17,x17,#(idxmask<<4):
                                                    * ROR(ones(idxbits), 60) */
                      (64 - 4) & 63,
-                     (unsigned)__builtin_ctz(A64_DTLB_ENTRIES) - 1));
+                     dtlb_idxbits(be) - 1));
     ei(e, enc_ldr(3, 2, 27, (unsigned)offsetof(JitEnv, dtlb)));
     ei(e, enc_addr(17, 2, 17));                   /* x17 = &dtlb[idx] */
-    ei(e, enc_ldr(3, 2, 17, 0));                  /* tag = ent->tag (arm64chroot: ->page) */
+    ei(e, enc_ldr(3, 2, 17, 0));                  /* tag = ent->tag */
     ei(e, enc_cmp(2, 16));
     slow1 = bcond_fwd(e, 1);                      /* b.ne slow */
     ei(e, enc_ldr(3, 2, 17, 8));                  /* pte -> x2 */
     slow2 = tbz_fwd(e, 2, need == 2 ? 1 : 0);     /* perm bit clear -> slow */
-#if ARM64_SYSTEM
     ei(e, enc_andi64(2, 2, 52, 51));              /* and x2, x2, #~0xfff */
-#else
-    ei(e, enc_andi64(2, 2, 61, 60));              /* and x2, x2, #~7 (host) */
-#endif
     ei(e, enc_andi64(16, 1, 0, 11));              /* and x16, x1, #0xfff */
 
 #if ARM64_SYSTEM
@@ -781,17 +774,13 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     /* span-checked probe: compare the run's last byte's page against the
      * tag stored for va0's page — any crossing of the span mismatches */
     enc_addsub_imm(e, 0, 16, 1, (u64)(hi - lo - 1));
-#if ARM64_SYSTEM
     ei(e, enc_andi64(16, 16, 52, 51));            /* page address: & ~0xfff */
     ei(e, enc_ldr(3, 2, 27,                       /* | gen/MMU/EL0 tag bits */
                   (unsigned)offsetof(JitEnv, dtlb_ctxgen)));
     ei(e, enc_orr(1, 16, 16, 2));
-#else
-    ei(e, enc_ubfm(1, 16, 16, 12, 63));           /* lsr x16, x16, #12 */
-#endif
     ei(e, enc_ubfm(1, 17, 1, 8, 63));
     ei(e, enc_andi64(17, 17, (64 - 4) & 63,
-                     (unsigned)__builtin_ctz(A64_DTLB_ENTRIES) - 1));
+                     dtlb_idxbits(be) - 1));
     ei(e, enc_ldr(3, 2, 27, (unsigned)offsetof(JitEnv, dtlb)));
     ei(e, enc_addr(17, 2, 17));
     ei(e, enc_ldr(3, 2, 17, 0));
@@ -799,11 +788,7 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     slow1 = bcond_fwd(e, 1);
     ei(e, enc_ldr(3, 2, 17, 8));
     slow2 = tbz_fwd(e, 2, need == 2 ? 1 : 0);
-#if ARM64_SYSTEM
     ei(e, enc_andi64(2, 2, 52, 51));              /* host page: & ~0xfff */
-#else
-    ei(e, enc_andi64(2, 2, 61, 60));              /* host backing base */
-#endif
     ei(e, enc_andi64(16, 1, 0, 11));              /* pageoff of va0 */
     ei(e, enc_addr(17, 2, 16));                   /* x17 = host ptr va0 */
 
@@ -1826,10 +1811,13 @@ static void emit_atomic_end(BE *be, const IROp *o) {
 #endif
         }
 #if ARM64_SMP
-        ei(e, enc_ubfm(1, 16, 1, 12, 63));        /* page (aligned: no cross) */
+        ei(e, enc_andi64(16, 1, 52, 51));         /* page address (aligned: no cross) */
+        ei(e, enc_ldr(3, 2, 27,                   /* | the tag's low bits */
+                      (unsigned)offsetof(JitEnv, dtlb_ctxgen)));
+        ei(e, enc_orr(1, 16, 16, 2));
         ei(e, enc_ubfm(1, 17, 1, 8, 63));
         ei(e, enc_andi64(17, 17, (64 - 4) & 63,
-                         (unsigned)__builtin_ctz(A64_DTLB_ENTRIES) - 1));
+                         dtlb_idxbits(be) - 1));
         ei(e, enc_ldr(3, 2, 27, (unsigned)offsetof(JitEnv, dtlb)));
         ei(e, enc_addr(17, 2, 17));
         ei(e, enc_ldr(3, 2, 17, 0));
@@ -1837,7 +1825,7 @@ static void emit_atomic_end(BE *be, const IROp *o) {
         slow2 = bcond_fwd(e, 1);                  /* b.ne slow */
         ei(e, enc_ldr(3, 2, 17, 8));
         slow3 = tbz_fwd(e, 2, need == 2 ? 1 : 0);
-        ei(e, enc_andi64(2, 2, 61, 60));          /* host base */
+        ei(e, enc_andi64(2, 2, 52, 51));          /* host page: & ~0xfff */
         ei(e, enc_andi64(16, 1, 0, 11));          /* page offset */
         ei(e, enc_addr(17, 2, 16));               /* x17 = host ptr */
 #else

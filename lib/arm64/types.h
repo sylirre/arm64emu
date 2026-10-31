@@ -20,6 +20,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Branch-prediction hints for the hot paths. */
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
 /* ---- work-it-out-once flags ----------------------------------------------
  * A host capability, a fallback switch, a policy the host applies once
  * and for all: decided on first use and remembered. Every one of them is

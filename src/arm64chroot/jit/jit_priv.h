@@ -97,7 +97,14 @@ typedef struct JitEnv {
     u32 active;
     void *helper_exec1;         /* u32 (*)(CPU*, u64 pc, u32 insn) */
     void *helper_exec1_ic;      /* same, for IC IVAU (invalidates after) */
-    void *dtlb;                 /* this thread's D-TLB base (jit_dtlb_base) */
+    void *dtlb;                 /* the CPU's D-TLB (c->eng.dtlb); the inline
+                                 * probe takes the entry layout from mem.h and
+                                 * the index mask, at emit time, from c->eng */
+    u64 dtlb_ctxgen;            /* low 12 bits of the dtlb_tag() the probe
+                                 * compares (mem.h): the EL0 bit alone here --
+                                 * no generation, the MMU bit clear -- and set
+                                 * once, since a user-mode CPU never leaves EL0
+                                 * nor writes SCTLR_EL1 */
     void *helper_ld;            /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_st;            /* u32 (*)(CPU*, u64 va, u64 val, u64 pc, u32) */
     void *helper_ldv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */

@@ -70,6 +70,7 @@ full on real armv7 silicon.
 Makefile                             (repository root) `make arm64chroot` -> build/arm64chroot; also arm64chroot32 (ILP32 host) and arm64chroot_asim (Android behavior)
 lib/arm64/                           Shared with arm64emu (compiled into both):
   types.h cpu.h                      Fixed-width types; CPU state + core interpreter API
+  mem.h                              Guest memory as the core reaches it: typed accesses, fetch and mem_host_ptr, inline over the CPU's translation caches (c->eng: the D-TLB, whose entry layout the JIT probes inline, and the fetch cache); the slow paths and cache maintenance are the program's
   decode.c                           A64 decoder/executor (+ LSE atomics, host-atomic exclusives under ARM64_SMP)
   jit/ir.h jit/frontend.c            JIT translator: per-block decode -> linear IR -> liveness / flag fusion
   jit/backend_a64.c jit/backend_x86_64.c  Register-allocating single-pass emitters (the 32-bit hosts' two stay in src/arm64chroot/jit)
@@ -81,7 +82,7 @@ src/arm64chroot/
   arm64_config.h                     How lib/arm64 is built here: ARM64_SYSTEM 0 (user mode, the guest stays at EL0), ARM64_SMP 1 (guest threads run concurrently)
   core/                              The user-mode variant of the rest of arm64emu's core, kept diffable against src/arm64emu until merged into lib/arm64:
     cpu.c                            Step driver, reset, condition codes, debug dump
-  mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot), guest mmap/brk/mprotect, copy_to/from_guest, mem_host_ptr, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
+  mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot) behind lib/arm64's mem.h (its slow paths; each thread's translation caches, attached to the CPU it runs by as_cpu_attach), guest mmap/brk/mprotect, copy_to/from_guest, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
   pdrun.c pdrun.h                    Decoded-instruction cache: direct-threaded fast path over ~200 hot forms (classified by lib/arm64 predecode.c); PD_GENERIC falls back to exec_a64 (the default engine)

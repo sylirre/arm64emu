@@ -39,6 +39,11 @@ lib/arm64/                shared with arm64chroot (compiled into both):
   types.h                 u8..u64 / bool / small helpers; includes the
                           program's arm64_config.h first
   cpu.h                   CPU state struct, PSTATE bits, core interpreter API
+  mem.h                   guest memory as the core reaches it: typed accesses,
+                          fetch and mem_host_ptr, inline over the CPU's
+                          translation caches (c->eng: the D-TLB, whose entry
+                          layout the JIT probes inline, and the fetch cache);
+                          the slow paths and TLB maintenance are the program's
   sysreg.h                MSR/MRS + SMCCC hooks (smccc_conduit weak: only
                           arm64emu has PSCI)
   sysreg.c                system-register file: MSR/MRS/SYS/MSR-immediate, ID
@@ -83,11 +88,12 @@ src/arm64emu/
                           hot-PC profiler
   exception.c             exception entry/return: VBAR vectors, ESR/FAR/ELR/
                           SPSR banking, DAIF masking, ERET
-  mmu.h                   translation + typed guest memory access API,
-                          D-TLB layout (shared with the JIT fast path),
-                          mem_host_ptr (lib/arm64's host-pointer seam)
+  mmu.h                   the MMU behind lib/arm64's mem.h: translation, the
+                          CPU's caches (mmu_cpu_init: a 4096-entry D-TLB
+                          tagged with the TLB flush generation)
   mmu.c                   stage-1 walk (EL1&0, 4 KB granule), software TLB,
-                          instruction-fetch cache, guest load/store helpers
+                          mem.h's slow paths (D-TLB/fetch-cache fills, the
+                          bus), TLBI/AT
   machine.h               Machine struct + virt platform constants
                           (FLASH/RAM base and size, device windows)
   memory.c                physical bus: RAM, Intel CFI NOR flash command set,

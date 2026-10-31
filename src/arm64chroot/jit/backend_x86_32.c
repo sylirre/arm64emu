@@ -275,6 +275,13 @@ static u32 env_abs(BE *be, size_t off) {
     return (u32)(uintptr_t)be->env + (u32)off;
 }
 
+/* The VA bits that select a D-TLB entry, in place (index mask << 12): the
+ * table belongs to the CPU this cache translates for and is sized by the
+ * program (mem.h), so it is read as the code is emitted. */
+static u32 dtlb_idx_bits(BE *be) {
+    return (u32)(be->env->c->eng.dtlb_mask << 12);
+}
+
 /* ---- register allocator (over guest halves) ---- */
 
 /* Memory home of a half. VREG_ZERO has none — it reads as zero and its writes
@@ -894,25 +901,27 @@ static void emit_mem(BE *be, const IROp *o) {
         alu_ri(e, AL_ADC, EDX, (u32)(o->imm >> 32));
     }
     st_r(e, EAX, M_esp(FR_VLO));                 /* for the page offset below */
-    /* entry byte offset = ((va >> 12) & 1023) * 16 == (va & 0x3ff000) >> 8 */
+    /* entry byte offset = ((va >> 12) & mask) * 16 == (va & mask << 12) >> 8 */
     mov_rr(e, t, EAX);
-    alu_ri(e, AL_AND, t, 0x003FF000u);
+    alu_ri(e, AL_AND, t, dtlb_idx_bits(be));
     shift_ri(e, SH_SHR, t, 8);
     if (sz > 1) {                                /* the access's last byte */
         alu_ri(e, AL_ADD, EAX, sz - 1);
         alu_ri(e, AL_ADC, EDX, 0);
     }
-    shrd_ri(e, EAX, EDX, 12);                    /* tag, low word */
-    shift_ri(e, SH_SHR, EDX, 12);                /* tag, high word */
+    /* tag (mem.h): the page address of the last byte with the low bits the
+     * dispatcher keeps in dtlb_ctxgen; its high word is the VA's own. */
+    alu_ri(e, AL_AND, EAX, 0xFFFFF000u);         /* tag, low word */
+    op_rm(e, 0x0B, EAX, RM_M(M_abs(env_abs(be, offsetof(JitEnv, dtlb_ctxgen)))));
     u32 tlb = (u32)(uintptr_t)be->env->dtlb;
-    op_rm(e, 0x3B, EAX, RM_M(M_absx(tlb, t, 0)));         /* cmp against page */
+    op_rm(e, 0x3B, EAX, RM_M(M_absx(tlb, t, 0)));         /* cmp against tag */
     slow1 = jcc_fwd(e, CC_NE);
     op_rm(e, 0x3B, EDX, RM_M(M_absx(tlb + 4, t, 0)));
     slow2 = jcc_fwd(e, CC_NE);
     ld_r(e, EAX, M_absx(tlb + 8, t, 0));                  /* pte */
     e8(e, 0xA8); e8(e, (u8)need);                         /* test al, need */
     slow3 = jcc_fwd(e, CC_E);
-    alu_ri(e, AL_AND, EAX, 0xFFFFFFF8u);         /* strip PTE_FLAGS */
+    alu_ri(e, AL_AND, EAX, 0xFFFFF000u);         /* host page */
     ld_r(e, EDX, M_esp(FR_VLO));
     alu_ri(e, AL_AND, EDX, GUEST_PAGE_MASK);
     op_rr(e, 0x03, EAX, EDX);                    /* eax = host pointer */
@@ -1097,14 +1106,14 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     }
     st_r(e, EAX, M_esp(FR_VLO));
     mov_rr(e, t_reg, EAX);
-    alu_ri(e, AL_AND, t_reg, 0x003FF000u);
+    alu_ri(e, AL_AND, t_reg, dtlb_idx_bits(be));
     shift_ri(e, SH_SHR, t_reg, 8);
     if (hi - lo > 1) {                           /* the span's last byte */
         alu_ri(e, AL_ADD, EAX, (u32)(hi - lo - 1));
         alu_ri(e, AL_ADC, EDX, 0);
     }
-    shrd_ri(e, EAX, EDX, 12);
-    shift_ri(e, SH_SHR, EDX, 12);
+    alu_ri(e, AL_AND, EAX, 0xFFFFF000u);         /* tag: page address | ctxgen */
+    op_rm(e, 0x0B, EAX, RM_M(M_abs(env_abs(be, offsetof(JitEnv, dtlb_ctxgen)))));
     u32 tlb = (u32)(uintptr_t)be->env->dtlb;
     op_rm(e, 0x3B, EAX, RM_M(M_absx(tlb, t_reg, 0)));
     slow1 = jcc_fwd(e, CC_NE);
@@ -1113,7 +1122,7 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     ld_r(e, EAX, M_absx(tlb + 8, t_reg, 0));
     e8(e, 0xA8); e8(e, (u8)need);                /* test al, need */
     slow3 = jcc_fwd(e, CC_E);
-    alu_ri(e, AL_AND, EAX, 0xFFFFFFF8u);
+    alu_ri(e, AL_AND, EAX, 0xFFFFF000u);         /* host page */
     ld_r(e, EDX, M_esp(FR_VLO));
     alu_ri(e, AL_AND, EDX, GUEST_PAGE_MASK);
     op_rr(e, 0x03, EAX, EDX);                    /* eax = host pointer of va0 */

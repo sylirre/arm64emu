@@ -5,7 +5,7 @@
  * compiled in only for a full system (ARM64_SYSTEM, arm64_config.h). */
 #include "sysreg.h"
 #include "esr.h"
-#include "mmu.h"
+#include "mem.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -138,11 +138,11 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
         if (op1 == 0 && (CRm == 3 || CRm == 7) && (op2 & 1)) {
             u64 va = (reg_x(c, Rt) & 0xFFFFFFFFFFFULL) << 12;
             if (va & (1ULL << 55)) va |= 0xFF00000000000000ULL;
-            tlb_flush_page(va);
+            tlb_flush_page(c, va);
             return;
         }
 #endif
-        tlb_flush_all();
+        tlb_flush_all(c);
         return;
     }
     if (CRn == 7) {
@@ -281,14 +281,14 @@ void cpu_fp_trap(CPU *c) {
 static void do_msr(CPU *c, unsigned key, unsigned Rt) {
     u64 v = reg_x(c, Rt);
     switch (key) {
-        case KEY(3,0,1,0,0): c->sctlr[1] = v; tlb_flush_all(); break;  /* SCTLR_EL1 */
+        case KEY(3,0,1,0,0): c->sctlr[1] = v; tlb_flush_all(c); break;  /* SCTLR_EL1 */
         case KEY(3,0,1,0,2):                                           /* CPACR_EL1 */
             c->cpacr_el1 = v;
-            cpu_refresh_fp_trap(c);
+            cpu_refresh_el_state(c);
             break;
-        case KEY(3,0,2,0,0): c->ttbr0[1] = v; tlb_flush_all(); break;  /* TTBR0_EL1 */
-        case KEY(3,0,2,0,1): c->ttbr1[1] = v; tlb_flush_all(); break;  /* TTBR1_EL1 */
-        case KEY(3,0,2,0,2): c->tcr[1] = v; tlb_flush_all(); break;    /* TCR_EL1 */
+        case KEY(3,0,2,0,0): c->ttbr0[1] = v; tlb_flush_all(c); break;  /* TTBR0_EL1 */
+        case KEY(3,0,2,0,1): c->ttbr1[1] = v; tlb_flush_all(c); break;  /* TTBR1_EL1 */
+        case KEY(3,0,2,0,2): c->tcr[1] = v; tlb_flush_all(c); break;    /* TCR_EL1 */
         case KEY(3,0,10,2,0): c->mair[1] = v; break;                   /* MAIR_EL1 */
         case KEY(3,0,10,3,0): c->amair[1] = v; break;                  /* AMAIR_EL1 */
         case KEY(3,0,12,0,0): c->vbar[1] = v; break;                   /* VBAR_EL1 */
@@ -375,7 +375,7 @@ void sysreg_init(CPU *c) {
     c->cntkctl_el1 = CNTK_EL0VCTEN;
     c->cpacr_el1 = 0x300000;
 #endif
-    cpu_refresh_fp_trap(c);
+    cpu_refresh_el_state(c);
     c->mdscr_el1 = 0;
     if (fpsr_sync) { fpsr_sync(c); c->fpsr = 0; }  /* drop pre-reset FP flags */
 }

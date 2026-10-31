@@ -1,83 +1,34 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* Guest (user-space) memory access. Replaces the system emulator's MMU with a
- * software page table mapping guest 4 KB pages to host pointers. Guest VAs are
- * decoupled from host VAs, so a 39-bit guest address space works on 32-bit
- * hosts. The API surface below is exactly what the copied core (decode.c,
- * sysreg.c, cpu.c) expects. */
+/* Guest (user-space) memory access: a software page table mapping guest
+ * 4 KB pages to host pointers, behind the shared core's guest memory
+ * interface (lib/arm64/mem.h), whose slow paths and cache maintenance mem.c
+ * defines. Guest VAs are decoupled from host VAs, so a 39-bit guest address
+ * space works on 32-bit hosts. Beyond mem.h: the address space itself, and
+ * the bulk copies, loans and bus-fault recovery of the syscall layer. */
 #ifndef A64_MMU_H
 #define A64_MMU_H
 
 #include <setjmp.h>
 
 #include "cpu.h"
-
-/* Branch-prediction hints for the interpreter hot paths (run loop, mem seam). */
-#define LIKELY(x)   __builtin_expect(!!(x), 1)
-#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#include "mem.h"
 
 /* PROBE_ONCE, the work-it-out-once flag, is lib/arm64's (types.h). */
 
-typedef enum { ACC_READ, ACC_WRITE, ACC_EXEC } AccType;
-
-/* Typed accesses. Return false if a fault was raised (caller must abort the
- * instruction and let the exception take effect). On success, *out holds data. */
-bool mem_read(CPU *c, u64 va, unsigned size, u64 *out);
-bool mem_write(CPU *c, u64 va, unsigned size, u64 val);
-
-/* Non-faulting read for diagnostics (false if VA doesn't translate). */
-bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out);
-
-/* Instruction-fetch fast path: caches the host base pointer of the current code
- * page so sequential fetches skip the page-table walk. Invalidated by any
- * mapping change (tlb_flush_all). */
-typedef struct {
-    u64  page;   /* VA page base of the cached translation */
-    u8  *host;   /* host pointer to that guest page; NULL = invalid */
-} FetchCache;
-extern __thread FetchCache g_fcache;
-
-/* Slow path: walk the table, refresh the fetch cache, read. */
-bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out);
-
-/* The 4-byte alignment of the PC has to be tested here and not only in the
- * slow path: a branch to a misaligned address inside the page this thread is
- * already fetching from would otherwise never reach mem_ifetch_slow, so the
- * PC-alignment exception never happened -- the misparsed word was decoded
- * instead, and the guest saw SIGILL (or worse, a plausible instruction) where
- * a kernel reports SIGBUS/BUS_ADRALN -- and a target in the last three bytes
- * of the page read past the end of the cached page's host backing while doing
- * it. Free to check: the cached page base has no bits below 12, so keeping
- * va's low two bits in the compared key (mask ~0xffc rather than ~0xfff)
- * makes any misaligned VA miss the compare and take the slow path, which
- * raises the exception. */
-#define IFETCH_KEY(va) ((va) & ~0xffcULL)
-static inline bool mem_ifetch(CPU *c, u64 va, u32 *insn_out) {
-    if (LIKELY(g_fcache.host && IFETCH_KEY(va) == g_fcache.page)) {
-        u32 v;
-        __builtin_memcpy(&v, g_fcache.host + (va & 0xfffULL), 4);
-        *insn_out = v;
-        return true;
-    }
-    return mem_ifetch_slow(c, va, insn_out);
-}
-
-/* Block helpers for SIMD 128-bit and pair accesses. */
-bool mem_read128(CPU *c, u64 va, V128 *out);
-bool mem_write128(CPU *c, u64 va, const V128 *val);
-
-/* Invalidate this thread's cached translations (fetch cache + data TLB). Kept
- * under the system emulator's name so the copied core compiles unchanged.
- * Cross-thread invalidation happens via the address-space generation counter
- * in mem.c, bumped by every PTE mutation. */
-void tlb_flush_all(void);
-
 /* The calling thread runs c from here on: point c at this thread's own
- * translation caches (c->eng), which translate() reaches through the CPU on
- * every guest access. Called by every thread that takes up a CPU -- the main
- * thread at startup, a new guest thread on its copy of its creator's, and a
- * thread adopting another CPU's state wholesale (an exec's) -- before its
- * first guest memory access. */
+ * translation caches (mem.h's CpuEngine, c->eng), which every guest access
+ * reaches through the CPU. Called by every thread that takes up a CPU -- the
+ * main thread at startup, a new guest thread on its copy of its creator's,
+ * and a thread adopting another CPU's state wholesale (an exec's) -- before
+ * its first guest memory access.
+ *
+ * Those caches and the D-TLB they point at live in the thread's own storage.
+ * The D-TLB is filled for the TBI-stripped page, and its entries are checked
+ * against the address-space generation on every access (CpuEngine.gen_src):
+ * every PTE mutation, by any thread, bumps it, so one thread's munmap or
+ * mprotect invalidates every thread's cached translations at their next
+ * access. tlb_flush_all forces the calling thread's caches to re-sync. */
 void as_cpu_attach(CPU *c);
 
 /* ---- host bus-error recovery (mem.c) ----
@@ -160,8 +111,6 @@ void as_bus_disarm(void);
 
 #define GUEST_VA_BITS   47
 #define GUEST_TASK_SIZE (1ULL << GUEST_VA_BITS)
-#define GUEST_PAGE_SIZE 4096ULL
-#define GUEST_PAGE_MASK (GUEST_PAGE_SIZE - 1)
 
 /* AArch64 TBI0: on Linux, EL0 data accesses run with TCR_EL1.TBI0=1, so the top
  * byte (VA bits [63:56]) is ignored during translation. Bionic's scudo allocator
@@ -537,11 +486,10 @@ u64  as_vma_end(AddrSpace *as, int i);
  * mapping (vm_start_gap) -- 256 pages, the default of its boot parameter. */
 #define STACK_GUARD_GAP (256ULL << 12)
 
-/* Stable host pointer for [va, va+size) if within one guest page and permitted
- * for `acc`; NULL otherwise. Substrate for futex/atomics/DC ZVA fast paths.
- * It may grow a stack down to `va`, but never moves one to do it: the caller
- * may still hold a pointer an earlier call handed out (mem.c). */
-void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc);
+/* mem_host_ptr (mem.h) is the substrate for the futex, atomics and DC ZVA
+ * fast paths too. Its slow path here resolves a missed page, and may grow a
+ * stack down to `va` to do it, but never moves one: the caller may still
+ * hold a pointer an earlier call handed out (mem.c). */
 /* Could an access of `acc` reach [va, va+size) (within one guest page)? A
  * page mapped with the permission, or one under a stack that the access would
  * grow the stack over -- without growing it: the copy that touches the page
@@ -646,18 +594,12 @@ void as_lend_fork_child(AddrSpace *as);
 #endif
 
 /* ---- JIT data-TLB seam ----
- * The interpreter's per-thread direct-mapped D-TLB (mem.c) whose entry format
- * the JIT inlines: 16-byte {u64 page; uintptr_t pte}, page = (va & TBI) >> 12,
- * indexed by (page & (A64_DTLB_ENTRIES-1)). pte = host_ptr | prot (low 3 bits).
- * The JIT probes it directly; on any miss/perm-fail/page-cross it calls the
- * mem_* slow path, which refills the TLB. Generated code never does TLS math:
- * jit_dtlb_base() (evaluated on the owning thread at cache init) hands back a
- * stable pointer to this thread's array. */
-#define A64_DTLB_ENTRIES 1024
-void *jit_dtlb_base(void);
-/* Empty this thread's D-TLB and resync it to the current address-space
- * generation (what translate() does lazily; the JIT does it eagerly at a
- * safepoint because its inline probe skips the per-access generation check). */
+ * The JIT probes the thread's D-TLB (mem.h's entry layout, c->eng) inline,
+ * and on any miss, permission failure or page crossing calls the mem_* slow
+ * path, which refills it. Its inline probe skips the per-access generation
+ * check: jit_dtlb_reset empties this thread's D-TLB and resyncs it to the
+ * current address-space generation -- what translate() does lazily -- at the
+ * JIT's safepoint, eagerly. */
 void  jit_dtlb_reset(void);
 
 /* Bulk copies for the syscall layer. Never raise guest exceptions.

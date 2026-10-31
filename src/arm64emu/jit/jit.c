@@ -343,7 +343,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->helper_ldv = (void *)jit_ldv;
     env->helper_stv = (void *)jit_stv;
     env->helper_spchk = (void *)jit_sp_check;
-    env->dtlb = g_dtlb;
+    env->dtlb = c->eng.dtlb;
     /* Full memset, not jcache_purge: the dirty list is empty here but the
      * zeroed entries must still become the all-ones empty pattern. */
     memset(env->jcache, 0xff, sizeof env->jcache);
@@ -493,7 +493,12 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
  * On a fault the exception has already been taken synchronously (c->pc is
  * the vector); count the faulting instruction here — it is excluded from the
  * block's batched icount, and the interpreter counts aborted instructions
- * (cpu_step runs icount++ unconditionally after exec_a64). */
+ * (cpu_step runs icount++ unconditionally after exec_a64).
+ *
+ * Generated code calls these once its own inline D-TLB probe has missed, so
+ * they go straight to mem.h's slow paths instead of probing the same entry
+ * again; the slow paths are whole accesses, hits included, so this also
+ * holds under ARM64EMU_JIT_SLOWMEM, which skips the inline probe. */
 
 /* SP-alignment check (SCTLR_EL1.SA/SA0). Generated code calls this only when the
  * SP base is already known-misaligned (low 4 bits set). Raises an SP-alignment
@@ -515,7 +520,7 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), sz = 1u << MDESC_SZLOG(desc);
     u64 v;
-    if (!mem_read(c, va, sz, &v)) { c->icount++; return 1; }
+    if (!mem_read_slow(c, va, sz, &v)) { c->icount++; return 1; }
     if (MDESC_SIGN(desc)) {
         unsigned b = sz * 8;
         v = (u64)((s64)(v << (64 - b)) >> (64 - b));
@@ -528,7 +533,7 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
 
 u32 jit_st(CPU *c, u64 va, u64 val, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
-    if (!mem_write(c, va, 1u << MDESC_SZLOG(desc), val)) {
+    if (!mem_write_slow(c, va, 1u << MDESC_SZLOG(desc), val)) {
         c->icount++;
         return 1;
     }
@@ -540,11 +545,11 @@ u32 jit_ldv(CPU *c, u64 va, u64 pc, u32 desc) {
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
     if (bytes == 16) {
         V128 v;
-        if (!mem_read128(c, va, &v)) { c->icount++; return 1; }
+        if (!mem_read128_slow(c, va, &v)) { c->icount++; return 1; }
         c->v[rt] = v;
     } else {
         u64 t;
-        if (!mem_read(c, va, bytes, &t)) { c->icount++; return 1; }
+        if (!mem_read_slow(c, va, bytes, &t)) { c->icount++; return 1; }
         c->v[rt].d[0] = t;
         c->v[rt].d[1] = 0;
     }
@@ -555,10 +560,10 @@ u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
     if (bytes == 16) {
-        if (!mem_write128(c, va, &c->v[rt])) { c->icount++; return 1; }
+        if (!mem_write128_slow(c, va, &c->v[rt])) { c->icount++; return 1; }
         return 0;
     }
-    if (!mem_write(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
+    if (!mem_write_slow(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
     return 0;
 }
 
@@ -634,9 +639,10 @@ retry:
      * identifies the physical page across all VA aliases.) */
     if (!bitmap_test(c->m, pa_page)) {
         bitmap_set(c->m, pa_page);
-        for (u32 i = 0; i < DTLB_SIZE; i++)
-            if ((g_dtlb[i].pte & ~0xfffULL) == (u64)(uintptr_t)host_page)
-                g_dtlb[i].pte &= ~(u64)DTLB_W;
+        DTlbEnt *dt = c->eng.dtlb;
+        for (u64 i = 0; i <= c->eng.dtlb_mask; i++)
+            if ((dt[i].pte & ~0xfffULL) == (u64)(uintptr_t)host_page)
+                dt[i].pte &= ~(u64)DTLB_W;
     }
 
     be_flush_icache(b->code, env->ptr, (size_t)(e.rw - env->ptr));
@@ -714,14 +720,12 @@ static inline u64 jit_tag(u64 pc, u64 ctx) {
  * (host = NULL). Mirrors mem_ifetch's tag discipline. */
 static int resolve_code_page(CPU *c, u64 pc, const u8 **host, u64 *pa_page) {
     u64 page = pc & ~0xfffULL;
-    FetchCache *f = &g_fcache[c->el == 0];
-    if (!(f->host && f->page == page &&
-          f->mmu == (u8)(c->sctlr[1] & 1))) {
+    FetchCache *f = &c->eng.fetch[0];   /* the current EL's */
+    if (!(f->host && f->page == page)) {
         u32 w0;
         c->cur_insn_pc = pc;             /* precise IABORT ELR (cpu_step:447) */
         if (!mem_ifetch_slow(c, pc, &w0)) return 0;   /* abort taken */
-        if (!(f->host && f->page == page &&
-              f->mmu == (u8)(c->sctlr[1] & 1))) {
+        if (!(f->host && f->page == page)) {
             *host = NULL;                /* executing from MMIO */
             return 1;
         }
@@ -859,7 +863,7 @@ StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
         /* Inline D-TLB probes OR these low tag bits into the VA page. Gen,
          * EL and MMU state can only change through block-exiting paths, so
          * refreshing here keeps every probe's compare current. */
-        env->dtlb_ctxgen = ((u64)(g_tlb_gen & 0x3ff) << 2) | (ctx & 3);
+        env->dtlb_ctxgen = c->eng.genbits | (ctx & 3);
         u64 tag = jit_tag(pc, ctx);
         JBlock *b = jit_lookup(env, tag, hp);
         if (!b) {

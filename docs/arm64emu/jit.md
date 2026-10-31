@@ -78,12 +78,14 @@ interpreter's VA-tagged fetch cache. The empty pattern is all-ones
 `br` to VA 0 jump generated code to a NULL pointer.
 
 **Memory accesses.** Generated loads/stores probe the interpreter's own
-host-pointer D-TLB (`mmu.h: DTlbEnt`, a 16-byte-entry ABI): tag compare =
-the access's last-byte page address OR `env->dtlb_ctxgen` (flush
-generation + MMU + EL0) — page-crossers and stale generations mismatch by
-construction, so a guest TLBI invalidates inline probes with no flush
-protocol at all. Misses call `jit_ld/st/ldv/stv` → `mem_read/mem_write`
-(the full translate + bus path; MMIO and flash never enter the D-TLB).
+host-pointer D-TLB (`lib/arm64/mem.h`: `DTlbEnt`, a 16-byte-entry ABI the
+shared core and both programs use): tag compare = the access's last-byte
+page address OR `env->dtlb_ctxgen` (flush generation + MMU + EL0) —
+page-crossers and stale generations mismatch by construction, so a guest
+TLBI invalidates inline probes with no flush protocol at all. The index
+mask is the CPU's D-TLB's, read as the code is emitted. Misses call
+`jit_ld/st/ldv/stv` → `mem_read_slow/mem_write_slow` (the full translate +
+bus path; MMIO and flash never enter the D-TLB).
 Entries are only ever filled by the interpreter's slow path. Faults are
 taken synchronously by `cpu_raise_sync` inside the helper; the helper
 returns nonzero, the block exits with precise state (base writeback is

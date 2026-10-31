@@ -21,8 +21,8 @@
  *    jit_exec1_ic, which invalidates the written line's page. Plain stores
  *    are not instrumented: skipping IC on this CPU is architecturally
  *    undefined, exactly as on hardware.
- *  - D-TLB: generated code (from Phase C) probes this thread's D-TLB (mem.c,
- *    reached through jit_dtlb_base) without the per-access generation check
+ *  - D-TLB: generated code (from Phase C) probes this thread's D-TLB (mem.h's
+ *    layout, the CPU's c->eng) without the per-access generation check
  *    translate() does, so every PTE mutation also sets `interrupt` (via
  *    as_gen_bump) and the safepoint service resyncs this thread's TLB. Stale
  *    hits between safepoints are benign by the same retired-backing
@@ -477,7 +477,8 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->helper_st = (void *)jit_st;
     env->helper_ldv = (void *)jit_ldv;
     env->helper_stv = (void *)jit_stv;
-    env->dtlb = jit_dtlb_base();
+    env->dtlb = c->eng.dtlb;
+    env->dtlb_ctxgen = dtlb_tag(c, 0);
     env->slowmem = getenv("ARM64CHROOT_JIT_SLOWMEM") != NULL;
     EMU_LOCK(&g_jstat_mu, EMU_LK_JSTAT);
     if (__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) < 0) {
@@ -653,12 +654,16 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
 }
 
 /* ---- memory slow paths (see jit_priv.h MDESC_*) ---- */
+/* Generated code calls these once its own inline D-TLB probe has missed, so
+ * they go straight to mem.h's slow paths instead of probing the same entry
+ * again; the slow paths are whole accesses, hits included, so this also
+ * holds under ARM64CHROOT_JIT_SLOWMEM, which skips the inline probe. */
 
 u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), sz = 1u << MDESC_SZLOG(desc);
     u64 v;
-    if (!mem_read(c, va, sz, &v)) { c->icount++; return 1; }
+    if (!mem_read_slow(c, va, sz, &v)) { c->icount++; return 1; }
     if (MDESC_SIGN(desc)) {
         unsigned b = sz * 8;
         v = (u64)((s64)(v << (64 - b)) >> (64 - b));
@@ -671,7 +676,7 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
 
 u32 jit_st(CPU *c, u64 va, u64 val, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
-    if (!mem_write(c, va, 1u << MDESC_SZLOG(desc), val)) {
+    if (!mem_write_slow(c, va, 1u << MDESC_SZLOG(desc), val)) {
         c->icount++;
         return 1;
     }
@@ -683,11 +688,11 @@ u32 jit_ldv(CPU *c, u64 va, u64 pc, u32 desc) {
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
     if (bytes == 16) {
         V128 v;
-        if (!mem_read128(c, va, &v)) { c->icount++; return 1; }
+        if (!mem_read128_slow(c, va, &v)) { c->icount++; return 1; }
         c->v[rt] = v;
     } else {
         u64 t;
-        if (!mem_read(c, va, bytes, &t)) { c->icount++; return 1; }  /* zero-extended */
+        if (!mem_read_slow(c, va, bytes, &t)) { c->icount++; return 1; }  /* zero-extended */
         c->v[rt].d[0] = t;
         c->v[rt].d[1] = 0;
     }
@@ -698,10 +703,10 @@ u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
     if (bytes == 16) {
-        if (!mem_write128(c, va, &c->v[rt])) { c->icount++; return 1; }
+        if (!mem_write128_slow(c, va, &c->v[rt])) { c->icount++; return 1; }
         return 0;
     }
-    if (!mem_write(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
+    if (!mem_write_slow(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
     return 0;
 }
 

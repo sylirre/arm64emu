@@ -9,7 +9,6 @@
 #include "types.h"
 
 struct Machine;
-struct CpuEngine;
 
 /* PSTATE condition flag bit positions (matching SPSR_ELx / NZCV layout). */
 #define PS_N (1u << 31)
@@ -40,6 +39,54 @@ typedef enum {
     STEP_HALT,        /* fatal: unimplemented / stop the machine */
 } StepResult;
 
+/* ---- the CPU's translation caches ----------------------------------------
+ * What every guest access and fetch goes through before the slow paths of
+ * guest memory (mem.h, which also states the probe ABI); part of the CPU
+ * (c->eng), so reaching them costs no thread-local access. The program sets
+ * them up for each CPU it runs and keeps the D-TLB's table itself.
+ *
+ * DTlbEnt: tag = VA page | the CPU's tagctx; pte = host page | DTLB_R/W/X. */
+typedef struct { u64 tag; u64 pte; } DTlbEnt;
+
+/* The host page of the code page last fetched from. Only the page
+ * *translation* is cached, never decoded bytes: the instruction word is read
+ * live, so self-modifying code in the page is seen at once. Whatever changes
+ * a translation empties it: tlb_flush_all, which every SCTLR_EL1 write runs,
+ * and cpu_reset. */
+typedef struct {
+    u64  page;      /* VA page base of the cached translation */
+    u64  pa_page;   /* its physical page, where the program has one (JIT block
+                     * identity in arm64emu) */
+    u8  *host;      /* host pointer to the page; NULL = invalid */
+} FetchCache;
+
+typedef struct CpuEngine {
+    DTlbEnt *dtlb;          /* the D-TLB: dtlb_mask + 1 entries */
+    u64 dtlb_mask;
+    /* The low bits current tags carry: genbits | SCTLR_EL1.M << 1 | EL0, the
+     * EL0 bit the effective privilege (an LDTR/STTR at EL1 is EL0's). Kept,
+     * not computed per access: cpu_refresh_dtlb_ctx at every change of what
+     * it depends on. */
+    u64 tagctx;
+    u64 genbits;            /* the program's flush generation, as tags carry it
+                             * (bits 11:2); 0 where it keeps none */
+    /* Where entries can go stale behind this CPU's back -- another thread
+     * changing the mappings they were filled from -- the program names the
+     * generation counter it bumps for that, and `gen` is the one the entries
+     * reflect: a hit is taken only while the two agree, and the slow path
+     * empties the table when they do not. NULL where nothing but this CPU
+     * invalidates its own entries. */
+    const unsigned long *gen_src;
+    unsigned long gen;
+    /* One fetch cache per privilege, so the EL0<->EL1 ping-pong of every
+     * syscall/IRQ/ERET keeps both code pages cached: fetch[0] is the current
+     * EL's, the one every fetch probes, and fetch[1] the other's.
+     * cpu_refresh_el_state swaps them when the EL crosses between EL0 and the
+     * rest; fetch_el0 says whose fetch[0] is. */
+    FetchCache fetch[2];
+    u8 fetch_el0;
+} CpuEngine;
+
 typedef struct CPU {
     /* General purpose. x[31] is reserved; use reg helpers for XZR/SP semantics. */
     u64 x[31];
@@ -62,7 +109,7 @@ typedef struct CPU {
     /* SIMD/FP */
     V128 v[32];
     u32 fpcr, fpsr;
-    bool fp_trapped;  /* CPACR_EL1.FPEN traps FP/SIMD at this EL (cpu_refresh_fp_trap) */
+    bool fp_trapped;  /* CPACR_EL1.FPEN traps FP/SIMD at this EL (cpu_refresh_el_state) */
     u8 ldst_unpriv;   /* transient: current data access is LDTR/STTR (EL0 view);
                          read by arm64emu's MMU */
     /* The FP core's lazy state (exec_fpsimd.c): FPCR.FZ/FZ16 latched for the
@@ -126,11 +173,10 @@ typedef struct CPU {
     u64  cur_insn_pc;  /* address of the instruction currently executing */
 
     struct Machine *m;
-    /* The engines' per-CPU state the program keeps outside the architecture
-     * -- its translation caches -- reached through the CPU, not thread-local
-     * storage, which where it is emulated (Bionic) costs a call per access.
-     * The program's own type; NULL where it keeps none here. */
-    struct CpuEngine *eng;
+    /* Its translation caches (above), kept by cpu_reset. Part of the CPU
+     * rather than thread-local storage, which where it is emulated (Bionic)
+     * costs a call per access; set up by the program for each CPU it runs. */
+    CpuEngine eng;
 } CPU;
 
 /* ---- Register access helpers (XZR vs SP semantics) ---- */
@@ -169,16 +215,36 @@ static inline void set_x_sz(CPU *c, unsigned n, bool is64, u64 v) {
 u32 cpu_pack_spsr(CPU *c);
 void cpu_unpack_spsr(CPU *c, u32 spsr);
 
-/* Recompute the cached CPACR_EL1.FPEN trap predicate. Depends only on
- * (cpacr, el), so it is refreshed at the four points either can change:
- * CPACR MSR, exception entry, ERET (inside cpu_unpack_spsr), and reset --
- * in arm64chroot only the last: its guest never leaves EL0, where CPACR is
- * out of reach, so fp_trapped stays as sysreg_init leaves it, false. FPEN: 0b11 no trap; 0b01 traps EL0 only; 0b00/0b10 trap EL0 and EL1.
- * EL2+ is outside CPACR's reach (CPTR_EL2/3 are not modeled). */
-static inline void cpu_refresh_fp_trap(CPU *c) {
+/* Recompute the D-TLB tag context (CpuEngine.tagctx) from the flush
+ * generation, SCTLR_EL1.M, the EL and an LDTR/STTR in flight: called by
+ * cpu_refresh_el_state, by tlb_flush_all (the generation; every SCTLR_EL1
+ * write runs it) and around an unprivileged access (decode.c). */
+static inline void cpu_refresh_dtlb_ctx(CPU *c) {
+    c->eng.tagctx = c->eng.genbits | ((c->sctlr[1] & 1) ? 2u : 0u)
+                  | ((c->el == 0 || c->ldst_unpriv) ? 1u : 0u);
+}
+
+/* Recompute what is cached of the current EL's configuration: the CPACR_EL1
+ * FPEN trap predicate, which depends only on (cpacr, el), the D-TLB tag
+ * context, and which of the two fetch caches is the current EL's. Refreshed
+ * at every point the EL or CPACR can change: CPACR MSR, exception entry, ERET
+ * (inside cpu_unpack_spsr), and reset -- in arm64chroot only the last
+ * matters: its guest never leaves EL0, where CPACR is out of reach, so
+ * fp_trapped stays as sysreg_init leaves it, false. FPEN: 0b11 no trap; 0b01
+ * traps EL0 only; 0b00/0b10 trap EL0 and EL1. EL2+ is outside CPACR's reach
+ * (CPTR_EL2/3 are not modeled). */
+static inline void cpu_refresh_el_state(CPU *c) {
     unsigned fpen = (unsigned)(c->cpacr_el1 >> 20) & 3;
     c->fp_trapped = (c->el == 0) ? (fpen != 3)
                   : (c->el == 1) ? (fpen == 0 || fpen == 2) : false;
+    cpu_refresh_dtlb_ctx(c);
+    u8 el0 = c->el == 0;
+    if (el0 != c->eng.fetch_el0) {           /* the current EL's fetch cache */
+        FetchCache t = c->eng.fetch[0];
+        c->eng.fetch[0] = c->eng.fetch[1];
+        c->eng.fetch[1] = t;
+        c->eng.fetch_el0 = el0;
+    }
 }
 
 /* Raise the EC 0x07 FP/SIMD-access trap (A64 ISS: CV=1, COND=0b1110).

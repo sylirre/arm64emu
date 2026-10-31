@@ -63,26 +63,35 @@ raises the appropriate data/instruction abort ESR via `cpu_raise_sync`, so later
 
 In front of the walk sits a **data-side TLB**: a 1024-entry direct-mapped
 VA-page → PTE cache, so a hit is one tag compare instead of the two dependent
-table loads. Each thread has its own (`struct CpuEngine` in `mem.c`, kept in
-that thread's `__thread` storage), and the CPU the thread runs points at it
-(`c->eng`, set by `as_cpu_attach`): the lookup goes through the CPU rather
-than naming the thread-local, because where thread-local storage is emulated
+table loads. Its entry layout and its hit path are the shared core's
+(`lib/arm64/mem.h`): the tag is the TBI-stripped page address with the EL0 bit
+set, the value the PTE as it is (host page | `PTE_R/W/X`, which are mem.h's
+`DTLB_R/W/X`), and `mem_read`/`mem_write`/... probe it inline at every call
+site, coming here (`mem_read_slow`, ...) only on a miss. Each thread has its own
+table, in its `__thread` storage, and the CPU the thread runs points at it
+(`c->eng`, set by `as_cpu_attach`): the lookup goes through the CPU rather than
+naming the thread-local, because where thread-local storage is emulated
 (Bionic) every such access is a library call, and this one is on every guest
-load and store. The permission check still runs per
-access (one entry serves R/W/X), and negative results are never cached.
-Cross-thread coherence — the page table is shared — comes from a global
-generation counter bumped under the AS lock by every PTE mutation; each lookup
-compares it (acquire load) against the generation its TLB reflects and empties
-the TLB on mismatch, so another thread's `munmap`/`mprotect` is honored at the
-next access. `tlb_flush_all` also forces a re-sync for the calling thread.
+load and store. The permission check runs per access (one entry serves R/W/X),
+and negative results are never cached. A tagged pointer never hits — the probe
+compares the VA as given — so its access always takes the slow path, which
+strips the tag (and refuses it, for a syscall's pointer, where the
+tagged-address ABI says so). Cross-thread coherence — the page table is shared
+— comes from a global generation counter bumped under the AS lock by every PTE
+mutation, which the CPU's caches name as their `gen_src`: each probe compares it
+(acquire load) against the generation the table reflects and misses on a
+mismatch, and `translate()` empties the table then, so another thread's
+`munmap`/`mprotect` is honored at the next access. `tlb_flush_all` also forces
+a re-sync for the calling thread.
 
-- `mem_read` / `mem_write` / `mem_read128` / `mem_write128`: bounds-check, walk,
-  permission-check, `memcpy`. An access that straddles a page boundary is split
-  recursively (unaligned in-page access is a plain `memcpy` — EL0 Linux semantics
-  with `SCTLR.A` clear, no extra work).
-- `mem_ifetch` (inline): a per-thread single-page host-pointer cache (`g_fcache`,
-  `__thread`) so sequential fetches skip the walk. Invalidated by any mapping
-  change via `tlb_flush_all`. A misaligned PC misses it by construction — the
+- `mem_read` / `mem_write` / `mem_read128` / `mem_write128` (inline in mem.h,
+  the slow paths here): bounds-check, walk, permission-check, `memcpy`. An
+  access that straddles a page boundary is split recursively (unaligned in-page
+  access is a plain `memcpy` — EL0 Linux semantics with `SCTLR.A` clear, no
+  extra work).
+- `mem_ifetch` (inline, mem.h): a single-page host-pointer cache per privilege
+  in the CPU's caches, so sequential fetches skip the walk. Invalidated by any
+  mapping change via `tlb_flush_all`. A misaligned PC misses it by construction — the
   compared key keeps the VA's low two bits, so only the slow path answers such
   a fetch, and it raises the PC-alignment exception (`SIGBUS`/`BUS_ADRALN`)
   instead of reading four bytes that straddle the address.

@@ -222,7 +222,8 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 ## What is per-thread vs per-process
 
 - **Per-thread** (`g_tls`, thread-local; `src/arm64chroot/thread.h`): the `CPU` register
-  file, the pending exception, the instruction-fetch cache (`g_fcache`), the tid,
+  file, the pending exception, the translation caches (D-TLB and instruction-fetch
+  cache, in the thread's storage and reached through its CPU, `c->eng`), the tid,
   and syscall-restart state. Each guest thread runs its own `emu_loop` on its own
   host thread.
 - **Per-process** (`struct Machine`, shared across threads, copied on `fork`): the

@@ -44,42 +44,47 @@ static inline int range_ok(u64 addr, u64 len) {
     return addr <= GUEST_TASK_SIZE && len <= GUEST_TASK_SIZE - addr;
 }
 
-/* Per-thread: each guest thread fetches from its own PC. */
-__thread FetchCache g_fcache;
-
-/* Data-side TLB: direct-mapped VA-page -> PTE cache in front of the 2-level
- * walk in translate(). Per-thread like g_fcache. Coherence across threads
- * (the page table is shared): g_as_gen is bumped, under the AS lock, by every
- * PTE mutation; a lookup that sees a generation other than the one its TLB
- * reflects empties the TLB first, so one thread's munmap/mprotect invalidates
- * every thread's cached translations at their next access. */
-#define DTLB_BITS 10                       /* 1024 entries x 16 B = 16 KB/thread */
+/* A thread's translation caches: the CpuEngine in the CPU it runs (cpu.h) --
+ * the fetch cache, and the D-TLB in front of the 2-level walk in translate()
+ * -- and the table that D-TLB points at, which lives in the thread's own
+ * storage: each guest thread fetches from its own PC and caches its own
+ * translations. as_cpu_attach sets a thread's CPU up; the thread then
+ * reaches its caches through the CPU, never through thread-local storage,
+ * which where it is emulated (Bionic) costs a call. The paths with no CPU at
+ * hand -- tlb_flush_self, the JIT seam, the SIGBUS repair -- find the
+ * calling thread's through t_cpu, the CPU it attached.
+ *
+ * Coherence across threads (the page table is shared): g_as_gen is bumped,
+ * under the AS lock, by every PTE mutation; the CPU's caches name it as their
+ * gen_src, so a lookup that sees a generation other than the one its D-TLB
+ * reflects misses, and translate() empties the table first: one thread's
+ * munmap/mprotect invalidates every thread's cached translations at their
+ * next access. 1024 entries x 16 B = 16 KB per thread. */
+#define DTLB_BITS 10
 #define DTLB_SIZE (1u << DTLB_BITS)
-/* 16 bytes on every host: the JIT's inline probe turns the index into a byte
- * offset with a shift (and, on x86, a scaled-index addressing mode), so an
- * entry that shrank to 12 on ILP32 would need a multiply in the hot path. */
-typedef struct { u64 page; uintptr_t pte; A64_HOST_PTRPAD } DTlbEntry;
-/* A thread's D-TLB and the generation it reflects (cpu.h's CpuEngine, as this
- * program has it). Each lives in its thread's storage and is reached through
- * the CPU that thread runs (c->eng, as_cpu_attach): an address taken once per
- * thread instead of once per guest access, which is what thread-local storage
- * costs where it is emulated -- on Bionic a call, and translate() is on every
- * access. The paths with no CPU at hand -- tlb_flush_all, the JIT seam, the
- * SIGBUS repair -- name the calling thread's directly; it is the same one. */
-struct CpuEngine {
-    DTlbEntry dtlb[DTLB_SIZE];
-    unsigned long dtlb_gen;                /* generation dtlb reflects; 0 = flushed */
-};
-static __thread struct CpuEngine t_eng;
+static __thread DTlbEnt t_dtlb[DTLB_SIZE];
+static __thread CPU *t_cpu;                /* the CPU this thread runs */
 static unsigned long g_as_gen = 1;         /* never 0; word-sized: lock-free on ILP32 */
+/* A PTE goes into a D-TLB entry as it is: its permission bits are mem.h's,
+ * and its host address is page aligned, so the probe's ~0xfff mask finds it. */
+_Static_assert(PTE_R == DTLB_R && PTE_W == DTLB_W && PTE_X == DTLB_X,
+               "a PTE is a D-TLB entry's pte");
 
 /* The calling thread runs c from here on: c reaches this thread's caches. A
  * CPU copied from another thread's (clone, an exec adopting the main thread's
- * image) must be attached again by the thread that runs it. The first access
- * to the block is made here, in ordinary context, not by a signal handler
- * (sig_tls_prewarm says why that matters on Bionic). */
+ * image) must be attached again by the thread that runs it. The caches start
+ * out empty (generation 0 is "flushed"), whatever this thread last cached.
+ * The first access to the block is made here, in ordinary context, not by a
+ * signal handler (sig_tls_prewarm says why that matters on Bionic). */
 void as_cpu_attach(CPU *c) {
-    c->eng = &t_eng;
+    CpuEngine *e = &c->eng;
+    memset(e, 0, sizeof *e);
+    e->dtlb = t_dtlb;
+    e->dtlb_mask = DTLB_SIZE - 1;
+    e->gen_src = &g_as_gen;                /* gen 0: empty until resynced */
+    e->fetch_el0 = c->el == 0;
+    cpu_refresh_dtlb_ctx(c);
+    t_cpu = c;
 }
 
 static void as_gen_bump(void) {
@@ -89,9 +94,19 @@ static void as_gen_bump(void) {
     jit_notify_mapping_change();
 }
 
-void tlb_flush_all(void) {
-    g_fcache.host = NULL;
-    t_eng.dtlb_gen = 0;        /* re-sync (and empty) the D-TLB at the next lookup */
+/* Re-sync (and empty) the D-TLB at the next lookup, and drop the fetch
+ * cache: mem.h's tlb_flush_all for the CPU the calling thread runs, and the
+ * same for the paths below that have no CPU at hand. */
+static void cpu_caches_flush(CpuEngine *e) {
+    e->fetch[0].host = e->fetch[1].host = NULL;
+    e->gen = 0;
+}
+void tlb_flush_all(CPU *c) {
+    cpu_caches_flush(&c->eng);
+    cpu_refresh_dtlb_ctx(c);
+}
+static void tlb_flush_self(void) {
+    if (t_cpu) cpu_caches_flush(&t_cpu->eng);   /* before the first attach: none */
 }
 
 /* ---- published D-TLB epochs (what lets the quarantine drain) --------------
@@ -278,17 +293,16 @@ void as_tlb_fork_child(void) {
 }
 
 /* ---- JIT D-TLB seam (see mmu.h) ---- */
-_Static_assert(DTLB_SIZE == A64_DTLB_ENTRIES, "JIT D-TLB size mismatch");
-_Static_assert(sizeof(DTlbEntry) == 16, "JIT assumes 16-byte D-TLB entries");
-void *jit_dtlb_base(void) { return t_eng.dtlb; }
 void jit_dtlb_reset(void) {
     /* The interpreter empties lazily on a generation mismatch; the JIT's
      * inline probe has no per-access generation check, so empty eagerly and
      * adopt the current generation. Also drops the fetch cache. */
     unsigned long gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
-    memset(t_eng.dtlb, 0, sizeof t_eng.dtlb);
-    t_eng.dtlb_gen = gen;
-    g_fcache.host = NULL;
+    memset(t_dtlb, 0, sizeof t_dtlb);
+    if (t_cpu) {
+        t_cpu->eng.gen = gen;
+        t_cpu->eng.fetch[0].host = t_cpu->eng.fetch[1].host = NULL;
+    }
     dtlb_publish(gen);
 }
 
@@ -609,7 +623,7 @@ static void pte_sync_range(AddrSpace *as, u64 addr, u64 len) {
     (void)as;
     jit_invalidate_range(addr, len);   /* map-over/unmap of translated code */
     as_gen_bump();
-    tlb_flush_all();
+    tlb_flush_self();
 }
 
 /* Register host pages for [addr, addr+len). */
@@ -743,7 +757,7 @@ void as_vfork_track_begin(AddrSpace *as) {
         pte_prot_raw(as, r->start, r->end - r->start, r->prot & ~PTE_W);
     }
     as_gen_bump();
-    tlb_flush_all();
+    tlb_flush_self();
     as_unlock();
 }
 
@@ -956,7 +970,7 @@ static void as_drain_retired(AddrSpace *as) {
  * syscall handed the guest's own pages (guest_lend) -- and those are kept
  * alive by the loan's pins, not by this thread's epoch. */
 void as_tlb_block_begin(void) {
-    if (g_pub_slot < 0) dtlb_publish(t_eng.dtlb_gen);   /* claim a slot to flag */
+    if (g_pub_slot < 0) dtlb_publish(t_cpu ? t_cpu->eng.gen : 0);   /* claim a slot to flag */
     if (g_pub_slot >= 0) __atomic_store_n(&g_pub[g_pub_slot].blocked, 1, __ATOMIC_RELEASE);
 }
 void as_tlb_block_end(void) {
@@ -2098,7 +2112,7 @@ int guest_protect_impl(AddrSpace *as, u64 addr, u64 len, u32 prot) {
     }
     jit_invalidate_range(addr, len);   /* mprotect over translated code */
     as_gen_bump();
-    tlb_flush_all();
+    tlb_flush_self();
     region_merge_range(as, addr, addr + len);
     return 0;
 }
@@ -2496,7 +2510,7 @@ void as_destroy(AddrSpace *as) {
     as->nretired = as->cap_retired = 0;
     jit_execve_flush();
     as_gen_bump();
-    tlb_flush_all();
+    tlb_flush_self();
 }
 
 /* ---- access seam used by the copied core ---- */
@@ -3108,18 +3122,20 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
      * fault reporting (FAR retains the tag, as on hardware). */
     if (need != PTE_X) va &= A64_TBI_MASK;
     if (UNLIKELY(va >= GUEST_TASK_SIZE)) return NULL;
-    struct CpuEngine *te = c->eng;          /* this thread's (as_cpu_attach) */
+    CpuEngine *te = &c->eng;                /* this thread's (as_cpu_attach) */
     unsigned long gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
-    if (UNLIKELY(gen != te->dtlb_gen)) {
-        memset(te->dtlb, 0, sizeof te->dtlb);
-        te->dtlb_gen = gen;
+    if (UNLIKELY(gen != te->gen)) {
+        memset(te->dtlb, 0, (size_t)(te->dtlb_mask + 1) * sizeof *te->dtlb);
+        te->gen = gen;
         dtlb_publish(gen);   /* lets the quarantine release what we just dropped */
     }
-    u64 page = va >> 12;
-    DTlbEntry *e = &te->dtlb[page & (DTLB_SIZE - 1)];
+    /* mem.h's entry: the tag of the (stripped) page, the host page with its
+     * PTE_R/W/X bits -- the same bits as mem.h's DTLB_R/W/X. */
+    u64 tag = dtlb_tag(c, va);
+    DTlbEnt *e = dtlb_ent(c, va);
     uintptr_t pte;
-    if (LIKELY(e->pte && e->page == page)) {
-        pte = e->pte;
+    if (LIKELY(e->tag == tag)) {
+        pte = (uintptr_t)e->pte;
     } else {
         /* Miss: walk the shared table under the AS lock so a concurrent
          * mapper can't be mid-rewrite (torn L1/L2 reads on weakly-ordered
@@ -3136,7 +3152,7 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
         /* ...or be the hole under a stack, which grows down to meet it. */
         if (UNLIKELY(!pte)) pte = as_stack_grow(c, va);
         if (!pte) return NULL;                 /* never cache misses */
-        e->page = page;
+        e->tag = tag;
         e->pte = pte;
     }
     if (UNLIKELY((pte & need) != need)) {
@@ -3146,36 +3162,13 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
         uintptr_t h = (need == PTE_W) ? as_write_heal(c, va) : 0;
         if (!h) { *perm_fault = true; return NULL; }
         pte = h;
-        e->page = page;
+        e->tag = tag;
         e->pte = pte;
     }
     return (u8 *)(pte & ~(uintptr_t)PTE_FLAGS) + (va & GUEST_PAGE_MASK);
 }
 
-/* Host and guest are both little-endian, so a copy preserves byte order.
- * Fixed-size copies for the power-of-two access sizes (#3): the compiler
- * turns each into a single load/store; odd sizes (page-split fragments from
- * the callers below) keep the runtime-size memcpy. */
-static inline u64 ld_le(const u8 *p, unsigned size) {
-    switch (size) {
-        case 1: return *p;
-        case 2: { u16 v; memcpy(&v, p, 2); return v; }
-        case 4: { u32 v; memcpy(&v, p, 4); return v; }
-        case 8: { u64 v; memcpy(&v, p, 8); return v; }
-        default: { u64 v = 0; memcpy(&v, p, size); return v; }
-    }
-}
-static inline void st_le(u8 *p, unsigned size, u64 v) {
-    switch (size) {
-        case 1: *p = (u8)v; break;
-        case 2: { u16 x = (u16)v; memcpy(p, &x, 2); break; }
-        case 4: { u32 x = (u32)v; memcpy(p, &x, 4); break; }
-        case 8: memcpy(p, &v, 8); break;
-        default: memcpy(p, &v, size); break;
-    }
-}
-
-bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
+bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
     /* Split accesses that cross a page boundary (unaligned in-page accesses
      * are plain memcpy — EL0 Linux semantics, SCTLR.A clear). */
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) {
@@ -3189,11 +3182,11 @@ bool mem_read(CPU *c, u64 va, unsigned size, u64 *out) {
     bool perm;
     u8 *p = translate(c, va, PTE_R, &perm);
     if (!p) { raise_dabort(c, va, false, perm); return false; }
-    *out = ld_le(p, size);
+    *out = mem_ld(p, size);
     return true;
 }
 
-bool mem_write(CPU *c, u64 va, unsigned size, u64 val) {
+bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) {
         unsigned first = (unsigned)(GUEST_PAGE_SIZE - (va & GUEST_PAGE_MASK));
         if (!mem_write(c, va, first, val)) return false;
@@ -3202,11 +3195,11 @@ bool mem_write(CPU *c, u64 va, unsigned size, u64 val) {
     bool perm;
     u8 *p = translate(c, va, PTE_W, &perm);
     if (!p) { raise_dabort(c, va, true, perm); return false; }
-    st_le(p, size, val);
+    mem_st(p, size, val);
     return true;
 }
 
-bool mem_read128(CPU *c, u64 va, V128 *out) {
+bool mem_read128_slow(CPU *c, u64 va, V128 *out) {
     if (((va & GUEST_PAGE_MASK) + 16) > GUEST_PAGE_SIZE)
         return mem_read(c, va, 8, &out->d[0]) && mem_read(c, va + 8, 8, &out->d[1]);
     bool perm;
@@ -3216,7 +3209,7 @@ bool mem_read128(CPU *c, u64 va, V128 *out) {
     return true;
 }
 
-bool mem_write128(CPU *c, u64 va, const V128 *val) {
+bool mem_write128_slow(CPU *c, u64 va, const V128 *val) {
     if (((va & GUEST_PAGE_MASK) + 16) > GUEST_PAGE_SIZE)
         return mem_write(c, va, 8, val->d[0]) && mem_write(c, va + 8, 8, val->d[1]);
     bool perm;
@@ -3241,7 +3234,7 @@ bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out) {
     u8 *p = translate(c, va, PTE_R, &perm);
     g_tls.nogrow = saved;
     if (!p) return false;
-    *out = ld_le(p, size);
+    *out = mem_ld(p, size);
     return true;
 }
 
@@ -3259,8 +3252,9 @@ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
         cpu_raise_sync(c, esr_make(EC_IABORT_LOWER, fsc), va);
         return false;
     }
-    g_fcache.page = va & ~0xfffULL;
-    g_fcache.host = p - (va & GUEST_PAGE_MASK);
+    FetchCache *f = &c->eng.fetch[0];       /* the current EL's */
+    f->page = va & ~0xfffULL;
+    f->host = p - (va & GUEST_PAGE_MASK);
     memcpy(insn_out, p, 4);
     return true;
 }
@@ -3353,7 +3347,7 @@ int mem_stack_touch(CPU *c, u64 va, AccType acc) {
     return p != NULL;
 }
 
-void *mem_host_ptr(CPU *c, u64 va, unsigned size, AccType acc) {
+void *mem_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) return NULL;
     if (uaddr_tag_refused(va)) return NULL;
     u32 need = (acc == ACC_WRITE) ? PTE_W : (acc == ACC_EXEC) ? PTE_X : PTE_R;

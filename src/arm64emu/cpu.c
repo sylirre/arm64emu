@@ -343,10 +343,14 @@ void prof_dump(void) {
 
 void cpu_reset(CPU *c, u64 entry, unsigned reset_el) {
     struct Machine *m = c->m;
-    struct CpuEngine *eng = c->eng;    /* the caches this CPU's thread keeps */
+    CpuEngine eng = c->eng;            /* its caches, as the program set them up */
     memset(c, 0, sizeof(*c));
     c->m = m;
     c->eng = eng;
+    /* A reset changes what a translation means (SCTLR_EL1.M, the EL): no
+     * fetch-cache entry outlives it. The tag context is refreshed below
+     * (sysreg_init). */
+    c->eng.fetch[0].host = c->eng.fetch[1].host = NULL;
     c->host_fzmode = HOST_FZMODE_UNKNOWN; /* the host FPCR is as it was */
     c->pc = entry;
     c->el = reset_el;

@@ -41,12 +41,16 @@ unified. A file in `lib/` is compiled into every program that uses it, with
 that program's flags, so a change there must pass every such program's suites.
 
 What differs between the programs is configured, not forked. `lib/arm64` takes
-exactly two headers from the program, found on its include path:
-`arm64_config.h`, how the library is built there (`ARM64_SYSTEM`: 1 for
-arm64emu's full system, 0 for arm64chroot's user mode, where the guest never
-leaves EL0; `ARM64_SMP`: 1 where guest threads run concurrently on host
-threads, arm64chroot's case, so atomics and barriers must be host ones), and `mmu.h`, guest memory access (`mem_read`/`mem_write`,
-`mem_host_ptr`, `tlb_flush_all`, ...). `lib/arm64/jit` also takes the program's
+one header from the program, found on its include path: `arm64_config.h`, how
+the library is built there (`ARM64_SYSTEM`: 1 for arm64emu's full system, 0 for
+arm64chroot's user mode, where the guest never leaves EL0; `ARM64_SMP`: 1 where
+guest threads run concurrently on host threads, arm64chroot's case, so atomics
+and barriers must be host ones). Guest memory is the library's own interface,
+`lib/arm64/mem.h`: the typed accesses, instruction fetch and `mem_host_ptr`,
+inline over the translation caches part of every CPU (`c->eng`: one
+D-TLB entry layout and one fetch cache for both programs), with slow paths and
+cache maintenance (`mem_read_slow`, ..., `tlb_flush_all`) the program defines
+for the memory it models. `lib/arm64/jit` also takes the program's
 `jit_priv.h`: each program's JIT runtime (`jit.c`) defines the environment the
 translator emits code against (`JitEnv`, its jump cache, helpers). Beyond
 those it calls functions the program defines (`exception_take`, `gt_count`,

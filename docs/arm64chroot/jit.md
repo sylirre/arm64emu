@@ -87,7 +87,9 @@ ARM `SBC = a + ~b + C`) from whichever lazy-flag state is live — for a
 stays live in `EFLAGS` end to end.
 
 **Inline softmmu.** Loads and stores inline the interpreter's per-thread D-TLB
-probe (`jit_dtlb_base()`; 1024 entries, shared with `translate()`). The fast
+probe (`lib/arm64/mem.h`'s entry layout, the CPU's `c->eng.dtlb`; 1024 entries,
+shared with `translate()`; the tag is the page address OR `dtlb_ctxgen`, which
+here is the EL0 bit alone). The fast
 path is probe + access only — operands and results stay in allocated host
 registers, and the page-cross gate is folded into the tag compare (the compare
 uses the *last* byte's page against the tag stored for the first byte's, so a
@@ -507,10 +509,12 @@ faulting pc baked in, and converges on the registers the fast path would have
 left a loaded value in, so one post-merge commit serves both.
 
 The probe is ~20 instructions rather than the 64-bit hosts' 8, and the whole
-difference is that the tag is a guest *page number* — 64-bit — so it takes two
-compares and a `shrd` to assemble. Register budget: the entry offset must survive
-three memory references, so it takes one pool register, computed as
-`(va & 0x3ff000) >> 8` (the ×16 entry stride folded into the shift); `eax` then
+difference is that the tag (`lib/arm64/mem.h`: page address | `dtlb_ctxgen`) is
+64-bit, so it takes two compares: the low word is the page address with the
+dispatcher's low bits ORed in, the high word is the VA's own. Register budget:
+the entry offset must survive three memory references, so it takes one pool
+register, computed as `(va & mask << 12) >> 8` (the ×16 entry stride folded into
+the shift; the mask is the CPU's D-TLB's, read as the code is emitted); `eax` then
 carries the host pointer into the access and `edx` shuttles the data, which is
 why an 8-byte load reads its *high* word first — the second load is what finally
 overwrites the pointer. Byte stores route through `edx` because `esi`/`edi` have

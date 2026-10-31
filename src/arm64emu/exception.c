@@ -19,7 +19,8 @@ void cpu_unpack_spsr(CPU *c, u32 spsr) {
     unsigned m = spsr & 0xf;
     c->el = (m >> 2) & 3;
     c->sp_sel = m & 1u;
-    cpu_refresh_fp_trap(c);        /* ERET may drop to an FPEN-trapped EL */
+    cpu_refresh_el_state(c);       /* ERET may drop to an FPEN-trapped EL,
+                                    * and changes the D-TLB tag's EL0 bit */
 }
 
 void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
@@ -44,7 +45,8 @@ void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
 
     c->el = tel;
     c->sp_sel = 1;
-    cpu_refresh_fp_trap(c);                 /* FPEN=0b01 stops trapping at EL1 */
+    cpu_refresh_el_state(c);                /* FPEN=0b01 stops trapping at EL1;
+                                             * the D-TLB tag follows the EL */
     c->daif |= PS_D | PS_A | PS_I | PS_F;   /* mask on entry */
     c->pc = (c->vbar[tel] & ~0x7ffULL) + off;
     c->halted = false;
