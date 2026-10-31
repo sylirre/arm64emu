@@ -61,9 +61,14 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
 raises the appropriate data/instruction abort ESR via `cpu_raise_sync`, so later
 `SIGSEGV` `si_code` is precise.
 
-In front of the walk sits a **data-side TLB** (`g_dtlb`, `__thread`): a
-1024-entry direct-mapped VA-page → PTE cache, so a hit is one tag compare
-instead of the two dependent table loads. The permission check still runs per
+In front of the walk sits a **data-side TLB**: a 1024-entry direct-mapped
+VA-page → PTE cache, so a hit is one tag compare instead of the two dependent
+table loads. Each thread has its own (`struct CpuEngine` in `mem.c`, kept in
+that thread's `__thread` storage), and the CPU the thread runs points at it
+(`c->eng`, set by `as_cpu_attach`): the lookup goes through the CPU rather
+than naming the thread-local, because where thread-local storage is emulated
+(Bionic) every such access is a library call, and this one is on every guest
+load and store. The permission check still runs per
 access (one entry serves R/W/X), and negative results are never cached.
 Cross-thread coherence — the page table is shared — comes from a global
 generation counter bumped under the AS lock by every PTE mutation; each lookup

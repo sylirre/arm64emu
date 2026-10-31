@@ -72,6 +72,14 @@ bool mem_write128(CPU *c, u64 va, const V128 *val);
  * in mem.c, bumped by every PTE mutation. */
 void tlb_flush_all(void);
 
+/* The calling thread runs c from here on: point c at this thread's own
+ * translation caches (c->eng), which translate() reaches through the CPU on
+ * every guest access. Called by every thread that takes up a CPU -- the main
+ * thread at startup, a new guest thread on its copy of its creator's, and a
+ * thread adopting another CPU's state wholesale (an exec's) -- before its
+ * first guest memory access. */
+void as_cpu_attach(CPU *c);
+
 /* ---- host bus-error recovery (mem.c) ----
  * A file truncated from outside this address space leaves PTEs pointing at
  * host pages the kernel now refuses; the resulting SIGBUS lands on the

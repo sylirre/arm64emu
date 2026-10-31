@@ -973,6 +973,7 @@ int main(int argc, char **argv)
     as_bus_init();   /* host SIGBUS on a file truncated from outside this
                       * address space becomes the guest's own abort */
     m->cpu.m = m;
+    as_cpu_attach(&m->cpu);   /* this thread runs the main CPU: its caches */
     g_tls.tid = getpid();     /* main thread tid == pid */
 
     /* Arm the SIGSYS net (seccomp trap -> -ENOSYS) before any guest work:

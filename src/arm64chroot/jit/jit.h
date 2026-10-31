@@ -6,7 +6,7 @@
  * every phase of the JIT must keep the differential test suite green.
  *
  * The JIT is per-thread throughout (code cache, block tables), mirroring
- * g_pdcache/g_dtlb: there are no locks in the JIT runtime and never any
+ * g_pdcache and the D-TLB: there are no locks in the JIT runtime and never any
  * cross-thread writes to generated code. Cross-thread coherence rides on a
  * per-thread interrupt flag checked at every block entry (safepoint). */
 #ifndef A64_JIT_H

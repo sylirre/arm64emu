@@ -824,10 +824,11 @@ static void futex_wake_addr(CPU *c, u64 va) {
 
 /* Give c, the CPU of the calling thread, `from`'s state: a struct copy, less
  * what belongs to the host thread c runs on rather than to the program --
- * what that thread's FPCR mirrors, which the copy would claim was `from`'s
- * host thread's (fpcr_host_sync). */
+ * its translation caches (as_cpu_attach) and what its FPCR mirrors, which the
+ * copy would claim were `from`'s host thread's (fpcr_host_sync). */
 static void cpu_adopt(CPU *c, const CPU *from) {
     *c = *from;
+    as_cpu_attach(c);
     c->host_fzmode = HOST_FZMODE_UNKNOWN;
 }
 
@@ -853,8 +854,10 @@ static void *thread_entry(void *arg) {
                                                     * child starts with none */
     CPU *c = &t->cpu;
     c->m = t->m;
-    /* The creator's CPU, copied, but not its host thread: what this one's
-     * FPCR mirrors has yet to be synced (fpcr_host_sync). */
+    /* The creator's CPU, copied, but not its host thread: this one's own
+     * translation caches, and what this one's FPCR mirrors has yet to be
+     * synced (fpcr_host_sync). Before the first guest access below. */
+    as_cpu_attach(c);
     c->host_fzmode = HOST_FZMODE_UNKNOWN;
     sig_sync_host_mask(c->m);   /* the creator's mask, as clone gives it -- the
                                  * host thread inherited the creator's host

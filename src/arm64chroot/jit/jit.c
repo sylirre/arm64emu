@@ -21,11 +21,12 @@
  *    jit_exec1_ic, which invalidates the written line's page. Plain stores
  *    are not instrumented: skipping IC on this CPU is architecturally
  *    undefined, exactly as on hardware.
- *  - D-TLB: generated code (from Phase C) probes g_dtlb without the
- *    per-access generation check translate() does, so every PTE mutation
- *    also sets `interrupt` (via as_gen_bump) and the safepoint service
- *    resyncs this thread's TLB. Stale hits between safepoints are benign by
- *    the same retired-backing quarantine the interpreter relies on.
+ *  - D-TLB: generated code (from Phase C) probes this thread's D-TLB (mem.c,
+ *    reached through jit_dtlb_base) without the per-access generation check
+ *    translate() does, so every PTE mutation also sets `interrupt` (via
+ *    as_gen_bump) and the safepoint service resyncs this thread's TLB. Stale
+ *    hits between safepoints are benign by the same retired-backing
+ *    quarantine the interpreter relies on.
  *  - Signals: the host catcher sets `interrupt`; blocks re-check it at every
  *    entry, so delivery latency is bounded by one block.
  *

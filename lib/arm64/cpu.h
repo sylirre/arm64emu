@@ -9,6 +9,7 @@
 #include "types.h"
 
 struct Machine;
+struct CpuEngine;
 
 /* PSTATE condition flag bit positions (matching SPSR_ELx / NZCV layout). */
 #define PS_N (1u << 31)
@@ -125,6 +126,11 @@ typedef struct CPU {
     u64  cur_insn_pc;  /* address of the instruction currently executing */
 
     struct Machine *m;
+    /* The engines' per-CPU state the program keeps outside the architecture
+     * -- its translation caches -- reached through the CPU, not thread-local
+     * storage, which where it is emulated (Bionic) costs a call per access.
+     * The program's own type; NULL where it keeps none here. */
+    struct CpuEngine *eng;
 } CPU;
 
 /* ---- Register access helpers (XZR vs SP semantics) ---- */

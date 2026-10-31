@@ -119,8 +119,10 @@ void prof_dump(void) {
 
 void cpu_reset(CPU *c, u64 entry, unsigned reset_el) {
     struct Machine *m = c->m;
+    struct CpuEngine *eng = c->eng;    /* the caches this CPU's thread keeps */
     memset(c, 0, sizeof(*c));
     c->m = m;
+    c->eng = eng;
     c->host_fzmode = HOST_FZMODE_UNKNOWN; /* the host FPCR is as it was */
     c->pc = entry;
     c->el = reset_el;

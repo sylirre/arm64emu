@@ -59,9 +59,28 @@ __thread FetchCache g_fcache;
  * offset with a shift (and, on x86, a scaled-index addressing mode), so an
  * entry that shrank to 12 on ILP32 would need a multiply in the hot path. */
 typedef struct { u64 page; uintptr_t pte; A64_HOST_PTRPAD } DTlbEntry;
-static __thread DTlbEntry g_dtlb[DTLB_SIZE];
-static __thread unsigned long g_dtlb_gen;  /* generation g_dtlb reflects; 0 = flushed */
+/* A thread's D-TLB and the generation it reflects (cpu.h's CpuEngine, as this
+ * program has it). Each lives in its thread's storage and is reached through
+ * the CPU that thread runs (c->eng, as_cpu_attach): an address taken once per
+ * thread instead of once per guest access, which is what thread-local storage
+ * costs where it is emulated -- on Bionic a call, and translate() is on every
+ * access. The paths with no CPU at hand -- tlb_flush_all, the JIT seam, the
+ * SIGBUS repair -- name the calling thread's directly; it is the same one. */
+struct CpuEngine {
+    DTlbEntry dtlb[DTLB_SIZE];
+    unsigned long dtlb_gen;                /* generation dtlb reflects; 0 = flushed */
+};
+static __thread struct CpuEngine t_eng;
 static unsigned long g_as_gen = 1;         /* never 0; word-sized: lock-free on ILP32 */
+
+/* The calling thread runs c from here on: c reaches this thread's caches. A
+ * CPU copied from another thread's (clone, an exec adopting the main thread's
+ * image) must be attached again by the thread that runs it. The first access
+ * to the block is made here, in ordinary context, not by a signal handler
+ * (sig_tls_prewarm says why that matters on Bionic). */
+void as_cpu_attach(CPU *c) {
+    c->eng = &t_eng;
+}
 
 static void as_gen_bump(void) {
     __atomic_fetch_add(&g_as_gen, 1, __ATOMIC_RELEASE);
@@ -72,7 +91,7 @@ static void as_gen_bump(void) {
 
 void tlb_flush_all(void) {
     g_fcache.host = NULL;
-    g_dtlb_gen = 0;        /* re-sync (and empty) the D-TLB at the next lookup */
+    t_eng.dtlb_gen = 0;        /* re-sync (and empty) the D-TLB at the next lookup */
 }
 
 /* ---- published D-TLB epochs (what lets the quarantine drain) --------------
@@ -261,14 +280,14 @@ void as_tlb_fork_child(void) {
 /* ---- JIT D-TLB seam (see mmu.h) ---- */
 _Static_assert(DTLB_SIZE == A64_DTLB_ENTRIES, "JIT D-TLB size mismatch");
 _Static_assert(sizeof(DTlbEntry) == 16, "JIT assumes 16-byte D-TLB entries");
-void *jit_dtlb_base(void) { return g_dtlb; }
+void *jit_dtlb_base(void) { return t_eng.dtlb; }
 void jit_dtlb_reset(void) {
     /* The interpreter empties lazily on a generation mismatch; the JIT's
      * inline probe has no per-access generation check, so empty eagerly and
      * adopt the current generation. Also drops the fetch cache. */
     unsigned long gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
-    memset(g_dtlb, 0, sizeof g_dtlb);
-    g_dtlb_gen = gen;
+    memset(t_eng.dtlb, 0, sizeof t_eng.dtlb);
+    t_eng.dtlb_gen = gen;
     g_fcache.host = NULL;
     dtlb_publish(gen);
 }
@@ -937,7 +956,7 @@ static void as_drain_retired(AddrSpace *as) {
  * syscall handed the guest's own pages (guest_lend) -- and those are kept
  * alive by the loan's pins, not by this thread's epoch. */
 void as_tlb_block_begin(void) {
-    if (g_pub_slot < 0) dtlb_publish(g_dtlb_gen);   /* claim a slot to flag */
+    if (g_pub_slot < 0) dtlb_publish(t_eng.dtlb_gen);   /* claim a slot to flag */
     if (g_pub_slot >= 0) __atomic_store_n(&g_pub[g_pub_slot].blocked, 1, __ATOMIC_RELEASE);
 }
 void as_tlb_block_end(void) {
@@ -3089,14 +3108,15 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
      * fault reporting (FAR retains the tag, as on hardware). */
     if (need != PTE_X) va &= A64_TBI_MASK;
     if (UNLIKELY(va >= GUEST_TASK_SIZE)) return NULL;
+    struct CpuEngine *te = c->eng;          /* this thread's (as_cpu_attach) */
     unsigned long gen = __atomic_load_n(&g_as_gen, __ATOMIC_ACQUIRE);
-    if (UNLIKELY(gen != g_dtlb_gen)) {
-        memset(g_dtlb, 0, sizeof g_dtlb);
-        g_dtlb_gen = gen;
+    if (UNLIKELY(gen != te->dtlb_gen)) {
+        memset(te->dtlb, 0, sizeof te->dtlb);
+        te->dtlb_gen = gen;
         dtlb_publish(gen);   /* lets the quarantine release what we just dropped */
     }
     u64 page = va >> 12;
-    DTlbEntry *e = &g_dtlb[page & (DTLB_SIZE - 1)];
+    DTlbEntry *e = &te->dtlb[page & (DTLB_SIZE - 1)];
     uintptr_t pte;
     if (LIKELY(e->pte && e->page == page)) {
         pte = e->pte;

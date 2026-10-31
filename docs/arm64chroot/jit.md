@@ -57,7 +57,7 @@ branches (`BR`/`BLR`/`RET`) probe a per-thread guest-pc → host-code cache.
 **Per-thread everything.** Each guest thread has its own `JitEnv`: code cache,
 block table, chain-edge list, jump cache, and D-TLB view. There are no locks in
 the JIT runtime and generated code is never written by another thread. This
-mirrors the interpreter's per-thread `g_pdcache` / `g_dtlb` design; the cost is
+mirrors the interpreter's per-thread `g_pdcache` / D-TLB design; the cost is
 that a heavily-threaded guest re-translates hot code per thread.
 
 **Registers and flags.** Guest GPRs live in the `CPU` struct between blocks and
