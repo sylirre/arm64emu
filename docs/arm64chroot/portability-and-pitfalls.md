@@ -340,7 +340,10 @@ way. The pending set is **per thread** — `fpsr_sync` clears what it folds, so
 a set shared between guest threads does not merely show one thread flags it
 never raised, it takes them away from the thread that did (`tests/arm64chroot/c/
 fpsr_threads.c`; the host's own status word is per host thread already and
-needs no help). And **anything that reads or writes `c->fpsr` behind the
+needs no help). It lives in the guest thread's CPU (`c->fpexc`, beside the
+latched `c->fz`/`c->fz16`), not in thread-local storage: nearly every FP
+operation touches it, and where TLS is emulated (Bionic) each access would be a
+library call. And **anything that reads or writes `c->fpsr` behind the
 guest's back has to fold first** — a signal frame and a ptrace `NT_PRFPREG`
 regset both do, and both were working with a value as of the guest's last
 `MRS`: the frame showed a stale FPSR to the handler, and a handler that

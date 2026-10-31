@@ -644,7 +644,7 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
      * that newly matters invalidates the inline FP in every block already
      * translated, including the rest of this one, so end the block and let
      * jit_run's loop drop the cache before anything else runs. */
-    fpcr_host_sync(c->fpcr);
+    fpcr_host_sync(c);
     if (UNLIKELY((jit_fpmode(c) & JIT_FPMODE_XLATE_MASK) &&
                  !(g_jit_env.fpmode_seen & JIT_FPMODE_XLATE_MASK)))
         return 1;
@@ -914,7 +914,7 @@ void jit_run(CPU *c) {
         /* Keep the host's own FZ/FZ16 on the guest's (a no-op where the host
          * has none): this covers what jit_exec1 cannot -- a thread starting
          * with its creator's FPCR, and a sigreturn that restored one. */
-        fpcr_host_sync(c->fpcr);
+        fpcr_host_sync(c);
         /* First sight of a mode that changes what may be emitted: blocks
          * translated before it inlined FP that cannot honor it. Drop them
          * all; from here the frontend withdraws whatever this host cannot

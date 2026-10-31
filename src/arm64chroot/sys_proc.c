@@ -822,6 +822,15 @@ static void futex_wake_addr(CPU *c, u64 va) {
     BUS_GUARD_END();
 }
 
+/* Give c, the CPU of the calling thread, `from`'s state: a struct copy, less
+ * what belongs to the host thread c runs on rather than to the program --
+ * what that thread's FPCR mirrors, which the copy would claim was `from`'s
+ * host thread's (fpcr_host_sync). */
+static void cpu_adopt(CPU *c, const CPU *from) {
+    *c = *from;
+    c->host_fzmode = HOST_FZMODE_UNKNOWN;
+}
+
 static void *thread_entry(void *arg) {
     GThread *t = arg;
     sig_kick_timer_init();   /* the capture kick's timer, aimed at this thread */
@@ -844,6 +853,9 @@ static void *thread_entry(void *arg) {
                                                     * child starts with none */
     CPU *c = &t->cpu;
     c->m = t->m;
+    /* The creator's CPU, copied, but not its host thread: what this one's
+     * FPCR mirrors has yet to be synced (fpcr_host_sync). */
+    c->host_fzmode = HOST_FZMODE_UNKNOWN;
     sig_sync_host_mask(c->m);   /* the creator's mask, as clone gives it -- the
                                  * host thread inherited the creator's host
                                  * mask, gate bits and all; make it this one's */
@@ -2964,7 +2976,7 @@ static void dethread_join(CPU *c) {
      * state -- and resume at its first instruction. The rest is per-thread
      * state execve resets, except the blocked signal mask: that is the caller's,
      * because execve preserves it. */
-    if (c != &m->cpu) *c = m->cpu;
+    if (c != &m->cpu) cpu_adopt(c, &m->cpu);
     /* If this thread had already exited as the previous program's main thread,
      * it is a live guest thread again -- the same outcome the kernel reaches by
      * releasing a zombie leader and giving its pid to the exec'ing thread.
@@ -3584,7 +3596,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
      * (PC, g in x28, SP) against the freshly loaded address space and faults
      * immediately. The initial exec and any main-thread exec pass c == &m->cpu,
      * where this is a no-op. */
-    if (c != &m->cpu) *c = m->cpu;
+    if (c != &m->cpu) cpu_adopt(c, &m->cpu);
     g_tls.image_gen = img;
     g_tls.stop_gen = gen;
     /* What the dismantled siblings had pending that was the process's, and

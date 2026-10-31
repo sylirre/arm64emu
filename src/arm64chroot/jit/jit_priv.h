@@ -218,7 +218,7 @@ void be_fixup_add(JitEnv *env, u32 fast_off, u32 slow_off);
 /* exec_fpsimd.c: mirror the guest's FZ/FZ16 into the host's own FPCR where
  * the host has them, so generated code flushes to zero as the guest asked.
  * A no-op on every other host. See the block comment there. */
-void fpcr_host_sync(u32 fpcr);
+void fpcr_host_sync(CPU *c);
 
 u32 jit_exec1(CPU *c, u64 pc, u32 insn);
 u32 jit_exec1_ic(CPU *c, u64 pc, u32 insn);

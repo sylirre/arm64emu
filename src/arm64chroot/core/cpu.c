@@ -121,6 +121,7 @@ void cpu_reset(CPU *c, u64 entry, unsigned reset_el) {
     struct Machine *m = c->m;
     memset(c, 0, sizeof(*c));
     c->m = m;
+    c->host_fzmode = HOST_FZMODE_UNKNOWN; /* the host FPCR is as it was */
     c->pc = entry;
     c->el = reset_el;
     c->sp_sel = 1;                       /* SPSel=1 at reset (use SP_ELx) */

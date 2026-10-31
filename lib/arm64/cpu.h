@@ -30,6 +30,9 @@ typedef enum {
     EXC_SERROR = 3,
 } ExcKind;
 
+/* CPU.host_fzmode before the host FPCR has been synced: no FZ/FZ16 value. */
+#define HOST_FZMODE_UNKNOWN 0xffffffffu
+
 /* Result of executing a single instruction. */
 typedef enum {
     STEP_OK = 0,
@@ -46,6 +49,11 @@ typedef struct CPU {
     u32 daif;         /* uses PS_D/A/I/F bit positions */
     u8  el;           /* current exception level 0..3 (we implement 0,1; minimal 2) */
     u8  sp_sel;       /* SPSel: 0 => SP_EL0, 1 => SP_ELx */
+    /* The FZ/FZ16 bits the host FPCR currently mirrors (exec_fpsimd.c,
+     * fpcr_host_sync; AArch64 hosts only), HOST_FZMODE_UNKNOWN where the host
+     * thread's FPCR has not been synced since this CPU started or was reset.
+     * Host-thread state, kept here because a CPU runs on one host thread. */
+    u32 host_fzmode;
 
     /* Banked stack pointers SP_EL0..SP_EL3 */
     u64 sp_el[4];
@@ -56,6 +64,11 @@ typedef struct CPU {
     bool fp_trapped;  /* CPACR_EL1.FPEN traps FP/SIMD at this EL (cpu_refresh_fp_trap) */
     u8 ldst_unpriv;   /* transient: current data access is LDTR/STTR (EL0 view);
                          read by arm64emu's MMU */
+    /* The FP core's lazy state (exec_fpsimd.c): FPCR.FZ/FZ16 latched for the
+     * instruction in flight, and the FPSR flags raised in software that
+     * fpsr_sync has yet to fold into fpsr. */
+    u8  fz, fz16;
+    u32 fpexc;
 
     /* Banked system registers (index by EL where meaningful) */
     u64 sctlr[4];

@@ -240,7 +240,7 @@ void be_flush_icache(const u8 *rx, const u8 *rw, size_t len);
 /* exec_fpsimd.c: mirror the guest's FZ/FZ16 into the host's own FPCR where
  * the host has them, so generated code flushes to zero as the guest asked.
  * A no-op on every other host. See the block comment there. */
-void fpcr_host_sync(u32 fpcr);
+void fpcr_host_sync(CPU *c);
 
 u32 jit_exec1(CPU *c, u64 pc, u32 insn);
 u32 jit_exec1_ic(CPU *c, u64 pc, u32 insn);
