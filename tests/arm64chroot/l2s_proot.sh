@@ -233,6 +233,38 @@ $'lstat /g/x: reg nlink=3 size=8\ncat /g/x: ROGROUP|\nlink /g/new: -1 errno=18\n
 $'lstat /g/x: reg nlink=3 size=8\nlink /g/new: 0 errno=0\nlstat /g/x: reg nlink=4 size=8\nunlink /g/y: 0 errno=0\nunlink /g/z: 0 errno=0\nlstat /g/x: reg nlink=2 size=8' "$got"
     l2sp_verdict "... and the data file carries the count" "$([ -f "$W/ldir/.l2s.a0001.0002" ] && echo 1 || echo 0)" "$(ls -A "$W/ldir" | tr '\n' ' ')"
     rm -rf "$W"
+    # The emulator's own scheme and :ro binds. A file linked inside a bind
+    # that was writable then has its data moved into the rootfs's store, under
+    # no bind at all. With that bind :ro now, every name of it is read-only:
+    # the mount a name sits under governs it, as it governs a real hardlink
+    # (which cannot span mounts). A walk that follows the name lands in the
+    # store, a no-follow call is re-pinned there, and a descriptor opened
+    # through the name is on the store's file: all of them used to write it.
+    l2sp_newroot; mkdir "$W/bd"; echo DATA > "$W/bd/f"
+    l2sp_run -b "$WP/bd:/b" "$R" /bin/p link /b/f /b/g > /dev/null
+    before=$(l2sp_snap "$R/.l2s")
+    got=$(l2sp_run -b "$WP/bd:/b:ro" "$R" /bin/p w /b/f wnf /b/f trunc /b/g chmod /b/f utime /b/g setx /b/f fchmod /b/f reopen /b/g cat /b/g)
+    l2sp_row "a name under a :ro bind is read-only though its data is in the store" \
+$'w /b/f: -1 errno=30\nwnf /b/f: -1 errno=30\ntrunc /b/g: -1 errno=30\nchmod /b/f: -1 errno=30\nutime /b/g: -1 errno=30\nsetx /b/f: -1 errno=30\nfchmod /b/f: -1 errno=30\nreopen /b/g: -1 errno=30\ncat /b/g: DATA|' "$got"
+    l2sp_verdict "... and the data in the store is byte for byte what it was" \
+        "$([ "$(readlink "$W/bd/f")" = "$P/.l2s/$(ls -A "$R/.l2s" | grep -v '\.[0-9]*\.' | head -1)" ] &&
+           [ "$before" = "$(l2sp_snap "$R/.l2s")" ] && echo 1 || echo 0)" \
+        "$(readlink "$W/bd/f"); $(ls -A "$R/.l2s" | tr '\n' ' ')"
+    rm -rf "$W"
+    # ... and the other way round: the names writable, the data under a :ro
+    # bind (here the store itself, bound over itself). A following walk lands
+    # on the bind and was refused; O_NOFOLLOW asked about the name, before the
+    # re-pin onto the data, and opened it for writing.
+    l2sp_newroot; mkdir "$R/d"; echo DATA > "$R/d/a"
+    l2sp_run "$R" /bin/p link /d/a /d/b > /dev/null
+    before=$(l2sp_snap "$R/.l2s")
+    got=$(l2sp_run -b "$P/.l2s:/.l2s:ro" "$R" /bin/p w /d/a wnf /d/a trunc /d/b chmod /d/a utime /d/b setx /d/a fchmod /d/a reopen /d/b cat /d/b)
+    l2sp_row "a name whose data is under a :ro bind is read-only, O_NOFOLLOW too" \
+$'w /d/a: -1 errno=30\nwnf /d/a: -1 errno=30\ntrunc /d/b: -1 errno=30\nchmod /d/a: -1 errno=30\nutime /d/b: -1 errno=30\nsetx /d/a: -1 errno=30\nfchmod /d/a: -1 errno=30\nreopen /d/b: -1 errno=30\ncat /d/b: DATA|' "$got"
+    l2sp_verdict "... and the data is byte for byte what it was" \
+        "$([ -n "$(ls -A "$R/.l2s" 2>/dev/null)" ] && [ "$before" = "$(l2sp_snap "$R/.l2s")" ] && echo 1 || echo 0)" \
+        "$(ls -A "$R/.l2s" | tr '\n' ' ')"
+    rm -rf "$W"
     # The l2s directory is a symlink INSIDE the rootfs: resolved like any path.
     l2sp_newroot; rm -rf "$R/.l2s"; mkdir "$R/real"; ln -s real "$R/.l2s"
     l2sp_group "$R/real" "$P/.l2s" a 2 $'VIA-LINK\n'

@@ -11,6 +11,11 @@
  *   cat P          the first bytes of P                  readlink P what it holds
  *   unlink P       link A B / linkf A B (AT_SYMLINK_FOLLOW)   rename A B
  *   utime P        utimensat NOFOLLOW                    onf P      open O_NOFOLLOW
+ *   w P / wnf P    open O_WRONLY, without / with O_NOFOLLOW
+ *   trunc P        truncate to 1 byte                    chmod P    chmod 0600
+ *   setx P         setxattr user.l2s                     fchmod P   fchmod through
+ *                                                                   an O_RDONLY fd
+ *   reopen P       open O_RDONLY, then its /proc/self/fd link O_WRONLY
  *   stress P N K   K children, each: N times link P to a name of its own and
  *                  unlink it -- the count must come back to where it was.
  */
@@ -24,6 +29,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 static void rc(const char *what, const char *a, int r) {
@@ -78,6 +84,32 @@ int main(int argc, char **argv) {
         } else if (!strcmp(op, "onf") && i + 1 < argc) {
             int fd = open(argv[i + 1], O_RDONLY | O_NOFOLLOW);
             printf("onf %s: %s errno=%d\n", argv[i + 1], fd >= 0 ? "ok" : "failed", fd >= 0 ? 0 : errno);
+            if (fd >= 0) close(fd);
+            i++;
+        } else if ((!strcmp(op, "w") || !strcmp(op, "wnf")) && i + 1 < argc) {
+            int fd = open(argv[i + 1], O_WRONLY | (op[1] ? O_NOFOLLOW : 0));
+            rc(op, argv[i + 1], fd < 0 ? -1 : 0);
+            if (fd >= 0) close(fd);
+            i++;
+        } else if (!strcmp(op, "trunc") && i + 1 < argc) { rc("trunc", argv[i + 1], truncate(argv[i + 1], 1)); i++; }
+        else if (!strcmp(op, "chmod") && i + 1 < argc) { rc("chmod", argv[i + 1], chmod(argv[i + 1], 0600)); i++; }
+        else if (!strcmp(op, "setx") && i + 1 < argc) {
+            rc("setx", argv[i + 1], setxattr(argv[i + 1], "user.l2s", "v", 1, 0));
+            i++;
+        } else if (!strcmp(op, "fchmod") && i + 1 < argc) {
+            int fd = open(argv[i + 1], O_RDONLY);
+            rc("fchmod", argv[i + 1], fd < 0 ? -1 : fchmod(fd, 0600));
+            if (fd >= 0) close(fd);
+            i++;
+        } else if (!strcmp(op, "reopen") && i + 1 < argc) {
+            int fd = open(argv[i + 1], O_RDONLY), w = -1;
+            if (fd >= 0) {
+                char l[64];
+                snprintf(l, sizeof l, "/proc/self/fd/%d", fd);
+                w = open(l, O_WRONLY);
+            }
+            rc("reopen", argv[i + 1], w < 0 ? -1 : 0);
+            if (w >= 0) close(w);
             if (fd >= 0) close(fd);
             i++;
         } else if (!strcmp(op, "stress") && i + 3 < argc) {

@@ -67,6 +67,43 @@ int oflags_h2g(int h) {
     return g;
 }
 
+#ifdef L2S_ENABLED
+/* Is any bind mount read-only? The --link2symlink :ro questions that cost a
+ * lookup of their own are asked only then. */
+static int any_ro_bind(void) {
+    for (int i = 0, n = bind_count(); i < n; i++)
+        if (bind_ro(i)) return 1;
+    return 0;
+}
+#endif
+
+/* --link2symlink and :ro binds, by descriptor. A descriptor opened through a
+ * name of a group is on the group's data file -- in the store under the
+ * rootfs, which no bind covers -- and which name it came through is not
+ * something a description remembers. What it does remember is its access
+ * mode: a writable one came through a writable name, since every write-open
+ * under a :ro name is refused by name (pin_ro), so it may write; a read-only
+ * or O_PATH one is judged as if it came through a :ro bind, whenever one
+ * exists at all. That over-refuses exactly one shape -- a read-only descriptor
+ * on a hardlinked file opened through a writable name, then written through by
+ * descriptor or reopened for writing through its fd link, while some :ro bind
+ * exists -- and nothing else (chroot-ng draws the same line). `real` is where
+ * the kernel says the description's file is; `fd` is the descriptor, or -1
+ * for another process's, which cannot be asked and is taken as read-only,
+ * the side that refuses. */
+static int l2s_fd_ro(struct Machine *m, const char *real, int fd) {
+#ifdef L2S_ENABLED
+    if (!m->link2symlink || !any_ro_bind()) return 0;
+    const char *b = strrchr(real, '/');
+    if (!l2s_hidden(b ? b + 1 : real)) return 0;
+    int fl = fd >= 0 ? fcntl(fd, F_GETFL) : -1;
+    return fl < 0 || (fl & O_ACCMODE) == O_RDONLY;
+#else
+    (void)m; (void)real; (void)fd;
+    return 0;
+#endif
+}
+
 /* 1 if `host` (a resolved host path) lies under a read-only -bind mount, so a
  * mutating syscall on it must return -EROFS. bind_of_host matches the bound
  * host prefix at a '/' boundary; non-bind paths never match.
@@ -80,20 +117,31 @@ int oflags_h2g(int h) {
  * alone, "/proc/self/fd/N" matched nothing, so a guest holding a read-only
  * (or O_PATH) descriptor of a file under a :ro bind re-opened it writable
  * through its own link -- with O_TRUNC, if it liked. The link is followed
- * here, once, for every caller. An anonymous target (pipe:[N]) is nothing a
- * bind can cover. */
+ * here, once, for every caller -- and a link on a data file of a group is
+ * judged by its access mode as well (l2s_fd_ro). An anonymous target
+ * (pipe:[N]) is nothing a bind can cover. */
 static int host_ro(struct Machine *m, const char *host) {
     if (bind_count() == 0) return 0;
     char tgt[PATH_MAX];
+    int link_fd = -2;              /* not an fd link */
     if (proc_zone_path(host)) {
         ssize_t n = readlink(host, tgt, sizeof tgt - 1);
         if (n <= 0) return 0;
         tgt[n] = 0;
         if (tgt[0] != '/') return 0;
+        if (proc_fd_link_path(host)) link_fd = proc_own_fd_path(host);
         host = tgt;
     }
     int i = bind_of_host(m, host, NULL);
-    return i >= 0 && bind_ro(i);
+    if (i >= 0 && bind_ro(i)) return 1;
+    return link_fd != -2 && l2s_fd_ro(m, host, link_fd);
+}
+
+/* host_ro of the file a pin names, and, for a name of a group, of the name
+ * and of the data as well (PathPin.l2s_ro): the file lives on that mount, and
+ * every name of it is read-only there. */
+static int pin_ro(struct Machine *m, const PathPin *p) {
+    return p->l2s_ro || host_ro(m, p->host);
 }
 
 /* Same question asked of an open fd, for the syscalls that name a file by
@@ -113,7 +161,7 @@ static int fd_ro(struct Machine *m, int fd) {
     ssize_t n = readlink(link, host, sizeof host - 1);
     if (n <= 0 || (size_t)n >= sizeof host) return 0;
     host[n] = 0;
-    return host_ro(m, host);
+    return host_ro(m, host) || (host[0] == '/' && l2s_fd_ro(m, host, fd));
 }
 
 void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
@@ -985,6 +1033,32 @@ int l2s_guest_denied(struct Machine *m, int dirfd, const char *gp) {
     canon[cl] = '\0';
     return l2s_store_name(canon);
 }
+
+/* PathPin.l2s_ro, for the guest name (dirfd, gpath) just resolved into `pin`.
+ * Where that name is a name of a group, the :ro question is asked about the
+ * name -- to the guest it IS the file, and the mount it sits under governs it
+ * (a real hardlink cannot span mounts, so there is no second mount to argue
+ * for) -- and about where the data is: the file lives on that mount, and
+ * every name of it is read-only there. host_ro of the pin's own path answers
+ * neither once the walk has followed the name into the store, which sits
+ * under the rootfs and no bind covers: a name inside a :ro bind (its data
+ * moved into the store while the bind was writable) resolved to a perfectly
+ * writable file, and every writer went through. Nor does it after
+ * l2s_deref_pin has re-pinned a no-follow call onto the data, or for an
+ * O_NOFOLLOW open, which is asked before the re-pin. The l2s hop is always
+ * the last component -- a link to a file has nothing under it -- so the name
+ * itself is the same walk with the last component not followed. Asked only
+ * when some bind is :ro, so the default path pays nothing for it. */
+void l2s_pin_ro(struct Machine *m, int dirfd, const char *gpath, unsigned rflags,
+                PathPin *pin) {
+    pin->l2s_ro = 0;
+    if (!pin->pinned || !gpath[0] || !any_ro_bind()) return;
+    char hnf[PATH_MAX], data[PATH_MAX];
+    if (rflags & PATH_NOFOLLOW_LAST) strcpy(hnf, pin->host);
+    else if (path_resolve(m, dirfd, gpath, PATH_NOFOLLOW_LAST, hnf, NULL) < 0) return;
+    if (l2s_resolve(hnf, data, sizeof data, NULL) != 1) return;
+    pin->l2s_ro = host_ro(m, hnf) || host_ro(m, data);
+}
 #endif /* L2S_ENABLED */
 
 /* --link2symlink: a name of a group is a regular FILE to the guest, whatever
@@ -1015,9 +1089,11 @@ int l2s_deref_pin(struct Machine *m, PathPin *p) {
     if (l2s_resolve(p->host, data, sizeof data, NULL) != 1) return 0;
     PathPin d;
     if (l2s_host_pin(data, &d) < 0) { path_unpin(&d); return 0; }
+    int ro = p->l2s_ro;                       /* the name's verdict stays (pin_ro) */
     path_unpin(p);
     *p = d;
     p->name = d.pinned ? p->base : p->host;   /* into p's own storage, not d's */
+    p->l2s_ro = ro;
     return 1;
 #else
     (void)m; (void)p;
@@ -1212,7 +1288,7 @@ SYSDEF(openat) {
      * EROFS a kernel gives for the create it would have had to do. */
     int hflags = oflags_g2h(gflags);
     int ro = 0;
-    if ((gflags & (O_ACCMODE | O_CREAT | O_TRUNC)) && (ro = host_ro(c->m, host))) {
+    if ((gflags & (O_ACCMODE | O_CREAT | O_TRUNC)) && (ro = pin_ro(c->m, &pin))) {
         if ((gflags & O_ACCMODE) != O_RDONLY || (gflags & O_TRUNC)) {
             path_unpin(&pin);
             return (u64)(s64)-EROFS;
@@ -1829,6 +1905,10 @@ SYSDEF(readlinkat) {
     }
     PathPin pin;
     char canon[PATH_MAX];
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink && l2s_guest_denied(c->m, (int)(s32)a0, gpath))
+        return (u64)(s64)-ENOENT;   /* as resolve_pin */
+#endif
     int r = path_resolve(c->m, (int)(s32)a0, gpath, PATH_NOFOLLOW_LAST, pin.host, canon);
     if (r < 0) return (u64)(s64)r;
     if ((r = path_pin(c->m, canon, pin.host, &pin)) < 0) return (u64)(s64)r;
@@ -2311,7 +2391,7 @@ SYSDEF(setxattr) {   /* (path, name, value, size, flags) — follow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     u64 ret = nn < 0            ? (u64)(s64)nn
-            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
             : xattr_write(c, spell, -1, !pin.pinned, name, a2, a3, (int)a4);
     path_unpin(&pin);
     return ret;
@@ -2323,7 +2403,7 @@ SYSDEF(lsetxattr) {  /* (path, name, value, size, flags) — nofollow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     u64 ret = nn < 0            ? (u64)(s64)nn
-            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
             : xattr_write(c, spell, -1, 0, name, a2, a3, (int)a4);
     path_unpin(&pin);
     return ret;
@@ -2342,7 +2422,7 @@ SYSDEF(removexattr) {  /* (path, name) — follow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     u64 ret = nn < 0                  ? (u64)(s64)nn
-            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
             : (pin.pinned ? lremovexattr(spell, name)
                           : removexattr(spell, name)) < 0 ? host_err() : 0;
     path_unpin(&pin);
@@ -2355,7 +2435,7 @@ SYSDEF(lremovexattr) { /* (path, name) — nofollow */
     if (r < 0) return (u64)(s64)r;
     long nn = xattr_name(c, name, a1);
     u64 ret = nn < 0                  ? (u64)(s64)nn
-            : host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
             : lremovexattr(spell, name) < 0 ? host_err() : 0;
     path_unpin(&pin);
     return ret;
@@ -4131,7 +4211,7 @@ SYSDEF(truncate) {
     PathPin pin;
     int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    if (pin_ro(c->m, &pin)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
     /* truncate(2) follows the final component and has no way to be told not
      * to, so the component itself is pinned and named by its descriptor: that
      * magic link resolves to the inode the walk found, whatever the tree looks
@@ -4178,7 +4258,7 @@ SYSDEF(fchmodat) {
     PathPin pin;
     int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
-    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    if (pin_ro(c->m, &pin)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
     /* The path spelling of one of our own fds: same object, same answer as
      * fchmod above, and on the host this exists for the path form is refused
      * as flatly as the fd one. */
@@ -4231,7 +4311,7 @@ SYSDEF(fchownat) {
      * group shares (l2s_deref_pin). */
     if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
     int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
-    u64 ret = host_ro(c->m, pin.host)
+    u64 ret = pin_ro(c->m, &pin)
                   ? (u64)(s64)-EROFS
                   : chattr_result(c->m, fchownat(pin.dfd, pin.name, (uid_t)a2,
                                                  (gid_t)a3, hf));
@@ -4299,15 +4379,22 @@ SYSDEF(utimensat) {
     PathPin pin;
     unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
     /* An empty name under AT_EMPTY_PATH at AT_FDCWD is the working directory. */
-    int r = path_resolve_pin(c->m, dfd, n == 0 && (gf & G_AT_EMPTY_PATH) ? "." : gpath,
-                             rf, &pin, NULL);
+    const char *gp = n == 0 && (gf & G_AT_EMPTY_PATH) ? "." : gpath;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink && l2s_guest_denied(c->m, dfd, gp))
+        return (u64)(s64)-ENOENT;   /* as resolve_pin */
+#endif
+    int r = path_resolve_pin(c->m, dfd, gp, rf, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink) l2s_pin_ro(c->m, dfd, gp, rf, &pin);
+#endif
     /* As fchownat: timestamps belong to the shared data, so a no-follow stamp
      * on an emulated hardlink has to land on the backing. Left alone, the call
      * returned 0 and moved a timestamp nothing could ever read back. */
     if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
     int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
-    u64 ret = host_ro(c->m, pin.host) ? (u64)(s64)-EROFS
+    u64 ret = pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
             : utimensat(pin.dfd, pin.name, tsp, hf) < 0 ? host_err() : 0;
     path_unpin(&pin);
     return ret;
@@ -4597,6 +4684,10 @@ SYSDEF(statx) {
     } else {
         unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
         char canon[PATH_MAX];
+#ifdef L2S_ENABLED
+        if (c->m->link2symlink && l2s_guest_denied(c->m, (int)(s32)a0, gpath))
+            return (u64)(s64)-ENOENT;   /* as resolve_pin */
+#endif
         int rr = path_resolve(c->m, (int)(s32)a0, gpath, rf, host, canon);
         if (rr < 0) return (u64)(s64)rr;
         PathPin pin;

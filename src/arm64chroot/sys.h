@@ -472,10 +472,15 @@ static inline int resolve_pin(CPU *c, int dirfd, u64 path_va, unsigned rflags,
     if (n >= 0 && c->m->link2symlink && l2s_guest_denied(c->m, dirfd, gpath)) n = -ENOENT;
 #endif
     if (n < 0) {
-        pin->dfd = AT_FDCWD; pin->pinned = 0; pin->name = pin->host; pin->host[0] = 0;
+        pin->dfd = AT_FDCWD; pin->pinned = 0; pin->l2s_ro = 0;
+        pin->name = pin->host; pin->host[0] = 0;
         return (int)n;
     }
-    return path_resolve_pin(c->m, dirfd, gpath, rflags, pin, canon_out);
+    int r = path_resolve_pin(c->m, dirfd, gpath, rflags, pin, canon_out);
+#ifdef L2S_ENABLED
+    if (r == 0 && c->m->link2symlink) l2s_pin_ro(c->m, dirfd, gpath, rflags, pin);
+#endif
+    return r;
 }
 
 /* Resolve, pin, and spell the target as a path for the syscalls that have no

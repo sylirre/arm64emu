@@ -772,11 +772,25 @@ and walked as any guest path, under the same containment. Each name is then
   directory is re-pointed at the data's path. The last name removed deletes
   the data and the marker (or the indirection). A proot group takes no more
   than 9999 names (`EMLINK`).
-* A write the guest could not make is not made for it: a group's data can sit
+* A write the guest could not make is not made for it. A group's data can sit
   on a read-only bind while its names do not — a new name is then `EXDEV`
   (the file is on the bind, the new name is not: a link across mounts), and a
   removed name still succeeds with its count left alone (`host_ro`, as every
-  other writer).
+  other writer). And a name can sit on a read-only bind while its data does
+  not: a file linked in a bind that was writable then has its data in the
+  store, under no bind at all. To the guest the name *is* the file, so where
+  a call's name is a name of a group the `:ro` question is asked about the
+  name and about the data (`PathPin.l2s_ro`, set by `resolve_pin`; `pin_ro`):
+  a following walk lands in the store and a no-follow call is re-pinned
+  there, and `host_ro` of the pin alone let every writer through. A
+  descriptor on a data file does not remember the name it came through, only
+  its access mode: a writable one came through a writable name (every
+  write-open under a `:ro` name is refused by name), a read-only or `O_PATH`
+  one is judged read-only whenever some bind is `:ro` (`l2s_fd_ro`, for the
+  by-descriptor calls and for a reopen through its `/proc/self/fd` link).
+  That over-refuses one shape — a read-only descriptor on a hardlinked file
+  opened through a writable name, then written through by descriptor while
+  some `:ro` bind exists — as chroot-ng does.
 
 A program run through a name sees the name, as it does through a hardlink:
 `/proc/self/exe` (and the mapping names) is where a kernel's walk ends, which
@@ -794,17 +808,14 @@ file name, so a name made by anything that does not keep it (a host tool
 copying the symlink) is one the count does not know, and a group whose names
 outnumber its count loses the data when the count reaches zero; proot takes no
 lock, so proot and the emulator changing one proot group at the same moment
-can leave its count one off. A name in a read-only bind whose data an earlier
-session moved into the store (the bind was writable then) is writable through
-the store: arm64chroot judges a followed name by where its data is, where
-chroot-ng also asks about the name's own mount.
+can leave its count one off.
 
 `tests/arm64chroot/l2s_proot.sh` lays proot's layouts down by hand — over
 real hardlinks for the differential row, and hostile ones (targets that climb
 out, sibling directories, loops, a read-only l2s directory, a backing that is
-a symlink to a host file, six processes on one group) whose canaries must be
-untouched — and `c/l2s_*` compare the scheme with real hardlinks on the same
-host.
+a symlink to a host file, six processes on one group, names and data on
+either side of a `:ro` bind) whose canaries must be untouched — and `c/l2s_*`
+compare the scheme with real hardlinks on the same host.
 
 Four syscalls have no `*at` form and no no-follow flag at all. `chmod`,
 `truncate` and `statfs` pin the final component itself and reach it through

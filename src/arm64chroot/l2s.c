@@ -54,6 +54,7 @@ int l2s_host_pin(const char *host, PathPin *p) {
         p->dfd = AT_FDCWD;
         p->pinned = 0;
         p->lowfd = -1;
+        p->l2s_ro = 0;
         p->base[0] = 0;
         if (strlen(host) + 1 > sizeof p->host) return -ENAMETOOLONG;
         strcpy(p->host, host);

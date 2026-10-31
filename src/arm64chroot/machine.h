@@ -1159,6 +1159,11 @@ typedef struct {
      * open at once and ends one above where it started. -1 when nothing was
      * opened. */
     int  lowfd;
+    /* --link2symlink: the final component is a name of a group, and that name
+     * or the group's data is under a :ro bind -- which `host` alone cannot
+     * say once the walk, or l2s_deref_pin, has gone on to the data file
+     * (sys_file.c, l2s_pin_ro; asked by pin_ro). */
+    int  l2s_ro;
     char host[PATH_MAX];   /* the host path, as path_resolve produced it */
     char base[256];        /* storage behind `name` when pinned */
 } PathPin;
@@ -1259,6 +1264,10 @@ int l2s_host_stat(const char *host, struct stat *st, int follow);
  * -- a data or marker basename anywhere, or the store "/.l2s" -- which do not
  * exist for the guest (resolve_pin answers ENOENT for them)? */
 int l2s_guest_denied(struct Machine *m, int dirfd, const char *gp);
+/* sys_file.c: set pin->l2s_ro for the guest name (dirfd, gpath) just resolved
+ * with `rflags` into `pin` (resolve_pin calls it). */
+void l2s_pin_ro(struct Machine *m, int dirfd, const char *gpath, unsigned rflags,
+                PathPin *pin);
 #endif
 
 /* -link2symlink (sys_file.c): if `p` names one of the emulated-hardlink

@@ -1600,6 +1600,7 @@ int path_pin(struct Machine *m, const char *canon, const char *host, PathPin *p)
     p->dfd = AT_FDCWD;
     p->pinned = 0;
     p->lowfd = -1;
+    p->l2s_ro = 0;
     p->base[0] = 0;
     if (host != p->host) {
         if (strlen(host) + 1 > sizeof p->host) return -ENAMETOOLONG;
@@ -2146,6 +2147,7 @@ int path_resolve_pin(struct Machine *m, int dirfd, const char *gpath,
     pin->dfd = AT_FDCWD;
     pin->pinned = 0;
     pin->lowfd = -1;
+    pin->l2s_ro = 0;
     pin->name = pin->host;
     pin->host[0] = 0;
     int fast = !pathfast_off();
