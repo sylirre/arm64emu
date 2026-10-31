@@ -1,6 +1,8 @@
 -I.
+-Ijit
 -I../../src/arm64chroot
 -I../../src/arm64chroot/core
+-I../../src/arm64chroot/jit
 -std=gnu11
 -D_GNU_SOURCE
 -D_FILE_OFFSET_BITS=64

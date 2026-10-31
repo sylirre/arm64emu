@@ -16,6 +16,10 @@
  * nothing that is not already ordered. */
 #define ARM64_SMP 0
 
+/* The environment knobs of the shared code carry this program's prefix:
+ * getenv(ARM64_JIT_ENV("PDMAX")) reads ARM64EMU_JIT_PDMAX. */
+#define ARM64_JIT_ENV(name) "ARM64EMU_JIT_" name
+
 #ifdef ANDROID_JNI
 /* Embedded build (see main.c): the emulator is linked into a host process and
  * entered in a fork()ed child of it, so the atexit handlers and DSO destructors

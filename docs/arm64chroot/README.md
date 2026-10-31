@@ -358,6 +358,9 @@ lib/arm64/      AArch64 emulation shared with arm64emu:
   types.h cpu.h fixed-width types; CPU state + core interpreter API
   decode.c      A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
   predecode.{h,c}  the pre-decode classifier: word -> PDEnt (op id + operands)
+  jit/          the JIT translator: ir.h, frontend.c (per-block decode ->
+                linear IR -> liveness / flag fusion), backend_a64.c and
+                backend_x86_64.c (register-allocating single-pass emitters)
   sysreg.{h,c}  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers, what EL0 may run
   esr.h         ESR exception classes + syndrome construction
   exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
@@ -380,8 +383,7 @@ src/arm64chroot/
                 hot forms (classified by lib/arm64's predecode.c); PD_GENERIC
                 falls back to exec_a64 (the default engine)
   jit/          optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
-    ir.h frontend.c   per-block decode -> linear IR -> liveness / flag fusion
-    backend_a64.c backend_x86_64.c   register-allocating single-pass emitters
+    (ir.h frontend.c backend_a64.c backend_x86_64.c are lib/arm64/jit's)
     backend_x86_32.c backend_arm32.c   ILP32 emitters: guest 64-bit values as
                 host register-pair halves, only destinations allocated
     jit.c         code cache, block chaining, invalidation, W^X/memfd fallback

@@ -40,7 +40,7 @@ size (default 32, max 128).
 
 **Pipeline.** For each guest basic block, on first execution:
 `mem_ifetch` → `pd_fill` (the predecode classifier, reused as the JIT's
-decoder) → a small linear IR (`src/arm64chroot/jit/ir.h`) → one backward liveness pass
+decoder) → a small linear IR (`lib/arm64/jit/ir.h`) → one backward liveness pass
 (dead-flag elimination, producer/consumer flag fusion) → single-pass emission
 with greedy per-block register allocation (`backend_x86_64.c` /
 `backend_a64.c`). Anything the frontend does not recognize becomes a call to

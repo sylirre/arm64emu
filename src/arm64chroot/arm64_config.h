@@ -20,4 +20,8 @@
  * torn or reordered memory (weakly ordered hosts reorder ordinary accesses). */
 #define ARM64_SMP 1
 
+/* The environment knobs of the shared code carry this program's prefix:
+ * getenv(ARM64_JIT_ENV("PDMAX")) reads ARM64CHROOT_JIT_PDMAX. */
+#define ARM64_JIT_ENV(name) "ARM64CHROOT_JIT_" name
+
 #endif /* ARM64CHROOT_ARM64_CONFIG_H */

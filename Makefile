@@ -40,7 +40,7 @@ PROJECT_VERSION := $(shell cat VERSION)
 VERSION_DEFINE  := -DPROJECT_VERSION='"$(PROJECT_VERSION)"'
 
 # Code shared by both emulators.
-LIB_ARM64 := $(wildcard lib/arm64/*.c)
+LIB_ARM64 := $(wildcard lib/arm64/*.c lib/arm64/jit/*.c)
 
 # $(call cfgstamp,TREE,TEXT): the path of a stamp file holding TEXT, rewritten
 # only when TEXT changes. Every object of TREE depends on it, so changing the
@@ -79,7 +79,8 @@ DEPFLAGS := -MMD -MP
 ARM64EMU_OPT    ?= -O2
 ARM64EMU_FLAGS   = -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter \
                    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
-                   -Isrc/arm64emu -Ilib/arm64 -fno-math-errno -g $(CFLAGS)
+                   -Isrc/arm64emu -Isrc/arm64emu/jit -Ilib/arm64 -Ilib/arm64/jit \
+                   -fno-math-errno -g $(CFLAGS)
 ARM64EMU_SRC    := $(wildcard src/arm64emu/*.c src/arm64emu/devices/*.c \
                      src/arm64emu/fdt/*.c src/arm64emu/net/*.c \
                      src/arm64emu/jit/*.c) $(LIB_ARM64)
@@ -131,7 +132,8 @@ ARM64EMU_A64_CC      ?= clang --target=aarch64-linux-gnu -nostdlibinc \
 
 $(BUILD)/arm64emu-a64: $(ARM64EMU_SRC) VERSION
 	$(ARM64EMU_A64_CC) -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter \
-	    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc/arm64emu -Ilib/arm64 \
+	    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc/arm64emu -Isrc/arm64emu/jit \
+	    -Ilib/arm64 -Ilib/arm64/jit \
 	    -fno-math-errno $(VERSION_DEFINE) -o $@ $(ARM64EMU_SRC) -lm
 
 -include $(ARM64EMU_OBJ:.o=.d) $(ARM64EMU_EMBED_OBJ:.o=.d)
@@ -159,7 +161,7 @@ ARM64CHROOT_LTO ?=
 ARM64CHROOT_FLAGS = -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno \
                     -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 \
                     -Isrc/arm64chroot -Isrc/arm64chroot/core -Isrc/arm64chroot/jit \
-                    -Ilib/arm64 $(ARM64CHROOT_LTO) $(ARM64CHROOT_NOATOMICWARN) $(CFLAGS)
+                    -Ilib/arm64 -Ilib/arm64/jit $(ARM64CHROOT_LTO) $(ARM64CHROOT_NOATOMICWARN) $(CFLAGS)
 ARM64CHROOT_NOATOMICWARN := $(shell echo 'int main(){return 0;}' | $(CC) -Werror \
                     -Wno-atomic-alignment -x c - -o /dev/null 2>/dev/null \
                     && echo -Wno-atomic-alignment)
@@ -194,8 +196,7 @@ ARM64CHROOT_ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
 
 ARM64CHROOT_SRC := $(LIB_ARM64) \
     src/arm64chroot/core/cpu.c \
-    src/arm64chroot/jit/jit.c src/arm64chroot/jit/frontend.c \
-    src/arm64chroot/jit/backend_x86_64.c src/arm64chroot/jit/backend_a64.c \
+    src/arm64chroot/jit/jit.c \
     src/arm64chroot/jit/backend_x86_32.c src/arm64chroot/jit/backend_arm32.c \
     $(addprefix src/arm64chroot/,mem.c exception.c loop.c pdrun.c elf.c path.c \
       signal.c syscall.c strace.c sys_file.c sys_mm.c sys_ipc.c sys_proc.c \

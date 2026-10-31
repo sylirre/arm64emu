@@ -37,7 +37,7 @@ SP-based memory ops are deliberately GENERIC so SP-alignment faults match.
 ## Deliberate punts (interpreter stays authoritative)
 
 The frontend refuses these so host semantics can never leak
-(`src/arm64emu/jit/frontend.c`):
+(`lib/arm64/jit/frontend.c`):
 
 - **FMADD/FMLA/FMLS families** — inlined only where the backend can genuinely
   fuse (a64 replays the guest `fmadd`; x86-64 uses the FMA3 231-forms and

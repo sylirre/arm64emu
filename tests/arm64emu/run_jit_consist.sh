@@ -12,7 +12,7 @@
 # print different timestamps while both runs stay individually deterministic
 # (see docs/arm64emu/jit.md). The windows below are empirically interleave-identical;
 # a divergence here means a real translation bug — bisect with ARM64EMU_JIT_PDMAX
-# (see src/arm64emu/jit/frontend.c) and ARM64EMU_JIT_SLOWMEM/ARM64EMU_JIT_NOFUSE.
+# (see lib/arm64/jit/frontend.c) and ARM64EMU_JIT_SLOWMEM/ARM64EMU_JIT_NOFUSE.
 #
 # Env: ARM64EMU_BIOS, ARM64EMU_KERNEL, ARM64EMU_INITRD override the images;
 #      ARM64EMU_POINTS overrides the checkpoint list;

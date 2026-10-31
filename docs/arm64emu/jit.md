@@ -36,7 +36,7 @@ The lesson for anyone reading `ARM64EMU_JIT_STATS` output: rank by what the targ
 Ported from the arm64chroot user-mode emulator (same author; its CPU core
 is a copy of this repo's). Its `docs/arm64chroot/jit.md` describes the pipeline in
 depth — predecode classifier (`lib/arm64/predecode.c`) → linear IR
-(`src/arm64emu/jit/ir.h`, built by `src/arm64emu/jit/frontend.c`) → single-pass backend with
+(`lib/arm64/jit/ir.h`, built by `lib/arm64/jit/frontend.c`) → single-pass backend with
 per-block greedy register allocation and lazy NZCV in host flags
 (`src/arm64emu/jit/backend_*.c`) — plus block chaining, the bump-allocated code
 cache, and the W^X fallback (RWX mmap → dual-mapped memfd → interpreter).

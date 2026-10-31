@@ -2,9 +2,9 @@
 /* Copyright 2026 Sylirre */
 /* JIT intermediate representation. One guest instruction becomes 1..
  * IR_MAX_OPS_PER_INSN linear IR ops; the backends emit host code from them
- * with per-block register allocation. The frontend (frontend.c) is a transcription of the predecode
- * handler semantics (pdrun.c, itself checked against decode.c by the
- * differential suite) — XZR/SP resolution, width truncation, pre-decoded
+ * with per-block register allocation. The frontend (frontend.c) is a
+ * transcription of the predecode handler semantics (each program's pdrun.c,
+ * itself checked against decode.c by the differential suites) — XZR/SP resolution, width truncation, pre-decoded
  * immediates and writeback ordering are all resolved HERE, never in a
  * backend.
  *
@@ -124,6 +124,20 @@ enum {
      * No faults. */
     IRO_VOP,
 
+    /* Exclusives, LSE atomics and ordered accesses: a host-atomic op of its
+     * own where guest threads run concurrently (ARM64_SMP, arm64chroot); on
+     * one CPU (arm64emu) a bracket around ordinary probed loads/stores. */
+#if ARM64_SMP
+    /* Inline exclusives / LSE atomics / ordered accesses, [base] only (the
+     * guest encodings carry no offset). aux = AT_MAKE(kind, szlog, acq, rel);
+     * a = base, b = store value / RMW operand, cc = extra source vreg (CAS
+     * expected), dst = result (loaded / old value / STXR status; ZERO for
+     * the ST* forms). Any TLB miss, misalignment, or perm failure re-runs
+     * the whole instruction through jit_exec1 (imm2pc = pc, aux2 = insn in
+     * imm). NOT counted in ninsns: the fast path bumps icount inline and
+     * jit_exec1 counts itself, so both routes retire exactly once. */
+    IRO_ATOMIC,             /* imm = raw insn word (slow-path re-execution) */
+#else
     IRO_ATOMIC,             /* atomic bracket open. imm selects the mode:
                              * imm=0 store-exclusive — a = base, compares the
                              * monitor (excl_valid/excl_addr) and branches to
@@ -135,9 +149,30 @@ enum {
                              * (0 = stored, 1 = no monitor), clears excl_valid.
                              * imm=1 CAS: a = old, dst = Rs; writes Rs = old on
                              * both join paths, touches no monitor. */
+#endif
 
     IRO_N_
 };
+#if ARM64_SMP
+
+/* IRO_ATOMIC kinds (aux bits 0..7) */
+enum {
+    AT_LDX,                 /* LDXR/LDAXR: load + record monitor */
+    AT_STX,                 /* STXR/STLXR: monitor check + host CAS, status */
+    AT_LDAR,                /* LDAR/LDLAR/LDAPR: atomic acquire load */
+    AT_STLR,                /* STLR/STLLR: atomic release store */
+    AT_SWP,                 /* SWP: dst = old, [base] = b */
+    AT_LDADD, AT_LDCLR, AT_LDEOR, AT_LDSET,   /* dst = old, [base] op= b */
+    AT_LDSMAX, AT_LDSMIN, AT_LDUMAX, AT_LDUMIN,   /* (order = LSE opc 4-7) */
+    AT_CAS,                 /* dst/cc = Rs (expected/old), b = Rt (new) */
+};
+#define AT_MAKE(kind, szlog, acq, rel) \
+    ((u32)((kind) | ((szlog) << 8) | ((acq) << 12) | ((rel) << 13)))
+#define AT_KIND(a)  ((a) & 0xff)
+#define AT_SZL(a)   (((a) >> 8) & 3)
+#define AT_ACQ(a)   (((a) >> 12) & 1)
+#define AT_REL(a)   (((a) >> 13) & 1)
+#endif
 
 /* IRO_VOP classes (aux bits 0..5) + flags. The frontend whitelists exact
  * encodings and asks the backend (be_vop_ok) about per-host gaps; anything
@@ -403,9 +438,12 @@ typedef struct IRBlock {
      * costs the inline FP surface, which is everything on most hosts and
      * almost nothing on one that carries the mode in its own FPCR. */
     u8   fpmode;
-    u8   ctx_spx;           /* block's SP bank ((tag>>2)&3): 0 = the live SP
+#if ARM64_SYSTEM
+    u8   ctx_spx;           /* block's SP bank ((tag>>2)&3; EL1 exists only in
+                             * a full system): 0 = the live SP
                              * is sp_el[0], so SP_EL0 moves must not bypass
                              * the backend's SP register cache */
+#endif
     /* Per-op vreg liveness (bit v set = vreg v live after this op). Computed
      * by fe_liveness for a free-after-last-use allocator; NO backend reads it
      * yet — both allocate LRU-style and spill on demand. Kept because the

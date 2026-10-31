@@ -71,6 +71,8 @@ Makefile                             (repository root) `make arm64chroot` -> bui
 lib/arm64/                           Shared with arm64emu (compiled into both):
   types.h cpu.h                      Fixed-width types; CPU state + core interpreter API
   decode.c                           A64 decoder/executor (+ LSE atomics, host-atomic exclusives under ARM64_SMP)
+  jit/ir.h jit/frontend.c            JIT translator: per-block decode -> linear IR -> liveness / flag fusion
+  jit/backend_a64.c jit/backend_x86_64.c  Register-allocating single-pass emitters (the 32-bit hosts' two stay in src/arm64chroot/jit)
   predecode.h predecode.c            Pre-decode classifier: instruction word -> PDEnt (dense op id + operands), PD_GENERIC when uncertain; the tier's and the JIT frontend's decoder
   sysreg.h sysreg.c                  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers (sysreg_id_read), what EL0 may run
   esr.h                              ESR exception classes + syndrome construction
@@ -84,9 +86,7 @@ src/arm64chroot/
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
   pdrun.c pdrun.h                    Decoded-instruction cache: direct-threaded fast path over ~200 hot forms (classified by lib/arm64 predecode.c); PD_GENERIC falls back to exec_a64 (the default engine)
   jit/                               Optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
-    jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends
-    ir.h frontend.c                  Per-block decode -> linear IR -> liveness / flag fusion
-    backend_a64.c backend_x86_64.c   Register-allocating single-pass emitters
+    jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends (the JitEnv ABI lib/arm64/jit compiles against)
     backend_x86_32.c backend_arm32.c ILP32 emitters: guest 64-bit values as host register-pair halves
     jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
@@ -123,7 +123,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the code and documentation (`docs/arm64chroot/`).
 * Keep in sync the file structure in design section of `docs/arm64chroot/README.md` and structure section of this file.
 * New implemented syscalls must also be defined in `src/arm64chroot/strace.c` argdefs, so they can be decoded by `--strace-full`.
-* The step driver (`cpu.c`), the predecoded tier's executor and the JIT have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
+* The step driver (`cpu.c`), the predecoded tier's executor and the JIT runtime (`jit/jit.c`) have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
 
 ## Testing
 

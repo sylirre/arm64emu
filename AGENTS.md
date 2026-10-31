@@ -25,7 +25,7 @@ tooling, test suites and diagnostics. Read it before working on that program.
 Makefile               the one build of everything (see "Building")
 VERSION                the version of all three programs
 lib/arm64/             AArch64 emulation shared by arm64emu and arm64chroot
-lib/arm64/jit/         (reserved) the JIT shared by both emulators
+lib/arm64/jit/         the JIT translator (IR, frontend, x86-64 and AArch64 backends)
 lib/link2symlink/      (reserved) hardlink emulation shared by arm64chroot and chroot-ng
 src/<program>/         each program's own sources, and its AGENTS.md
 tests/<program>/       each program's test suite
@@ -35,7 +35,7 @@ build/                 everything the build makes (gitignored, see below)
 ```
 
 The parts of the emulation core that still differ between the two emulators
-(step driver, the predecoded tier's executor, JIT) live in each emulator's tree for now and
+(step driver, the predecoded tier's executor, the JIT runtime) live in each emulator's tree for now and
 are kept diffable against each other; they move into `lib/` as they are
 unified. A file in `lib/` is compiled into every program that uses it, with
 that program's flags, so a change there must pass every such program's suites.
@@ -46,9 +46,11 @@ exactly two headers from the program, found on its include path:
 arm64emu's full system, 0 for arm64chroot's user mode, where the guest never
 leaves EL0; `ARM64_SMP`: 1 where guest threads run concurrently on host
 threads, arm64chroot's case, so atomics and barriers must be host ones), and `mmu.h`, guest memory access (`mem_read`/`mem_write`,
-`mem_host_ptr`, `tlb_flush_all`, ...). Beyond those it calls functions the
-program defines (`exception_take`, `gt_count`, ...). It includes no other
-program header.
+`mem_host_ptr`, `tlb_flush_all`, ...). `lib/arm64/jit` also takes the program's
+`jit_priv.h`: each program's JIT runtime (`jit.c`) defines the environment the
+translator emits code against (`JitEnv`, its jump cache, helpers). Beyond
+those it calls functions the program defines (`exception_take`, `gt_count`,
+...). It includes no other program header.
 
 ## Building
 
