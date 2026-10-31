@@ -1001,6 +1001,14 @@ static int l2s_resolve(const PathPin *p, char *data, unsigned long *count) {
     unsigned long long ino;
     if (strchr(tgt, '/') || !l2s_parse_data(tgt, &ino)) return 0;
     if (l2s_data_name(data, ino) < 0) return 0;
+    /* ... and the backing has to be there, the regular file the scheme moved
+     * there. Under that name, a symlink (to a host file, say), a directory or
+     * nothing at all makes this an ordinary symlink, which the bookkeeping
+     * must leave to the host: a move out of the directory used to copy the
+     * backing and failed ELOOP, where a kernel moves the symlink. */
+    struct stat bst;
+    if (fstatat(p->dfd, data, &bst, AT_SYMLINK_NOFOLLOW) < 0 || !S_ISREG(bst.st_mode))
+        return 0;
     if (count && l2s_find_marker(p->dfd, ino, count) != 0) *count = 0;
     return 1;
 }
@@ -1407,9 +1415,11 @@ static void l2s_fix_fd(int fd, struct stat *st) {
  *    directory: never "." or "..", never a '/'.
  *  - A write the guest could not make is not made on its behalf: the count
  *    lives in the l2s directory, which can sit on a read-only bind while the
- *    names do not. A new name is then EROFS (as a link onto a read-only mount
- *    is); a removed name still succeeds and its count is left alone (a leak,
- *    never a write through a :ro mount -- host_ro, as every other writer).
+ *    names do not. A new name is then EXDEV (the file is on the bind, the new
+ *    name is not: a link across mounts, which the kernel refuses before it
+ *    asks whether either is writable); a removed name still succeeds and its
+ *    count is left alone (a leak, never a write through a :ro mount --
+ *    host_ro, as every other writer).
  *  - The count only ever errs high: a name is added after the count is raised
  *    and removed before it is lowered, and the last reference is deleted only
  *    after the count is read afresh -- so a crash or a race leaks a file,
@@ -1856,6 +1866,8 @@ static int pr_link(struct Machine *m, const PathPin *src, const PathPin *dst, in
         rc = -EXDEV;                 /* a name in a zone (/proc, /dev) holds no link */
     } else if (fstatat(dst->dfd, dst->name, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
         rc = -EEXIST;                /* link(2): the new name must not exist */
+    } else if (host_ro(m, g.ref)) {
+        rc = -EXDEV;                 /* the file is on a :ro bind, the new name is not */
     } else if ((rc = pr_adjust(m, &g, +1)) == 0) {
         if (symlinkat(g.t1, dst->dfd, dst->name) < 0) {
             rc = -errno;
@@ -2158,9 +2170,12 @@ SYSDEF(openat) {
      * then is the group looked up, so the ordinary path costs nothing: a guest
      * that did NOT ask for O_NOFOLLOW never gets here, because the resolver
      * followed the link and the pin already names the backing. */
-    if (fd < 0 && errno == ELOOP && (gflags & G_O_NOFOLLOW) &&
-        l2s_deref_pin(c->m, &pin))
-        fd = openat(pin.dfd, pin.name, hflags | O_NOFOLLOW, (mode_t)a3);
+    if (fd < 0 && errno == ELOOP && (gflags & G_O_NOFOLLOW)) {
+        if (l2s_deref_pin(c->m, &pin))
+            fd = openat(pin.dfd, pin.name, hflags | O_NOFOLLOW, (mode_t)a3);
+        else
+            errno = ELOOP;   /* not a group: the lookup's own misses are not the answer */
+    }
     {   /* Close the pin before anything else allocates a descriptor. */
         int e = errno, dfd = pin.dfd;
         path_unpin(&pin);

@@ -135,12 +135,13 @@ l2s_proot_suite() {
 
     # ---- 2. hostile layouts ----
     # A target that climbs out of the rootfs with ".." towards a VALID group
-    # outside it. Resolved as a guest path, the climb stops at the root.
+    # outside it. Resolved as a guest path, the climb stops at the root: an
+    # ordinary symlink, so an O_NOFOLLOW open is a symlink's ELOOP.
     l2sp_newroot; l2sp_group "$W/out" "$WP/out" k 2 $'SECRET\n'
     ln -s "$P/.l2s/../../out/.l2s.k0001" "$R/m"; before=$(l2sp_snap "$W/out")
     got=$(l2sp_run "$R" /bin/p lstat /m stat /m cat /m onf /m utime /m link /m /m2 lstat /m2 unlink /m unlink /m2)
     l2sp_row "a target climbing out with '..' reaches nothing" \
-$'lstat /m: lnk nlink=1\nstat /m: errno=2\ncat /m: errno=2\nonf /m: failed errno=2\nutime /m: 0 errno=0\nlink /m2: 0 errno=0\nlstat /m2: lnk nlink=1\nunlink /m: 0 errno=0\nunlink /m2: 0 errno=0' "$got"
+$'lstat /m: lnk nlink=1\nstat /m: errno=2\ncat /m: errno=2\nonf /m: failed errno=40\nutime /m: 0 errno=0\nlink /m2: 0 errno=0\nlstat /m2: lnk nlink=1\nunlink /m: 0 errno=0\nunlink /m2: 0 errno=0' "$got"
     l2sp_verdict "... and the group outside is untouched" "$([ "$before" = "$(l2sp_snap "$W/out")" ] && echo 1 || echo 0)" "canary changed"
     rm -rf "$W"
     # The host path of a SIBLING directory whose name merely starts with the
@@ -211,15 +212,16 @@ $'lstat /m_zero: reg nlink=1 size=3\nlink /m_zero2: 0 errno=0\nlstat /m_zero2: r
     l2sp_verdict "... the emptied group is gone, the full one is as it was" "$ok" "$(ls -A "$R/.l2s" | tr '\n' ' ')"
     rm -rf "$W"
     # The l2s directory on a READ-ONLY bind, the names in the writable rootfs: a
-    # new name is EROFS (as a link onto a read-only mount), a stamp on the data
-    # is EROFS, and a removed name still goes -- its count left alone, because
-    # the count is a write into a mount the guest may not write.
+    # new name is EXDEV (the file is on the bind, the new name is not: a link
+    # across mounts), a stamp on the data is EROFS, and a removed name still
+    # goes -- its count left alone, because the count is a write into a mount
+    # the guest may not write.
     l2sp_newroot; rm -rf "$R/.l2s"; mkdir "$R/.l2s" "$W/ldir" "$R/g"
     l2sp_group "$W/ldir" "$P/.l2s" a 3 $'ROGROUP\n'; for n in x y z; do ln -s "$P/.l2s/.l2s.a0001" "$R/g/$n"; done
     echo hello > "$R/g/plain"; before=$(l2sp_snap "$W/ldir")
     got=$(l2sp_run -b "$WP/ldir:/.l2s:ro" "$R" /bin/p lstat /g/x cat /g/x link /g/x /g/new utime /g/x onf /g/x unlink /g/y rename /g/plain /g/z lstat /g/x)
     l2sp_row "the l2s directory on a read-only bind" \
-$'lstat /g/x: reg nlink=3 size=8\ncat /g/x: ROGROUP|\nlink /g/new: -1 errno=30\nutime /g/x: -1 errno=30\nonf /g/x: ok errno=0\nunlink /g/y: 0 errno=0\nrename /g/z: 0 errno=0\nlstat /g/x: reg nlink=3 size=8' "$got"
+$'lstat /g/x: reg nlink=3 size=8\ncat /g/x: ROGROUP|\nlink /g/new: -1 errno=18\nutime /g/x: -1 errno=30\nonf /g/x: ok errno=0\nunlink /g/y: 0 errno=0\nrename /g/z: 0 errno=0\nlstat /g/x: reg nlink=3 size=8' "$got"
     l2sp_verdict "... and the read-only directory is byte for byte what it was" "$([ "$before" = "$(l2sp_snap "$W/ldir")" ] && echo 1 || echo 0)" "written through a :ro bind"
     l2sp_verdict "... and no name was made" "$([ ! -L "$R/g/new" ] && [ -L "$R/g/x" ] && [ ! -L "$R/g/y" ] && echo 1 || echo 0)" "$(ls "$R/g" | tr '\n' ' ')"
     rm -rf "$W"
@@ -258,13 +260,15 @@ $'lstat /m1: lnk nlink=1\ncat /m1: errno=2\nlink /m2: 0 errno=0\nunlink /m1: 0 e
 $'link /m2: 0 errno=0\nlstat /m2: lnk nlink=1\ncat /m2: errno=2\nlink /h2: 0 errno=0\nlstat /h2: lnk nlink=1\ncat /h2: errno=2\nreadlink /h2: /etc/hostname' "$got"
     rm -rf "$W"
     # The emulator's OWN scheme, hostile: the backing name is a symlink to a
-    # host file. Moving a member out of its directory copies the backing, and
+    # host file. Moving a member out of its directory copied the backing, and
     # lstat reported its size and mode: both followed the host's resolution.
+    # A backing that is not a regular file is not the scheme's: the name is an
+    # ordinary symlink, and moved as one, its text still naming nothing.
     l2sp_newroot; echo "HOSTONLY" > "$W/out/hostfile"
     ln -s "$WP/out/hostfile" "$R/.l2s.123"; : > "$R/.l2s.123.0002"; ln -s .l2s.123 "$R/x"; mkdir "$R/sub"
     got=$(l2sp_run "$R" /bin/p lstat /x cat /x rename /x /sub/y cat /sub/y lstat /sub/y)
     l2sp_row "the emulator's own scheme does not follow a backing symlink out" \
-$'lstat /x: lnk nlink=1\ncat /x: errno=2\nrename /sub/y: -1 errno=40\ncat /sub/y: errno=2\nlstat /sub/y: errno=2' "$got"
+$'lstat /x: lnk nlink=1\ncat /x: errno=2\nrename /sub/y: 0 errno=0\ncat /sub/y: errno=2\nlstat /sub/y: lnk nlink=1' "$got"
     rm -rf "$W"
     # A process killed between the two renames of a count change leaves the data
     # file renamed and the indirection naming a file that is gone: the chain is

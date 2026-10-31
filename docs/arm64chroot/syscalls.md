@@ -756,8 +756,9 @@ ordinary symlink and behaves as one. Every name the bookkeeping makes, renames
 or removes is a bare basename built from the validated indirection name. A
 write the guest could not make is not made for it: the count lives in the l2s
 directory, which can sit on a read-only bind while the names do not — a new
-name is then `EROFS`, and a removed name still succeeds with its count left
-alone (`host_ro`, as every other writer). The count errs high, never low (a
+name is then `EXDEV` (the file is on the bind, the new name is not: a link
+across mounts), and a removed name still succeeds with its count left alone
+(`host_ro`, as every other writer). The count errs high, never low (a
 name is added after the count is raised and removed before it is lowered), so a
 crash leaks a file where the other order would lose one.
 
