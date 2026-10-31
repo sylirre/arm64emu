@@ -2,7 +2,8 @@ name: arm64chroot
 
 # Build and run the full differential test suite whenever something arm64chroot
 # is built from changes — its own sources and tests, the AArch64 emulation it
-# shares with arm64emu (lib/arm64), or the build itself. A push to a branch
+# shares with arm64emu (lib/arm64), the hardlink emulation it shares with
+# chroot-ng (lib/link2symlink), or the build itself. A push to a branch
 # that also has an open PR fires BOTH a `push` and a `pull_request` event — the
 # concurrency group below collapses those two (and any superseded run) into a
 # single run per branch, so the suite never executes twice for the same ref.
@@ -11,6 +12,7 @@ on:
     paths:
       - 'src/arm64chroot/**'
       - 'lib/arm64/**'
+      - 'lib/link2symlink/**'
       - 'tests/arm64chroot/**'
       - 'Makefile'
       - '.github/workflows/arm64chroot.yml'
@@ -18,6 +20,7 @@ on:
     paths:
       - 'src/arm64chroot/**'
       - 'lib/arm64/**'
+      - 'lib/link2symlink/**'
       - 'tests/arm64chroot/**'
       - 'Makefile'
       - '.github/workflows/arm64chroot.yml'

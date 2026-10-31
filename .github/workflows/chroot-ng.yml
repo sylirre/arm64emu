@@ -15,7 +15,8 @@
 # (pinned by hash in tests/chroot-ng/lib.sh), and only their tarballs are cached
 # between runs here. `make test-chroot-ng` builds arm64chroot first, the oracle
 # the differential legs (M10 and friends) compare against — which is why
-# arm64chroot's sources are in the trigger paths below.
+# arm64chroot's sources are in the trigger paths below. lib/link2symlink is the
+# -l engine itself, compiled into both.
 
 name: chroot-ng
 
@@ -26,6 +27,7 @@ on:
       - 'tests/chroot-ng/**'
       - 'src/arm64chroot/**'
       - 'lib/arm64/**'
+      - 'lib/link2symlink/**'
       - 'Makefile'
       - '.github/workflows/chroot-ng.yml'
   pull_request:
@@ -34,6 +36,7 @@ on:
       - 'tests/chroot-ng/**'
       - 'src/arm64chroot/**'
       - 'lib/arm64/**'
+      - 'lib/link2symlink/**'
       - 'Makefile'
       - '.github/workflows/chroot-ng.yml'
   workflow_dispatch:
