@@ -86,6 +86,13 @@ void cng_l2s_decref(const char *data, unsigned long count);
 int cng_l2s_rename_prep(const char *srch, char *absdata, size_t sz);
 void cng_l2s_rename_fixup(const char *dsth, const char *absdata);
 
+/* rename(2) of a group's last name: move the data file onto `dsth` (so the
+ * group dissolves into the plain file a real hardlink's last name is) and drop
+ * the marker and `srch`. Returns 1 if handled (*res = 0 or -errno), 0 if the
+ * caller should rename the name itself. `flags`: RENAME_NOREPLACE or 0. */
+int cng_l2s_rename_last(const char *srch, const char *dsth, unsigned flags,
+                        long *res);
+
 /* If `host` resolves to a backing file (via our symlink, or is the data file
  * itself), stat/statx it into `buf` (a real regular file) with st_nlink set to
  * the live count. statx honors the guest's mask and (follow-forced) flags and

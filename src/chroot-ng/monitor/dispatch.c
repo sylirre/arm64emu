@@ -5379,6 +5379,16 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
                 strcmp(sdata, data) == 0)
                 return 0;
             dec = dst_l2s && !exch;
+            /* The group's last name moving away takes the data with it (see
+             * cng_l2s_rename_last); the destination's own group, if it was a
+             * member, still loses a name. */
+            long lr;
+            if (src_ok && !exch && !(rfl & ~(unsigned)CNG_RENAME_NOREPLACE) &&
+                cng_l2s_rename_last(hnf, dsth, rfl, &lr)) {
+                if (lr == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
+                    cng_l2s_decref(data, cnt);
+                return lr;
+            }
             if (src_ok)
                 fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
             /* Under EXCHANGE the destination's name moves to the source's

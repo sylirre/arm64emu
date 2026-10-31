@@ -231,7 +231,15 @@ kernel 3.18 (Galaxy S7).
     cross-dir ln, `ls -a` hiding, readlink refusal, write-through, cross-dir
     `mv`, rm-one/rm-all + `rmdir`, `rm -rf` over groups, dup-`ln` EEXIST,
     busybox tar round-trip, `cmp` on a linked binary, and two-session
-    persistence. A Debian/GNU leg (`find -samefile`, GNU stat) is gated on a
+    persistence. It also runs arm64chroot's own `--link2symlink` C tests
+    (`tests/arm64chroot/c/l2s_{access,nofollow,rename}.c`, `rename` with and
+    without `exchange`) against the same oracle, in a rootfs copy whose
+    writable `/.l2s` puts them on the central store. Running them against
+    chroot-ng first (2026-10-31, before the engine became shared) found that
+    a rename of a group's LAST name left the data file and marker behind
+    (with `/` as the rootfs, the legacy layout, inside the source directory,
+    which could then never be removed); `cng_l2s_rename_last` now moves the
+    data file onto the destination instead, as arm64chroot does. A Debian/GNU leg (`find -samefile`, GNU stat) is gated on a
     translation smoke test — it skips under qemu (ld.so-loaded libc.so has no
     rewritten svc sites; the seccomp tier covers it on devices).
   - Accepted divergences (deliberate, documented):

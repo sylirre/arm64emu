@@ -1436,6 +1436,57 @@ void cng_l2s_rename_fixup(const char *dsth, const char *absdata) {
     l2s_symlink(absdata, dsth);
 }
 
+/* rename(2) of a group's LAST name: the group dissolves onto the destination.
+ * Moving the bare name would leave the data file and its marker where the
+ * group lived — in the legacy layout inside the source directory, which then
+ * can never be removed (rmdir ENOTEMPTY, with nothing listed) — while a real
+ * hardlink's last name carries its inode along. So the data file itself moves
+ * onto the destination: the same inode and contents with st_nlink 1, which is
+ * the truth; then the marker and the stale name go. Under the group's lock,
+ * with the count read afresh, so a concurrent link keeps the group whole.
+ * Returns 1 when it handled the rename (*res = 0 or -errno), 0 when the caller
+ * should rename the name as before: not a member, a proot group (kept the way
+ * proot keeps it), another name still in the group, or a destination the data
+ * cannot reach (EXDEV) or whose flags the host would have to refuse. */
+int cng_l2s_rename_last(const char *srch, const char *dsth, unsigned flags,
+                        long *res) {
+    char data[CNG_PATH_MAX];
+    unsigned long count;
+    if (cng_l2s_resolve(srch, data, sizeof data, &count) != 1)
+        return 0;
+    unsigned long long ino;
+    if (pr_is_data(l2s_basename(data)) || !parse_data(l2s_basename(data), &ino))
+        return 0;
+    if (flags && cng_blocked[__NR_renameat2])
+        return 0;
+    char dir[CNG_PATH_MAX], m[CNG_PATH_MAX];
+    l2s_dirname(data, dir, sizeof dir);
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
+    if (lk.fd >= 0) {
+        unsigned long c;
+        if (find_marker(dir, ino, &c) == 0)
+            count = c;
+    }
+    if (count > 1) {
+        l2s_unlock(&lk);
+        return 0;
+    }
+    long r = cng_pin_rename(data, dsth, flags);
+    if (r == -EXDEV) {
+        l2s_unlock(&lk);
+        return 0;
+    }
+    if (r == 0) {
+        if (build_name(m, sizeof m, dir, ino, (long)(count ? count : 1)) == 0)
+            l2s_unlink(m);
+        l2s_unlink(srch);
+    }
+    l2s_unlock(&lk);
+    *res = r;
+    return 1;
+}
+
 void cng_l2s_decref(const char *data, unsigned long count) {
     unsigned long long ino;
     if (pr_is_data(l2s_basename(data))) {

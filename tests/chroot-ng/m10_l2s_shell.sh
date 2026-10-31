@@ -401,4 +401,44 @@ elif [ "$m10_ready" -eq 1 ]; then
     skip "debian leg: no debian rootfs${m10_deb_why:+ ($m10_deb_why)}"
 fi
 
+# arm64chroot's own --link2symlink C tests (tests/arm64chroot/c/l2s_*.c, the
+# ones its android-sim build runs): each runs under the real-hardlink oracle
+# and under the forced emulation, in its own copy of the rootfs, and stdout and
+# status must match. Here the rootfs's writable /.l2s puts the emulation on the
+# central store; arm64chroot's suite runs them with "/" as the rootfs, on the
+# legacy layout. They are the contract the shared l2s engine keeps for both
+# programs.
+if [ "$m10_ready" -eq 1 ] && [ "${GUEST_STATIC:-0}" = 1 ]; then
+    M10C=$(mktemp -d)
+    for m10t in l2s_access l2s_nofollow l2s_rename; do
+        if ! guest_cc "$M10C/$m10t" "tests/arm64chroot/c/$m10t.c"; then
+            skip "m10 c/$m10t: guest build failed"
+            continue
+        fi
+        for m10a in "" exchange; do
+            [ -n "$m10a" ] && [ "$m10t" != l2s_rename ] && continue
+            RO=$(mktemp -d); REM=$(mktemp -d)
+            cp -a "$M10_ALPINE/." "$RO"; cp -a "$M10_ALPINE/." "$REM"
+            mkdir -p "$RO/t" "$REM/t"
+            cp "$M10C/$m10t" "$RO/t/"; cp "$M10C/$m10t" "$REM/t/"
+            # shellcheck disable=SC2086  # $m10a is one word or empty
+            out_o=$("$M10_ORACLE" -E TMPDIR=/tmp "$RO" /t/$m10t $m10a 2>/dev/null); rc_o=$?
+            # shellcheck disable=SC2086
+            out_e=$(run -R -l "$REM" /usr/bin/env TMPDIR=/tmp /t/$m10t $m10a 2>/dev/null); rc_e=$?
+            if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
+                pass=$((pass + 1)); echo "  ok   m10 c/$m10t${m10a:+ $m10a}"
+            else
+                fail=$((fail + 1)); echo "  FAIL m10 c/$m10t${m10a:+ $m10a}"
+                printf '%s\n' "$out_o" > "$M10C/o"; printf '%s\n' "$out_e" > "$M10C/e"
+                echo "    oracle rc=$rc_o, chroot rc=$rc_e:"
+                diff "$M10C/o" "$M10C/e" | head -8 | sed 's/^/    /'
+            fi
+            rm -rf "$RO" "$REM"
+        done
+    done
+    rm -rf "$M10C"
+elif [ "$m10_ready" -eq 1 ]; then
+    skip "m10 c/l2s_*: needs a self-contained (static) guest to drop into the rootfs"
+fi
+
 unset CHROOTNG_L2S_FORCE
