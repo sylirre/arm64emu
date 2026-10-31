@@ -732,6 +732,21 @@ static int pr_set_data(struct pr_group *g, const char *dn) {
     return 0;
 }
 
+/* The host path a proot member's or indirection's text means in the guest's
+ * view. The text is the host path proot wrote, and proot knew nothing of the
+ * binds and symlinks this session's view has: with the l2s directory a bind
+ * mount, or a symlink inside the rootfs, the literal path names nothing — or
+ * whatever the mount point hides on the host — while the guest reaches the
+ * group through its view (as arm64chroot does). So the text is taken back to
+ * its guest name and resolved as the guest's own would be, contained, without
+ * following the last component (an indirection is a symlink). 0 or -errno. */
+static int pr_view(const char *text, char *host, size_t sz) {
+    char g[CNG_PATH_MAX];
+    if (!cng_g_fs || cng_host_dir_guest(text, g, sizeof g) != 0)
+        return -ENOENT;
+    return cng_resolve_at(CNG_AT_FDCWD, g, 0, host, sz) == 0 ? 0 : -ENOENT;
+}
+
 /* Read the chain from the indirection at g->ind: 1 (g->data and g->count
  * filled; the data file is there), 0 (not a group), or -ENOENT (the
  * indirection names a data file that is not there: another process between
@@ -750,9 +765,13 @@ static int pr_chain(struct pr_group *g) {
     if (!pr_data_of(db, ib, strlen(ib), &g->count) ||
         pr_set_data(g, db) != 0)
         return 0;
-    /* Beside the indirection, as proot writes it — or, for a tree that was
+    /* Beside the indirection, as proot writes it — the text naming it either
+     * literally or through the view (pr_view) — or, for a tree that was
      * moved, any store's spelling while the indirection is in a store. */
+    char tv[CNG_PATH_MAX];
     if (strcmp(t2, g->data) != 0 &&
+        !(l2s_canonical(t2) && l2s_owned(t2) &&
+          pr_view(t2, tv, sizeof tv) == 0 && strcmp(tv, g->data) == 0) &&
         !(l2s_canonical(t2) && l2s_store_shaped(t2) &&
           l2s_store_shaped(g->ind)))
         return 0;
@@ -905,8 +924,7 @@ static int pr_member(const char *host, const char *tgt, struct pr_group *g) {
     if (tgt[0] != '/' || !pr_is_ind(l2s_basename(tgt)) || !l2s_canonical(tgt))
         return 0;
     int r = 0, heal = 0;
-    if (l2s_owned(tgt) &&
-        cng_strlcpy(g->ind, tgt, sizeof g->ind) < sizeof g->ind)
+    if (l2s_owned(tgt) && pr_view(tgt, g->ind, sizeof g->ind) == 0)
         r = pr_chain_look(g);
     if (r == 0) {
         if (l2s_store_heal(tgt, g->ind, sizeof g->ind) != 1)
