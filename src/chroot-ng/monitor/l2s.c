@@ -335,14 +335,20 @@ static int l2s_store_dir(char *out, size_t sz);
  * file that could not be opened that way — mode 0200, mode 0000, both of which
  * a package can ship — left the update running unlocked, so two links or
  * unlinks of the group at once could leave st_nlink wrong or a backing file
- * behind. The lock is now a file of our own in the store, ".l2s/.lock" under
- * the rootfs, created 0600 in a directory we made 0700: openable by us
- * whatever mode the group's own files carry, and one lock per rootfs is the
- * right scope, since that is what the store is. The data file (either way it
- * can be opened) and then its directory stand in only where the store cannot
- * be had at all — a rootfs on which nothing can be created, where no link is
- * going to be made either. Proceeding unlocked is the last resort and is
- * logged, since it is the one outcome the scheme's counts cannot survive.
+ * behind. The lock is now the store directory itself, "<rootfs>/.l2s",
+ * opened read-only: ours (made 0700, or the user's own proot-distro made),
+ * openable whatever mode the group's own files carry, and one lock per rootfs
+ * is the right scope, since that is what the store is. It leaves nothing
+ * behind. A lock FILE in the store did, and in a rootfs proot-distro
+ * installed the store is the very directory proot keeps its own groups in,
+ * which was then no longer as proot leaves it; such a file, left by an
+ * earlier chroot-ng, is removed under the lock by each process's first
+ * update. The data file (either way it can be opened) and then its directory
+ * stand in only where the store cannot be had at all — a rootfs on which
+ * nothing can be created, where no link is going to be made either — or
+ * where the filesystem refuses flock on a directory. Proceeding unlocked is
+ * the last resort and is logged, since it is the one outcome the scheme's
+ * counts cannot survive.
  *
  * A first link asks by its source, the file that is to become the data file,
  * and that can be a FIFO or a device: only a regular file is opened to stand
@@ -364,6 +370,17 @@ struct l2s_held {
     unsigned long mask; /* the signal mask to restore */
 };
 
+/* An earlier chroot-ng's lock file in the store: swept once per process. */
+static int l2s_stale_lock_swept;
+
+static long l2s_flock_ex(long fd) {
+    long r;
+    do {
+        r = CNG_SYS(__NR_flock, (int)fd, 2 /* LOCK_EX */, 0, 0, 0, 0);
+    } while (r == -EINTR);
+    return r;
+}
+
 static long l2s_lock(const char *data, struct l2s_held *h) {
     char lk[CNG_PATH_MAX], st[ST_SIZE];
     long fd = -1;
@@ -371,11 +388,19 @@ static long l2s_lock(const char *data, struct l2s_held *h) {
     CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &all, &h->mask, 8, 0, 0);
     h->fd = -1;
     if (l2s_store_dir(lk, sizeof lk) == 0) {
-        size_t n = strlen(lk);
-        if (n + 7 < sizeof lk) {
-            memcpy(lk + n, "/.lock", 7);
-            fd = cng_pin_open(lk, CNG_O_RDWR | CNG_O_CREAT | CNG_O_CLOEXEC,
-                              0600);
+        fd = cng_pin_open(lk, CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+        if (fd >= 0 && l2s_flock_ex(fd) == 0) {
+            size_t n = strlen(lk);
+            if (!__atomic_exchange_n(&l2s_stale_lock_swept, 1, __ATOMIC_RELAXED) &&
+                n + 7 < sizeof lk) {
+                memcpy(lk + n, "/.lock", 7);
+                l2s_unlink(lk);
+            }
+            return h->fd = fd;
+        }
+        if (fd >= 0) { /* no flock on a directory here: try the stand-ins */
+            sys_close((int)fd);
+            fd = -1;
         }
     }
     if (fd < 0 && l2s_lstat(data, st) == 0 && is_reg(st)) {
@@ -393,10 +418,7 @@ static long l2s_lock(const char *data, struct l2s_held *h) {
                 data, fd);
         return -1;
     }
-    long r;
-    do {
-        r = CNG_SYS(__NR_flock, (int)fd, 2 /* LOCK_EX */, 0, 0, 0, 0);
-    } while (r == -EINTR);
+    long r = l2s_flock_ex(fd);
     if (r < 0) {
         L2S_LOG("[cng] l2s: flock for %s refused (%ld): unlocked update\n",
                 data, r);

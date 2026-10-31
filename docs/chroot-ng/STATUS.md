@@ -3796,7 +3796,9 @@ kernel 3.18 (Galaxy S7).
 
 - [x] **M83 — the l2s store lock waited on itself**
   Every change of a group's count is made under one exclusive flock per
-  rootfs (`.l2s/.lock`), held across the several syscalls the change takes.
+  rootfs (then a `.l2s/.lock` file; since 2026-10-31 the `.l2s` directory
+  itself, which leaves proot-distro's shared store as proot leaves it),
+  held across the several syscalls the change takes.
   Two ways it could never be had again, both found while M82 added callers:
   - A signal. On the `-R` tier the dispatcher runs on the guest's own mask, so
     a handler was delivered on the way out of any syscall a change makes, and a

@@ -257,7 +257,7 @@ if [ "$m10_ready" -eq 1 ]; then
         echo "    oracle rc=$rc_o: $(printf %s "$out_o" | head -c 600)"
         echo "    chroot rc=$rc_e: $(printf %s "$out_e" | head -c 600)"
     fi
-    left=$(cd "$REM" && ls -A .l2s | grep -v '^\.lock$' | tr '\n' ' ';
+    left=$(cd "$REM" && ls -A .l2s | tr '\n' ' ';
         readlink .l2s/.l2s.echo0001 .l2s/.l2s.m10001 g/echo g/m2 g/m3 |
             sed "s|^$P|P|" | tr '\n' ' '; ls -A h | tr '\n' ' ')
     check "m10 ...and proot's bookkeeping is what proot would leave" \
