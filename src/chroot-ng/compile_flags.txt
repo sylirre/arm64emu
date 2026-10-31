@@ -3,6 +3,7 @@
 -ffreestanding
 -fno-builtin
 -Iinclude
+-I../../lib/link2symlink
 -Wall
 -Wextra
 -Wno-unused-parameter

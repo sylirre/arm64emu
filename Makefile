@@ -41,6 +41,8 @@ VERSION_DEFINE  := -DPROJECT_VERSION='"$(PROJECT_VERSION)"'
 
 # Code shared by both emulators.
 LIB_ARM64 := $(wildcard lib/arm64/*.c lib/arm64/jit/*.c)
+# Hardlink emulation, shared by arm64chroot and chroot-ng.
+LIB_L2S := $(wildcard lib/link2symlink/*.c)
 
 # $(call cfgstamp,TREE,TEXT): the path of a stamp file holding TEXT, rewritten
 # only when TEXT changes. Every object of TREE depends on it, so changing the
@@ -291,6 +293,7 @@ CHROOTNG_FLAGS = -O2 -g -std=gnu11 -ffreestanding -fno-pie \
                  -fno-asynchronous-unwind-tables -fno-builtin \
                  -ffunction-sections -fdata-sections \
                  -Wall -Wextra -Wno-unused-parameter -Isrc/chroot-ng/include \
+                 -Ilib/link2symlink \
                  $(CHROOTNG_GCCONLY) $(CHROOTNG_INLINEATOMICS) -mgeneral-regs-only \
                  $(CHROOTNG_CFLAGS)
 # Stop gcc turning our mem* loops into calls to themselves. Clang rejects this
@@ -338,7 +341,8 @@ CHROOTNG_LINK     = $(CHROOTNG_LDFLAGS) -static -nostdlib -Wl,-T,$(CHROOTNG_LDS)
                     -Wl,--gc-sections -Wl,-e,_start \
                     $(if $(filter 0,$(CHROOTNG_IS_CLANG)),-no-pie)
 
-CHROOTNG_SRC := $(shell find src/chroot-ng -name '*.c' -o -name '*.S' 2>/dev/null | LC_ALL=C sort)
+CHROOTNG_SRC := $(shell find src/chroot-ng -name '*.c' -o -name '*.S' 2>/dev/null | LC_ALL=C sort) \
+                $(LIB_L2S)
 CHROOTNG_OBJ := $(CHROOTNG_SRC:%=$(OBJDIR)/chroot-ng/%.o)
 CHROOTNG_CFG  = $(call cfgstamp,chroot-ng,$(CHROOTNG_CC) $(CHROOTNG_FLAGS))
 

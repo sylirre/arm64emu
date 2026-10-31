@@ -140,7 +140,7 @@ static int fd_link_ro(const char *host) {
         return 1;
     if (cng_g_l2s && fs_has_ro()) {
         const char *b = strrchr(real, '/');
-        if (cng_l2s_hidden(b ? b + 1 : real)) {
+        if (l2s_hidden(b ? b + 1 : real)) {
             int fd = cng_proc_self_fd(host);
             long fl = fd >= 0 ? sys_fcntl(fd, CNG_F_GETFL, 0) : -1;
             /* Another process's descriptor cannot be asked (fl < 0): it is
@@ -1568,7 +1568,7 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
              * first: the walk goes on from the data file itself. (A link of
              * our own names the data file by its text, as it stands.) */
             char d[CNG_PATH_MAX], dg[CNG_PATH_MAX];
-            if (!(cng_g_l2s && cng_l2s_resolve(host, d, sizeof d, 0) == 1)) {
+            if (!(cng_g_l2s && l2s_resolve(host, d, sizeof d, 0) == 1)) {
                 lim->err = -ELOOP;
                 return -ELOOP;
             }
@@ -1585,7 +1585,7 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
              * file, which is a HOST path (central store / cross-directory
              * group) and must be mapped into the guest view instead. */
             char tmp[CNG_PATH_MAX];
-            if (cng_g_l2s && cng_l2s_untranslate_target(link, tmp, sizeof tmp))
+            if (cng_g_l2s && l2s_untranslate_target(link, tmp, sizeof tmp))
                 cng_strlcpy(link, tmp, sizeof link);
             /* Under a scope the target is re-rooted onto that instead of onto
              * the guest root, and BENEATH refuses it: an absolute target is a
@@ -2201,7 +2201,7 @@ static int ro_denied_l2s(long dirfd, const char *gp) {
         return 0;
     char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
     return cng_resolve_at(dirfd, gp, 0, hnf, sizeof hnf) == 0 &&
-           cng_l2s_resolve(hnf, data, sizeof data, 0) == 1 && l2s_ro(hnf, data);
+           l2s_resolve(hnf, data, sizeof data, 0) == 1 && l2s_ro(hnf, data);
 }
 
 /* --- links out of a :ro bind ----------------------------------------------
@@ -2234,7 +2234,7 @@ static int link_src_ro(long fd, const char *srch, int by_fd, int followed) {
         return 1;
     char data[CNG_PATH_MAX];
     return cng_g_l2s && !followed &&
-           cng_l2s_resolve(srch, data, sizeof data, 0) == 1 &&
+           l2s_resolve(srch, data, sizeof data, 0) == 1 &&
            cng_fs_host_ro(cng_g_fs, data);
 }
 
@@ -2290,7 +2290,7 @@ static int l2s_nofollow_data(long dirfd, const char *gp, char *hnf_out,
         return 0;
     char hnf[CNG_PATH_MAX];
     if (cng_resolve_at(dirfd, gp, 0, hnf, sizeof hnf) != 0 ||
-        cng_l2s_resolve(hnf, data, dsz, 0) != 1)
+        l2s_resolve(hnf, data, dsz, 0) != 1)
         return 0;
     if (hnf_out)
         cng_strlcpy(hnf_out, hnf, hsz);
@@ -2956,7 +2956,7 @@ __attribute__((noinline)) static long do_getdents64(long a0, long a1, long a2,
             if (reclen == 0 || o + reclen > n)
                 break;
             const char *nm = kb + o + 19;
-            int hide = (cng_g_l2s && (cng_l2s_hidden(nm) ||
+            int hide = (cng_g_l2s && (l2s_hidden(nm) ||
                                       (at_root && !strcmp(nm, ".l2s")))) ||
                        (at_proc && !proc_name_visible(nm));
             if (!hide) {
@@ -4711,7 +4711,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * that file, made at the same moment (the pin refuses a final link the
          * walk never saw). Following the link is opening its backing file. */
         else if (r == -ELOOP && is_open && deref && cng_g_l2s &&
-                 cng_l2s_resolve(p, l2d, sizeof l2d, 0) == 1)
+                 l2s_resolve(p, l2d, sizeof l2d, 0) == 1)
             r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, rnr);
         if ((r == -EACCES || r == -EPERM) && nr == __NR_openat)
             r = cng_fd_reopen(p, a2, a3, r);
@@ -4750,7 +4750,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
             char hnf[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
                     0 &&
-                cng_l2s_resolve(hnf, fdata, sizeof fdata, 0) == 1) {
+                l2s_resolve(hnf, fdata, sizeof fdata, 0) == 1) {
                 p = fdata;
                 dfd = CNG_AT_FDCWD;
                 fl = a3 & ~CNG_AT_SYMLINK_NOFOLLOW;
@@ -4857,7 +4857,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         if (cng_g_l2s && !((int)a2 & CNG_AT_REMOVEDIR)) {
             char hnf[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1)
+                l2s_resolve(hnf, data, sizeof data, &cnt) == 1)
                 dec = 1;
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
@@ -4870,7 +4870,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * writable name, and keeps its count: the marker is on the :ro
          * mount, and nothing is written there. */
         if (r == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
-            cng_l2s_decref(data, cnt);
+            l2s_decref(data, cnt);
         return r;
     }
 
@@ -4891,7 +4891,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         if (cng_g_l2s) {
             char hnf[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
+                l2s_resolve(hnf, data, sizeof data, &cnt) == 1) {
                 /* The backing file is in the store, which no bind covers: the
                  * mount that governs this call is the one the NAME sits under,
                  * or the data's where that is a :ro one (see ro_denied_l2s).
@@ -5043,7 +5043,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
             char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
             if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) ==
                     0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1) {
+                l2s_resolve(hnf, data, sizeof data, 0) == 1) {
                 if (l2s_ro(hnf, data)) /* the name's mount, not the store's */
                     return -EROFS;
                 return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3,
@@ -5111,11 +5111,11 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         if (cng_g_l2s) {
             char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX], gv[CNG_PATH_MAX];
             if (cng_resolve_at(a0, gp, 0, hnf, sizeof hnf) == 0) {
-                if (cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
+                if (l2s_resolve(hnf, data, sizeof data, 0) == 1)
                     return -EINVAL;
                 long n = cng_pin_readlink(hnf, data, sizeof data - 1);
                 if (n > 0 && (data[n] = '\0', data[0] == '/') &&
-                    cng_l2s_untranslate_target(data, gv, sizeof gv)) {
+                    l2s_untranslate_target(data, gv, sizeof gv)) {
                     long gl = (long)strlen(gv);
                     if (gl > bufsiz)
                         gl = bufsiz;
@@ -5163,7 +5163,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
             if (n < 0)
                 return n == -E2BIG ? -ENAMETOOLONG : n;
             const char *tb = strrchr(b1, '/');
-            if (cng_l2s_hidden(tb ? tb + 1 : b1)) {
+            if (l2s_hidden(tb ? tb + 1 : b1)) {
                 if (cng_g_debug)
                     cng_dprintf(2, "[cng] l2s deny nr=%ld (target %s)\n", nr,
                                 b1);
@@ -5381,39 +5381,39 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         int dec = 0, fix = 0, fix_back = 0;
         if (cng_g_l2s && strcmp(op, np) != 0 &&
             cng_resolve_at(a2, (const char *)a3, 0, dsth, sizeof dsth) == 0) {
-            int dst_l2s = cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1;
+            int dst_l2s = l2s_resolve(dsth, data, sizeof data, &cnt) == 1;
             int src_ok =
                 cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0;
             if (dst_l2s && src_ok && !(rfl & ~(unsigned)CNG_RENAME_EXCHANGE) &&
-                cng_l2s_resolve(hnf, sdata, sizeof sdata, 0) == 1 &&
+                l2s_resolve(hnf, sdata, sizeof sdata, 0) == 1 &&
                 strcmp(sdata, data) == 0)
                 return 0;
             dec = dst_l2s && !exch;
             /* The group's last name moving away takes the data with it (see
-             * cng_l2s_rename_last); the destination's own group, if it was a
+             * l2s_rename_last); the destination's own group, if it was a
              * member, still loses a name. */
             long lr;
             if (src_ok && !exch && !(rfl & ~(unsigned)CNG_RENAME_NOREPLACE) &&
-                cng_l2s_rename_last(hnf, dsth, rfl, &lr)) {
+                l2s_rename_last(hnf, dsth, rfl, &lr)) {
                 if (lr == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
-                    cng_l2s_decref(data, cnt);
+                    l2s_decref(data, cnt);
                 return lr;
             }
             if (src_ok)
-                fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
+                fix = l2s_rename_prep(hnf, absdata, sizeof absdata);
             /* Under EXCHANGE the destination's name moves to the source's
              * place as well, and a legacy link of its lands there the same
              * way (sdata is free: the pair was not one group). */
             if (src_ok && exch)
-                fix_back = cng_l2s_rename_prep(dsth, sdata, sizeof sdata);
+                fix_back = l2s_rename_prep(dsth, sdata, sizeof sdata);
         }
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
         if (r == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
-            cng_l2s_decref(data, cnt); /* not on a :ro mount: see unlinkat */
+            l2s_decref(data, cnt); /* not on a :ro mount: see unlinkat */
         if (r == 0 && fix)
-            cng_l2s_rename_fixup(dsth, absdata);
+            l2s_rename_fixup(dsth, absdata);
         if (r == 0 && fix_back)
-            cng_l2s_rename_fixup(hnf, sdata);
+            l2s_rename_fixup(hnf, sdata);
         return r;
     }
 
@@ -5637,7 +5637,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
                         cng_strlcpy(srch, tgt, sizeof srch);
                 }
             }
-            int s = cng_l2s_link(srch, dsth);
+            int s = l2s_link(srch, dsth);
             if (cng_g_debug)
                 cng_dprintf(2, "[cng] l2s %s -> %s rc=%d\n", srch, dsth, s);
             return s;

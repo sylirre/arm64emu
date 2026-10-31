@@ -1605,7 +1605,7 @@ static int l2s_exe_name(int dirfd, const char *path, char *out, size_t sz) {
     for (int hops = 0; hops < 40; hops++) {
         if (cng_resolve_at(d, p, 0, nm, sizeof nm) != 0)
             return 0;
-        if (cng_l2s_resolve(nm, tgt, sizeof tgt, 0) == 1) {
+        if (l2s_resolve(nm, tgt, sizeof tgt, 0) == 1) {
             cng_strlcpy(out, nm, sz);
             return 1;
         }
@@ -1685,7 +1685,7 @@ static long execve_plan(struct exec_job *j, int dirfd, const char *path,
                     (*(unsigned *)(st + 16) & 0170000) == 0120000) {
                     char data[CNG_PATH_MAX];
                     if (!(cng_g_l2s &&
-                          cng_l2s_resolve(host, data, sizeof data, 0) == 1))
+                          l2s_resolve(host, data, sizeof data, 0) == 1))
                         return -ELOOP;
                     cng_strlcpy(host, data, sizeof j->host);
                 }

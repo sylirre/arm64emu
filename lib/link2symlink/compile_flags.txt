@@ -1,0 +1,5 @@
+-I.
+-std=gnu11
+-Wall
+-Wextra
+-Wno-unused-parameter

@@ -1116,8 +1116,8 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
         cng_strlcpy(sib + hl, ".l2", sizeof sib - hl);
         size_t gl = cng_strlcpy(gsib, gpath, sizeof gsib);
         cng_strlcpy(gsib + gl, ".l2", sizeof gsib - gl);
-        int lrc = cng_l2s_link(host, sib);
-        int isgrp = cng_l2s_resolve(host, data, sizeof data, 0) == 1;
+        int lrc = l2s_link(host, sib);
+        int isgrp = l2s_resolve(host, data, sizeof data, 0) == 1;
         /* The point of the leg is the data file living OUTSIDE the bind: that
          * is the central-store layout, and it is what takes the name's mount
          * out of the picture. A same-directory (legacy) group keeps the data

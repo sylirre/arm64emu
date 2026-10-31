@@ -26,7 +26,7 @@ Makefile               the one build of everything (see "Building")
 VERSION                the version of all three programs
 lib/arm64/             AArch64 emulation shared by arm64emu and arm64chroot
 lib/arm64/jit/         the JIT translator (IR, frontend, x86-64 and AArch64 backends)
-lib/link2symlink/      (reserved) hardlink emulation shared by arm64chroot and chroot-ng
+lib/link2symlink/      hardlink emulation (--link2symlink), chroot-ng's and, next, arm64chroot's
 src/<program>/         each program's own sources, and its AGENTS.md
 tests/<program>/       each program's test suite
 docs/<program>/        each program's documentation; README.md is its user guide
@@ -51,6 +51,13 @@ threads, arm64chroot's case, so atomics and barriers must be host ones), and `mm
 translator emits code against (`JitEnv`, its jump cache, helpers). Beyond
 those it calls functions the program defines (`exception_take`, `gt_count`,
 ...). It includes no other program header.
+
+`lib/link2symlink` includes no program header at all: it reaches the host only
+through the table of operations the program defines as `l2s_host` (`struct
+l2s_ops` in `link2symlink.h`: path calls kept inside the guest's places, a few
+descriptor calls, the view), and it never fills a `struct stat` — it says which
+file and which link count a name stands for, and the program makes the stat
+call in its own host's layout.
 
 ## Building
 

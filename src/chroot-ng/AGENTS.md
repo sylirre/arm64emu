@@ -28,6 +28,8 @@ src/chroot-ng/
   rt/                  the freestanding runtime: _start, the syscall gate (the only svc #0), libc-like helpers
   include/cng/         headers, including the UAPI constants re-declared from the AArch64 syscall ABI
   chroot-ng.ld         linker script: the image lives far above the guest ET_EXEC range
+lib/link2symlink/      (repository root) the -l/--link2symlink engine, shared with arm64chroot;
+                       monitor/l2s.c is chroot-ng's host for it (struct l2s_ops) and its stat answers
 tests/chroot-ng/       run.sh + lib.sh (host detection) + one m*.sh per milestone; guests/ are the
                        AArch64 test programs the milestones build
 docs/chroot-ng/        README.md (user guide), DESIGN.md, STATUS.md (milestone log), testing.md
