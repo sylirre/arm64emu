@@ -1103,13 +1103,21 @@ static int host_dir_guest(const char *hdir, char *gdir, size_t sz);
 #define XLATE_OUTSIDE ((const char *)16)
 #define XLATE_AT_OUTSIDE (-3) /* xlate_at's spelling of the same verdict */
 
-/* The two refusals a translation can come back as, and the errno each earns.
+/* A walk that ran into a symlink loop: the call is ELOOP, as the kernel's own
+ * walk makes it. Not a path to fall back to: the lexical translation names the
+ * looping link itself, and the re-issue pins its last component with NOFOLLOW,
+ * so a following stat described that symlink instead of failing. */
+#define XLATE_LOOP ((const char *)24)
+
+/* The refusals a translation can come back as, and the errno each earns.
  * Every caller asks these of what xlate() handed it before using it as a path. */
 static int xlate_bad(const char *p) {
-    return p == XLATE_TOOLONG || p == XLATE_OUTSIDE;
+    return p == XLATE_TOOLONG || p == XLATE_OUTSIDE || p == XLATE_LOOP;
 }
 static long xlate_errno(const char *p) {
-    return p == XLATE_OUTSIDE ? -EACCES : -ENAMETOOLONG;
+    return p == XLATE_OUTSIDE ? -EACCES
+           : p == XLATE_LOOP  ? -ELOOP
+                              : -ENAMETOOLONG;
 }
 
 /* Append one synthesized linux_dirent64. Layout is a fixed kernel ABI:
@@ -2449,6 +2457,8 @@ static const char *xlate_lim(long dirfd, const char *gp, char *buf,
          * name for (an fd link to one; see cng_resolve_lim). */
         if (r == -EACCES)
             return XLATE_OUTSIDE;
+        if (r == -ELOOP)
+            return XLATE_LOOP;
         if (cng_fs_translate(cng_g_fs, gp, buf, bufsz) == 0)
             return buf;
         /* Both routes failing means the name does not fit — cng_fs_translate
