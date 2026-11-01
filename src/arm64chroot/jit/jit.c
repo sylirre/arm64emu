@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include "machine.h"
+#include "esr.h"
 #include "predecode.h"
 #include "jit_priv.h"
 #include "ir.h"
@@ -477,6 +478,7 @@ static int jit_env_init(JitEnv *env, CPU *c) {
     env->helper_st = (void *)jit_st;
     env->helper_ldv = (void *)jit_ldv;
     env->helper_stv = (void *)jit_stv;
+    env->helper_spchk = (void *)jit_sp_check;
     env->dtlb = c->eng.dtlb;
     env->dtlb_ctxgen = dtlb_tag(c, 0);
     env->slowmem = getenv("ARM64CHROOT_JIT_SLOWMEM") != NULL;
@@ -707,6 +709,22 @@ u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc) {
         return 0;
     }
     if (!mem_write_slow(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
+    return 0;
+}
+
+/* SP-alignment check (SCTLR_EL1.SA/SA0). Generated code calls this only when the
+ * SP base is already known-misaligned (low 4 bits set). Raises an SP-alignment
+ * fault and returns 1 (exit the block) when the check is enabled for the current
+ * EL; returns 0 when it is off (the native access then proceeds). Counts the
+ * faulting instruction like the mem helpers above. */
+u32 jit_sp_check(CPU *c, u64 pc) {
+    c->cur_insn_pc = pc;
+    unsigned bit = (c->el == 0) ? 4 : 3;      /* SCTLR_EL1.SA0 : .SA */
+    if ((c->sctlr[1] >> bit) & 1) {
+        cpu_raise_sync(c, esr_make(EC_SP_ALIGN, 0), 0);
+        c->icount++;
+        return 1;
+    }
     return 0;
 }
 

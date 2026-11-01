@@ -33,6 +33,8 @@ void mmu_cpu_init(CPU *c) {
     c->eng.dtlb_mask = DTLB_SIZE - 1;
     c->eng.genbits = (u64)(g_tlb_gen & 0x3ff) << 2;
     c->eng.fetch_el0 = c->el == 0;
+    c->eng.sys = 1;                     /* a full system, */
+    c->eng.smp = 0;                     /* one CPU on one host thread */
     cpu_refresh_dtlb_ctx(c);
 }
 const u8 *g_jit_code_bitmap;

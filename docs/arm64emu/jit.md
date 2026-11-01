@@ -55,6 +55,13 @@ Single CPU, single thread: the donor's per-thread caches, thread registry
 and cross-thread interrupt protocol collapsed into one global `JitEnv`,
 no locks anywhere.
 
+The translator itself (`lib/arm64/jit`) is one for both programs. What a
+full system's blocks need beyond a user-mode one's — the block ctx in the
+jump-cache key, the banked SP, the SP-alignment check, the icount deadline,
+atomics lowered to ordinary probed accesses on the one CPU — is chosen per
+block from the mode of the CPU it is translated for (`IRBlock.sys`/`smp`,
+from `c->eng`), so generated code carries no test for it.
+
 **Block identity.** A translation is keyed by
 `(pc << 2) | ctx` where ctx = EL0 flag, `SCTLR_EL1.M`, and the active SP
 bank (`sp_el[]` is banked by SPSel/EL; backends bake the bank's offset

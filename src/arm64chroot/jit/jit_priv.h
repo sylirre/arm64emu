@@ -109,6 +109,9 @@ typedef struct JitEnv {
     void *helper_st;            /* u32 (*)(CPU*, u64 va, u64 val, u64 pc, u32) */
     void *helper_ldv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_stv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
+    void *helper_spchk;         /* u32 (*)(CPU*, u64 pc): SP-align fault or 0;
+                                 * called only where SCTLR_EL1.SA0 is set,
+                                 * which user mode leaves clear (sysreg_init) */
     u64 tmp_spill[4];           /* spill homes for IR temps 0-2 (generated
                                  * code); slot 3 saves a fused memory run's
                                  * base VA across its bail-path helper calls.
@@ -132,6 +135,12 @@ typedef struct JitEnv {
      * startup and leaves it -- which is what -ffast-math startup code does --
      * pays a single flush. */
     u8 fpmode_seen;
+    /* What the backends emit only for a full system's blocks (IRBlock.sys):
+     * the block ctx jcache probes OR into pc<<3, and the block-entry icount
+     * deadline. A user-mode block's jcache key is its pc, and it has no
+     * deadline -- signals reach it through `interrupt`. */
+    u64 ctx;
+    u64 icount_deadline;
 
     /* Indirect-branch target cache, probed inline by generated code for
      * BR/BLR/RET: guest pc -> block entry. Purged on any invalidation. */
@@ -237,6 +246,7 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc);
 u32 jit_st(CPU *c, u64 va, u64 val, u64 pc, u32 desc);
 u32 jit_ldv(CPU *c, u64 va, u64 pc, u32 desc);   /* into c->v[rt] */
 u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc);   /* from c->v[rt] */
+u32 jit_sp_check(CPU *c, u64 pc);                /* SP-align fault (1) or proceed (0) */
 
 /* Memory-access descriptor bit layout (shared by frontend, backends, jit.c). */
 #define MDESC_RT(d)    ((d) & 31)

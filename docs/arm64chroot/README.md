@@ -355,7 +355,8 @@ host-portability pitfalls.
 
 ```
 lib/arm64/      AArch64 emulation shared with arm64emu:
-  types.h cpu.h fixed-width types; CPU state + core interpreter API
+  types.h cpu.h fixed-width types; CPU state + core interpreter API, the
+                CPU's mode (here: user mode, guest threads running at once)
   mem.h         guest memory as the core reaches it: typed accesses, fetch and
                 mem_host_ptr inline over the CPU's translation caches (D-TLB,
                 fetch cache); the slow paths are the program's
@@ -368,7 +369,7 @@ lib/arm64/      AArch64 emulation shared with arm64emu:
   esr.h         ESR exception classes + syndrome construction
   exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
-  arm64_config.h  how lib/arm64 is built here (user mode: the guest stays at EL0)
+  arm64_config.h  how lib/arm64 is built here (its knob prefix)
   core/         the user-mode variant of the rest of arm64emu's core, kept
                 diffable against it until the two are merged into lib/arm64:
     cpu.c       step driver, reset, condition codes, debug dump

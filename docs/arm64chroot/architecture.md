@@ -5,10 +5,12 @@
 `arm64chroot` is built around a decode/execute core it shares with its sibling,
 the arm64emu full-system emulator. What is already identical in both lives once,
 in `lib/arm64/` (`types.h`, `cpu.h`, `decode.c`, `sysreg.c`, `exec_fpsimd.c`,
-`esr.h`), built in user mode (`src/arm64chroot/arm64_config.h`: `ARM64_SYSTEM`
-0 leaves the EL1-only instructions and checks out and has `sysreg_init` set
-EL1 up as Linux does; `ARM64_SMP` 1 makes LSE atomics, exclusives, LDAR/STLR
-and barriers host atomics and fences, since guest threads run concurrently);
+`esr.h`), and every CPU runs it in user mode (`as_cpu_attach` sets the CPU's
+mode, `c->eng`: `sys` 0 has `sysreg_init` set EL1 up as Linux does, so the
+EL1-only instructions and checks are what they are at EL0 under Linux --
+UNDEFINED, or never enabled; `smp` 1 makes LSE atomics, exclusives,
+LDAR/STLR and barriers host atomics and fences, since guest threads run
+concurrently);
 the rest of the core, in `src/arm64chroot/core/`, is kept **diffable**
 against arm64emu's copy so fixes flow both ways until the two are merged into
 `lib/arm64/`. Everything below the memory seam and above the exception seam is
@@ -196,7 +198,7 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 
 | File | Responsibility |
 |------|----------------|
-| `lib/arm64/decode.c` | A64 integer/branch/load-store decode+exec; LSE atomics; exclusives as host CAS (`ARM64_SMP`). |
+| `lib/arm64/decode.c` | A64 integer/branch/load-store decode+exec; LSE atomics; exclusives as host CAS (`c->eng.smp`). |
 | `lib/arm64/exec_fpsimd.c` | Scalar FP, Advanced-SIMD, crypto; FPCR rounding; 32-bit-host-safe (no `__int128` in the hot paths). |
 | `src/arm64chroot/core/cpu.c` | `cpu_step` fetch/decode/execute driver; register/condition helpers; debug trace. |
 | `lib/arm64/cpu.h` | CPU state (one struct for both emulators), register helpers, core API. |

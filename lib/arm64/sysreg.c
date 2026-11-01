@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* System registers: MSR/MRS/SYS/MSR-immediate, ID registers, generic-timer
- * register plumbing. Shared by both emulators; the EL1-only instructions are
- * compiled in only for a full system (ARM64_SYSTEM, arm64_config.h). */
+ * register plumbing. One for both of the CPU's modes: what EL0 may execute
+ * is decided by the EL1 configuration (el0_allowed), which in user mode is
+ * the one sysreg_init gives a process, so the EL1-only instructions (TLBI,
+ * AT) are reached only in a full system. */
 #include "sysreg.h"
 #include "esr.h"
 #include "mem.h"
@@ -34,6 +36,7 @@ static u64 timer_count(CPU *c, bool virt) {
 #define SCTLR_DZE       (1ULL << 14)   /* DC ZVA */
 #define SCTLR_UCT       (1ULL << 15)   /* CTR_EL0 */
 #define SCTLR_UCI       (1ULL << 26)   /* DC CVAC/CVAU/CIVAC, IC IVAU */
+#define SCTLR_SA0       (1ULL << 4)    /* SP-alignment check at EL0 (decode.c) */
 #define CNTK_EL0PCTEN   (1ULL << 0)    /* CNTPCT_EL0 (and CNTFRQ_EL0) */
 #define CNTK_EL0VCTEN   (1ULL << 1)    /* CNTVCT_EL0 (and CNTFRQ_EL0) */
 #define CNTK_EL0VTEN    (1ULL << 8)    /* CNTV_TVAL/CTL/CVAL_EL0 */
@@ -129,7 +132,6 @@ static void msr_immediate(CPU *c, u32 insn) {
 static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
                    unsigned op2, unsigned Rt) {
     if (CRn == 8) {                                      /* TLBI * */
-#if ARM64_SYSTEM
         /* EL1 VA forms — VAE1/VAAE1/VALE1/VAALE1, IS (CRm==3) and non-IS
          * (CRm==7) — invalidate a single page: Xt[43:0] holds VA[55:12],
          * rebuilt to a canonical VA by sign-extending bit 55. Every other
@@ -141,17 +143,14 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
             tlb_flush_page(c, va);
             return;
         }
-#endif
         tlb_flush_all(c);
         return;
     }
     if (CRn == 7) {
-#if ARM64_SYSTEM
         if (CRm == 8 && op1 == 0 && op2 <= 3) {          /* AT S1E1R/W, S1E0R/W */
             c->par_el1 = mmu_at_s1(c, reg_x(c, Rt), op2 & 1, op2 >= 2);
             return;
         }
-#endif
         if (CRm == 4 && op2 == 1) {                      /* DC ZVA: zero 64 bytes */
             u64 base = reg_x(c, Rt) & ~63ULL;
             /* One translation covers the line (64-aligned: never crosses a
@@ -281,7 +280,11 @@ void cpu_fp_trap(CPU *c) {
 static void do_msr(CPU *c, unsigned key, unsigned Rt) {
     u64 v = reg_x(c, Rt);
     switch (key) {
-        case KEY(3,0,1,0,0): c->sctlr[1] = v; tlb_flush_all(c); break;  /* SCTLR_EL1 */
+        case KEY(3,0,1,0,0):                                           /* SCTLR_EL1 */
+            c->sctlr[1] = v;
+            tlb_flush_all(c);
+            cpu_refresh_el_state(c);                 /* SA/SA0 */
+            break;
         case KEY(3,0,1,0,2):                                           /* CPACR_EL1 */
             c->cpacr_el1 = v;
             cpu_refresh_el_state(c);
@@ -358,23 +361,27 @@ void sysreg_exec(CPU *c, u32 insn) {
 }
 
 void sysreg_init(CPU *c) {
-#if ARM64_SYSTEM
-    c->sctlr[1] = 0x00C50838;   /* RES1 bits set, MMU/caches off */
-    /* CPACR_EL1 resets architecturally UNKNOWN; reset FPEN=0b11 (no trap) so
-     * flat-loaded images and firmware that touch SIMD before programming
-     * CPACR keep working — enforcement engages only when a guest explicitly
-     * writes a trapping FPEN. */
-    c->cpacr_el1 = 0x300000;
-#else
-    /* RES1 bits set, MMU/caches off. The rest is the kernel role's, and
-     * Linux's: MSCEn (EL0 MOPS, as it advertises HWCAP2_MOPS), DZE, UCT and
-     * UCI (DC ZVA, CTR_EL0 and cache maintenance by VA at EL0), never UMA;
-     * of the counters only the virtual one opened to EL0; and FP/SIMD
-     * untrapped (FPEN=0b11). */
-    c->sctlr[1] = 0x00C50838ULL | SCTLR_DZE | SCTLR_UCT | SCTLR_UCI | (1ULL << 33);
-    c->cntkctl_el1 = CNTK_EL0VCTEN;
-    c->cpacr_el1 = 0x300000;
-#endif
+    if (c->eng.sys) {
+        c->sctlr[1] = 0x00C50838;   /* RES1 bits set, MMU/caches off */
+        /* CPACR_EL1 resets architecturally UNKNOWN; reset FPEN=0b11 (no trap)
+         * so flat-loaded images and firmware that touch SIMD before
+         * programming CPACR keep working — enforcement engages only when a
+         * guest explicitly writes a trapping FPEN. */
+        c->cpacr_el1 = 0x300000;
+    } else {
+        /* User mode: the configuration for good, since nothing at EL0 can
+         * change it. RES1 bits set, MMU/caches off; nTWE and nTWI, so
+         * WFE/WFI never trap. The rest is the kernel role's, and Linux's:
+         * MSCEn (EL0 MOPS, as it advertises HWCAP2_MOPS), DZE, UCT and UCI
+         * (DC ZVA, CTR_EL0 and cache maintenance by VA at EL0), never UMA;
+         * of the counters only the virtual one opened to EL0; and FP/SIMD
+         * untrapped (FPEN=0b11). Not Linux's SA0: user mode has never
+         * checked SP alignment (decode.c sp_align_ok). */
+        c->sctlr[1] = (0x00C50838ULL & ~SCTLR_SA0) | SCTLR_DZE | SCTLR_UCT |
+                      SCTLR_UCI | (1ULL << 33);
+        c->cntkctl_el1 = CNTK_EL0VCTEN;
+        c->cpacr_el1 = 0x300000;
+    }
     cpu_refresh_el_state(c);
     c->mdscr_el1 = 0;
     if (fpsr_sync) { fpsr_sync(c); c->fpsr = 0; }  /* drop pre-reset FP flags */

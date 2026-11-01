@@ -185,7 +185,6 @@ static void put_ld_tmp(IRBlock *ir, u8 base, s64 off, unsigned k,
                      MDESC_MAKE(k, szlog, sign, is64) | MDESC_TMPBIT);
     o->imm2pc = pc;
 }
-#if ARM64_SYSTEM
 /* Stage the guest base in TMP2 so a destination that aliases it still reads
  * the original value, and return the vreg to address from.
  *
@@ -200,7 +199,6 @@ static u8 base_stage(IRBlock *ir, unsigned rn) {
     return VREG_TMP2;
 }
 
-#endif
 /* Pre/post-indexed load: the interpreter computes the writeback value from
  * the OLD base and applies it AFTER the register write (base wins when
  * rt == rn), so a base-clobbering load must stash the base in TMP2 first. */
@@ -699,17 +697,10 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
     return 1;
 }
 
-#if ARM64_SMP
-/* Inline exclusives / LSE atomics / ordered accesses (decode.c
- * ldst_exclusive and ldst_atomic are the reference; predecode classifies
- * them all PD_GENERIC). Emits one IRO_ATOMIC and returns 1 when the word is
- * a form the backends inline; 0 = caller falls back to the helper. These
- * are NOT counted in ninsns — the fast path bumps icount itself and the
- * slow path re-runs the insn through the self-counting jit_exec1. */
-#else
-/* Inline the LSE atomic memory operations (decode.c ldst_atomic is the
- * reference). Without ARM64_SMP the LSE is a plain single-CPU
- * read-modify-write through the MMU — a generated load->ALU->store is atomic w.r.t. the guest and
+/* ---- exclusives, LSE atomics and ordered accesses on one CPU ----
+ * Inline the LSE atomic memory operations (decode.c ldst_atomic_up is the
+ * reference). On one CPU the LSE is a plain read-modify-write through the
+ * MMU — a generated load->ALU->store is atomic w.r.t. the guest and
  * byte-identical to the interpreter, so no host LOCK/fence is needed and no
  * backend change: everything lowers to existing probed IR ops. The store is an
  * ordinary IRO_ST, so a store fault exits the block with the guest pc baked in
@@ -755,7 +746,7 @@ static int fe_lse_memop(IRBlock *ir, u32 insn, u64 pc) {
     return 1;
 }
 
-/* Inline CAS/CASA/CASL/CASAL (decode.c ldst_cas is the reference; single-CPU,
+/* Inline CAS/CASA/CASL/CASAL (decode.c ldst_cas_up is the reference; one CPU,
  * so a load / compare / conditional store is atomic and matches the interpreter).
  * Reuses the store-exclusive bracket generalized for a value compare (IRO_ATOMIC
  * with imm=1: `cmp old,expected; b.ne fail`), with the probed store in between
@@ -785,7 +776,7 @@ static int fe_lse_cas(IRBlock *ir, u32 insn, u64 pc) {
     return 1;
 }
 
-/* Inline exclusives (decode.c ldst_exclusive is the reference: an
+/* Inline exclusives (decode.c excl_up is the reference: an
  * address-match monitor with NO size compare on store — stay
  * bug-compatible). Only the o2=0 space: LDAR/STLR are plain accesses in
  * fe_insn, CASP stays on the CALL1 helper, and CAS is handled above —
@@ -798,12 +789,7 @@ static int fe_lse_cas(IRBlock *ir, u32 insn, u64 pc) {
  * branches to the fail label) and IRO_ATOMIC_END (status write + monitor
  * clear) — a store fault exits the block with the monitor still set and
  * Rs unwritten. Counted in ninsns here like any inline insn. */
-#endif
-static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
-#if ARM64_SMP
-    unsigned rt = insn & 31, rn = (insn >> 5) & 31, rs = (insn >> 16) & 31;
-    IROp *o = NULL;
-#else
+static int fe_atomic_up(IRBlock *ir, u32 insn, u64 pc) {
     /* bit 26 (V) MUST be in the mask: the atomic-memory-operation page is
      * defined for V=0 only, and decode.c reaches ldst_atomic through
      * `BITS(11,10) == 0 && !V`. Without it a V=1 word — architecturally
@@ -822,28 +808,7 @@ static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
     int L = (insn >> 22) & 1, o1 = (insn >> 21) & 1;
     unsigned rt = insn & 31, rn = (insn >> 5) & 31;
     unsigned rt2 = (insn >> 10) & 31, rs = (insn >> 16) & 31;
-#endif
 
-#if ARM64_SMP
-    if ((insn & 0x3F000000u) == 0x08000000u) {   /* exclusives group */
-        unsigned szl = insn >> 30;               /* 00..11 = 1..8B */
-        int o2 = (insn >> 23) & 1, L = (insn >> 22) & 1, o1 = (insn >> 21) & 1;
-        int o0 = (insn >> 15) & 1;
-        if (o2 && o1) {                          /* CAS/CASA/CASL/CASAL */
-            o = ir_put(ir, IRO_ATOMIC, 1, rx(rs), rsp(rn), rx(rt),
-                       rx(rs), (u64)insn,
-                       AT_MAKE(AT_CAS, szl, (insn >> 22) & 1, o0));
-        } else if (o2 && !o1) {                  /* LDAR/LDLAR / STLR/STLLR */
-            if (L) o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
-                              VREG_ZERO, (u64)insn, AT_MAKE(AT_LDAR, szl, 1, 0));
-            else   o = ir_put(ir, IRO_ATOMIC, 1, VREG_ZERO, rsp(rn), rx(rt),
-                              VREG_ZERO, (u64)insn, AT_MAKE(AT_STLR, szl, 0, 1));
-        } else if (!o2 && !o1) {                 /* LDXR/LDAXR / STXR/STLXR */
-            if (L) o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
-                              VREG_ZERO, (u64)insn, AT_MAKE(AT_LDX, szl, o0, 0));
-            else   o = ir_put(ir, IRO_ATOMIC, 1, rx(rs), rsp(rn), rx(rt),
-                              VREG_ZERO, (u64)insn, AT_MAKE(AT_STX, szl, 0, o0));
-#else
     if (L) {                                     /* LDXR/LDAXR/LDXP/LDAXP */
         /* va first: rt may alias rn, and excl_addr is the OLD base. */
         u8 xbase = base_stage(ir, rn);
@@ -857,30 +822,7 @@ static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
             if (rt2 != 31)
                 ir_put(ir, IRO_MOV, 1, (u8)rt2, VREG_TMP1, 0, 0, 0, 0);
             bytes *= 2;
-#endif
         }
-#if ARM64_SMP
-        /* LDXP/STXP/CASP: helper (128-bit / pair monitor; rare) */
-    } else if ((insn & 0x3F200C00u) == 0x38200000u) {   /* LSE atomic memops */
-        /* bit 26 (V) MUST be in the mask: the atomic-memory-operation page is
-         * defined for V=0 only, and decode.c reaches ldst_atomic through
-         * `BITS(11,10) == 0 && !V`. Without it a V=1 word — architecturally
-         * unallocated, and UNDEF in the interpreter — was translated here as
-         * an LSE atomic and *wrote guest memory* under --jit. */
-        unsigned szl = insn >> 30;
-        int A = (insn >> 23) & 1, R = (insn >> 22) & 1;
-        int o3 = (insn >> 15) & 1;
-        unsigned opc = (insn >> 12) & 7;
-        if (o3 && opc == 0)                      /* SWP */
-            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), rx(rs), VREG_ZERO,
-                       (u64)insn, AT_MAKE(AT_SWP, szl, A, R));
-        else if (o3 && opc == 4 && rs == 31)     /* LDAPR */
-            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
-                       VREG_ZERO, (u64)insn, AT_MAKE(AT_LDAR, szl, 1, 0));
-        else if (!o3)                            /* LDADD..LDSET, LDSMAX..LDUMIN */
-            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), rx(rs), VREG_ZERO,
-                       (u64)insn, AT_MAKE(AT_LDADD + opc, szl, A, R));
-#else
         ir_put(ir, IRO_MOVI, 1, VREG_TMP0, 0, 0, 0, 1, 0);
         ir_put(ir, IRO_CPUST, 0, VREG_ZERO, VREG_TMP0, 0, 0,
                offsetof(CPU, excl_valid), 0);    /* u32 field */
@@ -902,15 +844,71 @@ static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
         if (o1) put_st(ir, rsp(rn), bytes, rx(rt2), szl, pc);
         ir_put(ir, IRO_ATOMIC_END, 1, rx(rs), VREG_ZERO, VREG_ZERO,
                VREG_ZERO, 0, 0);
-#endif
     }
-#if ARM64_SMP
+    ir->ninsns++;
+    return 1;
+}
+
+/* ---- ... where guest threads run concurrently ----
+ * Inline exclusives / LSE atomics / ordered accesses (decode.c excl_smp and
+ * ldst_atomic_smp are the reference; predecode classifies them all
+ * PD_GENERIC). Emits one IRO_ATOMIC and returns 1 when the word is
+ * a form the backends inline; 0 = caller falls back to the helper. These
+ * are NOT counted in ninsns — the fast path bumps icount itself and the
+ * slow path re-runs the insn through the self-counting jit_exec1. */
+static int fe_atomic_smp(IRBlock *ir, u32 insn, u64 pc) {
+    unsigned rt = insn & 31, rn = (insn >> 5) & 31, rs = (insn >> 16) & 31;
+    IROp *o = NULL;
+
+    if ((insn & 0x3F000000u) == 0x08000000u) {   /* exclusives group */
+        unsigned szl = insn >> 30;               /* 00..11 = 1..8B */
+        int o2 = (insn >> 23) & 1, L = (insn >> 22) & 1, o1 = (insn >> 21) & 1;
+        int o0 = (insn >> 15) & 1;
+        if (o2 && o1) {                          /* CAS/CASA/CASL/CASAL */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rs), rsp(rn), rx(rt),
+                       rx(rs), (u64)insn,
+                       AT_MAKE(AT_CAS, szl, (insn >> 22) & 1, o0));
+        } else if (o2 && !o1) {                  /* LDAR/LDLAR / STLR/STLLR */
+            if (L) o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_LDAR, szl, 1, 0));
+            else   o = ir_put(ir, IRO_ATOMIC, 1, VREG_ZERO, rsp(rn), rx(rt),
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_STLR, szl, 0, 1));
+        } else if (!o2 && !o1) {                 /* LDXR/LDAXR / STXR/STLXR */
+            if (L) o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_LDX, szl, o0, 0));
+            else   o = ir_put(ir, IRO_ATOMIC, 1, rx(rs), rsp(rn), rx(rt),
+                              VREG_ZERO, (u64)insn, AT_MAKE(AT_STX, szl, 0, o0));
+        }
+        /* LDXP/STXP/CASP: helper (128-bit / pair monitor; rare) */
+    } else if ((insn & 0x3F200C00u) == 0x38200000u) {   /* LSE atomic memops */
+        /* bit 26 (V) MUST be in the mask: the atomic-memory-operation page is
+         * defined for V=0 only, and decode.c reaches ldst_atomic through
+         * `BITS(11,10) == 0 && !V`. Without it a V=1 word — architecturally
+         * unallocated, and UNDEF in the interpreter — was translated here as
+         * an LSE atomic and *wrote guest memory* under --jit. */
+        unsigned szl = insn >> 30;
+        int A = (insn >> 23) & 1, R = (insn >> 22) & 1;
+        int o3 = (insn >> 15) & 1;
+        unsigned opc = (insn >> 12) & 7;
+        if (o3 && opc == 0)                      /* SWP */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), rx(rs), VREG_ZERO,
+                       (u64)insn, AT_MAKE(AT_SWP, szl, A, R));
+        else if (o3 && opc == 4 && rs == 31)     /* LDAPR */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), VREG_ZERO,
+                       VREG_ZERO, (u64)insn, AT_MAKE(AT_LDAR, szl, 1, 0));
+        else if (!o3)                            /* LDADD..LDSET, LDSMAX..LDUMIN */
+            o = ir_put(ir, IRO_ATOMIC, 1, rx(rt), rsp(rn), rx(rs), VREG_ZERO,
+                       (u64)insn, AT_MAKE(AT_LDADD + opc, szl, A, R));
+    }
     if (!o) return 0;
     o->imm2pc = pc;
-#else
-    ir->ninsns++;
-#endif
     return 1;
+}
+
+/* Exclusives, LSE atomics and ordered accesses, lowered for the block's mode
+ * (ir.h, IRO_ATOMIC). */
+static int fe_atomic(IRBlock *ir, u32 insn, u64 pc) {
+    return ir->smp ? fe_atomic_smp(ir, insn, pc) : fe_atomic_up(ir, insn, pc);
 }
 
 /* Load/store forms predecode leaves PD_GENERIC (decode.c ldst_register /
@@ -969,15 +967,11 @@ static int fe_ldst_extra(IRBlock *ir, u32 insn, u64 pc) {
         if (L) {                                   /* all-or-nothing commit */
             int wb = (mode == 1 || mode == 3);
             s64 a0 = (mode == 1) ? 0 : imm;
-#if ARM64_SYSTEM
             /* Stage only for a writeback whose base is not SP: an SP base
              * cannot be aliased by Rt/Rt2 and must stay VREG_SP so the
              * backends' SP-alignment check fires (see base_stage). */
             int stage = wb && rn != 31;
             if (stage) {                           /* old base survives in TMP2 */
-#else
-            if (wb) {                              /* old base survives in TMP2 */
-#endif
                 if (a0) ir_put(ir, IRO_ADDI, 1, VREG_TMP2, rsp(rn), 0, 0, (u64)a0, 0);
                 else    ir_put(ir, IRO_MOV,  1, VREG_TMP2, rsp(rn), 0, 0, 0, 0);
                 put_ld_tmp(ir, VREG_TMP2, 0,        0, szl, sign, 1, pc);
@@ -989,17 +983,12 @@ static int fe_ldst_extra(IRBlock *ir, u32 insn, u64 pc) {
             u8 w = (u8)(sign || opc == 2);
             if (rt  != 31) ir_put(ir, IRO_MOV, w, (u8)rt,  VREG_TMP0, 0, 0, 0, 0);
             if (rt2 != 31) ir_put(ir, IRO_MOV, w, (u8)rt2, VREG_TMP1, 0, 0, 0, 0);
-#if ARM64_SYSTEM
             if (wb) {
                 if (stage) ir_put(ir, IRO_ADDI, 1, rsp(rn), VREG_TMP2, 0, 0,
                                   (mode == 1) ? (u64)imm : 0, 0);
                 else       ir_put(ir, IRO_ADDI, 1, rsp(rn), rsp(rn), 0, 0,
                                   (u64)imm, 0);
             }
-#else
-            if (wb) ir_put(ir, IRO_ADDI, 1, rsp(rn), VREG_TMP2, 0, 0,
-                           (mode == 1) ? (u64)imm : 0, 0);
-#endif
         } else {
             if (mode != 0) return 0;               /* offset STP: PD covers */
             put_st(ir, rsp(rn), imm,            rx(rt),  szl, pc);
@@ -1138,30 +1127,18 @@ static int fe_bitfield(IRBlock *ir, u32 insn, u64 pc) {
 
 /* Translate one classified instruction. Emits IR; returns FE_END when the
  * block must stop after it (all terminal ops emitted). */
-#if ARM64_SYSTEM
-/* CPACR_EL1.FPEN trap state of the block being translated (set by
- * jit_fe_block from c->fp_trapped; per-block constant — it is bit 4 of the
- * block-lookup ctx in jit.c, so a block only ever runs in the trap state it
- * was compiled under). Almost always false: Linux/firmware program FPEN=0b11
- * once, and generated code is then identical to the ungated build. */
-static bool g_fe_fptrap;
-
-/* The CPU of the block being translated, and whether that block runs at EL0
- * (bit 0 of its ctx, so a per-block constant like g_fe_fptrap). At EL0 the
- * EL1 configuration -- SCTLR_EL1 and CNTKCTL_EL1 -- decides which system
+/* A block that runs at EL0 (IRBlock.el0, bit 0 of its ctx): there the EL1
+ * configuration -- SCTLR_EL1 and CNTKCTL_EL1 -- decides which system
  * instructions the program may execute at all; the inline forms below would
  * carry out one it may not, so such a one goes to the helper, which raises
  * the UNDEFINED. Judged here, at translation; a change to those bits flushes
- * the cache (jit_el0cfg, jit.c). */
-static CPU *g_fe_c;
-static bool g_fe_el0;
-
-static bool fe_sys_el0_refused(u32 insn) {
+ * the cache (jit_el0cfg, jit.c), and in user mode they never change. */
+static bool fe_sys_el0_refused(const IRBlock *ir, u32 insn) {
     unsigned L = (insn >> 21) & 1, op0 = (insn >> 19) & 3, op1 = (insn >> 16) & 7;
     unsigned CRn = (insn >> 12) & 0xf, Rt = insn & 31;
     if (!L && op0 == 0 && op1 == 3 && (CRn == 2 || CRn == 3) && Rt == 31)
         return false;                /* hints and barriers: decode.c's own */
-    return !sysreg_el0_ok(g_fe_c, insn);
+    return !sysreg_el0_ok(ir->c, insn);
 }
 
 /* True if the instruction is FP/SIMD for CPACR.FPEN purposes: a specialized
@@ -1179,14 +1156,14 @@ static bool fe_fp_insn(u8 op, u32 insn) {
     return (grp & 5) == 4 && ((insn >> 26) & 1);
 }
 
-#endif
 static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
     const u32 insn = e->insn;
     const u64 next = pc + 4;
     u8 w = 0;
-#if ARM64_SYSTEM
-
-    if (UNLIKELY(g_fe_fptrap) && fe_fp_insn(e->op, insn)) {
+    /* CPACR_EL1.FPEN trap state of the block (IRBlock.fptrap): almost always
+     * clear -- Linux/firmware program FPEN=0b11 once, and user mode never
+     * traps -- and generated code is then identical to an ungated one. */
+    if (UNLIKELY(ir->fptrap) && fe_fp_insn(e->op, insn)) {
         /* Every FP/SIMD insn unconditionally traps in this block ctx:
          * compile it as the interpreter call (exec_a64's fp_access_ok
          * raises EC 0x07 -> the helper reports a control transfer and the
@@ -1195,7 +1172,6 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
         ir_put(ir, IRO_JMP, 0, 0, 0, 0, 0, next, 0);
         return FE_END;
     }
-#endif
 
     switch (e->op) {
         case PD_NOP:
@@ -1678,10 +1654,8 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
          * succeed (pdrun.c L_LDP64 is all-or-nothing), so read into IR
          * temps and commit with MOVs.
          *
-         * arm64chroot computes the address once into TMP2 up front, which also
-         * resolves the rd==rn / rm==rn hazards. In arm64emu the address goes
-         * through TMP2 only when a destination aliases the base, which is the
-         * hazard that staging exists for. Reading off the
+         * The address goes through TMP2 only when a destination aliases the
+         * base, which is the hazard that staging exists for. Reading off the
          * guest base directly otherwise matters for more than the one saved
          * IR op: the backends emit the SP-alignment check when a memory op's
          * base IS VREG_SP, and a base staged into a temp hides that — every
@@ -1696,7 +1670,6 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
             int wb = post || e->op == PD_LDP64PRE || e->op == PD_LDP32PRE;
             unsigned szl = is64 ? 3 : 2, esz = is64 ? 8 : 4;
             s64 a0 = post ? 0 : (s64)e->imm;
-#if ARM64_SYSTEM
             int alias = (e->rn != 31 && (e->rd == e->rn || e->rm == e->rn));
             if (alias) {
                 if (a0) ir_put(ir, IRO_ADDI, 1, VREG_TMP2, rsp(e->rn), 0, 0, (u64)a0, 0);
@@ -1707,15 +1680,8 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 put_ld_tmp(ir, rsp(e->rn), a0,             0, szl, 0, is64, pc);
                 put_ld_tmp(ir, rsp(e->rn), a0 + (s64)esz,  1, szl, 0, is64, pc);
             }
-#else
-            if (a0) ir_put(ir, IRO_ADDI, 1, VREG_TMP2, rsp(e->rn), 0, 0, (u64)a0, 0);
-            else    ir_put(ir, IRO_MOV,  1, VREG_TMP2, rsp(e->rn), 0, 0, 0, 0);
-            put_ld_tmp(ir, VREG_TMP2, 0,        0, szl, 0, is64, pc);
-            put_ld_tmp(ir, VREG_TMP2, (s64)esz, 1, szl, 0, is64, pc);
-#endif
             if (e->rd != 31) ir_put(ir, IRO_MOV, (u8)is64, e->rd, VREG_TMP0, 0, 0, 0, 0);
             if (e->rm != 31) ir_put(ir, IRO_MOV, (u8)is64, e->rm, VREG_TMP1, 0, 0, 0, 0);
-#if ARM64_SYSTEM
             /* Writeback last: a faulted read must leave the base alone. With
              * the staged form the value comes from TMP2 (the old base, plus
              * the pre-index offset already folded in); without it the base is
@@ -1726,10 +1692,6 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 else       ir_put(ir, IRO_ADDI, 1, rsp(e->rn), rsp(e->rn), 0, 0,
                                   e->imm, 0);
             }
-#else
-            if (wb) ir_put(ir, IRO_ADDI, 1, rsp(e->rn), VREG_TMP2, 0, 0,
-                           post ? e->imm : 0, 0);
-#endif
             break;
         }
 
@@ -1834,10 +1796,10 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 ir->ninsns++;
                 return FE_CONT;
             }
-#if !ARM64_SMP
-            if (e->op == PD_GENERIC && (insn & 0x3FA00000u) == 0x08800000u) {
+            if (!ir->smp && e->op == PD_GENERIC &&
+                (insn & 0x3FA00000u) == 0x08800000u) {
                 /* LDAR/STLR (and anything else with o2=1, o1=0 that decode.c
-                 * accepts leniently): the in-order interpreter runs these as
+                 * accepts leniently) on one CPU: the in-order interpreter runs these as
                  * plain mem_read/mem_write — no monitor effect, no fence —
                  * so plain accesses match it exactly. The o2=1, o1=1 CAS
                  * space stays CALL1: exec_a64 remains authoritative for
@@ -1851,7 +1813,6 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 ir->ninsns++;
                 return FE_CONT;
             }
-#endif
             if (e->op == PD_GENERIC && (insn >> 24) == 0xD5) {
                 /* System family: the hot TLS/barrier/DC-ZVA cases are inline
                  * (none touch translation state); everything else — sysreg
@@ -1859,17 +1820,15 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                  * system it may flush the TLB or change the EL/MMU context,
                  * so it ENDS the block, and one EL0 may not execute takes
                  * that road too, where sysreg.c raises its UNDEFINED
-                 * (g_fe_el0 above). In user mode none of it can (IC IVAU is
-                 * intercepted before pd_fill, and jit_exec1's return catches
-                 * faults/halt), so the block keeps going. */
+                 * (IRBlock.el0). In user mode the rest can do neither (IC
+                 * IVAU is intercepted before pd_fill, and jit_exec1's return
+                 * catches faults/halt), so the block keeps going. */
                 unsigned rt = insn & 31;
-#if ARM64_SYSTEM
-                if (g_fe_el0 && fe_sys_el0_refused(insn)) {
+                if (ir->el0 && fe_sys_el0_refused(ir, insn)) {
                     put_call1(ir, pc, insn);
                     ir_put(ir, IRO_JMP, 0, 0, 0, 0, 0, next, 0);
                     return FE_END;
                 }
-#endif
                 if ((insn & 0xFFFFFFE0u) == 0xD53BD040u) {   /* MRS Xt, TPIDR_EL0 */
                     if (rt != 31)
                         ir_put(ir, IRO_CPULD, 1, (u8)rt, VREG_ZERO, 0, 0,
@@ -1885,7 +1844,6 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 if ((insn & 0xFFFFFFE0u) == 0xD51BD040u) {   /* MSR TPIDR_EL0, Xt */
                     ir_put(ir, IRO_CPUST, 1, VREG_ZERO, rx(rt), 0, 0,
                            offsetof(CPU, tpidr), 0);
-#if ARM64_SYSTEM
                     break;
                 }
                 /* PSTATE views and banked registers that cannot change
@@ -1974,10 +1932,11 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                      * dropping the helper + block-end matters. */
                     break;
                 }
-                if (!g_rtclock &&
+                if (ir->sys && !g_rtclock &&
                     (insn & 0xFFFFFF00u) == 0xD53BE000u && ((insn >> 5) & 7) <= 2) {
-                    /* CNTFRQ/CNTPCT/CNTVCT_EL0 (op2 = 0/1/2), deterministic
-                     * clock only: pure functions of CPU fields (timer.c
+                    /* CNTFRQ/CNTPCT/CNTVCT_EL0 (op2 = 0/1/2), a full
+                     * system's deterministic clock only (user mode's is the
+                     * host's, gt_count): pure functions of CPU fields (timer.c
                      * gt_count = icount + timer_skip [- cntvoff]). Memory
                      * icount mid-block excludes the natively-retired batch,
                      * and ir->ninsns here is exactly that batch, so the sum
@@ -2014,7 +1973,6 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 if ((insn & 0xFFFFFFE0u) == 0xD53B00E0u) {   /* MRS Xt, DCZID_EL0 */
                     if (rt != 31)                            /* BS=4 (64B) */
                         ir_put(ir, IRO_MOVI, 1, (u8)rt, 0, 0, 0, 4, 0);
-#endif
                     break;
                 }
                 if ((insn & 0xFFFFF0FFu) == 0xD50330BFu ||   /* DMB */
@@ -2033,26 +1991,20 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                         put_st(ir, VREG_TMP2, 8 * zi, VREG_ZERO, 3, pc);
                     break;
                 }
-#if ARM64_SYSTEM
                 if ((insn & 0xFFFFF0FFu) == 0xD50330DFu) {   /* ISB */
                     /* Context synchronization: preceding sysreg/TLB changes
                      * take effect for instruction fetch here — end the block
-                     * so the dispatcher re-verifies pc's translation. */
+                     * so the dispatcher re-verifies pc's translation. In user
+                     * mode there are none: nothing to do. */
+                    if (!ir->sys) break;
                     ir->ninsns++;
                     ir_put(ir, IRO_JMP, 0, 0, 0, 0, 0, next, 0);
                     return FE_END;
                 }
-#else
-                if ((insn & 0xFFFFF0FFu) == 0xD50330DFu)     /* ISB */
-                    break;              /* context sync: nothing to do here */
-#endif
                 put_call1(ir, pc, insn);
-#if ARM64_SYSTEM
+                if (!ir->sys) return FE_CONT;
                 ir_put(ir, IRO_JMP, 0, 0, 0, 0, 0, next, 0);
                 return FE_END;
-#else
-                return FE_CONT;
-#endif
             }
             put_call1(ir, pc, insn);         /* jit_exec1 counts this insn */
             if (e->op == PD_GENERIC) {
@@ -2211,12 +2163,13 @@ int jit_mem_run_len(const IRBlock *ir, int i) {
 u32 jit_fe_block(CPU *c, u64 pc, IRBlock *ir, u32 max_insns) {
     ir->n = 0;
     ir->ninsns = 0;
-#if ARM64_SYSTEM
+    ir->sys = c->eng.sys;
+    ir->smp = c->eng.smp;
     ir->ctx_spx = (u8)(c->sp_sel ? c->el : 0);
-    g_fe_fptrap = c->fp_trapped;    /* ctx bit 4: see fe_insn's FP gate */
-    g_fe_c = c;                     /* ctx bit 0: see fe_sys_el0_refused */
-    g_fe_el0 = c->el == 0;
-#endif
+    ir->fptrap = c->fp_trapped;     /* ctx bit 4: see fe_insn's FP gate */
+    ir->el0 = c->el == 0;           /* ctx bit 0: see fe_sys_el0_refused */
+    ir->spchk = c->eng.sys || ((c->sctlr[1] >> 4) & 1);   /* SCTLR_EL1.SA0 */
+    ir->c = c;
     u32 guest_n = 0;
     u64 p = pc;
     if (max_insns == 0 || max_insns > JIT_MAX_BLOCK_INSNS)

@@ -227,6 +227,11 @@ void be_unpatch_chain(JitEnv *env, JBlock *b, int slot);
 int  be_vop_ok(unsigned vclass, u32 insn);
 /* Make [rx, rx+len) (written via rw) visible to instruction fetch. */
 void be_flush_icache(const u8 *rx, const u8 *rw, size_t len);
+/* Record one inline memory access for bus-fault recovery: the range of its
+ * fast path and the slow path a host fault inside it resumes at, as offsets
+ * from cache_rx. A full system's guest memory is its own RAM, which never
+ * faults on the host, so this runtime records nothing. */
+void be_fixup_add(JitEnv *env, u32 fast_off, u32 slow_off);
 
 /* ---- helpers called from generated code (jit.c) ---- */
 

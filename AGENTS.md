@@ -40,12 +40,17 @@ are kept diffable against each other; they move into `lib/` as they are
 unified. A file in `lib/` is compiled into every program that uses it, with
 that program's flags, so a change there must pass every such program's suites.
 
-What differs between the programs is configured, not forked. `lib/arm64` takes
-one header from the program, found on its include path: `arm64_config.h`, how
-the library is built there (`ARM64_SYSTEM`: 1 for arm64emu's full system, 0 for
-arm64chroot's user mode, where the guest never leaves EL0; `ARM64_SMP`: 1 where
-guest threads run concurrently on host threads, arm64chroot's case, so atomics
-and barriers must be host ones). Guest memory is the library's own interface,
+What differs between the programs is configured, not forked, and decided at
+run time, not at build time: each CPU carries the mode the program runs it in
+(`c->eng.sys`: 1 for arm64emu's full system, 0 for arm64chroot's user mode,
+where the guest never leaves EL0; `c->eng.smp`: 1 where guest threads run
+concurrently on host threads, arm64chroot's case, so atomics and barriers
+must be host ones). The interpreter's EL1-only checks are the architecture's
+own, decided by the EL and the reset values `sysreg_init` gives each mode; the
+JIT makes its choices as it translates, so generated code carries none.
+`lib/arm64` takes one header from the program, found on its include path:
+`arm64_config.h`, how the library is built there (the prefix of the
+environment knobs it reads). Guest memory is the library's own interface,
 `lib/arm64/mem.h`: the typed accesses, instruction fetch and `mem_host_ptr`,
 inline over the translation caches part of every CPU (`c->eng`: one
 D-TLB entry layout and one fetch cache for both programs), with slow paths and

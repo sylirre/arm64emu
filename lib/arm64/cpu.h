@@ -85,6 +85,20 @@ typedef struct CpuEngine {
      * rest; fetch_el0 says whose fetch[0] is. */
     FetchCache fetch[2];
     u8 fetch_el0;
+    /* The mode the program runs this CPU in, read by the library wherever
+     * the two differ (an architectural state decides the rest: the EL, the
+     * reset values sysreg_init gives the EL1 configuration).
+     * sys: a full system -- the guest runs at EL1 as well as EL0, behind the
+     *      stage-1 MMU, and owns the EL1 configuration. 0 is user mode: the
+     *      guest only ever runs at EL0, under the configuration Linux gives a
+     *      process, which nothing it can execute changes; the program plays
+     *      its kernel.
+     * smp: guest threads run guest code at the same time on host threads,
+     *      over shared memory: LSE atomics, exclusives and LDAR/STLR must be
+     *      host atomic accesses, and DMB/DSB host fences. 0 is one CPU
+     *      executed by one host thread in program order, where a plain
+     *      read-modify-write is atomic and a barrier orders nothing more. */
+    u8 sys, smp;
 } CpuEngine;
 
 typedef struct CPU {
@@ -97,6 +111,8 @@ typedef struct CPU {
     u32 daif;         /* uses PS_D/A/I/F bit positions */
     u8  el;           /* current exception level 0..3 (we implement 0,1; minimal 2) */
     u8  sp_sel;       /* SPSel: 0 => SP_EL0, 1 => SP_ELx */
+    u8  sp_chk;       /* SCTLR_EL1.SA/SA0 checks SP alignment at this EL
+                         (cpu_refresh_el_state) */
     /* The FZ/FZ16 bits the host FPCR currently mirrors (exec_fpsimd.c,
      * fpcr_host_sync; AArch64 hosts only), HOST_FZMODE_UNKNOWN where the host
      * thread's FPCR has not been synced since this CPU started or was reset.
@@ -149,11 +165,10 @@ typedef struct CPU {
     u64 cntpct_base;   /* ARM64EMU_RTCLOCK mode: host ns at which the counter == 0 */
     u64 timer_skip;    /* deterministic mode: virtual ticks fast-forwarded over WFI idle */
 
-    /* Exclusive monitor. arm64emu has one CPU and matches on the address;
-     * arm64chroot runs guest threads on host threads, so excl_val/excl_val2
-     * hold the values LDXR/LDXP loaded and STXR/STXP do a real host
-     * compare-and-swap (SMP-correct on weakly ordered hosts), not just an
-     * address match. excl_valid is u32, not bool, so the JITs' 32-bit
+    /* Exclusive monitor. On one CPU it matches on the address; where guest
+     * threads run concurrently (eng.smp) excl_val/excl_val2 hold the values
+     * LDXR/LDXP loaded and STXR/STXP do a real host compare-and-swap
+     * (SMP-correct on weakly ordered hosts), not just an address match. excl_valid is u32, not bool, so the JITs' 32-bit
      * CPU-struct accesses to it are well-formed. */
     u32  excl_valid;
     u64  excl_addr;
@@ -173,9 +188,10 @@ typedef struct CPU {
     u64  cur_insn_pc;  /* address of the instruction currently executing */
 
     struct Machine *m;
-    /* Its translation caches (above), kept by cpu_reset. Part of the CPU
-     * rather than thread-local storage, which where it is emulated (Bionic)
-     * costs a call per access; set up by the program for each CPU it runs. */
+    /* Its mode and translation caches (above), kept by cpu_reset. Part of
+     * the CPU rather than thread-local storage, which where it is emulated
+     * (Bionic) costs a call per access; set up by the program for each CPU
+     * it runs, before the CPU's first reset. */
     CpuEngine eng;
 } CPU;
 
@@ -225,18 +241,20 @@ static inline void cpu_refresh_dtlb_ctx(CPU *c) {
 }
 
 /* Recompute what is cached of the current EL's configuration: the CPACR_EL1
- * FPEN trap predicate, which depends only on (cpacr, el), the D-TLB tag
- * context, and which of the two fetch caches is the current EL's. Refreshed
- * at every point the EL or CPACR can change: CPACR MSR, exception entry, ERET
- * (inside cpu_unpack_spsr), and reset -- in arm64chroot only the last
- * matters: its guest never leaves EL0, where CPACR is out of reach, so
- * fp_trapped stays as sysreg_init leaves it, false. FPEN: 0b11 no trap; 0b01
- * traps EL0 only; 0b00/0b10 trap EL0 and EL1. EL2+ is outside CPACR's reach
- * (CPTR_EL2/3 are not modeled). */
+ * FPEN trap predicate, which depends only on (cpacr, el), whether SCTLR_EL1
+ * checks SP alignment there (SA0 at EL0, SA above), the D-TLB tag context,
+ * and which of the two fetch caches is the current EL's. Refreshed at every
+ * point the EL, CPACR or SCTLR can change: their MSRs, exception entry, ERET
+ * (inside cpu_unpack_spsr), and reset -- in user mode only the last matters:
+ * the guest never leaves EL0, where neither register is in reach, so they
+ * stay as sysreg_init leaves them. FPEN: 0b11 no trap; 0b01 traps EL0 only;
+ * 0b00/0b10 trap EL0 and EL1. EL2+ is outside CPACR's reach (CPTR_EL2/3 are
+ * not modeled). */
 static inline void cpu_refresh_el_state(CPU *c) {
     unsigned fpen = (unsigned)(c->cpacr_el1 >> 20) & 3;
     c->fp_trapped = (c->el == 0) ? (fpen != 3)
                   : (c->el == 1) ? (fpen == 0 || fpen == 2) : false;
+    c->sp_chk = (u8)((c->sctlr[1] >> (c->el == 0 ? 4 : 3)) & 1);
     cpu_refresh_dtlb_ctx(c);
     u8 el0 = c->el == 0;
     if (el0 != c->eng.fetch_el0) {           /* the current EL's fetch cache */

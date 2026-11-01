@@ -17,8 +17,9 @@
 /* PROBE_ONCE, the work-it-out-once flag, is lib/arm64's (types.h). */
 
 /* The calling thread runs c from here on: point c at this thread's own
- * translation caches (mem.h's CpuEngine, c->eng), which every guest access
- * reaches through the CPU. Called by every thread that takes up a CPU -- the
+ * translation caches (cpu.h's CpuEngine, c->eng), which every guest access
+ * reaches through the CPU, and set its mode (user mode, guest threads
+ * running concurrently). Called by every thread that takes up a CPU -- the
  * main thread at startup, a new guest thread on its copy of its creator's,
  * and a thread adopting another CPU's state wholesale (an exec's) -- before
  * its first guest memory access.

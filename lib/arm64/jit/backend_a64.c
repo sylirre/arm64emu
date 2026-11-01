@@ -51,10 +51,13 @@ typedef struct BE {
     u32 lru[HREG_N];
     u32 stamp;
     int fl;
-#if !ARM64_SMP
-    u8 *at_f0, *at_f1;          /* IRO_ATOMIC's fail branches, patched by
-                                 * the matching IRO_ATOMIC_END */
-#endif
+    /* The block's mode and context (ir.h, IRBlock): sys, smp, whether to
+     * emit the SP-alignment check, and the CPU-struct home of the live SP
+     * (sp_el[] is banked by SPSel/EL in a full system). */
+    u8  sys, smp, spchk;
+    s32 sp_off;
+    u8 *at_f0, *at_f1;          /* one CPU: IRO_ATOMIC's fail branches,
+                                 * patched by the matching IRO_ATOMIC_END */
     /* guest V-register cache: host v18-v29 (v0-v3/v16-v17 stay recipe
      * scratch; v8-v15 are AAPCS callee-saved and the thunks don't save
      * them) */
@@ -194,45 +197,31 @@ static void emit_imm64(Emit *e, unsigned rd, u64 v) {
     if (first) ei(e, enc_movz(1, rd, 0, 0));       /* v == 0 or all-ones */
 }
 
-#if ARM64_SYSTEM
-/* ---- register allocator (mirrors backend_x86_64.c) ---- */
-#else
 /* Offset of the emission cursor from the code-cache base, for the bus-fault
- * fixup table (see JFixup): a host SIGBUS inside an inline access resumes at
- * that access's slow path. */
+ * fixup table (be_fixup_add, jit_priv.h): a host SIGBUS inside an inline
+ * access resumes at that access's slow path. */
 static u32 cache_off(BE *be) {
     return (u32)(be->e->rx - be->env->cache_rx);
 }
-#endif
 
-#if ARM64_SYSTEM
-/* Active SP bank for the block being emitted (sp_el[] is banked by
- * SPSel/EL); set per block from the block tag's ctx bits. */
-static s32 g_sp_off = OFF_SP;
-#else
 /* ---- register allocator (mirrors backend_x86_64.c) ---- */
-#endif
 
-static s32 v_home(int v) {
+static s32 v_home(const BE *be, int v) {
     if (v < 31) return OFF_X(v);
-#if ARM64_SYSTEM
-    if (v == VREG_SP) return g_sp_off;
-#else
-    if (v == VREG_SP) return OFF_SP;
-#endif
+    if (v == VREG_SP) return be->sp_off;
     return -1;
 }
 static s32 v_spill(int v) { return (s32)(offsetof(JitEnv, tmp_spill) + 8 * (v - VREG_TMP0)); }
 
 static void v_store(BE *be, int v) {
     int h = be->v2h[v];
-    s32 off = v_home(v);
+    s32 off = v_home(be, v);
     if (off >= 0) ei(be->e, enc_str(3, (unsigned)h, 28, (unsigned)off));
     else ei(be->e, enc_str(3, (unsigned)h, 27, (unsigned)v_spill(v)));
 }
 static void v_load_into(BE *be, int v, int h) {
     if (v == VREG_ZERO) { ei(be->e, enc_movz(1, (unsigned)h, 0, 0)); return; }
-    s32 off = v_home(v);
+    s32 off = v_home(be, v);
     if (off >= 0) ei(be->e, enc_ldr(3, (unsigned)h, 28, (unsigned)off));
     else ei(be->e, enc_ldr(3, (unsigned)h, 27, (unsigned)v_spill(v)));
 }
@@ -489,7 +478,7 @@ static void alu3(BE *be, int w, u32 base, int d, int a, int b_) {
 /* Load a vreg's memory home into host reg h (scratch use around mem ops). */
 static void ld_home(BE *be, int h, int v) {
     if (v == VREG_ZERO) { ei(be->e, enc_movz(1, (unsigned)h, 0, 0)); return; }
-    s32 off = v_home(v);
+    s32 off = v_home(be, v);
     if (off >= 0) ei(be->e, enc_ldr(3, (unsigned)h, 28, (unsigned)off));
     else ei(be->e, enc_ldr(3, (unsigned)h, 27, (unsigned)v_spill(v)));
 }
@@ -542,7 +531,6 @@ static int enc_addsub_imm(Emit *e, int sub, unsigned rd, unsigned rn, u64 imm) {
  * stores), calls the helper, and reloads the caller-saved-mapped vregs so
  * both paths converge on the allocator state emission continues with. Loads
  * converge with the extended value in x16; one post-merge ra_def commits it. */
-#if ARM64_SYSTEM
 /* SP-alignment check (SCTLR_EL1.SA/SA0) for an access whose base is SP
  * (o->a == VREG_SP). Mirrors backend_x86_64.c emit_spchk: if SP's low 4 bits are
  * set, call jit_sp_check, which faults (and exits the block) when the check is
@@ -564,7 +552,6 @@ static void emit_spchk(BE *be, int ha, u64 pc, u32 icnt) {
     fwd_here(e, aligned);
 }
 
-#endif
 static void emit_mem(BE *be, const IRBlock *ir, int i) {
     Emit *e = be->e;
     const IROp *o = &ir->ops[i];
@@ -585,9 +572,7 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     int hb = -1;
     if (o->op == IRO_ST) hb = ra_use(be, o->b);   /* store operand */
     int ha = ra_use(be, o->a);                    /* base */
-#if ARM64_SYSTEM
-    if (o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
-#endif
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
 
     /* va = base + offset -> x1 (scratch; also the slow call's arg1) */
     if (o->imm == 0) {
@@ -634,12 +619,8 @@ static void emit_mem(BE *be, const IRBlock *ir, int i) {
     ei(e, enc_andi64(2, 2, 52, 51));              /* and x2, x2, #~0xfff */
     ei(e, enc_andi64(16, 1, 0, 11));              /* and x16, x1, #0xfff */
 
-#if ARM64_SYSTEM
-fast:
-#else
 fast:;
     u32 fix_fast = cache_off(be);
-#endif
     /* ---- fast access (base = x2, page offset = x16; loads -> x16) ---- */
     if (!is_v) {
         if (is_st) {
@@ -677,9 +658,7 @@ fast:;
     fwd_here(e, slow0);
     fwd_here(e, slow1);
     fwd_here(e, slow2);
-#if !ARM64_SYSTEM
     be_fixup_add(be->env, fix_fast, cache_off(be));
-#endif
     slow_store_dirty(be);                         /* dirty bits kept: above */
     unsigned hoff;
     if (o->op == IRO_ST) {
@@ -746,9 +725,7 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
 
     materialize_flags(be);                        /* the probe needs NZCV */
     int ha = ra_use(be, o->a);
-#if ARM64_SYSTEM
-    if (o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
-#endif
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
     for (int t = 0; t < k; t++) {
         const IROp *p = &ir->ops[i + t];
         if (is_st) hb[t] = ra_use(be, p->b);
@@ -792,12 +769,8 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     ei(e, enc_andi64(16, 1, 0, 11));              /* pageoff of va0 */
     ei(e, enc_addr(17, 2, 16));                   /* x17 = host ptr va0 */
 
-#if ARM64_SYSTEM
-fast:
-#else
 fast:;
     u32 fix_fast = cache_off(be);
-#endif
     for (int t = 0; t < k; t++) {
         const IROp *p = &ir->ops[i + t];
         u64 d = (u64)((s64)p->imm - lo);
@@ -819,9 +792,7 @@ fast:;
     fwd_here(e, slow0);
     fwd_here(e, slow1);
     fwd_here(e, slow2);
-#if !ARM64_SYSTEM
     be_fixup_add(be->env, fix_fast, cache_off(be));
-#endif
     slow_store_dirty(be);
     ei(e, enc_str(3, 1, 27, FUSE_VA_SLOT));
     for (int t = 0; t < k; t++) {
@@ -1709,8 +1680,76 @@ static void emit_vop(BE *be, const IROp *o) {
 
 
 /* ---- inline atomics (IRO_ATOMIC; decode.c ldst_exclusive/ldst_atomic are
- * the reference) ---- */
-#if ARM64_SMP
+ * the reference), lowered for the block's mode (ir.h) ---- */
+
+/* -- one CPU: the bracket around ordinary probed stores -- */
+/* ---- inline exclusives (IRO_ATOMIC / IRO_ATOMIC_END; decode.c
+ * ldst_exclusive is the reference semantics; see backend_x86_64.c for the
+ * bracket design) ---- */
+
+static void emit_atomic_up(BE *be, const IRBlock *ir, int i) {
+    Emit *e = be->e;
+    const IROp *o = &ir->ops[i];
+    materialize_flags(be);
+    sync_all(be);
+    if (o->imm) {                                /* CAS: value compare */
+        int ho = ra_use(be, o->a);               /* old (loaded from memory) */
+        int he = ra_use(be, o->b);               /* expected */
+        /* SUBS WZR/XZR, old, expected  (w selects 32/64-bit compare) */
+        ei(e, (o->w ? 0xEB00001Fu : 0x6B00001Fu) |
+              ((u32)he << 16) | ((u32)ho << 5));
+        be->at_f0 = bcond_fwd(e, 1);             /* b.ne fail */
+        be->at_f1 = NULL;
+        be->fl = FL_MEM;
+        return;
+    }
+    int ha = ra_use(be, o->a);                   /* base = monitor address */
+    /* Before the monitor is consulted: a monitor miss skips the stores, so
+     * putting the SP check on them would let a misaligned SP through. */
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
+    ei(e, enc_ldr(2, 16, 28, (unsigned)offsetof(CPU, excl_valid)));
+    ei(e, 0x7100001Fu | (16u << 5));             /* cmp w16, #0 */
+    be->at_f0 = bcond_fwd(e, 0);                 /* b.eq fail */
+    ei(e, enc_ldr(3, 16, 28, (unsigned)offsetof(CPU, excl_addr)));
+    ei(e, 0xEB000000u | ((u32)ha << 16) | (16u << 5) | 31);  /* cmp x16, ha */
+    be->at_f1 = bcond_fwd(e, 1);                 /* b.ne fail */
+    be->fl = FL_MEM;
+}
+
+static void emit_atomic_end(BE *be, const IROp *o) {
+    Emit *e = be->e;
+    sync_all(be);
+    invalidate_all(be);
+    if (o->imm) {                                /* CAS: Rs = old on both paths */
+        if (o->dst != VREG_ZERO) {               /* old is a temp (R27 spill) */
+            ei(e, enc_ldr(3, 16, 27, (unsigned)v_spill(o->a)));
+            ei(e, enc_str(3, 16, 28, (unsigned)v_home(be, o->dst)));
+        }
+        u8 *done = b_fwd(e);
+        fwd_here(e, be->at_f0);
+        if (o->dst != VREG_ZERO) {
+            ei(e, enc_ldr(3, 16, 27, (unsigned)v_spill(o->a)));
+            ei(e, enc_str(3, 16, 28, (unsigned)v_home(be, o->dst)));
+        }
+        fwd_here(e, done);
+        be->fl = FL_MEM;
+        return;
+    }
+    if (o->dst != VREG_ZERO)
+        ei(e, enc_str(3, 31, 28, (unsigned)v_home(be, o->dst)));   /* xzr: 0 */
+    u8 *done = b_fwd(e);
+    fwd_here(e, be->at_f0);
+    fwd_here(e, be->at_f1);
+    if (o->dst != VREG_ZERO) {
+        ei(e, enc_movz(1, 16, 1, 0));            /* x16 = 1 */
+        ei(e, enc_str(3, 16, 28, (unsigned)v_home(be, o->dst)));
+    }
+    fwd_here(e, done);
+    ei(e, enc_str(2, 31, 28, (unsigned)offsetof(CPU, excl_valid)));  /* wzr */
+    be->fl = FL_MEM;
+}
+
+/* -- guest threads running concurrently: a host-atomic op -- */
 static void cbnz_to(Emit *e, int w, unsigned rt, const u8 *target) {
     s64 off = target - e->rx;
     ei(e, ((u32)w << 31) | 0x35000000u |
@@ -1732,13 +1771,7 @@ static u32 enc_stlr(unsigned szl, unsigned rt, unsigned rn) {
 static u32 enc_eor(unsigned rd, unsigned rn, unsigned rm) {   /* 64-bit */
     return 0xCA000000u | (rm << 16) | (rn << 5) | rd;
 }
-#else
-/* ---- inline exclusives (IRO_ATOMIC / IRO_ATOMIC_END; decode.c
- * ldst_exclusive is the reference semantics; see backend_x86_64.c for the
- * bracket design) ---- */
-#endif
 
-#if ARM64_SMP
 #define OFF_EXCL_VALID ((unsigned)offsetof(CPU, excl_valid))
 #define OFF_EXCL_ADDR  ((unsigned)offsetof(CPU, excl_addr))
 #define OFF_EXCL_SIZE  ((unsigned)offsetof(CPU, excl_size))
@@ -1747,45 +1780,15 @@ static u32 enc_eor(unsigned rd, unsigned rn, unsigned rm) {   /* 64-bit */
 /* One IRO_ATOMIC (mirrors backend_x86_64.c). Fast path: align gate + probe
  * + ldaxr/stlxr sequence; result converges in x16. Slow path re-runs the
  * insn via jit_exec1 (self-counting; the fast path bumps icount inline). */
-#endif
-static void emit_atomic(BE *be, const IRBlock *ir, int i) {
+static void emit_atomic_smp(BE *be, const IRBlock *ir, int i) {
     Emit *e = be->e;
     const IROp *o = &ir->ops[i];
-#if ARM64_SMP
     unsigned kind = AT_KIND(o->aux), szl = AT_SZL(o->aux);
     unsigned sz = 1u << szl;
     int is_load_kind = (kind == AT_LDX || kind == AT_LDAR);
     int need = is_load_kind ? 1 : 2;
     int uses_b = !(kind == AT_LDX || kind == AT_LDAR);
-#else
-    materialize_flags(be);
-    sync_all(be);
-    if (o->imm) {                                /* CAS: value compare */
-        int ho = ra_use(be, o->a);               /* old (loaded from memory) */
-        int he = ra_use(be, o->b);               /* expected */
-        /* SUBS WZR/XZR, old, expected  (w selects 32/64-bit compare) */
-        ei(e, (o->w ? 0xEB00001Fu : 0x6B00001Fu) |
-              ((u32)he << 16) | ((u32)ho << 5));
-        be->at_f0 = bcond_fwd(e, 1);             /* b.ne fail */
-        be->at_f1 = NULL;
-        be->fl = FL_MEM;
-        return;
-    }
-    int ha = ra_use(be, o->a);                   /* base = monitor address */
-    /* Before the monitor is consulted: a monitor miss skips the stores, so
-     * putting the SP check on them would let a misaligned SP through. */
-    if (o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
-    ei(e, enc_ldr(2, 16, 28, (unsigned)offsetof(CPU, excl_valid)));
-    ei(e, 0x7100001Fu | (16u << 5));             /* cmp w16, #0 */
-    be->at_f0 = bcond_fwd(e, 0);                 /* b.eq fail */
-    ei(e, enc_ldr(3, 16, 28, (unsigned)offsetof(CPU, excl_addr)));
-    ei(e, 0xEB000000u | ((u32)ha << 16) | (16u << 5) | 31);  /* cmp x16, ha */
-    be->at_f1 = bcond_fwd(e, 1);                 /* b.ne fail */
-    be->fl = FL_MEM;
-}
-#endif
 
-#if ARM64_SMP
     materialize_flags(be);
     int hb = uses_b ? ra_use(be, o->b) : -1;
     int hs = (kind == AT_CAS) ? ra_use(be, o->cc) : -1;
@@ -1799,18 +1802,7 @@ static void emit_atomic(BE *be, const IRBlock *ir, int i) {
         if (sz > 1) {                             /* alignment gate */
             ei(e, enc_andi64(16, 1, 0, szl - 1)); /* and x16, x1, #sz-1 */
             slow1 = cbnz_fwd(e, 1, 16);
-#else
-static void emit_atomic_end(BE *be, const IROp *o) {
-    Emit *e = be->e;
-    sync_all(be);
-    invalidate_all(be);
-    if (o->imm) {                                /* CAS: Rs = old on both paths */
-        if (o->dst != VREG_ZERO) {               /* old is a temp (R27 spill) */
-            ei(e, enc_ldr(3, 16, 27, (unsigned)v_spill(o->a)));
-            ei(e, enc_str(3, 16, 28, (unsigned)v_home(o->dst)));
-#endif
         }
-#if ARM64_SMP
         ei(e, enc_andi64(16, 1, 52, 51));         /* page address (aligned: no cross) */
         ei(e, enc_ldr(3, 2, 27,                   /* | the tag's low bits */
                       (unsigned)offsetof(JitEnv, dtlb_ctxgen)));
@@ -1828,19 +1820,7 @@ static void emit_atomic_end(BE *be, const IROp *o) {
         ei(e, enc_andi64(2, 2, 52, 51));          /* host page: & ~0xfff */
         ei(e, enc_andi64(16, 1, 0, 11));          /* page offset */
         ei(e, enc_addr(17, 2, 16));               /* x17 = host ptr */
-#else
-        u8 *done = b_fwd(e);
-        fwd_here(e, be->at_f0);
-        if (o->dst != VREG_ZERO) {
-            ei(e, enc_ldr(3, 16, 27, (unsigned)v_spill(o->a)));
-            ei(e, enc_str(3, 16, 28, (unsigned)v_home(o->dst)));
-        }
-        fwd_here(e, done);
-        be->fl = FL_MEM;
-        return;
-#endif
     }
-#if ARM64_SMP
 
     u32 fix_fast = cache_off(be);
     icount_add(be, 1);                            /* retires from here (x16) */
@@ -1951,18 +1931,7 @@ static void emit_atomic_end(BE *be, const IROp *o) {
             fwd_here(e, out);
             break;
         }
-#else
-    if (o->dst != VREG_ZERO)
-        ei(e, enc_str(3, 31, 28, (unsigned)v_home(o->dst)));   /* xzr: 0 */
-    u8 *done = b_fwd(e);
-    fwd_here(e, be->at_f0);
-    fwd_here(e, be->at_f1);
-    if (o->dst != VREG_ZERO) {
-        ei(e, enc_movz(1, 16, 1, 0));            /* x16 = 1 */
-        ei(e, enc_str(3, 16, 28, (unsigned)v_home(o->dst)));
-#endif
     }
-#if !ARM64_SYSTEM
     u8 *done = b_fwd(e);
 
     /* ---- slow path: re-run the insn in the interpreter ---- */
@@ -1984,18 +1953,18 @@ static void emit_atomic_end(BE *be, const IROp *o) {
     slow_reload_clobbered(be);
     if (o->dst != VREG_ZERO)
         ld_home(be, 16, o->dst);
-#endif
     fwd_here(e, done);
-#if ARM64_SMP
 
     if (o->dst != VREG_ZERO) {
         int hd = ra_def(be, o->dst);
         ei(e, enc_mov(1, (unsigned)hd, 16));
     }
-#else
-    ei(e, enc_str(2, 31, 28, (unsigned)offsetof(CPU, excl_valid)));  /* wzr */
-#endif
     be->fl = FL_MEM;
+}
+
+static void emit_atomic(BE *be, const IRBlock *ir, int i) {
+    if (be->smp) emit_atomic_smp(be, ir, i);
+    else emit_atomic_up(be, ir, i);
 }
 
 static int emit_op(BE *be, const IRBlock *ir, int i);
@@ -2003,9 +1972,10 @@ static int emit_op(BE *be, const IRBlock *ir, int i);
 int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
     BE be;
     memset(&be, 0, sizeof be);
-#if ARM64_SYSTEM
-    g_sp_off = (s32)(offsetof(CPU, sp_el) + 8 * ((b->tag >> 2) & 3));
-#endif
+    be.sys = ir->sys;
+    be.smp = ir->smp;
+    be.spchk = ir->spchk;
+    be.sp_off = OFF_SP + 8 * ir->ctx_spx;
     be.e = e;
     be.env = env;
     be.b = b;
@@ -2024,25 +1994,24 @@ int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
      * on that path: a direct chain jump into this block bypassed the
      * predecessor's exit-stub pc write, so c->pc is stale on entry. */
     ei(e, enc_ldr(2, 16, 27, (unsigned)offsetof(JitEnv, interrupt)));
-    u8 *cold = cbnz_fwd(e, 0, 16);
-#if ARM64_SYSTEM
-    /* icount deadline: chained hot loops never return to the dispatcher, so
-     * the machine_tick/IRQ latency bound lives here (icount is committed by
-     * every exit stub before its patchable jump). */
-    ei(e, enc_ldr(3, 16, 28, (unsigned)OFF_ICOUNT));
-    ei(e, enc_ldr(3, 17, 27, (unsigned)offsetof(JitEnv, icount_deadline)));
-    ei(e, enc_cmp(16, 17));
-    u8 *cold2 = bcond_fwd(e, 2);                  /* b.hs (unsigned >=) */
-#endif
+    u8 *cold = cbnz_fwd(e, 0, 16), *cold2 = NULL;
+    if (be.sys) {
+        /* icount deadline: chained hot loops never return to the dispatcher,
+         * so a full system's machine_tick/IRQ latency bound lives here
+         * (icount is committed by every exit stub before its patchable
+         * jump). User mode has no devices to tick. */
+        ei(e, enc_ldr(3, 16, 28, (unsigned)OFF_ICOUNT));
+        ei(e, enc_ldr(3, 17, 27, (unsigned)offsetof(JitEnv, icount_deadline)));
+        ei(e, enc_cmp(16, 17));
+        cold2 = bcond_fwd(e, 2);                  /* b.hs (unsigned >=) */
+    }
 
     for (int i = 0; i < ir->n && !e->overflow; )
         i += emit_op(&be, ir, i);
 
     if (e->overflow) return -1;
     fwd_here(e, cold);
-#if ARM64_SYSTEM
-    fwd_here(e, cold2);
-#endif
+    if (cold2) fwd_here(e, cold2);
     emit_imm64(e, 16, b->pc);
     ei(e, enc_str(3, 16, 28, (unsigned)OFF_PC));
     exit_plain(&be, 0);
@@ -2398,22 +2367,22 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             ei(e, 0x91000000u |
                   (((u32)offsetof(JitEnv, jcache) & 0xfff) << 10) |
                   (16u << 5) | 16);
-#if ARM64_SYSTEM
-            /* x17 = key = (pc << 3) | env->ctx (must match jit_tag) */
-            ei(e, enc_ldr(3, 17, 27, (unsigned)offsetof(JitEnv, ctx)));
-            /* orr x17, x17, ha, lsl #3 (shifted-reg) */
-            ei(e, 0xAA000000u | ((u32)ha << 16) | (3u << 10) | (17u << 5) | 17);
-            /* ldr ha, [x16] — entry.tag; ha is dead now (pc stored above) */
-            ei(e, enc_ldr(3, (unsigned)ha, 16, 0));
-#else
-            ei(e, enc_ldstp64(1, 0, 17, 16, 16, 0));   /* ldp x17,x16,[x16] */
-#endif
+            if (be->sys) {
+                /* x17 = key = (pc << 3) | env->ctx (must match jit_tag) */
+                ei(e, enc_ldr(3, 17, 27, (unsigned)offsetof(JitEnv, ctx)));
+                /* orr x17, x17, ha, lsl #3 (shifted-reg) */
+                ei(e, 0xAA000000u | ((u32)ha << 16) | (3u << 10) | (17u << 5) | 17);
+                /* ldr ha, [x16] — entry.tag; ha is dead now (pc stored above) */
+                ei(e, enc_ldr(3, (unsigned)ha, 16, 0));
+            } else {
+                /* user mode: the key is the pc; x17 = entry.pc, x16 = .code */
+                ei(e, enc_ldstp64(1, 0, 17, 16, 16, 0));   /* ldp x17,x16,[x16] */
+            }
             /* cmp x17, ha : SUBS xzr */
             ei(e, 0xEB000000u | ((u32)ha << 16) | (17u << 5) | 31);
             u8 *miss = bcond_fwd(e, 1);           /* b.ne miss */
-#if ARM64_SYSTEM
-            ei(e, enc_ldr(3, 16, 16, 8));         /* x16 = entry.code */
-#endif
+            if (be->sys)
+                ei(e, enc_ldr(3, 16, 16, 8));     /* x16 = entry.code */
             ei(e, enc_br(16));
             fwd_here(e, miss);
             ei(e, enc_movn(0, 0, 0, 0));
@@ -2432,11 +2401,9 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
         case IRO_ATOMIC:
             emit_atomic(be, ir, i);
             break;
-#if !ARM64_SMP
         case IRO_ATOMIC_END:
             emit_atomic_end(be, o);
             break;
-#endif
         case IRO_VOP:
             emit_vop(be, o);
             break;
@@ -2447,20 +2414,12 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
         case IRO_CPULD: {                        /* dst = *(CPU+imm); arm64emu's
                                                   * w=0 form: u32 zero-extended */
             int hd = ra_def(be, o->dst);
-#if ARM64_SYSTEM
             ei(e, enc_ldr(o->w ? 3 : 2, (unsigned)hd, 28, (unsigned)o->imm));
-#else
-            ei(e, enc_ldr(3, (unsigned)hd, 28, (unsigned)o->imm));
-#endif
             break;
         }
         case IRO_CPUST: {
             int ha = ra_use(be, o->a);
-#if ARM64_SYSTEM
             ei(e, enc_str(o->w ? 3 : 2, (unsigned)ha, 28, (unsigned)o->imm));
-#else
-            ei(e, enc_str(3, (unsigned)ha, 28, (unsigned)o->imm));
-#endif
             break;
         }
         case IRO_FENCE:

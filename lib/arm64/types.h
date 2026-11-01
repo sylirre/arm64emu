@@ -4,17 +4,14 @@
 #ifndef A64_TYPES_H
 #define A64_TYPES_H
 
-/* How the program compiling this library builds it (ARM64_SYSTEM, ...): each
- * program has its own arm64_config.h in its source tree. Included first, by
- * the header every other one includes, so all of the library and of the
- * program see one configuration. */
+/* How the program compiling this library builds it (the prefix of the
+ * environment knobs it reads, ...): each program has its own arm64_config.h
+ * in its source tree. Included first, by the header every other one
+ * includes, so all of the library and of the program see one configuration.
+ * What the CPU emulates -- a full system or user mode, one CPU or guest
+ * threads running concurrently -- is not part of it: that is the CPU's mode,
+ * set at run time (cpu.h, CpuEngine). */
 #include "arm64_config.h"
-#ifndef ARM64_SYSTEM
-#error "arm64_config.h must define ARM64_SYSTEM (1: full system, 0: user mode)"
-#endif
-#ifndef ARM64_SMP
-#error "arm64_config.h must define ARM64_SMP (1: guest threads run concurrently)"
-#endif
 
 #include <stdint.h>
 #include <stdbool.h>

@@ -18,8 +18,9 @@ bool mmu_translate(CPU *c, u64 va, AccType acc, u64 *pa_out);
  * translations to drop. */
 bool mmu_probe_pa(CPU *c, u64 va, u64 *pa_out);
 
-/* The CPU's translation caches (cpu.h's CpuEngine), which mmu_cpu_init sets
- * up for it -- machine_init calls it once; cpu_reset keeps them.
+/* The CPU's mode (a full system, one CPU) and translation caches (cpu.h's
+ * CpuEngine), which mmu_cpu_init sets up for it -- machine_init calls it
+ * once, before the first cpu_reset; cpu_reset keeps them.
  *
  * The D-TLB holds RAM pages only: flash (CFI command state) and MMIO (side
  * effects) are never inserted, so they always take the bus path. Its tags

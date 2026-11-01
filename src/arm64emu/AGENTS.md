@@ -38,7 +38,9 @@ Makefile                  (repository root) `make arm64emu` -> build/arm64emu;
 lib/arm64/                shared with arm64chroot (compiled into both):
   types.h                 u8..u64 / bool / small helpers; includes the
                           program's arm64_config.h first
-  cpu.h                   CPU state struct, PSTATE bits, core interpreter API
+  cpu.h                   CPU state struct, PSTATE bits, core interpreter API;
+                          the CPU's mode (c->eng.sys/smp: a full system or
+                          user mode, one CPU or concurrent guest threads)
   mem.h                   guest memory as the core reaches it: typed accesses,
                           fetch and mem_host_ptr, inline over the CPU's
                           translation caches (c->eng: the D-TLB, whose entry
@@ -48,15 +50,15 @@ lib/arm64/                shared with arm64chroot (compiled into both):
                           arm64emu has PSCI)
   sysreg.c                system-register file: MSR/MRS/SYS/MSR-immediate, ID
                           registers (what features the guest kernel probes),
-                          generic-timer registers, DC ZVA, TLBI, AT (the
-                          EL1-only ones under ARM64_SYSTEM), CPACR FP trap
+                          generic-timer registers, DC ZVA, TLBI, AT, CPACR FP
+                          trap; each mode's reset configuration (sysreg_init)
   decode.c                A64 decoder/executor, part 1 — DP-immediate,
                           DP-register, branches/exceptions/system, the whole
                           load/store family, exclusives, LSE atomics,
                           FEAT_MOPS, CRC32, AdvSIMD load/store.
                           exec_a64() is the top-level dispatch and the
                           correctness reference for all three engines.
-                          ARM64_SYSTEM/ARM64_SMP pick each program's variants
+                          The CPU's mode picks the atomics' algorithm
   predecode.h             PDEnt: dense opcode id + pre-extracted operands
   predecode.c             the pre-decode classifier (mirrors decode.c; anything
                           uncertain stays PD_GENERIC -> exec_a64), the
@@ -78,9 +80,8 @@ src/arm64emu/
   main.c                  entry point: CLI parsing, --help text (the option and
                           env-var reference), image loading, the run loop,
                           signal-flush of diagnostics, ARM64EMU_* debug env vars
-  arm64_config.h          how lib/arm64 is built here: ARM64_SYSTEM 1 (full
-                          system), ARM64_SMP 0 (one in-order CPU), and the
-                          -DANDROID_JNI exit -> _exit shadow
+  arm64_config.h          how lib/arm64 is built here: the ARM64EMU_JIT_ knob
+                          prefix, and the -DANDROID_JNI exit -> _exit shadow
   cpu.c                   reset, cpu_step (fetch/decode/execute driver),
                           condition codes, cpu_dump, and the diagnostics:
                           SVC syscall trace, musl-heap tracker (ARM64EMU_HEAP),

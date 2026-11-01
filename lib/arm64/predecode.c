@@ -178,12 +178,11 @@ static void fill_branch(PDEnt *e, u32 insn) {
     if (BITS(31, 24) == 0xd5) {                      /* hints: NOP and friends */
         unsigned L = BIT(21), op0 = BITS(20, 19), op1 = BITS(18, 16);
         unsigned CRn = BITS(15, 12), CRm = BITS(11, 8), op2 = BITS(7, 5), Rt = BITS(4, 0);
-        /* WFE/WFI stay GENERIC. In arm64emu so do SEV/SEVL, which set the
-         * event register a WFE consumes: as NOPs they left a SEVL; WFE pair to
-         * wait there where the reference interpreter runs straight through.
-         * arm64chroot's decode.c has no event register (SEV is a no-op). */
+        /* WFE/WFI stay GENERIC, and so do SEV/SEVL, which set the event
+         * register a WFE consumes: as NOPs they left a SEVL; WFE pair to wait
+         * there where the reference interpreter runs straight through. */
         if (L == 0 && op0 == 0 && op1 == 3 && CRn == 2 && Rt == 31 &&
-            !(CRm == 0 && op2 >= 2 && op2 <= (ARM64_SYSTEM ? 5 : 3)))
+            !(CRm == 0 && op2 >= 2 && op2 <= 5))
             e->op = PD_NOP;
         return;
     }
@@ -288,20 +287,13 @@ static void fill_ldst(PDEnt *e, u32 insn) {
         {                                            /* imm9 addressing modes */
             unsigned mode = BITS(11, 10);
             u64 imm9 = (u64)(s64)sign_extend(BITS(20, 12), 9);
-#if ARM64_SYSTEM
             if (mode == 2) return;                   /* LDTR/STTR: unprivileged EL0-
                                                       * view access (or UNDEF for the
                                                       * V forms) -> GENERIC, decode.c
-                                                      * has the semantics */
+                                                      * has the semantics; rare at
+                                                      * EL0, where they are LDUR/STUR */
             if (mode == 0) {                         /* LDUR/STUR: plain */
                 if (V) {
-#else
-            if (mode == 0 || mode == 2) {            /* LDUR/STUR (+unpriv): plain */
-                /* coverage: at EL0, where arm64chroot's guest always is, the
-                 * integer LDTR/STTR are exactly LDUR/STUR. */
-                if (V) {
-                    if (mode == 2) return;           /* no SIMD&FP unpriv form: UNDEF */
-#endif
                     if (opc & 2) {
                         if (size != 0) return;
                         e->op = (opc & 1) ? PD_LDRQ : PD_STRQ;

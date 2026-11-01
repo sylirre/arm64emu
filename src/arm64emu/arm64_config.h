@@ -6,16 +6,6 @@
 #ifndef ARM64EMU_ARM64_CONFIG_H
 #define ARM64EMU_ARM64_CONFIG_H
 
-/* A full system: the guest runs at EL1 as well as EL0, behind the stage-1 MMU,
- * with its own exception vectors, TLB and address-translation maintenance,
- * and CPACR_EL1 traps. */
-#define ARM64_SYSTEM 1
-
-/* One CPU, executed by one host thread in program order: an LSE atomic or a
- * store-exclusive is an ordinary read-modify-write, and a barrier orders
- * nothing that is not already ordered. */
-#define ARM64_SMP 0
-
 /* The environment knobs of the shared code carry this program's prefix:
  * getenv(ARM64_JIT_ENV("PDMAX")) reads ARM64EMU_JIT_PDMAX. */
 #define ARM64_JIT_ENV(name) "ARM64EMU_JIT_" name

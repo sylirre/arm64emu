@@ -2,11 +2,13 @@
 /* Copyright 2026 Sylirre */
 /* A64 instruction decoder/executor — integer/branch/load-store (M1).
  * FP/SIMD lives in exec_fpsimd.c (M4). System regs in sysreg.c (M2).
- * Shared by both emulators; what differs between them is selected by the
- * program's arm64_config.h: ARM64_SYSTEM (the EL1-only checks and traps,
- * which fold away in user mode) and ARM64_SMP (host-atomic LSE, exclusives,
- * LDAR/STLR and barriers where guest threads run concurrently). Guest memory
- * is reached through mem.h, whose slow paths the program defines. */
+ * One decoder for both of the CPU's modes (cpu.h, CpuEngine.sys/smp). The
+ * EL1-only checks and traps are the architecture's own, decided by the EL and
+ * the EL1 configuration, so in user mode, where the guest stays at EL0 under
+ * the configuration sysreg_init gives it, they decide what Linux's would;
+ * where guest threads run concurrently (smp) the LSE atomics, exclusives,
+ * LDAR/STLR and barriers are host-atomic ones. Guest memory is reached
+ * through mem.h, whose slow paths the program defines. */
 #include "cpu.h"
 #include <string.h>
 #include "mem.h"
@@ -17,7 +19,6 @@
 /* FP/SIMD group hook (M4), implemented in exec_fpsimd.c. */
 void exec_fpsimd(CPU *c, u32 insn);
 
-#if ARM64_SYSTEM
 /* SCTLR_EL1.nTWI/nTWE: 0 traps an EL0 WFI/WFE that would wait. */
 #define SCTLR_nTWI (1ULL << 16)
 #define SCTLR_nTWE (1ULL << 18)
@@ -27,7 +28,6 @@ void exec_fpsimd(CPU *c, u32 insn);
 __attribute__((cold)) static void wfx_trap(CPU *c, unsigned ti) {
     cpu_raise_sync(c, esr_make(EC_WFx, (1u << 24) | (0xEu << 20) | ti), 0);
 }
-#endif
 
 __attribute__((cold)) static void undefined(CPU *c, u32 insn) {
     /* Architecturally an UNDEFINED instruction takes a synchronous exception
@@ -38,53 +38,54 @@ __attribute__((cold)) static void undefined(CPU *c, u32 insn) {
     cpu_raise_sync(c, esr_make(EC_UNKNOWN, 0), 0);
 }
 
-#if ARM64_SYSTEM
 /* CPACR_EL1.FPEN guard, one call per FP/SIMD dispatch point (data-processing
  * and every vector load/store family). Raises the EC 0x07 access trap and
  * returns false when the current EL's FP access is trapped. It runs before
  * the fine-grained decode, so an unallocated FP-space encoding traps 0x07
  * rather than UNDEF while trapping is active — unobservable for real guests
- * (trapping is off out of reset). */
+ * (trapping is off out of reset, and in user mode for good: the FPEN Linux
+ * gives a process, sysreg_init). */
 static inline bool fp_access_ok(CPU *c) {
     if (__builtin_expect(!c->fp_trapped, 1)) return true;
     cpu_fp_trap(c);
     return false;
 }
-#else
-/* User mode: the guest runs at EL0 under the FPEN Linux gives a process (see
- * sysreg_init), so its FP/SIMD accesses never trap. */
-static inline bool fp_access_ok(CPU *c) { (void)c; return true; }
-#endif
 
 /* The unprivileged loads and stores (LDTR/STTR, SETxT, CPYxRT/WT) at EL1
- * access memory with EL0's permissions: c->ldst_unpriv, which arm64emu's MMU
- * reads, is set across each such access, and the D-TLB tag context follows
- * it (cpu_refresh_dtlb_ctx). At EL0 they are the plain forms, and
- * arm64chroot's guest is always at EL0, so there both fold away. */
-#if ARM64_SYSTEM
+ * access memory with EL0's permissions: c->ldst_unpriv, which a full
+ * system's MMU reads, is set across each such access, and the D-TLB tag
+ * context follows it (cpu_refresh_dtlb_ctx). At EL0, where a user-mode
+ * guest always is, they are the plain forms. Every load and store brackets
+ * its access so; nearly always the flag is already what it needs, and then
+ * the bracket is a compare. */
 #define unpriv_at_el1(c, t)   ((t) && (c)->el == 1)
-#define set_ldst_unpriv(c, v) ((c)->ldst_unpriv = (v), cpu_refresh_dtlb_ctx(c))
-#else
-#define unpriv_at_el1(c, t)   ((void)(c), (void)(t), false)
-#define set_ldst_unpriv(c, v) ((void)(c), (void)(v))
-#endif
+static inline void set_ldst_unpriv(CPU *c, bool v) {
+    if (UNLIKELY(c->ldst_unpriv != v)) {
+        c->ldst_unpriv = v;
+        cpu_refresh_dtlb_ctx(c);
+    }
+}
 
 /* ---------- arithmetic helpers ---------- */
 
-/* add_with_carry has two shapes, one per program. arm64emu's computes NZCV
- * unconditionally, with __int128 for the 64-bit carry and overflow, and throws
- * it away when `flags` is NULL, the common non-S case (plain ADD/SUB). That is
- * deliberate, and it was measured (2026-08-04): `flags` is a runtime value at
- * every call site -- `S ? &fl : NULL` -- so neither compiler sinks the math
- * into the store, but hoisting it into an explicit `if (flags)` (arm64chroot's
- * shape) makes arm64emu's default gcc build SLOWER: on a 300M-instruction
- * interpreted ADD loop, 8.27s -> 9.07s with gcc-13, against 6.91s -> 6.54s with
- * clang. Whole-boot timings could not resolve either direction above the
- * noise. arm64chroot keeps the hoisted shape, which also does without __int128
- * for its 32-bit hosts. Static instruction counts predict the opposite of all
- * of this and should not be trusted here. Re-measure both compilers, in both
- * programs, before changing either shape. */
-#if ARM64_SYSTEM
+/* add_with_carry has two shapes, chosen by the compiler. The first computes
+ * NZCV unconditionally, with __int128 for the 64-bit carry and overflow, and
+ * throws it away when `flags` is NULL, the common non-S case (plain ADD/SUB);
+ * the second hoists the math into an explicit `if (flags)` and does without
+ * __int128. `flags` is a runtime value at every call site -- `S ? &fl : NULL`
+ * -- so neither compiler sinks the math into the store, and they disagree on
+ * which shape is faster: on a 300M-instruction interpreted ADD loop
+ * (2026-08-04) the hoisted shape is SLOWER with gcc-13, 8.27s -> 9.07s, and
+ * faster with clang, 6.91s -> 6.54s. Whole-boot timings could not resolve
+ * either direction above the noise, and neither could, re-measured with gcc
+ * when the choice stopped being per program (2026-11-01), a 300M-instruction
+ * boot or the user-mode bench kernels, interpreted: repeated interleaved
+ * runs came out either way. So gcc takes the first shape, and clang, and any
+ * host without __int128 (the 32-bit ones), the second. Static and dynamic
+ * instruction counts (the second shape runs ~3-4% fewer) predict the
+ * opposite and should not be trusted here. Re-measure both compilers, in both
+ * modes, before changing the choice. */
+#if defined(__SIZEOF_INT128__) && !defined(__clang__)
 static u64 add_with_carry(u64 x, u64 y, int cin, bool is64, u32 *flags) {
     u64 res;
     u32 N, Z, C, V;
@@ -646,189 +647,34 @@ static bool vreg_store(CPU *c, unsigned Vt, u64 va, unsigned bytes) {
     return mem_write(c, va, bytes, c->v[Vt].d[0]);
 }
 
-/* Two implementations: host atomics where guest threads run concurrently
- * (ARM64_SMP, arm64chroot), plain read-modify-writes on one CPU (arm64emu). */
-#if ARM64_SMP
-/* ============ ARMv8.1-A LSE atomics (contiguous addition) ============
- * Atomic memory operations (LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/
- * LDUMIN and SWP) plus Compare-and-Swap (CAS/CASP). Modern glibc selects these
- * via HWCAP_ATOMICS; -march=armv8.1-a+ code uses them unconditionally.
- * Implemented with host __atomic builtins on the translated host pointer, so
- * they are correct under real guest threads (M6) as well as single-threaded.
- * A (bit23/bit22 for exclusives) = acquire, R = release. */
+/* The atomics' and exclusives' implementations stay out of line: inlined
+ * into exec_a64 they took the inliner's budget from the plain loads and
+ * stores (ldst_register, ldst_pair), which are far more frequent, and next to
+ * an atomic access a call costs little. */
+#define NOINL __attribute__((noinline))
 
-/* Map the acquire/release bits to a C memory order. */
-static int lse_order(bool acq, bool rel) {
-    if (acq && rel) return __ATOMIC_ACQ_REL;
-    if (acq) return __ATOMIC_ACQUIRE;
-    if (rel) return __ATOMIC_RELEASE;
-    return __ATOMIC_RELAXED;
-}
-
-/* Raise an alignment fault (unaligned atomic) as a data abort -> SIGBUS. */
-static void atomic_align_fault(CPU *c, u64 va, bool write) {
-    cpu_raise_sync(c, esr_make(EC_DABORT_LOWER, iss_dabort(write, FSC_ALIGN)), va);
-}
-static void atomic_trans_fault(CPU *c, u64 va, bool write) {
-    cpu_raise_sync(c, esr_make(EC_DABORT_LOWER, iss_dabort(write, FSC_TRANS_L3)), va);
-}
-
-/* Perform one LD<op>/SWP on a `bytes`-wide host location. Returns the old value
- * (zero-extended). opc/o3 select the operation. */
-#define LSE_RMW(TY, STY)                                                        \
-    do {                                                                        \
-        TY *pp = (TY *)hp;                                                       \
-        TY exp = __atomic_load_n(pp, __ATOMIC_RELAXED), des;                     \
-        TY opnd = (TY)operand;                                                   \
-        if (o3 && opc == 0) { old = __atomic_exchange_n(pp, opnd, mo); break; }  \
-        do {                                                                     \
-            TY o = exp;                                                          \
-            switch (opc) {                                                       \
-                case 0: des = o + opnd; break;                 /* LDADD */       \
-                case 1: des = o & (TY)~opnd; break;            /* LDCLR */       \
-                case 2: des = o ^ opnd; break;                 /* LDEOR */       \
-                case 3: des = o | opnd; break;                 /* LDSET */       \
-                case 4: des = ((STY)o > (STY)opnd) ? o : opnd; break; /* LDSMAX */ \
-                case 5: des = ((STY)o < (STY)opnd) ? o : opnd; break; /* LDSMIN */ \
-                case 6: des = (o > opnd) ? o : opnd; break;    /* LDUMAX */      \
-                default: des = (o < opnd) ? o : opnd; break;   /* LDUMIN */      \
-            }                                                                    \
-        } while (!__atomic_compare_exchange_n(pp, &exp, des, true, mo,           \
-                                              __ATOMIC_RELAXED));                \
-        old = exp;                                                               \
-    } while (0)
-
-static void ldst_atomic(CPU *c, u32 insn) {
-    unsigned size = BITS(31, 30);
-    bool A = BIT(23), R = BIT(22);
-    unsigned Rs = BITS(20, 16), o3 = BIT(15), opc = BITS(14, 12);
-    unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
-    unsigned bytes = 1u << size;
-
-    /* o3==1 is SWP (opc==0) or LDAPR (opc==4); other opc are LD<op>. */
-    if (o3 && opc != 0) {
-        if (opc == 4) {                          /* LDAPR: load-acquire RCpc */
-            u64 v;
-            if (!mem_read(c, reg_xsp(c, Rn), bytes, &v)) return;
-            set_x(c, Rt, v);
-            return;
-        }
-        undefined(c, insn);
-        return;
-    }
-
-    u64 va = reg_xsp(c, Rn);
-    u64 operand = reg_x(c, Rs);
-    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
-    void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
-    if (!hp) {
-        /* Distinguish permission vs unmapped for the right siginfo. */
-        void *rp = mem_host_ptr(c, va, bytes, ACC_READ);
-        if (rp) atomic_align_fault(c, va, true);  /* mapped RO: perm -> treat as abort */
-        else atomic_trans_fault(c, va, true);
-        return;
-    }
-
-    int mo = lse_order(A, R);
-    u64 old = 0;
-    switch (bytes) {
-        case 1: LSE_RMW(u8, s8); break;
-        case 2: LSE_RMW(u16, s16); break;
-        case 4: LSE_RMW(u32, s32); break;
-        default: LSE_RMW(u64, s64); break;
-    }
-    set_x(c, Rt, old);   /* ST<op> forms use Rt==31 and discard */
-}
-
-/* CAS/CASA/CASL/CASAL: compare Rs, swap Rt, return old in Rs. */
-static void ldst_cas(CPU *c, u32 insn) {
-    unsigned size = BITS(31, 30);
-    bool A = BIT(22), R = BIT(15);
-    unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
-    unsigned bytes = 1u << size;
-    u64 va = reg_xsp(c, Rn);
-    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
-    void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
-    if (!hp) { atomic_trans_fault(c, va, true); return; }
-    int mo = lse_order(A, R);
-    /* Strong CAS: a spurious failure would leave the compare register equal to
-     * the expected value, which the guest reads as success while memory was not
-     * updated — a lost store that breaks every CAS-based lock. */
-    u64 cmp = reg_x(c, Rs), newv = reg_x(c, Rt), old;
-    switch (bytes) {
-        case 1: { u8  e = (u8)cmp;  __atomic_compare_exchange_n((u8 *)hp,  &e, (u8)newv,  false, mo, __ATOMIC_RELAXED); old = e; break; }
-        case 2: { u16 e = (u16)cmp; __atomic_compare_exchange_n((u16 *)hp, &e, (u16)newv, false, mo, __ATOMIC_RELAXED); old = e; break; }
-        case 4: { u32 e = (u32)cmp; __atomic_compare_exchange_n((u32 *)hp, &e, (u32)newv, false, mo, __ATOMIC_RELAXED); old = e; break; }
-        default:{ u64 e = cmp;      __atomic_compare_exchange_n((u64 *)hp, &e, newv,      false, mo, __ATOMIC_RELAXED); old = e; break; }
-    }
-    set_x(c, Rs, old);
-}
-
-/* CASP/CASPA/CASPL/CASPAL: 2-register compare-and-swap (Rs:Rs+1 vs Rt:Rt+1).
- * sz bit30: 0=two 32-bit words (8-byte total), 1=two 64-bit (16-byte). */
-static void ldst_casp(CPU *c, u32 insn) {
-    bool sz = BIT(30);
-    bool A = BIT(22), R = BIT(15);
-    unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
-    unsigned bytes = sz ? 16 : 8;
-    u64 va = reg_xsp(c, Rn);
-    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
-    void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
-    if (!hp) { atomic_trans_fault(c, va, true); return; }
-    int mo = lse_order(A, R);
-    if (!sz) {                                   /* pair of 32-bit -> one u64 */
-        u64 cmp = (reg_x(c, Rs) & 0xffffffff) | (reg_x(c, Rs + 1) << 32);
-        u64 newv = (reg_x(c, Rt) & 0xffffffff) | (reg_x(c, Rt + 1) << 32);
-        u64 e = cmp;
-        __atomic_compare_exchange_n((u64 *)hp, &e, newv, false, mo, __ATOMIC_RELAXED);
-        set_x(c, Rs, (u32)e);
-        set_x(c, Rs + 1, (u32)(e >> 32));
-    } else {                                      /* pair of 64-bit -> u128 */
-#ifdef __SIZEOF_INT128__
-        unsigned __int128 cmp = (unsigned __int128)reg_x(c, Rs) |
-                                ((unsigned __int128)reg_x(c, Rs + 1) << 64);
-        unsigned __int128 newv = (unsigned __int128)reg_x(c, Rt) |
-                                 ((unsigned __int128)reg_x(c, Rt + 1) << 64);
-        unsigned __int128 e = cmp;
-        __atomic_compare_exchange_n((unsigned __int128 *)hp, &e, newv, false, mo,
-                                    __ATOMIC_RELAXED);
-        set_x(c, Rs, (u64)e);
-        set_x(c, Rs + 1, (u64)(e >> 64));
-#else
-        /* 32-bit hosts lack lock-free 128-bit CAS: serialize on a global mutex.
-         * Correct (single interpreter thread per lock) at the cost of speed. */
-        extern void casp16_mutex_lock(void);
-        extern void casp16_mutex_unlock(void);
-        casp16_mutex_lock();
-        u64 lo, hi;
-        bool ok1 = mem_read(c, va, 8, &lo), ok2 = mem_read(c, va + 8, 8, &hi);
-        if (ok1 && ok2) {
-            if (lo == reg_x(c, Rs) && hi == reg_x(c, Rs + 1)) {
-                mem_write(c, va, 8, reg_x(c, Rt));
-                mem_write(c, va + 8, 8, reg_x(c, Rt + 1));
-            }
-            set_x(c, Rs, lo);
-            set_x(c, Rs + 1, hi);
-        }
-        casp16_mutex_unlock();
-#endif
-    }
-}
-#else
 /* ============ ARMv8.1-A LSE atomics ============
  * Atomic memory operations (LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/
  * LDUMIN and SWP) plus Compare-and-Swap (CAS/CASP) and LDAPR. Modern glibc
  * selects these via HWCAP_ATOMICS; -march=armv8.1-a+ code uses them
- * unconditionally. The ARM64_SMP host-__atomic implementation above,
- * simplified for a single in-order CPU: a plain read-modify-
- * write through the MMU is architecturally atomic here, and the A/R
- * acquire/release bits need no fences. A fault from either access aborts
- * the whole instruction with no register update (mem_read/mem_write raise
- * the data abort). Alignment is not checked, matching the exclusives below;
- * the compare-fail path of CAS skips the architectural write-permission
- * check (documented laxity, same family as TODO_OPCODES §5). */
+ * unconditionally. Two implementations, by the CPU's mode: plain
+ * read-modify-writes on one CPU, host atomics where guest threads run
+ * concurrently (CpuEngine.smp). */
 
-static void ldst_atomic(CPU *c, u32 insn) {
+/* ---- one CPU ----
+ * A plain read-modify-write through mem_read/mem_write is architecturally
+ * atomic on a single in-order CPU, and the A/R acquire/release bits need no
+ * fences. A fault from either access aborts the whole instruction with no
+ * register update (mem_read/mem_write raise the data abort). Alignment is not
+ * checked, matching the exclusives below; the compare-fail path of CAS skips
+ * the architectural write-permission check (documented laxity, same family
+ * as TODO_OPCODES §5). These are also the concurrent forms' way through
+ * memory with no host pointer to operate on (mem_host_ptr): the access then
+ * faults where the architecture does -- CAS `strict`, writing the old value
+ * back when the comparison fails, since the architecture translates a CAS as
+ * a write whatever it compares. */
+
+static NOINL void ldst_atomic_up(CPU *c, u32 insn) {
     unsigned size = BITS(31, 30);
     unsigned Rs = BITS(20, 16), o3 = BIT(15), opc = BITS(14, 12);
     unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
@@ -869,7 +715,7 @@ static void ldst_atomic(CPU *c, u32 insn) {
 }
 
 /* CAS/CASA/CASL/CASAL: compare Rs, swap Rt, return old in Rs. */
-static void ldst_cas(CPU *c, u32 insn) {
+static NOINL void ldst_cas_up(CPU *c, u32 insn, bool strict) {
     unsigned size = BITS(31, 30);
     unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
     unsigned bytes = 1u << size;
@@ -878,6 +724,8 @@ static void ldst_cas(CPU *c, u32 insn) {
     if (!mem_read(c, va, bytes, &old)) return;
     if (old == (reg_x(c, Rs) & emask)) {
         if (!mem_write(c, va, bytes, reg_x(c, Rt) & emask)) return;
+    } else if (strict) {
+        if (!mem_write(c, va, bytes, old)) return;
     }
     set_x(c, Rs, old);
 }
@@ -886,7 +734,7 @@ static void ldst_cas(CPU *c, u32 insn) {
  * sz bit30: 0=two 32-bit words (8-byte total), 1=two 64-bit (16-byte). The
  * pair is naturally aligned, so it never crosses a page: once the first
  * write succeeds the second cannot fault. */
-static void ldst_casp(CPU *c, u32 insn) {
+static NOINL void ldst_casp_up(CPU *c, u32 insn, bool strict) {
     bool sz = BIT(30);
     unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
     unsigned bytes = sz ? 8 : 4;
@@ -897,35 +745,198 @@ static void ldst_casp(CPU *c, u32 insn) {
     if (lo == (reg_x(c, Rs) & emask) && hi == (reg_x(c, Rs + 1) & emask)) {
         if (!mem_write(c, va, bytes, reg_x(c, Rt) & emask)) return;
         if (!mem_write(c, va + bytes, bytes, reg_x(c, Rt + 1) & emask)) return;
+    } else if (strict) {
+        if (!mem_write(c, va, bytes, lo)) return;
+        if (!mem_write(c, va + bytes, bytes, hi)) return;
     }
     set_x(c, Rs, lo);
     set_x(c, Rs + 1, hi);
 }
+
+/* ---- guest threads running concurrently ----
+ * Host __atomic builtins on the translated host pointer, so they are correct
+ * under real guest threads (M6) as well as single-threaded. A (bit23/bit22
+ * for exclusives) = acquire, R = release. */
+
+/* Map the acquire/release bits to a C memory order. */
+static int lse_order(bool acq, bool rel) {
+    if (acq && rel) return __ATOMIC_ACQ_REL;
+    if (acq) return __ATOMIC_ACQUIRE;
+    if (rel) return __ATOMIC_RELEASE;
+    return __ATOMIC_RELAXED;
+}
+
+/* Raise an alignment fault (unaligned atomic) as a data abort -> SIGBUS. */
+static void atomic_align_fault(CPU *c, u64 va, bool write) {
+    cpu_raise_sync(c, esr_make(c->el ? EC_DABORT_SAME : EC_DABORT_LOWER,
+                               iss_dabort(write, FSC_ALIGN)), va);
+}
+
+/* Perform one LD<op>/SWP on a `bytes`-wide host location. Returns the old value
+ * (zero-extended). opc/o3 select the operation. */
+#define LSE_RMW(TY, STY)                                                        \
+    do {                                                                        \
+        TY *pp = (TY *)hp;                                                       \
+        TY exp = __atomic_load_n(pp, __ATOMIC_RELAXED), des;                     \
+        TY opnd = (TY)operand;                                                   \
+        if (o3 && opc == 0) { old = __atomic_exchange_n(pp, opnd, mo); break; }  \
+        do {                                                                     \
+            TY o = exp;                                                          \
+            switch (opc) {                                                       \
+                case 0: des = o + opnd; break;                 /* LDADD */       \
+                case 1: des = o & (TY)~opnd; break;            /* LDCLR */       \
+                case 2: des = o ^ opnd; break;                 /* LDEOR */       \
+                case 3: des = o | opnd; break;                 /* LDSET */       \
+                case 4: des = ((STY)o > (STY)opnd) ? o : opnd; break; /* LDSMAX */ \
+                case 5: des = ((STY)o < (STY)opnd) ? o : opnd; break; /* LDSMIN */ \
+                case 6: des = (o > opnd) ? o : opnd; break;    /* LDUMAX */      \
+                default: des = (o < opnd) ? o : opnd; break;   /* LDUMIN */      \
+            }                                                                    \
+        } while (!__atomic_compare_exchange_n(pp, &exp, des, true, mo,           \
+                                              __ATOMIC_RELAXED));                \
+        old = exp;                                                               \
+    } while (0)
+
+static NOINL void ldst_atomic_smp(CPU *c, u32 insn) {
+    unsigned size = BITS(31, 30);
+    bool A = BIT(23), R = BIT(22);
+    unsigned Rs = BITS(20, 16), o3 = BIT(15), opc = BITS(14, 12);
+    unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
+    unsigned bytes = 1u << size;
+
+    /* o3==1 is SWP (opc==0) or LDAPR (opc==4); other opc are LD<op>. */
+    if (o3 && opc != 0) {
+        if (opc == 4) {                          /* LDAPR: load-acquire RCpc */
+            u64 v;
+            if (!mem_read(c, reg_xsp(c, Rn), bytes, &v)) return;
+            set_x(c, Rt, v);
+            return;
+        }
+        undefined(c, insn);
+        return;
+    }
+
+    u64 va = reg_xsp(c, Rn);
+    u64 operand = reg_x(c, Rs);
+    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
+    void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
+    if (!hp) { ldst_atomic_up(c, insn); return; }   /* faults as it should */
+
+    int mo = lse_order(A, R);
+    u64 old = 0;
+    switch (bytes) {
+        case 1: LSE_RMW(u8, s8); break;
+        case 2: LSE_RMW(u16, s16); break;
+        case 4: LSE_RMW(u32, s32); break;
+        default: LSE_RMW(u64, s64); break;
+    }
+    set_x(c, Rt, old);   /* ST<op> forms use Rt==31 and discard */
+}
+
+/* CAS/CASA/CASL/CASAL: compare Rs, swap Rt, return old in Rs. */
+static NOINL void ldst_cas_smp(CPU *c, u32 insn) {
+    unsigned size = BITS(31, 30);
+    bool A = BIT(22), R = BIT(15);
+    unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
+    unsigned bytes = 1u << size;
+    u64 va = reg_xsp(c, Rn);
+    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
+    void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
+    if (!hp) { ldst_cas_up(c, insn, true); return; }
+    int mo = lse_order(A, R);
+    /* Strong CAS: a spurious failure would leave the compare register equal to
+     * the expected value, which the guest reads as success while memory was not
+     * updated — a lost store that breaks every CAS-based lock. */
+    u64 cmp = reg_x(c, Rs), newv = reg_x(c, Rt), old;
+    switch (bytes) {
+        case 1: { u8  e = (u8)cmp;  __atomic_compare_exchange_n((u8 *)hp,  &e, (u8)newv,  false, mo, __ATOMIC_RELAXED); old = e; break; }
+        case 2: { u16 e = (u16)cmp; __atomic_compare_exchange_n((u16 *)hp, &e, (u16)newv, false, mo, __ATOMIC_RELAXED); old = e; break; }
+        case 4: { u32 e = (u32)cmp; __atomic_compare_exchange_n((u32 *)hp, &e, (u32)newv, false, mo, __ATOMIC_RELAXED); old = e; break; }
+        default:{ u64 e = cmp;      __atomic_compare_exchange_n((u64 *)hp, &e, newv,      false, mo, __ATOMIC_RELAXED); old = e; break; }
+    }
+    set_x(c, Rs, old);
+}
+
+/* CASP/CASPA/CASPL/CASPAL: 2-register compare-and-swap (Rs:Rs+1 vs Rt:Rt+1).
+ * sz bit30: 0=two 32-bit words (8-byte total), 1=two 64-bit (16-byte). */
+static NOINL void ldst_casp_smp(CPU *c, u32 insn) {
+    bool sz = BIT(30);
+    bool A = BIT(22), R = BIT(15);
+    unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
+    unsigned bytes = sz ? 16 : 8;
+    u64 va = reg_xsp(c, Rn);
+    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
+    void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
+    if (!hp) { ldst_casp_up(c, insn, true); return; }
+    int mo = lse_order(A, R);
+    if (!sz) {                                   /* pair of 32-bit -> one u64 */
+        u64 cmp = (reg_x(c, Rs) & 0xffffffff) | (reg_x(c, Rs + 1) << 32);
+        u64 newv = (reg_x(c, Rt) & 0xffffffff) | (reg_x(c, Rt + 1) << 32);
+        u64 e = cmp;
+        __atomic_compare_exchange_n((u64 *)hp, &e, newv, false, mo, __ATOMIC_RELAXED);
+        set_x(c, Rs, (u32)e);
+        set_x(c, Rs + 1, (u32)(e >> 32));
+    } else {                                      /* pair of 64-bit -> u128 */
+#ifdef __SIZEOF_INT128__
+        unsigned __int128 cmp = (unsigned __int128)reg_x(c, Rs) |
+                                ((unsigned __int128)reg_x(c, Rs + 1) << 64);
+        unsigned __int128 newv = (unsigned __int128)reg_x(c, Rt) |
+                                 ((unsigned __int128)reg_x(c, Rt + 1) << 64);
+        unsigned __int128 e = cmp;
+        __atomic_compare_exchange_n((unsigned __int128 *)hp, &e, newv, false, mo,
+                                    __ATOMIC_RELAXED);
+        set_x(c, Rs, (u64)e);
+        set_x(c, Rs + 1, (u64)(e >> 64));
+#else
+        /* 32-bit hosts lack lock-free 128-bit CAS: serialize on a global mutex.
+         * Correct (single interpreter thread per lock) at the cost of speed. */
+        extern void casp16_mutex_lock(void);
+        extern void casp16_mutex_unlock(void);
+        casp16_mutex_lock();
+        u64 lo, hi;
+        bool ok1 = mem_read(c, va, 8, &lo), ok2 = mem_read(c, va + 8, 8, &hi);
+        if (ok1 && ok2) {
+            if (lo == reg_x(c, Rs) && hi == reg_x(c, Rs + 1)) {
+                mem_write(c, va, 8, reg_x(c, Rt));
+                mem_write(c, va + 8, 8, reg_x(c, Rt + 1));
+            }
+            set_x(c, Rs, lo);
+            set_x(c, Rs + 1, hi);
+        }
+        casp16_mutex_unlock();
 #endif
+    }
+}
+
+static void ldst_atomic(CPU *c, u32 insn) {
+    if (c->eng.smp) ldst_atomic_smp(c, insn); else ldst_atomic_up(c, insn);
+}
+static void ldst_cas(CPU *c, u32 insn) {
+    if (c->eng.smp) ldst_cas_smp(c, insn); else ldst_cas_up(c, insn, false);
+}
+static void ldst_casp(CPU *c, u32 insn) {
+    if (c->eng.smp) ldst_casp_smp(c, insn); else ldst_casp_up(c, insn, false);
+}
 /* ============ end LSE atomics ============ */
 
-#if ARM64_SYSTEM
 /* CheckSPAlignment (SCTLR_EL1.SA/SA0): when SP is the base register of a memory
- * access and the check is enabled for the current EL, SP must be 16-byte
- * aligned, else the access takes an SP-alignment fault (EC 0x26). Returns true
- * if the access may proceed; false after raising the fault. Called before the
- * access and any base writeback, matching the architecture's per-instruction
- * check. */
-static bool sp_align_ok(CPU *c, unsigned Rn) {
-    if (Rn != 31) return true;                     /* base is not SP */
-    u64 sp = reg_xsp(c, 31);
-    if ((sp & 15) == 0) return true;               /* 16-byte aligned */
-    unsigned bit = (c->el == 0) ? 4 : 3;           /* SCTLR_EL1.SA0 : .SA */
-    if (!((c->sctlr[1] >> bit) & 1)) return true;  /* check disabled for this EL */
+ * access and the check is enabled for the current EL (c->sp_chk), SP must be
+ * 16-byte aligned, else the access takes an SP-alignment fault (EC 0x26).
+ * Returns true if the access may proceed; false after raising the fault.
+ * Called before the access and any base writeback, matching the
+ * architecture's per-instruction check. Inline, since every load and store
+ * asks; the fault is out of line. User mode has never checked: its
+ * sysreg_init leaves SA0 clear (a Linux kernel does set it, and answers the
+ * fault with SIGBUS; adopting that would be a behaviour change of its own). */
+__attribute__((cold)) static bool sp_align_fault(CPU *c) {
     cpu_raise_sync(c, esr_make(EC_SP_ALIGN, 0), 0);
     return false;
 }
-#else
-/* arm64chroot has never checked SP alignment. (A Linux kernel does enable the
- * check at EL0, SCTLR_EL1.SA0, and answers a fault with SIGBUS; adopting it
- * would be a behaviour change of its own.) */
-static inline bool sp_align_ok(CPU *c, unsigned Rn) { (void)c; (void)Rn; return true; }
-#endif
+static inline bool sp_align_ok(CPU *c, unsigned Rn) {
+    if (Rn != 31 || !c->sp_chk) return true;       /* not SP, or not checked */
+    if ((reg_xsp(c, 31) & 15) == 0) return true;   /* 16-byte aligned */
+    return sp_align_fault(c);
+}
 
 /* FEAT_LRCPC2: LDAPUR/STLUR, load-acquire RCpc / store-release with an
  * unscaled 9-bit immediate. The acquire/release ordering takes nothing extra
@@ -1339,26 +1350,60 @@ static void ldst_literal(CPU *c, u32 insn) {
     }
 }
 
-static void ldst_exclusive(CPU *c, u32 insn) {
+/* On one CPU: plain accesses, and an address match is the monitor. */
+static NOINL void excl_up(CPU *c, u32 insn, u64 va) {
     unsigned size = BITS(31, 30);
     bool o2 = BIT(23), L = BIT(22), o1 = BIT(21);
-    unsigned Rs = BITS(20, 16), Rt2 = BITS(14, 10), Rn = BITS(9, 5), Rt = BITS(4, 0);
+    unsigned Rs = BITS(20, 16), Rt2 = BITS(14, 10), Rt = BITS(4, 0);
     unsigned bytes = 1u << size;
-    u64 va = reg_xsp(c, Rn);
-    if (!sp_align_ok(c, Rn)) return;
+    if (o2) {                                  /* LDAR / STLR (ordered, non-exclusive) */
+        if (L) { u64 v; if (mem_read(c, va, bytes, &v)) set_x(c, Rt, v); }
+        else mem_write(c, va, bytes, reg_x(c, Rt));
+        return;
+    }
+    if (!o1) {                                 /* single-register exclusive */
+        if (L) {                               /* LDXR / LDAXR */
+            u64 v;
+            if (!mem_read(c, va, bytes, &v)) return;
+            set_x(c, Rt, v);
+            c->excl_valid = true; c->excl_addr = va; c->excl_size = bytes;
+        } else {                               /* STXR / STLXR */
+            if (c->excl_valid && c->excl_addr == va) {
+                if (!mem_write(c, va, bytes, reg_x(c, Rt))) return;
+                set_x(c, Rs, 0);
+            } else {
+                set_x(c, Rs, 1);
+            }
+            c->excl_valid = false;
+        }
+        return;
+    }
+    /* pair exclusive LDXP/STXP */
+    if (L) {
+        u64 a, b;
+        if (!mem_read(c, va, bytes, &a)) return;
+        if (!mem_read(c, va + bytes, bytes, &b)) return;
+        set_x(c, Rt, a); set_x(c, Rt2, b);
+        c->excl_valid = true; c->excl_addr = va; c->excl_size = bytes * 2;
+    } else {
+        if (c->excl_valid && c->excl_addr == va) {
+            if (!mem_write(c, va, bytes, reg_x(c, Rt))) return;
+            if (!mem_write(c, va + bytes, bytes, reg_x(c, Rt2))) return;
+            set_x(c, Rs, 0);
+        } else set_x(c, Rs, 1);
+        c->excl_valid = false;
+    }
+}
 
-    if (o2 && o1) {                            /* CAS/CASA/CASL/CASAL (LSE) */
-        ldst_cas(c, insn);
-        return;
-    }
-    if (!o2 && o1 && BIT(31) == 0) {           /* CASP/CASPA/CASPL/CASPAL (LSE) */
-        ldst_casp(c, insn);
-        return;
-    }
-    /* Ordered and exclusive accesses: host atomics, and an exclusive monitor
-     * that compares the value LDXR loaded, where guest threads run
-     * concurrently (ARM64_SMP); on one CPU an address match is the monitor. */
-#if ARM64_SMP
+/* Where guest threads run concurrently: LDAR/STLR are host atomic accesses,
+ * and the exclusive monitor compares the value LDXR loaded (a host CAS).
+ * Memory with no host pointer (mem_host_ptr) is accessed plainly, which
+ * faults where the architecture does. */
+static NOINL void excl_smp(CPU *c, u32 insn, u64 va) {
+    unsigned size = BITS(31, 30);
+    bool o2 = BIT(23), L = BIT(22), o1 = BIT(21);
+    unsigned Rs = BITS(20, 16), Rt2 = BITS(14, 10), Rt = BITS(4, 0);
+    unsigned bytes = 1u << size;
     if (o2) {                                  /* LDAR / STLR (ordered, non-exclusive) */
         /* These are the architecture's acquire/release accesses and commonly
          * pair with CAS/exclusives on the same word (locks). They must be host
@@ -1473,7 +1518,11 @@ static void ldst_exclusive(CPU *c, u32 insn) {
                     }
                     casp16_mutex_unlock();
 #endif
-                } else res = 1;
+                } else {
+                    if (!mem_write(c, va, 8, reg_x(c, Rt))) return;
+                    if (!mem_write(c, va + 8, 8, reg_x(c, Rt2))) return;
+                    res = 0;
+                }
             } else {                            /* 8-byte pair: one u64 CAS */
                 void *hp = mem_host_ptr(c, va, 8, ACC_WRITE);
                 if (hp) {
@@ -1481,51 +1530,35 @@ static void ldst_exclusive(CPU *c, u32 insn) {
                     u64 want = (reg_x(c, Rt) & 0xffffffff) | (reg_x(c, Rt2) << 32);
                     res = __atomic_compare_exchange_n((u64 *)hp, &exp, want, false,
                             __ATOMIC_SEQ_CST, __ATOMIC_RELAXED) ? 0 : 1;
-                } else res = 1;
+                } else {
+                    if (!mem_write(c, va, 4, reg_x(c, Rt))) return;
+                    if (!mem_write(c, va + 4, 4, reg_x(c, Rt2))) return;
+                    res = 0;
+                }
             }
         }
         set_x(c, Rs, res);
         c->excl_valid = false;
     }
-#else
-    if (o2) {                                  /* LDAR / STLR (ordered, non-exclusive) */
-        if (L) { u64 v; if (mem_read(c, va, bytes, &v)) set_x(c, Rt, v); }
-        else mem_write(c, va, bytes, reg_x(c, Rt));
+}
+
+static void ldst_exclusive(CPU *c, u32 insn) {
+    bool o2 = BIT(23), o1 = BIT(21);
+    unsigned Rn = BITS(9, 5);
+    u64 va = reg_xsp(c, Rn);
+    if (!sp_align_ok(c, Rn)) return;
+
+    if (o2 && o1) {                            /* CAS/CASA/CASL/CASAL (LSE) */
+        ldst_cas(c, insn);
         return;
     }
-    if (!o1) {                                 /* single-register exclusive */
-        if (L) {                               /* LDXR / LDAXR */
-            u64 v;
-            if (!mem_read(c, va, bytes, &v)) return;
-            set_x(c, Rt, v);
-            c->excl_valid = true; c->excl_addr = va; c->excl_size = bytes;
-        } else {                               /* STXR / STLXR */
-            if (c->excl_valid && c->excl_addr == va) {
-                if (!mem_write(c, va, bytes, reg_x(c, Rt))) return;
-                set_x(c, Rs, 0);
-            } else {
-                set_x(c, Rs, 1);
-            }
-            c->excl_valid = false;
-        }
+    if (!o2 && o1 && BIT(31) == 0) {           /* CASP/CASPA/CASPL/CASPAL (LSE) */
+        ldst_casp(c, insn);
         return;
     }
-    /* pair exclusive LDXP/STXP */
-    if (L) {
-        u64 a, b;
-        if (!mem_read(c, va, bytes, &a)) return;
-        if (!mem_read(c, va + bytes, bytes, &b)) return;
-        set_x(c, Rt, a); set_x(c, Rt2, b);
-        c->excl_valid = true; c->excl_addr = va; c->excl_size = bytes * 2;
-    } else {
-        if (c->excl_valid && c->excl_addr == va) {
-            if (!mem_write(c, va, bytes, reg_x(c, Rt))) return;
-            if (!mem_write(c, va + bytes, bytes, reg_x(c, Rt2))) return;
-            set_x(c, Rs, 0);
-        } else set_x(c, Rs, 1);
-        c->excl_valid = false;
-    }
-#endif
+    /* Ordered and exclusive accesses, by the CPU's mode. */
+    if (c->eng.smp) excl_smp(c, insn, va);
+    else excl_up(c, insn, va);
 }
 
 /* AdvSIMD load/store multiple structures: LD1/ST1 (contiguous, 1-4 registers)
@@ -1704,13 +1737,12 @@ static void branch_system(CPU *c, u32 insn) {
         } else if (opc == 0 && ll == 2) {                                 /* HVC */
             /* HVC is UNDEFINED at EL0 — guest userspace must not reach the PSCI
              * conduit (it could otherwise power off / reboot the machine).
-             * arm64chroot has no conduit: the lookup below finds none, and
-             * the instruction is UNDEFINED there all the same. */
-            if (ARM64_SYSTEM && c->el == 0) { undefined(c, insn); return; }
+             * A user-mode guest is always at EL0. */
+            if (c->el == 0) { undefined(c, insn); return; }
             if (smccc_conduit && smccc_conduit(c, true)) return;
             undefined(c, insn);
         } else if (opc == 0 && ll == 3) {                                 /* SMC */
-            if (ARM64_SYSTEM && c->el == 0) { undefined(c, insn); return; }
+            if (c->el == 0) { undefined(c, insn); return; }
             if (smccc_conduit && smccc_conduit(c, false)) return;
             undefined(c, insn);
         } else if (opc == 1 && ll == 0) {                                 /* BRK */
@@ -1744,13 +1776,14 @@ static void branch_system(CPU *c, u32 insn) {
         unsigned L = BIT(21), op0 = BITS(20, 19), op1 = BITS(18, 16);
         unsigned CRn = BITS(15, 12), CRm = BITS(11, 8), op2 = BITS(7, 5), Rt = BITS(4, 0);
         if (L == 0 && op0 == 0 && op1 == 3 && CRn == 2 && Rt == 31) {     /* hints */
-#if ARM64_SYSTEM
             if (CRm == 0 && op2 == 2) {                       /* WFE */
                 /* A pending event completes WFE immediately (and clears it);
                  * otherwise halt until an event/interrupt. Without this an
                  * SEVL/WFE pair only made progress when the timer tick fired.
                  * At EL0 a WFE that would wait traps to EL1 unless
-                 * SCTLR_EL1.nTWE lets it (Linux does). */
+                 * SCTLR_EL1.nTWE lets it (Linux does). A halt is the
+                 * program's to serve: in user mode the run loop takes it as
+                 * a no-op. */
                 if (c->event) c->event = false;
                 else if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWE)) wfx_trap(c, 1);
                 else c->halted = true;
@@ -1758,32 +1791,26 @@ static void branch_system(CPU *c, u32 insn) {
             else if (CRm == 0 && op2 == 3) {                  /* WFI */
                 /* ...and a WFI unless SCTLR_EL1.nTWI does: Linux leaves it
                  * clear and skips the instruction, so a user program cannot
-                 * idle the CPU. */
+                 * idle the CPU. User mode sets it (sysreg_init) and the
+                 * halt comes to the same thing. */
                 if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWI)) wfx_trap(c, 0);
                 else c->halted = true;
             }
             else if (CRm == 0 && (op2 == 4 || op2 == 5)) c->event = true;  /* SEV / SEVL */
             /* NOP/YIELD/DGH/etc -> no-op */
-#else
-            if (CRm == 0 && op2 == 2) c->halted = true;       /* WFE */
-            else if (CRm == 0 && op2 == 3) c->halted = true;  /* WFI */
-            /* NOP/YIELD/SEV/SEVL/etc -> no-op */
-#endif
             return;
         }
         if (L == 0 && op0 == 0 && op1 == 3 && CRn == 3 && Rt == 31) {     /* barriers/CLREX */
             if (op2 == 2) c->excl_valid = false;              /* CLREX */
-#if ARM64_SMP
-            else if (op2 == 4 || op2 == 5)                    /* DSB / DMB */
-                /* Map the guest barrier to a host fence. Essential on weakly
-                 * ordered hosts (ARM): without it the host reorders our plain
-                 * memcpy-based guest loads/stores across threads, breaking the
-                 * guest memory model (e.g. mutex owner-field corruption). */
+            else if ((op2 == 4 || op2 == 5) && c->eng.smp)    /* DSB / DMB */
+                /* Map the guest barrier to a host fence where guest threads
+                 * run concurrently. Essential on weakly ordered hosts (ARM):
+                 * without it the host reorders our plain memcpy-based guest
+                 * loads/stores across threads, breaking the guest memory
+                 * model (e.g. mutex owner-field corruption). On one in-order
+                 * CPU it orders nothing more. */
                 __atomic_thread_fence(__ATOMIC_SEQ_CST);
             /* ISB (op2==6)/SB: no ordering effect on data in this interpreter */
-#else
-            /* DSB/DMB/ISB/SB: no-op in an in-order interpreter */
-#endif
             return;
         }
         /* MSR(imm)/SYS/SYSL/MRS/MSR(reg) -> sysreg.c (M2) */

@@ -500,6 +500,10 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
  * again; the slow paths are whole accesses, hits included, so this also
  * holds under ARM64EMU_JIT_SLOWMEM, which skips the inline probe. */
 
+void be_fixup_add(JitEnv *env, u32 fast_off, u32 slow_off) {
+    (void)env; (void)fast_off; (void)slow_off;     /* RAM never host-faults */
+}
+
 /* SP-alignment check (SCTLR_EL1.SA/SA0). Generated code calls this only when the
  * SP base is already known-misaligned (low 4 bits set). Raises an SP-alignment
  * fault and returns 1 (exit the block) when the check is enabled for the current

@@ -41,6 +41,21 @@ VERSION_DEFINE  := -DPROJECT_VERSION='"$(PROJECT_VERSION)"'
 
 # Code shared by both emulators.
 LIB_ARM64 := $(wildcard lib/arm64/*.c lib/arm64/jit/*.c)
+# Its 16-byte atomics (a guest CASP or 128-bit exclusive where guest threads
+# run concurrently) are not lock-free on every host, and may need libatomic --
+# on 32-bit hosts its 8-byte ones too. clang warns about them; they are
+# deliberate -- the guest semantics need a single atomic access of that width
+# -- and libatomic's lock is the price. Silenced rather than left to make a
+# clang build noisy; probed because gcc has no such option.
+# $(call lib_arm64_atomic,CC,FLAGS): -latomic where that compiler has it. Probed
+# with the compiler and flags that will actually link, since a 32-bit variant
+# may be a different compiler entirely. Recursively expanded on purpose: the
+# probe then runs when a link needs it, not on every `make`.
+lib_arm64_atomic = $(shell echo 'int main(){return 0;}' | $(1) $(2) \
+                     -latomic -x c - -o /dev/null 2>/dev/null && echo -latomic)
+LIB_ARM64_NOATOMICWARN := $(shell echo 'int main(){return 0;}' | $(CC) -Werror \
+                    -Wno-atomic-alignment -x c - -o /dev/null 2>/dev/null \
+                    && echo -Wno-atomic-alignment)
 # Hardlink emulation, shared by arm64chroot and chroot-ng.
 LIB_L2S := $(wildcard lib/link2symlink/*.c)
 
@@ -82,7 +97,7 @@ ARM64EMU_OPT    ?= -O2
 ARM64EMU_FLAGS   = -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter \
                    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
                    -Isrc/arm64emu -Isrc/arm64emu/jit -Ilib/arm64 -Ilib/arm64/jit \
-                   -fno-math-errno -g $(CFLAGS)
+                   -fno-math-errno -g $(LIB_ARM64_NOATOMICWARN) $(CFLAGS)
 ARM64EMU_SRC    := $(wildcard src/arm64emu/*.c src/arm64emu/devices/*.c \
                      src/arm64emu/fdt/*.c src/arm64emu/net/*.c \
                      src/arm64emu/jit/*.c) $(LIB_ARM64)
@@ -103,7 +118,7 @@ $(ARM64EMU_VERSIONED): VERSION
 $(ARM64EMU_VERSIONED): ARM64EMU_FLAGS += $(VERSION_DEFINE)
 
 $(BUILD)/arm64emu: $(ARM64EMU_OBJ)
-	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ -lm
+	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ -lm $(call lib_arm64_atomic,$(CC),$(ARM64EMU_FLAGS))
 
 # Embedded configuration. An app that links the emulator in builds it with
 # -DANDROID_JNI: main() becomes arm64emu_main() so the host can call it after
@@ -123,7 +138,7 @@ $(OBJDIR)/arm64emu-embed/stub.c:
 	printf 'extern int arm64emu_main(int, char **);\nint main(int c, char **v) { return arm64emu_main(c, v); }\n' > $@
 
 $(BUILD)/arm64emu-embed: $(ARM64EMU_EMBED_OBJ) $(OBJDIR)/arm64emu-embed/stub.c
-	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ -lm
+	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ -lm $(call lib_arm64_atomic,$(CC),$(ARM64EMU_FLAGS))
 
 # AArch64-backend validation without ARM hardware: a static aarch64 build
 # (clang + lld + the Debian cross libc) run under qemu-user.
@@ -136,7 +151,8 @@ $(BUILD)/arm64emu-a64: $(ARM64EMU_SRC) VERSION
 	$(ARM64EMU_A64_CC) -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter \
 	    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc/arm64emu -Isrc/arm64emu/jit \
 	    -Ilib/arm64 -Ilib/arm64/jit \
-	    -fno-math-errno $(VERSION_DEFINE) -o $@ $(ARM64EMU_SRC) -lm
+	    -fno-math-errno $(VERSION_DEFINE) -o $@ $(ARM64EMU_SRC) -lm \
+	    $(call lib_arm64_atomic,$(ARM64EMU_A64_CC),)
 
 -include $(ARM64EMU_OBJ:.o=.d) $(ARM64EMU_EMBED_OBJ:.o=.d)
 
@@ -155,19 +171,11 @@ ARM64CHROOT_LTO ?=
 # Without it the compiler must keep a libm call for a possibly-negative operand
 # just to set errno, which nothing here reads — and whether that call raises
 # Invalid is then the libc's business, not ours.
-#
-# clang warns that the 16-byte atomics (guest CASP / 128-bit exclusives) are
-# not lock-free. They are deliberate — the guest semantics need a single atomic
-# access of that width — and libatomic's lock is the price. Silenced rather
-# than left to make a clang build noisy; probed because gcc has no such option.
 ARM64CHROOT_FLAGS = -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno \
                     -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 \
                     -Isrc/arm64chroot -Isrc/arm64chroot/core -Isrc/arm64chroot/jit \
                     -Ilib/arm64 -Ilib/arm64/jit -Ilib/link2symlink \
-                    $(ARM64CHROOT_LTO) $(ARM64CHROOT_NOATOMICWARN) $(CFLAGS)
-ARM64CHROOT_NOATOMICWARN := $(shell echo 'int main(){return 0;}' | $(CC) -Werror \
-                    -Wno-atomic-alignment -x c - -o /dev/null 2>/dev/null \
-                    && echo -Wno-atomic-alignment)
+                    $(ARM64CHROOT_LTO) $(LIB_ARM64_NOATOMICWARN) $(CFLAGS)
 
 # The ILP32-host variant keeps 32-bit-host correctness continuously tested, and
 # what "32-bit host" means depends on the machine doing the building: on x86-64
@@ -215,13 +223,6 @@ ARM64CHROOT_CFG       = $(call cfgstamp,arm64chroot/native,$(CC) $(ARM64CHROOT_F
 ARM64CHROOT_M32_CFG   = $(call cfgstamp,arm64chroot/m32,$(ARM64CHROOT_M32CC) $(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS))
 ARM64CHROOT_ASIM_CFG  = $(call cfgstamp,arm64chroot/asim,$(CC) $(ARM64CHROOT_FLAGS) $(ARM64CHROOT_ASIMFLAGS))
 
-# 8/16-byte atomics on 32-bit hosts may need libatomic; harmless if unused.
-# Probed with the compiler and flags that will actually link the variant, since
-# the 32-bit one may be a different compiler entirely. Recursively expanded on
-# purpose: the probe then runs when a link needs it, not on every `make`.
-arm64chroot_atomic = $(shell echo 'int main(){return 0;}' | $(1) $(ARM64CHROOT_FLAGS) $(2) \
-                       -latomic -x c - -o /dev/null 2>/dev/null && echo -latomic)
-
 $(OBJDIR)/arm64chroot/native/%.o: %.c $(ARM64CHROOT_CFG)
 	@mkdir -p $(@D)
 	$(CC) $(ARM64CHROOT_FLAGS) $(DEPFLAGS) -c $< -o $@
@@ -237,13 +238,14 @@ $(ARM64CHROOT_VERSIONED): VERSION
 $(ARM64CHROOT_VERSIONED): ARM64CHROOT_FLAGS += $(VERSION_DEFINE)
 
 $(BUILD)/arm64chroot: $(ARM64CHROOT_OBJ)
-	$(CC) $(ARM64CHROOT_FLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread $(call arm64chroot_atomic,$(CC),)
+	$(CC) $(ARM64CHROOT_FLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread \
+	    $(call lib_arm64_atomic,$(CC),$(ARM64CHROOT_FLAGS))
 $(BUILD)/arm64chroot32: $(ARM64CHROOT_M32_OBJ)
 	$(ARM64CHROOT_M32CC) $(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread \
-	    $(call arm64chroot_atomic,$(ARM64CHROOT_M32CC),$(ARM64CHROOT_M32FLAGS))
+	    $(call lib_arm64_atomic,$(ARM64CHROOT_M32CC),$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS))
 $(BUILD)/arm64chroot_asim: $(ARM64CHROOT_ASIM_OBJ)
 	$(CC) $(ARM64CHROOT_FLAGS) $(ARM64CHROOT_ASIMFLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread \
-	    $(call arm64chroot_atomic,$(CC),)
+	    $(call lib_arm64_atomic,$(CC),$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_ASIMFLAGS))
 
 -include $(ARM64CHROOT_OBJ:.o=.d) $(ARM64CHROOT_M32_OBJ:.o=.d) $(ARM64CHROOT_ASIM_OBJ:.o=.d)
 

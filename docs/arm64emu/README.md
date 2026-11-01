@@ -161,7 +161,7 @@ comparison.
 ```
 src/arm64emu/
   main.c        CLI, image loading, the run loop, signal-flush of diagnostics
-  arm64_config.h  how lib/arm64 is built here (full system; embedded _exit)
+  arm64_config.h  how lib/arm64 is built here (knob prefix; embedded _exit)
   cpu.c         fetch/decode/execute driver, condition codes, dump,
                 hot-PC profiler / ring buffer / coverage-divergence finder
   mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB, and the

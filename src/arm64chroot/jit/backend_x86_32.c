@@ -1839,18 +1839,21 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             emit_exec1(be, o->imm, o->aux, o->w, o->icnt);
             break;
 
-        case IRO_CPULD: {
+        case IRO_CPULD: {                        /* w=0: a u32 field, zero-extended */
             int dlo = def_hv(be, HV(o->dst, 0));
             ra_lock(be, dlo);
             ld_r(e, dlo, M_ebp((s32)o->imm));
-            ld_r(e, def_hv(be, HV(o->dst, 1)), M_ebp((s32)o->imm + 4));
+            if (o->w) ld_r(e, def_hv(be, HV(o->dst, 1)), M_ebp((s32)o->imm + 4));
+            else      set_zero_hv(be, HV(o->dst, 1));
             break;
         }
-        case IRO_CPUST:
+        case IRO_CPUST:                          /* w=0: a u32 field */
             mov_rs(e, EAX, src_hv(be, HV(o->a, 0)));
             st_r(e, EAX, M_ebp((s32)o->imm));
-            mov_rs(e, EAX, src_hv(be, HV(o->a, 1)));
-            st_r(e, EAX, M_ebp((s32)o->imm + 4));
+            if (o->w) {
+                mov_rs(e, EAX, src_hv(be, HV(o->a, 1)));
+                st_r(e, EAX, M_ebp((s32)o->imm + 4));
+            }
             break;
         case IRO_FENCE:
             e8(e, 0x0F); e8(e, 0xAE); e8(e, 0xF0);   /* mfence */

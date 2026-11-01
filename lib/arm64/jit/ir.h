@@ -124,38 +124,36 @@ enum {
      * No faults. */
     IRO_VOP,
 
-    /* Exclusives, LSE atomics and ordered accesses: a host-atomic op of its
-     * own where guest threads run concurrently (ARM64_SMP, arm64chroot); on
-     * one CPU (arm64emu) a bracket around ordinary probed loads/stores. */
-#if ARM64_SMP
-    /* Inline exclusives / LSE atomics / ordered accesses, [base] only (the
-     * guest encodings carry no offset). aux = AT_MAKE(kind, szlog, acq, rel);
-     * a = base, b = store value / RMW operand, cc = extra source vreg (CAS
-     * expected), dst = result (loaded / old value / STXR status; ZERO for
-     * the ST* forms). Any TLB miss, misalignment, or perm failure re-runs
-     * the whole instruction through jit_exec1 (imm2pc = pc, aux2 = insn in
-     * imm). NOT counted in ninsns: the fast path bumps icount inline and
-     * jit_exec1 counts itself, so both routes retire exactly once. */
-    IRO_ATOMIC,             /* imm = raw insn word (slow-path re-execution) */
-#else
-    IRO_ATOMIC,             /* atomic bracket open. imm selects the mode:
-                             * imm=0 store-exclusive — a = base, compares the
-                             * monitor (excl_valid/excl_addr) and branches to
-                             * the matching ATOMIC_END fail label;
-                             * imm=1 CAS — a = old (loaded), b = expected,
-                             * w = width, emits `cmp a,b; b.ne fail`.
-                             * The probed IRO_ST(s) in between are ordinary. */
-    IRO_ATOMIC_END,         /* bracket close. imm=0 exclusive: dst = status reg
-                             * (0 = stored, 1 = no monitor), clears excl_valid.
-                             * imm=1 CAS: a = old, dst = Rs; writes Rs = old on
-                             * both join paths, touches no monitor. */
-#endif
+    /* Exclusives, LSE atomics and ordered accesses, two lowerings by the
+     * block's mode (IRBlock.smp). Where guest threads run concurrently, a
+     * host-atomic op of its own:
+     *   Inline exclusives / LSE atomics / ordered accesses, [base] only (the
+     *   guest encodings carry no offset). aux = AT_MAKE(kind, szlog, acq,
+     *   rel); a = base, b = store value / RMW operand, cc = extra source vreg
+     *   (CAS expected), dst = result (loaded / old value / STXR status; ZERO
+     *   for the ST* forms). Any TLB miss, misalignment, or perm failure
+     *   re-runs the whole instruction through jit_exec1 (imm2pc = pc, aux2 =
+     *   insn in imm). NOT counted in ninsns: the fast path bumps icount
+     *   inline and jit_exec1 counts itself, so both routes retire exactly
+     *   once.
+     * On one CPU, a bracket around ordinary probed loads/stores:
+     *   IRO_ATOMIC opens it. imm selects the mode: imm=0 store-exclusive —
+     *   a = base, compares the monitor (excl_valid/excl_addr) and branches to
+     *   the matching ATOMIC_END fail label; imm=1 CAS — a = old (loaded),
+     *   b = expected, w = width, emits `cmp a,b; b.ne fail`. The probed
+     *   IRO_ST(s) in between are ordinary. */
+    IRO_ATOMIC,             /* concurrent: imm = raw insn word (slow-path
+                             * re-execution); one CPU: the bracket's mode */
+    IRO_ATOMIC_END,         /* one CPU only: bracket close. imm=0 exclusive:
+                             * dst = status reg (0 = stored, 1 = no monitor),
+                             * clears excl_valid. imm=1 CAS: a = old, dst = Rs;
+                             * writes Rs = old on both join paths, touches no
+                             * monitor. */
 
     IRO_N_
 };
-#if ARM64_SMP
 
-/* IRO_ATOMIC kinds (aux bits 0..7) */
+/* IRO_ATOMIC kinds (aux bits 0..7), where guest threads run concurrently */
 enum {
     AT_LDX,                 /* LDXR/LDAXR: load + record monitor */
     AT_STX,                 /* STXR/STLXR: monitor check + host CAS, status */
@@ -172,7 +170,6 @@ enum {
 #define AT_SZL(a)   (((a) >> 8) & 3)
 #define AT_ACQ(a)   (((a) >> 12) & 1)
 #define AT_REL(a)   (((a) >> 13) & 1)
-#endif
 
 /* IRO_VOP classes (aux bits 0..5) + flags. The frontend whitelists exact
  * encodings and asks the backend (be_vop_ok) about per-host gaps; anything
@@ -438,12 +435,23 @@ typedef struct IRBlock {
      * costs the inline FP surface, which is everything on most hosts and
      * almost nothing on one that carries the mode in its own FPCR. */
     u8   fpmode;
-#if ARM64_SYSTEM
-    u8   ctx_spx;           /* block's SP bank ((tag>>2)&3; EL1 exists only in
-                             * a full system): 0 = the live SP
+    /* Set by jit_fe_block from the CPU it translates for, and fixed for the
+     * block's life: the CPU's mode (CpuEngine.sys/smp), and the parts of its
+     * state a full system makes bits of the block-lookup ctx (jit.c), so a
+     * block only ever runs in the state it was compiled under. In user mode
+     * they never change: EL0, FP untrapped, the EL0 stack. */
+    u8   sys, smp;
+    u8   el0;               /* runs at EL0 (ctx bit 0) */
+    u8   fptrap;            /* CPACR_EL1.FPEN traps FP/SIMD here (ctx bit 4) */
+    u8   ctx_spx;           /* block's SP bank ((tag>>2)&3): 0 = the live SP
                              * is sp_el[0], so SP_EL0 moves must not bypass
                              * the backend's SP register cache */
-#endif
+    u8   spchk;             /* the SP-alignment check can fire here, so the
+                             * backends emit it on every SP-based access: in a
+                             * full system always (the helper reads SCTLR_EL1),
+                             * in user mode only if its SA0 were set */
+    CPU *c;                 /* the CPU translated for: its EL1 configuration
+                             * decides what EL0 may execute (frontend.c) */
     /* Per-op vreg liveness (bit v set = vreg v live after this op). Computed
      * by fe_liveness for a free-after-last-use allocator; NO backend reads it
      * yet — both allocate LRU-style and spill on demand. Kept because the

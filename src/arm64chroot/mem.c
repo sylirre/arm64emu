@@ -83,6 +83,8 @@ void as_cpu_attach(CPU *c) {
     e->dtlb_mask = DTLB_SIZE - 1;
     e->gen_src = &g_as_gen;                /* gen 0: empty until resynced */
     e->fetch_el0 = c->el == 0;
+    e->sys = 0;                            /* user mode, */
+    e->smp = 1;                            /* guest threads on host threads */
     cpu_refresh_dtlb_ctx(c);
     t_cpu = c;
 }
@@ -104,6 +106,18 @@ static void cpu_caches_flush(CpuEngine *e) {
 void tlb_flush_all(CPU *c) {
     cpu_caches_flush(&c->eng);
     cpu_refresh_dtlb_ctx(c);
+}
+/* The EL1-only maintenance mem.h asks for: TLBI by VA and AT are UNDEFINED at
+ * EL0 (sysreg.c's el0_allowed), the only EL this guest runs at, so these are
+ * never reached; they answer what a translation regime with nothing of its
+ * own to invalidate or report would. */
+void tlb_flush_page(CPU *c, u64 va) {
+    (void)va;
+    tlb_flush_all(c);
+}
+u64 mmu_at_s1(CPU *c, u64 va, bool is_write, bool as_el0) {
+    (void)c; (void)va; (void)is_write; (void)as_el0;
+    return 1;                                  /* PAR_EL1.F: did not translate */
 }
 static void tlb_flush_self(void) {
     if (t_cpu) cpu_caches_flush(&t_cpu->eng);   /* before the first attach: none */
