@@ -1003,24 +1003,26 @@ void procfs_locks_reinit(void);
  * That is the order emu_atfork_prepare takes them in (main.c), and the order
  * real code must take them in -- the two are the same statement, since a
  * prepare handler that grabs them outermost-first can only be right if nobody
- * ever goes the other way. Keep these in step with that triple. */
+ * ever goes the other way. Keep these in step with that triple. Outermost of
+ * all, ahead of these, is the JIT statistics' lock (lib/arm64/jit), which
+ * nothing is taken under and which no fork site can hold; the library takes
+ * it with plain pthread calls, so it is not in the mask. */
 enum {
-    EMU_LK_JSTAT  = 1u << 0,   /* jit/jit.c      — outermost */
-    EMU_LK_PF     = 1u << 1,   /* sys_procfs.c   */
-    EMU_LK_EST    = 1u << 2,   /* sys_procfs.c   — under pf_lock (put_stat) */
-    EMU_LK_NL     = 1u << 3,   /* sys_netlink.c  */
-    EMU_LK_SFD    = 1u << 4,   /* sys_sig.c      */
-    EMU_LK_SIGACT = 1u << 5,   /* signal.c       — under sfd_lock (by rank) */
-    EMU_LK_THR    = 1u << 6,   /* sys_proc.c     — the guest thread registry
+    EMU_LK_PF     = 1u << 0,   /* sys_procfs.c   */
+    EMU_LK_EST    = 1u << 1,   /* sys_procfs.c   — under pf_lock (put_stat) */
+    EMU_LK_NL     = 1u << 2,   /* sys_netlink.c  */
+    EMU_LK_SFD    = 1u << 3,   /* sys_sig.c      */
+    EMU_LK_SIGACT = 1u << 4,   /* signal.c       — under sfd_lock (by rank) */
+    EMU_LK_THR    = 1u << 5,   /* sys_proc.c     — the guest thread registry
                                 * (robust heads, personalities); the robust
                                 * walk copies guest memory (as_lock) */
-    EMU_LK_TASK   = 1u << 7,   /* sys_proc.c     — task_lock: the process-wide
+    EMU_LK_TASK   = 1u << 6,   /* sys_proc.c     — task_lock: the process-wide
                                 * Machine fields written rarely and read from
                                 * any thread (credentials, rlimits, cwd and
                                 * root, the seccomp chain); nothing but the
                                 * registry's lock-free publish runs under it */
-    EMU_LK_CASP16 = 1u << 8,   /* mem.c          */
-    EMU_LK_AS     = 1u << 9,   /* mem.c as_lock  — innermost; counted, not
+    EMU_LK_CASP16 = 1u << 7,   /* mem.c          */
+    EMU_LK_AS     = 1u << 8,   /* mem.c as_lock  — innermost; counted, not
                                 * flagged, because it legitimately re-enters */
 };
 extern __thread unsigned g_emu_lk_held;   /* the seven non-recursive locks */
@@ -1056,7 +1058,7 @@ void emu_fdwin_lock_warn(unsigned taking);
 
 /* The whole scheme is the bit positions being in hierarchy order; renumbering
  * them into anything else silently turns the check into noise. */
-_Static_assert(EMU_LK_JSTAT < EMU_LK_PF && EMU_LK_PF < EMU_LK_EST &&
+_Static_assert(EMU_LK_PF < EMU_LK_EST &&
                EMU_LK_EST < EMU_LK_NL && EMU_LK_NL < EMU_LK_SFD &&
                EMU_LK_SFD < EMU_LK_SIGACT && EMU_LK_SIGACT < EMU_LK_THR &&
                EMU_LK_THR < EMU_LK_TASK && EMU_LK_TASK < EMU_LK_CASP16 &&

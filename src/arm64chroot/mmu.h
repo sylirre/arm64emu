@@ -32,8 +32,9 @@
  * access. tlb_flush_all forces the calling thread's caches to re-sync. */
 void as_cpu_attach(CPU *c);
 /* Ask for the attention of the CPU the calling thread runs, if it has one
- * yet (cpu.h, cpu_attn). Async-signal-safe. */
+ * yet (cpu.h, cpu_attn); and that CPU itself, or NULL. Async-signal-safe. */
 void as_cpu_attn(void);
+CPU *as_cpu_current(void);
 
 /* ---- host bus-error recovery (mem.c) ----
  * A file truncated from outside this address space leaves PTEs pointing at
@@ -583,19 +584,6 @@ int    mem_stack_touch(CPU *c, u64 va, AccType acc);
 size_t copy_from_guest_look(CPU *c, void *dst, u64 va, size_t len);
 /* fork(2) child: the loans of the threads that did not come across are gone. */
 void as_lend_fork_child(AddrSpace *as);
-
-/* True on hosts where a pointer is 4 bytes (i686, ARM32). Tables whose entries
- * hold a host pointer AND are indexed by generated code are padded to the same
- * size on every host (see A64_HOST_PTRPAD), so an emitter can turn an index
- * into an offset with a shift instead of a multiply. */
-#define A64_HOST_ILP32 (UINTPTR_MAX == 0xffffffffu)
-/* Tail padding that keeps {u64, uintptr_t} 16 bytes wide on both widths: LP64
- * already is, ILP32 is 12 without it. */
-#if A64_HOST_ILP32
-#define A64_HOST_PTRPAD u32 pad_;
-#else
-#define A64_HOST_PTRPAD
-#endif
 
 /* ---- JIT data-TLB seam ----
  * The JIT probes the thread's D-TLB (mem.h's entry layout, c->eng) inline,

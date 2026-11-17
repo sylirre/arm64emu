@@ -33,14 +33,17 @@ reader would have guessed:
 The lesson for anyone reading `ARM64EMU_JIT_STATS` output: rank by what the target
 *workload* runs, not by what looks unfinished.
 
-Ported from the arm64chroot user-mode emulator (same author; its CPU core
-is a copy of this repo's). Its `docs/arm64chroot/jit.md` describes the pipeline in
+The JIT is one for both emulators (`lib/arm64/jit/`), first written for the
+arm64chroot user-mode emulator. Its `docs/arm64chroot/jit.md` describes the pipeline in
 depth — predecode classifier (`lib/arm64/predecode.c`) → linear IR
 (`lib/arm64/jit/ir.h`, built by `lib/arm64/jit/frontend.c`) → single-pass backend with
 per-block greedy register allocation and lazy NZCV in host flags
 (`lib/arm64/jit/backend_*.c`) — plus block chaining, the bump-allocated code
-cache, and the W^X fallback (RWX mmap → dual-mapped memfd → interpreter).
-This document covers what is *different* here.
+cache, and the W^X fallback (RWX mmap → dual-mapped memfd → interpreter), all
+in the runtime (`lib/arm64/jit/jit.c`). This document covers what is
+*different* in a full system, where the JIT's coherence with guest memory is
+this program's (`src/arm64emu/jit/coherence.c`, the runtime's `jit_mode_*`
+hooks).
 
 One invariant worth restating because it is easy to break silently: a guest
 instruction expands to at most `IR_MAX_OPS_PER_INSN` IR ops (`ir.h`), and
@@ -49,11 +52,10 @@ instruction expands to at most `IR_MAX_OPS_PER_INSN` IR ops (`ir.h`), and
 `DCZVA_STORES`, the same constant the DC ZVA expansion counts with, because
 DC ZVA is the outlier that broke the original guessed reserve of 8.
 
-## Full-system deltas vs the donor
+## Full-system deltas
 
-Single CPU, single thread: the donor's per-thread caches, thread registry
-and cross-thread interrupt protocol collapsed into one global `JitEnv`,
-no locks anywhere.
+Single CPU, single thread: the CPU's one `JitEnv` (`c->eng.jit`), no locks
+anywhere, and nothing raising its cross-thread `interrupt` flag.
 
 The translator itself (`lib/arm64/jit`) is one for both programs. What a
 full system's blocks need beyond a user-mode one's — the block ctx in the
@@ -63,26 +65,30 @@ block from the mode of the CPU it is translated for (`IRBlock.sys`/`smp`,
 from `c->eng`), so generated code carries no test for it.
 
 **Block identity.** A translation is keyed by
-`(pc << 2) | ctx` where ctx = EL0 flag, `SCTLR_EL1.M`, and the active SP
+`(pc << 3) | ctx` where ctx = EL0 flag, `SCTLR_EL1.M`, the active SP
 bank (`sp_el[]` is banked by SPSel/EL; backends bake the bank's offset
 into generated code — bugs here look like a firmware abort loop at the
-vectors). In addition, the dispatcher re-resolves pc's *host code page*
-through the fetch cache every dispatch and requires it to match the
-block's; a TTBR switch or remap therefore misses naturally, and
+vectors) and the FPEN trap. In addition, the dispatcher re-resolves pc's
+*host code page* through the fetch cache every dispatch and requires it to
+match the block's; a TTBR switch or remap therefore misses naturally, and
 correctness never depends on observing TLBI (the same "translate live"
-philosophy the interpreter's fetch path uses). Exit chaining is
-restricted to same-page, same-ctx successors so a chained jump can never
-cross a translation boundary unverified.
+philosophy the interpreter's fetch path uses). Both hold in user mode too;
+what is a full system's alone is that exit chaining is restricted to
+same-page, same-ctx successors so a chained jump can never cross a
+translation boundary unverified, and that blocks are invalidated by
+physical page.
 
 Indirect branches (`RET`/`BR`/`BLR`) probe a small inline cache keyed by
 the full block tag (the dispatcher refills it only after a verified
-lookup). A hit skips the per-dispatch host-page re-verification, so the
-cache is purged on every flush, page drop and TLB-generation change —
-an entry can never outlive the mapping it was verified under, and a VA
-remap *without* TLBI is outside the contract exactly as it is for the
-interpreter's VA-tagged fetch cache. The empty pattern is all-ones
-(a key's bit 3 is always clear), never zero: a zeroed entry would let a
-`br` to VA 0 jump generated code to a NULL pointer.
+lookup). A hit skips the per-dispatch host-page re-verification, so an
+entry goes with its block, and the whole cache with every flush and every
+move of the CPU's code epoch (`c->eng.code_epoch`, which TLB maintenance
+moves) — an entry can never outlive the mapping it was verified under, and
+a VA remap *without* TLBI is outside the contract exactly as it is for the
+interpreter's VA-tagged fetch cache. The empty pattern is the all-ones tag,
+which no key can equal (bits 2:0 of a ctx are never all set), with the code
+pointer of a miss entry that goes back to the dispatcher: a `br` that did
+equal it would still never reach a stale or NULL code pointer.
 
 **Memory accesses.** Generated loads/stores probe the interpreter's own
 host-pointer D-TLB (`lib/arm64/mem.h`: `DTlbEnt`, a 16-byte-entry ABI the

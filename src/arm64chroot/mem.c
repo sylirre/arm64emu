@@ -21,7 +21,7 @@
 
 #include "machine.h"
 #include "esr.h"
-#include "jit.h"
+#include "coherence.h"
 #include "sys.h"          /* mmap_min_addr */
 
 #define L1_BITS (GUEST_VA_BITS - 26)          /* 21 -> ~2M entries (~16 MiB L1) */
@@ -93,6 +93,8 @@ void as_cpu_attn(void) {
     CPU *c = t_cpu;
     if (c) cpu_attn(c);
 }
+
+CPU *as_cpu_current(void) { return t_cpu; }
 
 static void as_gen_bump(void) {
     __atomic_fetch_add(&g_as_gen, 1, __ATOMIC_RELEASE);
@@ -339,9 +341,8 @@ __thread int g_emu_as_depth;
 
 /* Indexed by rank, i.e. by bit position (machine.h). */
 static const char *const emu_lk_names[] = {
-    "the jit stats lock", "pf_lock", "est_lock", "nl_lock",
-    "sfd_lock", "sigact_lock", "thr_lock", "task_lock", "casp16_lock",
-    "as_lock",
+    "pf_lock", "est_lock", "nl_lock", "sfd_lock", "sigact_lock",
+    "thr_lock", "task_lock", "casp16_lock", "as_lock",
 };
 #define EMU_LK_COUNT ((int)(sizeof emu_lk_names / sizeof *emu_lk_names))
 _Static_assert(1u << (EMU_LK_COUNT - 1) == EMU_LK_AS,
@@ -3069,7 +3070,7 @@ static void bus_catcher(int sig, siginfo_t *si, void *uc) {
     u64 far = 0;
     if (sig == SIGBUS && si && si->si_code == BUS_ADRERR &&
         g_bus_armed == BUS_ARM_ENGINE &&
-        g_bus_cpu && jit_pc_in_generated(BUS_FAULT_PC(uc))) {
+        g_bus_cpu && jit_pc_in_generated(g_bus_cpu, BUS_FAULT_PC(uc))) {
         /* Inside JIT-generated code there is nothing to unwind to: guest
          * registers may live only in host registers, with no way to write
          * them back from here. Resume at the faulting access's own slow path
@@ -3080,7 +3081,7 @@ static void bus_catcher(int sig, siginfo_t *si, void *uc) {
          * right FAR and the instruction's own baked pc. Registers survive
          * because the redirect lands on a label the fast path could already
          * have branched to with exactly this machine state. */
-        const void *fix = jit_fault_fixup(BUS_FAULT_PC(uc));
+        const void *fix = jit_fault_fixup(g_bus_cpu, BUS_FAULT_PC(uc));
         if (fix && as_bus_repair(si->si_addr, &far)) {
             BUS_SET_PC(uc, fix);
             return;

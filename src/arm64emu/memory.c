@@ -63,7 +63,7 @@ enum { PG_NONE = 0, PG_WORD, PG_ERASE, PG_BUFCNT, PG_BUFDATA, PG_BUFCONF };
 static void flash_program(Machine *m, u64 off, unsigned size, u64 val) {
     /* Firmware code can live in flash: drop JIT translations on the
      * programmed bytes (no-op when -jit is off). */
-    jit_invalidate_phys_range(m->flash_base + off, size);
+    jit_invalidate_phys_range(m, m->flash_base + off, size);
     for (unsigned i = 0; i < size; i++)
         m->flash[off + i] &= (u8)(val >> (i * 8));
 }
@@ -251,7 +251,7 @@ void phys_write_blk(Machine *m, u64 pa, const void *src, u64 len) {
     /* Device DMA / loader writes bypass mem_write's store hook: drop any
      * JIT translations in the written range (virtio-blk module loads,
      * fwcfg blobs, warm-reboot DTB restore). Cheap no-op when -jit is off. */
-    jit_invalidate_phys_range(pa, len);
+    jit_invalidate_phys_range(m, pa, len);
     /* RAM fast path */
     if (pa >= m->ram_base && pa + len <= m->ram_base + m->ram_size) {
         memcpy(m->ram + (pa - m->ram_base), s, len);

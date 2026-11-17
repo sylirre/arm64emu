@@ -73,8 +73,11 @@ lib/arm64/                           Shared with arm64emu (compiled into both):
   cpu.c                              Step driver, reset, interrupt delivery, SPSR pack/unpack, condition codes, debug dump and the per-step diagnostics
   mem.h                              Guest memory as the core reaches it: typed accesses, fetch and mem_host_ptr, inline over the CPU's translation caches (c->eng: the D-TLB, whose entry layout the JIT probes inline, and the fetch cache); the slow paths and cache maintenance are the program's
   decode.c                           A64 decoder/executor (+ LSE atomics, host-atomic exclusives where guest threads run concurrently, c->eng.smp)
+  jit/jit.h jit/jit_priv.h           JIT public API (jit_run, the program's uses of a CPU's JIT, the jit_mode_* hooks it defines) + internals shared by the runtime, the backends and those hooks (JitEnv)
+  jit/jit.c                          JIT runtime: per-CPU code cache, block chaining, jump cache, invalidation by page, W^X/memfd fallback
   jit/ir.h jit/frontend.c            JIT translator: per-block decode -> linear IR -> liveness / flag fusion
-  jit/backend_a64.c jit/backend_x86_64.c  Register-allocating single-pass emitters (the 32-bit hosts' two stay in src/arm64chroot/jit)
+  jit/backend_a64.c jit/backend_x86_64.c  Register-allocating single-pass emitters
+  jit/backend_x86_32.c jit/backend_arm32.c  ILP32 emitters: guest 64-bit values as host register-pair halves
   predecode.h predecode.c            Pre-decode classifier: instruction word -> PDEnt (dense op id + operands), PD_GENERIC when uncertain; the tier's and the JIT frontend's decoder
   pdrun.c pdrun.h                    Decoded-instruction cache (per CPU): direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
   sysreg.h sysreg.c                  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers (sysreg_id_read), what EL0 may run
@@ -85,10 +88,8 @@ src/arm64chroot/
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot) behind lib/arm64's mem.h (its slow paths; each thread's translation caches, attached to the CPU it runs by as_cpu_attach), guest mmap/brk/mprotect, copy_to/from_guest, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
   exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop, through the CPU's attention)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
-  jit/                               Optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
-    jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends (the JitEnv ABI lib/arm64/jit compiles against)
-    backend_x86_32.c backend_arm32.c ILP32 emitters: guest 64-bit values as host register-pair halves
-    jit.c                            Code cache, block chaining, invalidation, W^X/memfd fallback
+  jit/                               The optional --jit's coherence with the guest address space (AArch64, x86-64, i686 & ARM32 hosts):
+    coherence.c coherence.h          lib/arm64 jit.h's jit_mode_* hooks: the thread registry and cross-thread interrupt, the sticky code-page map, invalidation by VA range (munmap/mprotect/IC IVAU), execve/fork
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c                             Rootfs containment resolver: the walk, plus the pin that hands each syscall a parent-directory fd + final component instead of a path string the host would re-resolve (no concurrent rename can redirect it); bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases
   l2s.c                              --link2symlink: the host the shared engine (lib/link2symlink) runs on -- every host path it names mapped back to its guest name and pinned like a guest path
@@ -124,7 +125,6 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the code and documentation (`docs/arm64chroot/`).
 * Keep in sync the file structure in design section of `docs/arm64chroot/README.md` and structure section of this file.
 * New implemented syscalls must also be defined in `src/arm64chroot/strace.c` argdefs, so they can be decoded by `--strace-full`.
-* The JIT runtime (`jit/jit.c`) has a near-verbatim twin in arm64emu (`src/arm64emu/jit/jit.c`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); the step driver and the predecoded tier are already shared (`lib/arm64/`).
 
 ## Testing
 

@@ -10,10 +10,10 @@ mode, `c->eng`: `sys` 0 has `sysreg_init` set EL1 up as Linux does, so the
 EL1-only instructions and checks are what they are at EL0 under Linux --
 UNDEFINED, or never enabled; `smp` 1 makes LSE atomics, exclusives,
 LDAR/STLR and barriers host atomics and fences, since guest threads run
-concurrently). The JIT runtime (`src/arm64chroot/jit/jit.c`) is kept
-**diffable** against arm64emu's copy so fixes flow both ways until the two are
-merged into `lib/arm64/`. Everything below the memory seam and above the
-exception seam is rewritten for user mode.
+concurrently). So is the JIT (`lib/arm64/jit/`), whose coherence with the
+guest address space is this program's (`src/arm64chroot/jit/coherence.c`).
+Everything below the memory seam and above the exception seam is rewritten for
+user mode.
 
 ```
     shared (lib/arm64/)                                    new (src/arm64chroot/)
@@ -216,7 +216,8 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 | `src/arm64chroot/sys_procfs.c` | Synthesized guest `/proc` views (`maps`, `cmdline`, `mounts`/`mountinfo`, `stat`, `loadavg`/`uptime`/`version`, `locks` minus the holders the guest cannot see, and the lines of per-process `status` that would otherwise describe the emulator). |
 | `src/arm64chroot/sys_netlink.c` | In-process `NETLINK_ROUTE` emulation for hosts that deny `AF_NETLINK` (Android/SELinux), reached from the socket calls in `sys_net.c` and from `read`/`write`/`readv`/`writev` in `sys_file.c`; also answers the read-only `SIOCGIF*` interface-query ioctls (ifconfig/net-tools) from the host interface table. |
 | `src/arm64chroot/proctab.c` | Shared-memory guest-PID registry powering the cross-process `ps`/`top` and hidden-process views, and holding the id maps of a faked user namespace (which a parent writes for its child) and each process's seccomp state. |
-| `src/arm64chroot/jit/` | Optional `--jit` translator: `frontend.c` (decode → IR), `backend_a64.c` / `backend_x86_64.c` / `backend_x86_32.c` / `backend_arm32.c` (emitters), `jit.c` (code cache, chaining, invalidation). |
+| `lib/arm64/jit/` | Optional `--jit` translator: `frontend.c` (decode → IR), `backend_a64.c` / `backend_x86_64.c` / `backend_x86_32.c` / `backend_arm32.c` (emitters), `jit.c` (code cache, chaining, invalidation). |
+| `src/arm64chroot/jit/coherence.c` | The JIT's coherence with the guest address space: thread registry, sticky code-page map, invalidation by VA range. |
 | `src/arm64chroot/signal.c` | Host signal capture → guest `rt_sigframe`; `rt_sigreturn`; job-control mask mirroring. |
 | `src/arm64chroot/thread.h` | Per-thread state (`g_tls`): pending exception, tid, syscall-restart bookkeeping. |
 | `src/arm64chroot/machine.h` | `struct Machine` = the shared per-process task state. |

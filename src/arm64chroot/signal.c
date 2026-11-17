@@ -36,7 +36,7 @@
 #include "machine.h"
 #include "ptrace.h"
 #include "guest_abi.h"
-#include "jit.h"
+#include "coherence.h"
 
 #define GSIG_DFL 0
 #define GSIG_IGN 1
@@ -853,7 +853,6 @@ void sig_tls_prewarm(void) {
     (void)*(volatile s32 *)&g_tls.tid;                /* handlers read g_tls */
     bus_tls_prewarm();   /* mem.c: bus_catcher's g_bus_jb/g_bus_armed/g_bus_cpu */
     proctab_tls_prewarm();   /* proctab.c: the slot a reap's charge publishes to */
-    jit_tls_prewarm();   /* jit.c: g_jit_env, jit_signal_interrupt's target */
 }
 
 static void host_catcher(int sig, siginfo_t *si, void *uctx);

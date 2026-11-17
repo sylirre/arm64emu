@@ -453,6 +453,8 @@ void be_emit_thunks(Emit *e, JitEnv *env) {
     ei(e, enc_ldr(3, 28, 0, (unsigned)offsetof(JitEnv, c)));
     ei(e, enc_br(1));                             /* br x1                  */
 
+    env->jc_miss_rx = e->rx;                      /* falls into the epilogue */
+    ei(e, enc_movn(0, 0, 0, 0));                  /* w0 = EXIT_NONE         */
     env->epilogue_rx = e->rx;
     ei(e, enc_ldstp64(1, 0, 19, 20, 31, 16));
     ei(e, enc_ldstp64(1, 0, 21, 22, 31, 32));

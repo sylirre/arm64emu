@@ -1,19 +1,21 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* JIT internals shared between the runtime (jit.c) and the host backends.
- * One backend compiles per host (self-selected by #ifdef in backend_*.c);
- * jit.c provides inert stubs on hosts without one, so the runtime links —
- * and stays ILP32-clean — everywhere. */
+/* JIT internals shared between the runtime (jit.c), the host backends and
+ * the program's part of the runtime (its jit_mode_* hooks, jit.h). One
+ * backend compiles per host (self-selected by #ifdef in backend_*.c); jit.c
+ * provides inert stubs on hosts without one, so the runtime links -- and
+ * stays ILP32-clean -- everywhere. */
 #ifndef A64_JIT_PRIV_H
 #define A64_JIT_PRIV_H
 
 #include <stddef.h>
 #include "cpu.h"
-#include "mmu.h"     /* LIKELY/UNLIKELY, guest page constants */
+#include "mem.h"     /* the CPU's translation caches: the probe ABI */
 #include "jit.h"
 
-/* Basic-block budget: capped length, and a translation never crosses a 4 KB
- * guest page boundary (invalidation is page-granular). JIT_INSN_MAX_BYTES is
+/* Basic-block budget: capped length (JIT_MAX_BLOCK_INSNS, jit.h), and a
+ * translation never crosses a 4 KB guest page boundary (invalidation is
+ * page-granular). JIT_INSN_MAX_BYTES is
  * the worst-case emitted host bytes per guest instruction across backends;
  * translate() reserves the full budget up front so emission cannot overrun.
  * An ILP32 backend legalizes every 64-bit guest op into 32-bit register pairs
@@ -23,7 +25,6 @@
  * the bound. Reserving too little does not truncate a block: emission latches
  * overflow and translate() retries with half the instructions, and a single
  * instruction that cannot fit disables the JIT outright. */
-#define JIT_MAX_BLOCK_INSNS 128
 #if A64_HOST_ILP32
 #define JIT_INSN_MAX_BYTES  384   /* measured: ~84 B/insn average, worst block
                                    * ~232, and a retry costs a re-translation */
@@ -32,7 +33,7 @@
 #endif
 #define JIT_BLOCK_MAX_BYTES (JIT_MAX_BLOCK_INSNS * JIT_INSN_MAX_BYTES + 256)
 
-/* Largest per-thread code cache a host's direct branch can span, in MiB: the
+/* Largest code cache a host's direct branch can span, in MiB: the
  * exit stubs and the chain patches are plain branches from anywhere in the cache
  * to anywhere else. x86 rel32 covers any size; AArch64's B imm26 reaches
  * +-128 MiB; ARM32's imm24 only +-32 MiB. */
@@ -42,7 +43,7 @@
 #define JIT_CACHE_MAX_MB 128
 #endif
 
-#define JIT_HASH_BITS 14                      /* block table buckets/thread */
+#define JIT_HASH_BITS 14                      /* block table buckets */
 #define JIT_HASH_SIZE (1u << JIT_HASH_BITS)
 #define JIT_PAGE_BITS 12                      /* page->blocks index buckets */
 #define JIT_PAGE_TBL  (1u << JIT_PAGE_BITS)
@@ -67,12 +68,22 @@ typedef struct { u32 fast, slow; } JFixup;
 #define JIT_EXIT_NONE 0xffffffffu
 
 typedef struct JBlock {
-    u64 pc;                     /* guest entry address (exact-match key) */
+    u64 pc;                     /* guest entry address */
+    u64 tag;                    /* pc << 3 | ctx (jit.c, jit_ctx): the lookup
+                                 * key, with host_page -- a block is valid
+                                 * only for the context it was built in */
+    const u8 *host_page;        /* host pointer of the code page at translate
+                                 * time; dispatch re-resolves pc's page and
+                                 * requires a match, so a VA that names other
+                                 * memory now (a TTBR switch, a remap) misses */
+    u64 page;                   /* the page key invalidation goes by: the
+                                 * physical page in a full system, the virtual
+                                 * one in user mode (resolve_code_page) */
     u32 ninsns;                 /* guest instructions covered */
     u32 in_head;                /* incoming chained-edge list (edge pool), ~0 end */
     const u8 *code;             /* entry point in the RX view */
-    struct JBlock *hash_next;   /* pc-hash chain */
-    struct JBlock *page_next;   /* per-guest-page chain (invalidation) */
+    struct JBlock *hash_next;   /* tag-hash chain */
+    struct JBlock *page_next;   /* per-page chain (invalidation) */
     u64 exit_pc[2];             /* chainable successor pcs (~0 = none) */
     u32 exit_off[2];            /* patch-site offset from code, in bytes */
     u32 stub_word0[2];          /* original first word at the patch site
@@ -87,31 +98,41 @@ typedef struct JEdge {
     u32 next;                   /* ~0 end */
 } JEdge;
 
-/* Per-thread JIT state. Generated code pins a host register on this struct
- * (x86-64: r15, arm64: x27) and addresses the fields BEFORE jcache at fixed
- * small offsets (arm64 LDR imm12 reach); keep new generated-code-visible
- * fields in that leading group, 8-aligned. */
+/* One CPU's JIT state (c->eng.jit), allocated by its first jit_run and only
+ * ever touched by the host thread running the CPU -- save `interrupt`, which
+ * any thread or a signal handler may raise. Generated code pins a host
+ * register on this struct (x86-64: r15, arm64: x27) and addresses the fields
+ * BEFORE jcache at fixed small offsets (arm64 LDR imm12 reach); keep new
+ * generated-code-visible fields in that leading group, 8-aligned. */
 typedef struct JitEnv {
     CPU *c;                     /* pinned second register loads this (offset 0) */
-    volatile u32 interrupt;     /* safepoint flag: signal/invalidate/mapping */
+    /* Block-entry safepoint flag: generated code leaves at the next block
+     * entry while it is set, and the dispatcher asks the program to resync
+     * (jit_mode_resync) before it runs another block. Raised by the
+     * program: a caught signal, another thread's mapping change. */
+    volatile u32 interrupt;
     u32 active;
     void *helper_exec1;         /* u32 (*)(CPU*, u64 pc, u32 insn) */
     void *helper_exec1_ic;      /* same, for IC IVAU (invalidates after) */
     void *dtlb;                 /* the CPU's D-TLB (c->eng.dtlb); the inline
                                  * probe takes the entry layout from mem.h and
                                  * the index mask, at emit time, from c->eng */
-    u64 dtlb_ctxgen;            /* low 12 bits of the dtlb_tag() the probe
-                                 * compares (mem.h): the EL0 bit alone here --
-                                 * no generation, the MMU bit clear -- and set
-                                 * once, since a user-mode CPU never leaves EL0
-                                 * nor writes SCTLR_EL1 */
+    u64 dtlb_ctxgen;            /* low 12 bits of the current dtlb_tag():
+                                 * c->eng.genbits | MMU<<1 | EL0, computed
+                                 * from the live state rather than taken from
+                                 * c->eng.tagctx, so that a missed tagctx
+                                 * refresh shows as the engines disagreeing.
+                                 * Inline probes OR this into the VA page for
+                                 * the tag compare; refreshed by the
+                                 * dispatcher every iteration (gen/EL/MMU can
+                                 * only change via block-exiting paths) */
     void *helper_ld;            /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_st;            /* u32 (*)(CPU*, u64 va, u64 val, u64 pc, u32) */
     void *helper_ldv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_stv;           /* u32 (*)(CPU*, u64 va, u64 pc, u32 desc) */
     void *helper_spchk;         /* u32 (*)(CPU*, u64 pc): SP-align fault or 0;
-                                 * called only where SCTLR_EL1.SA0 is set,
-                                 * which user mode leaves clear (sysreg_init) */
+                                 * emitted only where the check can apply
+                                 * (cpu_sp_chk_possible) */
     u64 tmp_spill[4];           /* spill homes for IR temps 0-2 (generated
                                  * code); slot 3 saves a fused memory run's
                                  * base VA across its bail-path helper calls.
@@ -125,9 +146,9 @@ typedef struct JitEnv {
                                  * code stores a translate-time constant here
                                  * and movdqu-loads it (x86 pshufb LUTs and
                                  * byte-shift masks; no RIP-relative pools) */
-    u32 slowmem;                /* ARM64CHROOT_JIT_SLOWMEM: every mem op takes the
-                                 * helper path (fast-path codegen bisection) */
-    /* Sticky union of the FP modes (FPMODE_*) this thread's guest has asked
+    u32 slowmem;                /* ARM64_JIT_ENV("SLOWMEM"): every mem op takes
+                                 * the helper path (fast-path codegen bisection) */
+    /* Sticky union of the FP modes (FPMODE_*) this CPU's guest has asked
      * for; what it costs the inline FP surface is ir.h's vop_fpcr_blocked.
      * Sticky rather than tracking the live bits because clearing them back
      * would have to discard the cache again, and a guest that toggles the
@@ -136,21 +157,31 @@ typedef struct JitEnv {
      * pays a single flush. */
     u8 fpmode_seen;
     /* What the backends emit only for a full system's blocks (IRBlock.sys):
-     * the block ctx jcache probes OR into pc<<3, and the block-entry icount
-     * deadline. A user-mode block's jcache key is its pc, and it has no
-     * deadline -- signals reach it through `interrupt`. */
+     * the block ctx jcache probes OR into pc<<3 (jit_ctx: EL0 | MMU<<1 |
+     * spx<<2 | fp_trapped<<4), and the block-entry icount deadline. A
+     * user-mode block's jcache key is its pc, and it has no deadline --
+     * signals reach it through `interrupt`. */
     u64 ctx;
     u64 icount_deadline;
 
     /* Indirect-branch target cache, probed inline by generated code for
-     * BR/BLR/RET: guest pc -> block entry. Purged on any invalidation. */
+     * BR/BLR/RET: key -> block entry, the key the backends emit (IRBlock.sys
+     * picks it: a full system's (pc << 3) | ctx, the pc in user mode).
+     * Filled by the dispatcher after a verified lookup; an entry goes with
+     * its block (jit_unlink_block), every entry with a flush or with the
+     * CPU's code epoch (CpuEngine.code_epoch), so a hit can never outlive
+     * the translation it was verified under. An empty entry holds the
+     * all-ones tag, which no full-system key can equal, and the miss entry
+     * (jc_miss_rx) as its code, so a user-mode key that does equal it -- a
+     * branch to the all-ones address -- just goes back to the dispatcher. */
 #define JIT_JC_BITS 12
 #define JIT_JC_SIZE (1u << JIT_JC_BITS)
-    /* 16 bytes on every host, for the same reason as DTlbEntry: the inline
+    /* 16 bytes on every host, for the same reason as DTlbEnt: the inline
      * probe scales the index by a shift. */
-    struct JCEnt { u64 pc; const u8 *code; A64_HOST_PTRPAD } jcache[JIT_JC_SIZE];
+    struct JCEnt { u64 tag; const u8 *code; A64_HOST_PTRPAD } jcache[JIT_JC_SIZE];
 
     const u8 *epilogue_rx;      /* generated blocks jump here to exit */
+    const u8 *jc_miss_rx;       /* returns JIT_EXIT_NONE through the epilogue */
     u32 (*enter)(struct JitEnv *env, const u8 *code_rx);   /* returns exit id */
 
     /* Code cache. rw == rx unless the W^X fallback dual-mapped a memfd. */
@@ -165,15 +196,38 @@ typedef struct JitEnv {
     u32 nblocks;
     JEdge *edges;               /* incoming-chain edge pool */
     u32 nedges;
-    JFixup *fixups;             /* inline-memory-access fault fixups */
+    JFixup *fixups;             /* inline-memory-access fault fixups, where
+                                 * guest memory can fault on the host (user
+                                 * mode); NULL otherwise */
     u32 nfixups;
     u32 flush_count;            /* invalidates jit_run's chaining pointers */
-    unsigned long inval_gen_seen;
+    u32 jc_epoch;               /* c->eng.code_epoch the jcache was purged at */
+    /* The EL1 configuration EL0 blocks were judged under (jit_el0cfg): what
+     * SCTLR_EL1 and CNTKCTL_EL1 open to EL0. Blocks translated under another
+     * inline what EL0 may no longer execute, or trap what it now may. */
+    u64 el0cfg;
+    /* Dirty-index list so a purge clears only the jcache entries actually
+     * filled since the last one (a TLBI-heavy phase purges constantly but
+     * fills few entries in between; a full 64 KB pass per TLBI costs as much
+     * as the IC IVAU flush storm the jcache replaced). Saturation (> MAX
+     * fills) falls back to the full pass. */
+#define JIT_JC_DIRTY_MAX 1024
+    u16 jc_dirty[JIT_JC_DIRTY_MAX];
+    u32 jc_ndirty;
+    unsigned long mode_gen;     /* the program's own coherence state
+                                 * (jit_mode_attach/resync) */
+    struct IRBlock *ir;         /* the translator's scratch block (~17 KB) */
+
+    /* ARM64_JIT_ENV("STATS") and ("DUMP"), jit.c: this CPU's share */
+    struct JStat *jstat;        /* helper-call histogram, merged at release */
+    u64 jstat_lost;
+    u64 ntrans, ndisp;          /* translations, dispatcher round trips */
+    int jdump_code_fd, jdump_map_fd;
 
     /* Self-modifying-code thrash guard: a direct-mapped count of how often
-     * each guest page has been invalidated. A page rewritten in a tight loop
-     * (each rewrite = IC IVAU = drop + retranslate) is run purely
-     * interpreted instead, so retranslation storms can't dominate. */
+     * each page key has been invalidated. A page rewritten in a tight loop
+     * (each rewrite = drop + retranslate) is run purely interpreted instead,
+     * so retranslation storms can't dominate. */
 #define JIT_THRASH_SLOTS 64
 #define JIT_THRASH_LIMIT 32
     struct { u64 page; u32 count; } thrash[JIT_THRASH_SLOTS];
@@ -195,8 +249,6 @@ _Static_assert(offsetof(CPU, v) + 16 * 32 <= 65520 &&
                offsetof(CPU, icount) <= 32760,
                "CPU fields generated code touches must stay in imm12 reach");
 
-extern __thread JitEnv g_jit_env;
-
 /* Emission cursor. rw is where bytes are written, rx the address the same
  * bytes will execute at; they advance in lockstep (branch displacements are
  * computed against rx). Overflow is latched, never trapped. */
@@ -207,12 +259,14 @@ typedef struct Emit {
     int overflow;
 } Emit;
 
-/* ---- backend surface (backend_x86_64.c / backend_a64.c) ---- */
+/* ---- backend surface (backend_x86_64.c / backend_a64.c /
+ *      backend_x86_32.c / backend_arm32.c) ---- */
 
 struct IRBlock;
 
 int  be_available(void);
-/* Emit the enter/exit thunks once per cache; sets env->enter/epilogue_rx. */
+/* Emit the enter/exit thunks once per cache; sets env->enter, epilogue_rx
+ * and jc_miss_rx. */
 void be_emit_thunks(Emit *e, JitEnv *env);
 /* Emit a whole block (entry safepoint, body, exit stubs). Fills b->exit_*.
  * Returns 0, or -1 on emission-buffer overflow (caller retries smaller). */

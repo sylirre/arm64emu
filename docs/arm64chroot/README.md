@@ -367,9 +367,13 @@ lib/arm64/      AArch64 emulation shared with arm64emu:
   pdrun.{h,c}   decoded-instruction cache (per CPU): direct-threaded fast path
                 over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the
                 default engine)
-  jit/          the JIT translator: ir.h, frontend.c (per-block decode ->
-                linear IR -> liveness / flag fusion), backend_a64.c and
-                backend_x86_64.c (register-allocating single-pass emitters)
+  jit/          the JIT: jit.c (the runtime: per-CPU code cache, block
+                chaining, jump cache, invalidation by page, W^X/memfd
+                fallback), ir.h, frontend.c (per-block decode -> linear IR ->
+                liveness / flag fusion), backend_a64.c and backend_x86_64.c
+                (register-allocating single-pass emitters), backend_x86_32.c
+                and backend_arm32.c (ILP32 emitters: guest 64-bit values as
+                host register-pair halves, only destinations allocated)
   sysreg.{h,c}  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers, what EL0 may run
   esr.h         ESR exception classes + syndrome construction
   exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
@@ -387,11 +391,10 @@ src/arm64chroot/
   loop.c        run loop + exception dispatch + signal delivery point +
                 the thread call-out safepoint (stop_gen) + EL0's view of the
                 ID registers (the kernel's MRS emulation)
-  jit/          optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
-    (ir.h frontend.c backend_a64.c backend_x86_64.c are lib/arm64/jit's)
-    backend_x86_32.c backend_arm32.c   ILP32 emitters: guest 64-bit values as
-                host register-pair halves, only destinations allocated
-    jit.c         code cache, block chaining, invalidation, W^X/memfd fallback
+  jit/          the optional --jit's coherence with the guest address space
+                (AArch64, x86-64, i686 & ARM32 hosts): coherence.{h,c}, the
+                thread registry, the sticky code-page map, invalidation by VA
+                range, execve/fork
   elf.c         ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c        rootfs containment resolver handing every syscall a pinned
                 parent-directory fd rather than a re-resolvable path string,

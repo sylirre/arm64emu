@@ -12,7 +12,8 @@
 #include "cpu.h"
 #include "fdt/fdt.h"
 #include "tty.h"
-#include "jit/jit.h"
+#include "jit.h"
+#include "mmu.h"
 #include "pdrun.h"
 #include "diag.h"
 #include <stdio.h>
@@ -374,7 +375,7 @@ static void help(void) {
                         "exec_a64 helper, =/path dumps the ranking to a file "
                         "at exit."},
         {"ARM64EMU_JIT_DUMP=PREFIX", "Write each translated block into a sparse "
-                        "code-cache image (PREFIX.code plus a .map)."},
+                        "code-cache image (PREFIX.<pid>.<tid>.code plus a .map)."},
         {"ARM64EMU_JIT_PDMAX=N", "Translate only PD ops <= N natively (bisects a "
                         "codegen bug to one instruction class)."},
         {"ARM64EMU_JIT_SLOWMEM=1", "Force every JIT memory access through the slow "
@@ -889,7 +890,7 @@ int main(int argc, char **argv)
             run_engine(c, tick_mask + 1, max_insn);
         if (c->stop) {
             if (m.cpu.reset && machine_reset) {   /* PSCI SYSTEM_RESET: warm reboot */
-                jit_reset();                      /* drop all translations */
+                jit_reset(&m);                    /* drop all translations */
                 machine_reset(&m, entry, (unsigned)reset_el);
                 /* machine_reset restores the built-in DTB; re-apply file-based
                  * overrides that live in RAM, which the previous OS reused. */

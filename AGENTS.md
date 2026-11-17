@@ -25,7 +25,7 @@ tooling, test suites and diagnostics. Read it before working on that program.
 Makefile               the one build of everything (see "Building")
 VERSION                the version of all three programs
 lib/arm64/             AArch64 emulation shared by arm64emu and arm64chroot
-lib/arm64/jit/         the JIT translator (IR, frontend, x86-64 and AArch64 backends)
+lib/arm64/jit/         the JIT: translator (IR, frontend), runtime, the four host backends
 lib/link2symlink/      hardlink emulation (--link2symlink) shared by arm64chroot and chroot-ng
 src/<program>/         each program's own sources, and its AGENTS.md
 tests/<program>/       each program's test suite
@@ -34,11 +34,10 @@ docs/<program>/        each program's documentation; README.md is its user guide
 build/                 everything the build makes (gitignored, see below)
 ```
 
-The one part of the emulation core that still differs between the two
-emulators, the JIT runtime, lives in each emulator's tree for now, kept
-diffable against its twin; it moves into `lib/` once unified. A file in
-`lib/` is compiled into every program that uses it, with that program's
-flags, so a change there must pass every such program's suites.
+The whole emulation core is shared: the interpreter, the predecoded tier and
+the JIT. A file in `lib/` is compiled into every program that uses it, with
+that program's flags, so a change there must pass every such program's
+suites.
 
 What differs between the programs is configured, not forked, and decided at
 run time, not at build time: each CPU carries the mode the program runs it in
@@ -60,11 +59,12 @@ of the environment knobs it reads). Guest memory is the library's own interface,
 inline over the translation caches part of every CPU (`c->eng`: one
 D-TLB entry layout and one fetch cache for both programs), with slow paths and
 cache maintenance (`mem_read_slow`, ..., `tlb_flush_all`) the program defines
-for the memory it models. `lib/arm64/jit` also takes the program's
-`jit_priv.h`: each program's JIT runtime (`jit.c`) defines the environment the
-translator emits code against (`JitEnv`, its jump cache, helpers). Beyond
-those it calls functions the program defines (`exception_take`, `gt_count`,
-...). It includes no other program header.
+for the memory it models. The JIT's coherence with that memory is the
+program's too: the runtime asks it through the `jit_mode_*` hooks
+(`lib/arm64/jit/jit.h`) what a translated page's change looks like there --
+a store to a code page in a full system, an munmap or IC IVAU in user mode.
+Beyond those it calls functions the program defines (`exception_take`,
+`gt_count`, ...). It includes no other program header.
 
 `lib/link2symlink` includes no program header at all: it reaches the host only
 through the table of operations the program defines as `l2s_host` (`struct

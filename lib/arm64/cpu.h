@@ -78,6 +78,13 @@ typedef struct CpuEngine {
      * invalidates its own entries. */
     const unsigned long *gen_src;
     unsigned long gen;
+    /* Moves wherever what a VA holds as code can change without anyone
+     * telling the JIT: a full system's TLB maintenance (the program's
+     * tlb_flush_all and tlb_flush_page). What caches code by VA beyond the
+     * D-TLB and the fetch caches -- the JIT's jump cache -- empties itself
+     * when it moves. User mode tells the JIT of every change instead, and
+     * leaves it be. */
+    u32 code_epoch;
     /* One fetch cache per privilege, so the EL0<->EL1 ping-pong of every
      * syscall/IRQ/ERET keeps both code pages cached: fetch[0] is the current
      * EL's, the one every fetch probes, and fetch[1] the other's.
@@ -99,10 +106,13 @@ typedef struct CpuEngine {
      *      executed by one host thread in program order, where a plain
      *      read-modify-write is atomic and a barrier orders nothing more. */
     u8 sys, smp;
-    /* The predecoded tier's decode cache (pdrun.h), allocated by its first
-     * run. Belongs to the host thread running the CPU, like everything here:
-     * a CPU copied to start another thread must not take it along. */
+    /* The engines' own state, allocated by their first run: the predecoded
+     * tier's decode cache (pdrun.h) and the JIT's code cache and tables
+     * (jit.h). They belong to the host thread running the CPU, like
+     * everything here: a CPU copied to start another thread must not take
+     * them along. */
     struct PDEnt *pd;
+    struct JitEnv *jit;
 } CpuEngine;
 
 typedef struct CPU {

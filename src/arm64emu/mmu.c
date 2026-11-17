@@ -83,9 +83,8 @@ void tlb_flush_all(CPU *c) {
     cpu_refresh_dtlb_ctx(c);     /* ...and an SCTLR_EL1 write's M bit */
     lp_base = lp_mask = ~0ULL;   /* every fragment died with the generation */
     e->fetch[0].host = e->fetch[1].host = NULL;   /* force a re-translate */
+    e->code_epoch++;             /* and VA->code bindings may have moved */
 }
-
-u32 g_tlbi_va_seq;
 
 void tlb_flush_page(CPU *c, u64 va) {
     if ((VA_NOTAG(va) & lp_mask) == lp_base) { tlb_flush_all(c); return; }
@@ -97,7 +96,7 @@ void tlb_flush_page(CPU *c, u64 va) {
     DTlbEnt *de = dtlb_ent(c, va);
     de->tag = 0; de->pte = 0;
     c->eng.fetch[0].host = c->eng.fetch[1].host = NULL;
-    ++g_tlbi_va_seq;
+    c->eng.code_epoch++;
 }
 
 /* ---------- fault injection ---------- */
@@ -346,7 +345,7 @@ bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
         if (pa_page >= m->ram_base && pa_page - m->ram_base < m->ram_size) {
             u64 pfn = (pa_page - m->ram_base) >> 12;
             if (g_jit_code_bitmap[pfn >> 3] & (1u << (pfn & 7)))
-                jit_invalidate_phys_range(pa, size);
+                jit_invalidate_phys_range(m, pa, size);
         }
     }
     dtlb_fill(c, va, pa);

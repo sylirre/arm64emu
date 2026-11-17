@@ -40,18 +40,18 @@ extern u32 g_tlb_gen;
  * translation survives. Escalates to tlb_flush_all when va falls inside the
  * recorded large-page (block-mapped) range — the TLB fragments 2 MB/1 GB
  * blocks into 4 KB entries, and one block-VA TLBI must not leave sibling
- * fragments alive.
- *
- * Bumped by every tlb_flush_page: the JIT dispatcher purges its VA-keyed
- * indirect-branch jcache when this moves (its blocks/D-TLB need nothing —
- * blocks are PA-keyed and re-verified at dispatch, D-TLB slots are cleared
- * there). */
-extern u32 g_tlbi_va_seq;
+ * fragments alive. Both move the CPU's code epoch (CpuEngine.code_epoch),
+ * which the JIT's VA-keyed jump cache follows (its blocks need nothing --
+ * they are PA-keyed and re-verified at dispatch). */
 
 /* Pages holding JIT-translated code: the D-TLB refuses the W bit for them so
  * guest stores fall to the slow path, where the JIT invalidates the page's
- * blocks (self-modifying-code coherence). NULL until a JIT allocates it. */
+ * blocks (self-modifying-code coherence). NULL until a JIT allocates it.
+ * jit/coherence.c owns it, and these two entry points: a write of physical
+ * memory that may hold translated code, and a warm reboot. */
 extern const u8 *g_jit_code_bitmap;
-void jit_invalidate_phys_range(u64 pa, u64 len);   /* defined in jit/jit.c */
+struct Machine;
+void jit_invalidate_phys_range(struct Machine *m, u64 pa, u64 len);
+void jit_reset(struct Machine *m);
 
 #endif /* A64_MMU_H */

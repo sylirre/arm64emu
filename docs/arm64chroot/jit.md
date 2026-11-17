@@ -9,11 +9,12 @@ otherwise; what an ILP32 host does differently is its own section at the end. Th
 does not handle natively is executed by calling `exec_a64`, and the whole
 differential test suite must pass with `--jit` on (`make test-arm64chroot-jit`).
 
-The core (`lib/arm64/`) is shared with the sibling system emulator. The JIT's
-translator is too (`lib/arm64/jit/`); its runtime lives in `src/arm64chroot/jit/`,
-kept diffable against the sibling's, plus a handful of small hooks in the
-program's files (run-loop rung, option parsing, mm invalidation
-hooks, the signal catcher, thread/fork lifecycle).
+The core (`lib/arm64/`) is shared with the sibling system emulator, and so is
+the whole JIT (`lib/arm64/jit/`: translator, runtime, backends). What is this
+program's is the JIT's coherence with the guest address space
+(`src/arm64chroot/jit/coherence.c`, the runtime's `jit_mode_*` hooks) plus a
+handful of small hooks in the program's files (run-loop rung, option parsing,
+mm invalidation hooks, the signal catcher, thread/fork lifecycle).
 
 ## What you get
 
@@ -53,10 +54,15 @@ the first branch, system instruction, or unrecognized group-0xa/0xb encoding;
 it is capped at 128 instructions and **never crosses a 4 KB guest page** (the
 invalidation granularity). Direct branches are chained block-to-block by
 patching the exit jump after the successor is first translated; indirect
-branches (`BR`/`BLR`/`RET`) probe a per-thread guest-pc → host-code cache.
+branches (`BR`/`BLR`/`RET`) probe a per-thread guest-pc → host-code cache. An
+empty entry of it holds the all-ones key and, as its code, a miss entry that
+returns to the dispatcher, so even a branch that matches one (to the all-ones
+address) cannot reach a stale or NULL code pointer; a dropped block empties
+its own entry (`tests/arm64chroot/c/brdropped.c`).
 
-**Per-thread everything.** Each guest thread has its own `JitEnv`: code cache,
-block table, chain-edge list, jump cache, and D-TLB view. There are no locks in
+**Per-thread everything.** Each guest thread runs its own CPU, and each CPU has
+its own `JitEnv` (`c->eng.jit`): code cache, block table, chain-edge list, jump
+cache, and D-TLB view. There are no locks in
 the JIT runtime and generated code is never written by another thread. This
 mirrors the interpreter's per-CPU decode cache / D-TLB design; the cost is
 that a heavily-threaded guest re-translates hot code per thread.
@@ -282,7 +288,7 @@ entry **safepoint restores `c->pc` to the block start** before exiting, because
 a direct chain jump into the block bypassed the predecessor's PC write.
 
 **Signals.** The host catcher enqueues the guest signal, raises the CPU's
-attention (`sig_npend_raise`) and sets the thread's JIT `interrupt` flag
+attention (`sig_npend_raise`) and sets the CPU's JIT `interrupt` flag
 (async-signal-safe: two stores). Generated code checks the flag at every block
 entry, so delivery latency is bounded by one block; the actual delivery
 happens only from `emu_loop`, from consistent state, so `rt_sigreturn` and
@@ -315,9 +321,9 @@ on running it where the interpreter took the zeroed page's SIGILL
 bitmap decides whether other threads must be interrupted. Each thread drops its own affected blocks at
 a safepoint and re-syncs its D-TLB (generated fast paths skip the interpreter's
 per-access generation check — the retired-backing quarantine in `mem.c` keeps a
-stale hit benign, exactly as for the interpreter). Dropping a page purges only
-the indirect-branch jump-cache entries whose target lies on it, not the whole
-cache, and a range too wide to visit page-by-page (a large `munmap`) is dropped
+stale hit benign, exactly as for the interpreter). Dropping a block empties
+only its own indirect-branch jump-cache entry, not the whole cache, and a range
+too wide to visit page-by-page (a large `munmap`) is dropped
 by walking the bounded block arena rather than flushing every translation — so a
 data-region unmap no longer evicts unrelated hot code. A page rewritten in a
 tight loop trips a **thrash guard** and is run purely interpreted, so a
@@ -475,8 +481,8 @@ rather than by operand count. Two consequences are load-bearing:
 
 **Registers.** `ebp` = `CPU*`; `eax`/`edx` scratch; `ebx`, `esi`, `edi`, `ecx`
 allocatable, with `ecx` last because it is the only one a C call does not
-preserve. `JitEnv` is *not* pinned: it is a `__thread` object and generated code
-is per-thread, so its address is a translate-time constant that x86 reaches as
+preserve. `JitEnv` is *not* pinned: it is the CPU's own and generated code is
+per-CPU, so its address is a translate-time constant that x86 reaches as
 an absolute displacement for free — which is also how the jump cache is probed
 (`[jcache + idx*4]`, the entry's 16-byte stride folded into the SIB scale), and
 how the D-TLB will be. Helpers are called by direct `call rel32`, since on a

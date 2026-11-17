@@ -666,6 +666,8 @@ void be_emit_thunks(Emit *e, JitEnv *env) {
     alu_ri(e, AL_SUB, ESP_, FR_SIZE);            /* esp now 0 mod 16 */
     op_rm(e, 0xFF, 4, RM_R(ECX));                /* jmp ecx */
 
+    env->jc_miss_rx = e->rx;                     /* falls into the epilogue */
+    mov_ri(e, EAX, JIT_EXIT_NONE);
     env->epilogue_rx = e->rx;
     alu_ri(e, AL_ADD, ESP_, FR_SIZE);
     e8(e, 0x5F);                                 /* pop edi */

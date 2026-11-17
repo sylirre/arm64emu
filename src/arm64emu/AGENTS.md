@@ -72,13 +72,20 @@ lib/arm64/                shared with arm64chroot (compiled into both):
                           predecoded tier's and the JIT frontend's decoder
   pdrun.h, pdrun.c        pd_run, the default computed-goto tier over the
                           CPU's decode cache of PDEnts (pinned to -O2 here)
-  jit/                    the JIT's translator (both emulators; the runtime,
-                          jit.c, stays in each program):
+  jit/                    the JIT (--jit, off by default):
+    jit.h                 public interface: jit_run, the program's uses of a
+                          CPU's JIT, and the jit_mode_* hooks it defines
+    jit_priv.h            internals shared by the runtime, the backends and
+                          the program's hooks: JitEnv, the block tables
+    jit.c                 the runtime: per-CPU code cache, block tables,
+                          dispatch loop, chaining, jump cache, memory slow
+                          paths, the ARM64EMU_JIT_* knobs
     ir.h                  the IR: op set, virtual registers, block layout
     frontend.c            basic-block discovery + PDEnt -> IR translation
                           (guest-shaped concerns are all resolved here)
     backend_x86_64.c      x86-64 code generator
     backend_a64.c         AArch64 code generator (same-ISA host)
+    backend_x86_32.c, backend_arm32.c  the ILP32 hosts' (arm64chroot's)
   exec_fpsimd.c           A64 decoder/executor, part 2 — scalar FP, the full
                           Advanced-SIMD surface (three-same/-diff/-extra,
                           by-element, across-lanes, two-misc, shift-imm, copy,
@@ -134,12 +141,11 @@ src/arm64emu/
                           never hand-edit
     fdt.h, fdt.c          minimal in-place FDT editing: sizes the /memory node
                           to --memory, in the built-in tree and in a --dtb file
-  jit/                    the JIT runtime (--jit)
-    jit.h                 public JIT interface (--jit, off by default)
-    jit_priv.h            internals shared between runtime and backends: the
-                          JitEnv ABI lib/arm64/jit compiles against
-    jit.c                 JIT runtime: code cache, block tables, dispatch loop,
-                          SMC coherence, memory slow paths, ARM64EMU_JIT_* knobs
+  jit/
+    coherence.c           the JIT's coherence with physical memory (lib/arm64
+                          jit.h's jit_mode_*): the code-page bitmap that keeps
+                          stores to translated pages off the D-TLB fast path,
+                          IC IVAU by physical address, warm reboot
   net/                    usernet: built-in user-mode NAT stack (no libslirp)
     usernet.h             device-facing API (input/poll/output callback)
     usernet_priv.h        internals: fixed topology, shared helpers
@@ -216,7 +222,6 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the interpreter and JIT parts of emulator where possible.
 * Keep in sync the code and documentation (`docs/arm64emu/`).
 * Keep in sync the file structure in architecture section of `docs/arm64emu/README.md` and structure section of this file.
-* The JIT runtime (`jit/jit.c`) has a near-verbatim twin in arm64chroot (`src/arm64chroot/jit/jit.c`). Mirror a fix to the twin, or say why it does not apply; the step driver and the predecoded tier are already shared (`lib/arm64/`).
 
 ## Testing
 

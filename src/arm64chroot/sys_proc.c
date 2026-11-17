@@ -27,7 +27,7 @@
 
 #include "sys.h"
 #include "sys_netlink.h"
-#include "jit.h"
+#include "coherence.h"
 #include "pdrun.h"
 #include "ptrace.h"
 
@@ -117,7 +117,7 @@ static void leader_park(CPU *c) {
      * as the kernel's exit_signals retargets it -- or with the leader, if it
      * was the leader's own. */
     sig_thread_exit();
-    jit_thread_exit();   /* hand back the code cache; jit_run builds a fresh
+    jit_cpu_release(c);  /* hand back the code cache; jit_run builds a fresh
                           * one if this thread is ever revived */
     pd_cache_free(c);    /* and the decode cache, which pd_run rebuilds */
     g_tls.sc_ret_eintr = 0;   /* exit(2) is not a syscall to be restarted */
@@ -826,14 +826,16 @@ static void futex_wake_addr(CPU *c, u64 va) {
 
 /* Give c, the CPU of the calling thread, `from`'s state: a struct copy, less
  * what belongs to the host thread c runs on rather than to the program --
- * its translation caches (as_cpu_attach), the decode cache it keeps
- * (pd_run's), and what its FPCR mirrors, which the copy would claim were
- * `from`'s host thread's (fpcr_host_sync). */
+ * its translation caches (as_cpu_attach), its engines' own (the decode
+ * cache and the JIT it keeps), and what its FPCR mirrors, which the copy
+ * would claim were `from`'s host thread's (fpcr_host_sync). */
 static void cpu_adopt(CPU *c, const CPU *from) {
     struct PDEnt *pd = c->eng.pd;
+    struct JitEnv *jit = c->eng.jit;
     *c = *from;
     as_cpu_attach(c);
     c->eng.pd = pd;
+    c->eng.jit = jit;
     c->host_fzmode = HOST_FZMODE_UNKNOWN;
 }
 
@@ -901,7 +903,7 @@ static void *thread_entry(void *arg) {
      * joiners. A tracer is a task, so what this thread traced is released
      * with it (exit_ptrace), however long its process goes on. */
     ptrace_tracer_thread_exit();
-    jit_thread_exit();
+    jit_cpu_release(c);
     pd_cache_free(c);
     sig_thread_exit();   /* what it caught for the process, to another thread */
     sig_tls_release();   /* and whatever this thread's signal queue grew into */

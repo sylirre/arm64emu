@@ -550,6 +550,8 @@ void be_emit_thunks(Emit *e, JitEnv *env) {
     alu_ri_s(e, OP_SUB, 0, SP_, SP_, FR_SIZE, R0);
     bx_r(e, R12);
 
+    env->jc_miss_rx = e->rx;                      /* falls into the epilogue */
+    mov_ri(e, R0, JIT_EXIT_NONE);
     env->epilogue_rx = e->rx;
     alu_ri_s(e, OP_ADD, 0, SP_, SP_, FR_SIZE, R1);
     ei(e, AL | 0x08BD0000u | 0x8FF0u);            /* pop {r4-r11, pc} */

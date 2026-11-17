@@ -15,7 +15,7 @@ transcriptions of it that fall back into it:
   `L_GENERIC: exec_a64(c, insn)` (`lib/arm64/pdrun.c`). The `NEXT` epilogue
   mirrors `cpu_step`'s tail exactly (icount, the CPU's attention, fetch).
 - `--jit`: anything the frontend does not translate becomes
-  `IRO_CALL1 → jit_exec1 → exec_a64` (`src/arm64emu/jit/jit.c`), which replicates
+  `IRO_CALL1 → jit_exec1 → exec_a64` (`lib/arm64/jit/jit.c`), which replicates
   `cpu_step`'s set-PC / execute / `icount++` contract, including counting
   aborted instructions.
 

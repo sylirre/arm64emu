@@ -206,14 +206,14 @@ ARM64CHROOT_ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
                          -DA64_LINK2SYMLINK -DA64_L2S_FORCE
 
 ARM64CHROOT_SRC := $(LIB_ARM64) $(LIB_L2S) \
-    src/arm64chroot/jit/jit.c \
-    src/arm64chroot/jit/backend_x86_32.c src/arm64chroot/jit/backend_arm32.c \
+    src/arm64chroot/jit/coherence.c \
     $(addprefix src/arm64chroot/,mem.c exception.c loop.c elf.c path.c l2s.c \
       signal.c syscall.c strace.c sys_file.c sys_mm.c sys_ipc.c sys_proc.c \
       sys_sig.c sys_time.c sys_misc.c sys_net.c sys_netlink.c sys_procfs.c \
       sys_ptrace.c sys_seccomp.c proctab.c ptracetab.c main.c)
-# (JIT backends self-select by host #ifdef — empty TUs elsewhere — so the list
-# is host-independent and the 32-bit builds get the interpreter-only stub.)
+# (The JIT backends, lib/arm64/jit's, self-select by host #ifdef — empty TUs
+# elsewhere — so the list is host-independent, and a host with none gets the
+# runtime's inert stubs.)
 
 ARM64CHROOT_OBJ      := $(ARM64CHROOT_SRC:%.c=$(OBJDIR)/arm64chroot/native/%.o)
 ARM64CHROOT_M32_OBJ  := $(ARM64CHROOT_SRC:%.c=$(OBJDIR)/arm64chroot/m32/%.o)

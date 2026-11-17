@@ -176,7 +176,8 @@ src/arm64emu/
                 virtio_net (--net), virtio_9p (--virtfs), virtio_console (--console)
   fdt/          device tree: virt.dts (QEMU virt tree; compiled to virt_dtb.h,
                 embedded) + fdt.c, which sizes its /memory node to --memory
-  jit/          the JIT runtime, jit.c (the translator is lib/arm64/jit)
+  jit/          coherence.c: the JIT's coherence with physical memory (the
+                runtime and the translator are lib/arm64/jit)
   net/          usernet, the built-in user-mode NAT stack behind virtio-net
                 (core/udp/tcp; no TAP, TUN, privileges or external libraries)
 lib/arm64/      AArch64 emulation shared with arm64chroot:
@@ -192,8 +193,9 @@ lib/arm64/      AArch64 emulation shared with arm64chroot:
   decode.c      A64 decoder: integer/branch/load-store, CRC32, AdvSIMD ld/st
   predecode.{h,c}  the pre-decode classifier (word -> PDEnt) both engines use
   pdrun.{h,c}   the predecoded tier, the default direct-threaded engine
-  jit/          the JIT translator: ir.h, frontend.c, backend_x86_64.c,
-                backend_a64.c
+  jit/          the JIT: jit.c (runtime), ir.h, frontend.c, backend_x86_64.c,
+                backend_a64.c (and arm64chroot's ILP32 backend_x86_32.c,
+                backend_arm32.c)
   sysreg.{h,c}  MSR/MRS, ID registers, generic-timer registers, DC ZVA, TLBI, AT
   exec_fpsimd.c FP/Advanced-SIMD execution (scalar FP + vector integer)
   esr.h         ESR_ELx exception classes + syndrome construction

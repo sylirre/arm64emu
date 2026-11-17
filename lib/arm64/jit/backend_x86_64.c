@@ -567,6 +567,8 @@ void be_emit_thunks(Emit *e, JitEnv *env) {
     op_rm(e, 1, 0x8B, R14, RDI, (s32)offsetof(JitEnv, c)); /* mov r14,[rdi+c] */
     e8(e, 0xFF); e8(e, 0xE6);                     /* jmp rsi */
 
+    env->jc_miss_rx = e->rx;                      /* falls into the epilogue */
+    mov_ri(e, 0, RAX, JIT_EXIT_NONE);
     env->epilogue_rx = e->rx;
     e8(e, 0x48); e8(e, 0x83); e8(e, 0xC4); e8(e, 0x08);   /* add rsp, 8 */
     e8(e, 0x41); e8(e, 0x5F);                     /* pop r15 */

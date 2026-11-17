@@ -8,7 +8,7 @@
 #include <sys/syscall.h>
 
 #include "sys.h"
-#include "jit.h"
+#include "coherence.h"
 
 #define PG_UP(x)   (((x) + GUEST_PAGE_MASK) & ~GUEST_PAGE_MASK)
 #define PG_DOWN(x) ((x) & ~GUEST_PAGE_MASK)
