@@ -7,8 +7,10 @@
 #define ARM64EMU_ARM64_CONFIG_H
 
 /* The environment knobs of the shared code carry this program's prefix:
- * getenv(ARM64_JIT_ENV("PDMAX")) reads ARM64EMU_JIT_PDMAX. */
-#define ARM64_JIT_ENV(name) "ARM64EMU_JIT_" name
+ * getenv(ARM64_ENV("PD_MAX")) reads ARM64EMU_PD_MAX, and the JIT's,
+ * getenv(ARM64_JIT_ENV("PDMAX")), ARM64EMU_JIT_PDMAX. */
+#define ARM64_ENV(name)     "ARM64EMU_" name
+#define ARM64_JIT_ENV(name) ARM64_ENV("JIT_" name)
 
 #ifdef ANDROID_JNI
 /* Embedded build (see main.c): the emulator is linked into a host process and

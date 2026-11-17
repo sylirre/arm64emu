@@ -1,27 +1,10 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* Exception entry/return. All exceptions are routed to EL1 (we model EL0/EL1). */
+/* Exception entry: every exception is taken to EL1 (we model EL0/EL1).
+ * Return (ERET, cpu_unpack_spsr) is lib/arm64's cpu.c. */
 #include "cpu.h"
 #include "esr.h"
 #include <stdio.h>
-
-u32 cpu_pack_spsr(CPU *c) {
-    u32 s = c->nzcv & (PS_N | PS_Z | PS_C | PS_V);
-    s |= c->daif & (PS_D | PS_A | PS_I | PS_F);
-    /* M[4]=0 (AArch64); M[3:2]=EL; M[1]=0; M[0]=SPSel */
-    s |= ((u32)c->el << 2) | (c->sp_sel ? 1u : 0u);
-    return s;
-}
-
-void cpu_unpack_spsr(CPU *c, u32 spsr) {
-    c->nzcv = spsr & (PS_N | PS_Z | PS_C | PS_V);
-    c->daif = spsr & (PS_D | PS_A | PS_I | PS_F);
-    unsigned m = spsr & 0xf;
-    c->el = (m >> 2) & 3;
-    c->sp_sel = m & 1u;
-    cpu_refresh_el_state(c);       /* ERET may drop to an FPEN-trapped EL,
-                                    * and changes the D-TLB tag's EL0 bit */
-}
 
 void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
     unsigned tel = 1;            /* route to EL1 */
@@ -60,21 +43,4 @@ void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
         fprintf(stderr, "[exc] kind=%d -> EL%u vec=0x%llx esr=0x%llx far=0x%llx elr=0x%llx\n",
                 kind, tel, (unsigned long long)c->pc, (unsigned long long)esr,
                 (unsigned long long)far, (unsigned long long)ret_addr);
-}
-
-void cpu_raise_sync(CPU *c, u64 esr, u64 far) {
-    unsigned ec = (unsigned)(esr >> 26);
-    if (g_iabort_log && (ec == 0x20 || ec == 0x21)) {   /* instruction aborts */
-        static int n = 0;
-        if (n++ < 60)
-            fprintf(stderr, "[iabort] el=%u far=0x%llx esr=0x%llx\n",
-                    c->el, (unsigned long long)far, (unsigned long long)esr);
-    }
-    if (g_tpc && c->cur_insn_pc == g_tpc) {
-        fprintf(stderr, "[sync] faulting pc=0x%llx esr=0x%llx (ec=0x%llx) far=0x%llx\n",
-                (unsigned long long)c->cur_insn_pc, (unsigned long long)esr,
-                (unsigned long long)(esr >> 26), (unsigned long long)far);
-        ring_dump();
-    }
-    exception_take(c, EXC_SYNC, esr, far, c->cur_insn_pc);
 }

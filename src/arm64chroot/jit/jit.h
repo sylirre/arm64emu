@@ -6,7 +6,7 @@
  * every phase of the JIT must keep the differential test suite green.
  *
  * The JIT is per-thread throughout (code cache, block tables), mirroring
- * g_pdcache and the D-TLB: there are no locks in the JIT runtime and never any
+ * the decode cache and the D-TLB: there are no locks in the JIT runtime and never any
  * cross-thread writes to generated code. Cross-thread coherence rides on a
  * per-thread interrupt flag checked at every block entry (safepoint). */
 #ifndef A64_JIT_H
@@ -38,14 +38,10 @@ static inline void jit_disable(void) {
  * (AArch64 or x86-64; other hosts run the interpreter). */
 int jit_backend_available(void);
 
-/* Run translated code until something needs emu_loop's attention (recorded
- * exception, pending signal, stop/halt, instruction-fetch fault) — the same
- * return contract as pd_run. */
-void jit_run(CPU *c);
-/* loop.c: must the run loop act for this thread before more guest code runs
- * (a deliverable signal, a tracer's kick, an execve call-out)? `at` is the pc
- * a signal frame would record. */
-int emu_callout_due(CPU *c, u64 at);
+/* Run translated code until the CPU asks for attention, icount reaches
+ * `deadline`, or an instruction fetch faults -- the same return contract as
+ * pd_run (cpu.h, "Run control"). */
+void jit_run(CPU *c, u64 deadline);
 
 /* ---- Coherence hooks (all cheap no-ops when -jit is off) ---- */
 

@@ -1,5 +1,4 @@
 -I.
--Icore
 -Ijit
 -I../../lib/arm64
 -I../../lib/arm64/jit

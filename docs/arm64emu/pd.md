@@ -8,12 +8,16 @@ reference. `--jit`, where a native backend is available, supersedes it.
 ## What it does
 
 Each instruction is classified once into a `PDEnt` (dense opcode id +
-pre-extracted operands) by `pd_fill` and cached in `g_pdcache`, a direct-mapped
-table indexed by `(pc>>2)`. Execution is a **computed-goto direct-threaded loop**
-(`pd_step` in `src/arm64emu/jit/pdrun.c`): each handler ends in a `NEXT` that
-bumps `icount`, runs the per-instruction rare-event checks, fetches the next word
-via `mem_ifetch`, validates the cache entry, and `goto`s the next handler. The
-per-handler dispatch gives each site its own branch-predictor slot.
+pre-extracted operands) by `pd_fill` and cached in the CPU's decode cache
+(`c->eng.pd`), a direct-mapped table indexed by `(pc>>2)`. Execution is a
+**computed-goto direct-threaded loop** (`pd_run` in `lib/arm64/pdrun.c`,
+arm64chroot's tier too): each handler ends in a `NEXT` that bumps `icount`,
+returns to the run loop if the CPU asks for attention (a stop or halt, an
+interrupt line raised and unmasked) or the slice's deadline is reached,
+fetches the next word via `mem_ifetch`, validates the cache entry, and
+`goto`s the next handler. The per-handler dispatch gives each site its own
+branch-predictor slot. The run loop delivers interrupts between slices
+(`cpu_take_interrupt`), for every engine alike.
 
 Only the **decode** (operand extraction, ~32% of interpreter time) is cached.
 Fetch/MMU translation still runs every instruction, so the predecoded tier is

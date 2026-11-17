@@ -7,13 +7,13 @@ predecoded tier).
 
 ## The structural guarantee
 
-The interpreter (`cpu_step` → `exec_a64`, `src/arm64emu/cpu.c` / `src/arm64emu/decode.c` /
+The interpreter (`cpu_step` → `exec_a64`, `lib/arm64/cpu.c` / `lib/arm64/decode.c` /
 `lib/arm64/exec_fpsimd.c`) is the reference semantics. Both accelerated tiers are
 transcriptions of it that fall back into it:
 
 - Predecoded tier (default): anything `pd_fill` leaves `PD_GENERIC` dispatches to
-  `L_GENERIC: exec_a64(c, insn)` (`src/arm64emu/jit/pdrun.c`). The `NEXT` epilogue
-  mirrors `cpu_step`'s tail exactly (icount, rare-event checks, fetch).
+  `L_GENERIC: exec_a64(c, insn)` (`lib/arm64/pdrun.c`). The `NEXT` epilogue
+  mirrors `cpu_step`'s tail exactly (icount, the CPU's attention, fetch).
 - `--jit`: anything the frontend does not translate becomes
   `IRO_CALL1 → jit_exec1 → exec_a64` (`src/arm64emu/jit/jit.c`), which replicates
   `cpu_step`'s set-PC / execute / `icount++` contract, including counting

@@ -1,16 +1,79 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* pd_run: the predecoded interpreter tier, arm64chroot's default engine — a
- * per-thread decode cache of PDEnts (classified by lib/arm64's pd_fill, on a
- * miss) executed by direct-threaded dispatch. The handlers are kept diffable
- * against arm64emu's jit/pdrun.c until the two are merged. */
-#include "machine.h"
-#include "thread.h"
+/* pd_run: the predecoded interpreter tier, the default engine in both modes --
+ * a per-CPU decode cache of PDEnts (classified by pd_fill, on a miss)
+ * executed by direct-threaded dispatch. Kept in its own TU so it never
+ * perturbs decode.c's codegen; arm64emu pins it to -O2 (the Makefile says
+ * why). */
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "arm64_config.h"
+#include "mem.h"
 #include "pdrun.h"
 
-__thread PDEnt g_pdcache[PD_SIZE];
+int g_pd = 1;          /* the tier is on unless the program turns it off */
 
-int g_predecode = 1;   /* cleared by -nopd */
+/* ARM64_ENV("PD_MAX")=N, a bisection knob: only PD ops <= N keep their
+ * native handlers, everything above runs through exec_a64 (L_GENERIC); 0 is
+ * the pure-interpreter floor. -1 is no limit; read once, by whichever CPU
+ * fills an entry first (every thread computes the same answer). */
+static int pd_max_op(void) {
+    static int max = -2;               /* -2: not read yet */
+    int m = __atomic_load_n(&max, __ATOMIC_RELAXED);
+    if (UNLIKELY(m == -2)) {
+        const char *s = getenv(ARM64_ENV("PD_MAX"));
+        m = s ? atoi(s) : -1;
+        if (m < -1) m = -1;
+        __atomic_store_n(&max, m, __ATOMIC_RELAXED);
+    }
+    return m;
+}
+
+/* The tier's fill: pd_fill plus what belongs to executing straight out of a
+ * PDEnt.
+ *
+ * SP-alignment faults (SCTLR_EL1.SA/SA0) are raised only on the exec_a64 path
+ * (decode.c sp_align_ok), and this tier's native handlers do not check, so
+ * where the check can apply at all (cpu_sp_chk_possible) an SP-based memory
+ * op has to run through L_GENERIC to fault like the interpreter when a
+ * misaligned SP is used as a base. Literal loads are PC-relative, never SP,
+ * so they keep their handlers.
+ *
+ * The JIT deliberately does NOT take this demotion: both backends emit an
+ * inline alignment check (emit_spchk) ahead of every memory op whose base is
+ * VREG_SP, so they can translate these natively and still fault identically.
+ * It matters more than it looks -- SP-based load/store is every function
+ * prologue and epilogue, and demoting it was the single largest source of
+ * helper calls in a guest boot. */
+static void pd_fill_tier(CPU *c, PDEnt *e, u32 insn) {
+    pd_fill(e, insn);
+    if (e->rn == 31 && e->op >= PD_LDR64U && e->op <= PD_STPDPOST &&
+        e->op != PD_LDRLIT64 && e->op != PD_LDRLIT32 && e->op != PD_LDRLITV &&
+        cpu_sp_chk_possible(c))
+        e->op = PD_GENERIC;
+    int max = pd_max_op();
+    if (UNLIKELY(max >= 0) && e->op > max) e->op = PD_GENERIC;
+}
+
+/* The CPU's decode cache, allocated on its first run; NULL if that failed. */
+static PDEnt *pd_cache(CPU *c) {
+    if (UNLIKELY(!c->eng.pd)) {
+        c->eng.pd = calloc(PD_SIZE, sizeof(PDEnt));
+        if (!c->eng.pd) {
+            static int warned;
+            if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+                fprintf(stderr, "cannot allocate the predecoded tier's cache, "
+                                "interpreting\n");
+        }
+    }
+    return c->eng.pd;
+}
+
+void pd_cache_free(CPU *c) {
+    free(c->eng.pd);
+    c->eng.pd = NULL;
+}
 
 /* ---- helpers transcribed from decode.c (which must stay unmodified) ---- */
 
@@ -85,9 +148,12 @@ static inline u64 pd_extend_reg(u64 v, unsigned option, unsigned shift) {
  * every handler gives each one its own branch-predictor slot that learns the
  * guest's instruction sequencing; a single shared switch site mispredicts
  * nearly every dispatch. pd_run executes instructions back-to-back and
- * returns to emu_loop only when something rare needs the loop's attention
- * (recorded exception, pending signal, stop/halt, fetch fault). */
-void pd_run(CPU *c) {
+ * returns to the run loop when the CPU asks for attention, when icount
+ * reaches `deadline`, or on an instruction-fetch fault (cpu.h, "Run
+ * control"); it executes at least one instruction. */
+void pd_run(CPU *c, u64 deadline) {
+    PDEnt *pd = pd_cache(c);
+    if (UNLIKELY(!pd)) { cpu_step(c); return; }
     /* Range default + per-id overrides: the override is the point. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Woverride-init"
@@ -301,25 +367,27 @@ void pd_run(CPU *c) {
     PDEnt *e;
     u32 insn;
 
+    /* Each handler ends in NEXT: bump icount, ask whether the run loop wants
+     * the CPU back, fetch+validate+dispatch. A raised synchronous exception
+     * has already done what it does (vectored, or asked for attention), so
+     * there is nothing extra to check here. */
 #define NEXT do { \
         c->icount++; \
-        if (UNLIKELY(c->stop | c->halted)) return; \
-        if (UNLIKELY(g_tls.pend_exc.valid)) return; \
-        if (UNLIKELY(g_sig_npend)) return; \
+        if (UNLIKELY(cpu_attn_pending(c) | (c->icount >= deadline))) return; \
         c->cur_insn_pc = c->pc; \
         if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return; \
         c->pc += 4; \
-        e = &g_pdcache[(c->cur_insn_pc >> 2) & PD_MASK]; \
-        if (UNLIKELY(e->insn != insn)) pd_fill(e, insn); \
+        e = &pd[(c->cur_insn_pc >> 2) & PD_MASK]; \
+        if (UNLIKELY(e->insn != insn)) pd_fill_tier(c, e, insn); \
         goto *pd_tab[e->op]; \
     } while (0)
 
-    /* Entry: emu_loop has just run the rare-event checks for us. */
+    /* The first instruction: the run loop has just looked at what it acts on. */
     c->cur_insn_pc = c->pc;
     if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return;
     c->pc += 4;
-    e = &g_pdcache[(c->cur_insn_pc >> 2) & PD_MASK];
-    if (UNLIKELY(e->insn != insn)) pd_fill(e, insn);
+    e = &pd[(c->cur_insn_pc >> 2) & PD_MASK];
+    if (UNLIKELY(e->insn != insn)) pd_fill_tier(c, e, insn);
     goto *pd_tab[e->op];
 
 L_GENERIC:
@@ -903,6 +971,15 @@ L_LDR64RO:
         NEXT;
     }
 
+    /* Handlers that touch V registers execute natively (no exec_a64 fallback),
+     * so they must apply the CPACR_EL1.FPEN guard themselves; cur_insn_pc is
+     * already set by the dispatch preamble, and NEXT follows the redirected
+     * c->pc into the vector. FP *data-processing* needs no guard here: it is
+     * PD_GENERIC and exec_a64's dispatch guard covers it. */
+#define FP_GUARD() do { \
+        if (__builtin_expect(c->fp_trapped, 0)) { cpu_fp_trap(c); NEXT; } \
+    } while (0)
+
     /* ---- literal ---- */
 L_LDRLIT64:
     {
@@ -918,6 +995,7 @@ L_LDRLIT32:
     }
 L_LDRLITV:
     {   /* SIMD&FP literal: rm = byte count 4/8/16; zero-extends into V[rd] */
+        FP_GUARD();
         V128 v; v.d[0] = 0; v.d[1] = 0;
         u64 va = c->cur_insn_pc + e->imm;
         if (e->rm == 16) { if (mem_read128(c, va, &v)) c->v[e->rd] = v; }
@@ -956,17 +1034,22 @@ L_STP64:
         NEXT;
     }
 
-    /* ---- FP/SIMD register load/store (rd = Vt) ---- */
+    /* ---- FP/SIMD register load/store (rd = Vt) ----
+     * FP_GUARD (defined above the literal section, which has a V-register form
+     * of its own) applies CPACR_EL1.FPEN to each of these. */
 L_LDRQ:
     {
+        FP_GUARD();
         V128 v;
         if (mem_read128(c, reg_xsp(c, e->rn) + e->imm, &v)) c->v[e->rd] = v;
         NEXT;
     }
 L_STRQ:
+    FP_GUARD();
     mem_write128(c, reg_xsp(c, e->rn) + e->imm, &c->v[e->rd]); NEXT;
 L_LDRV:
     {   /* rm = byte count 1/2/4/8; high half cleared */
+        FP_GUARD();
         u64 t;
         if (mem_read(c, reg_xsp(c, e->rn) + e->imm, e->rm, &t)) {
             c->v[e->rd].d[0] = t;
@@ -975,9 +1058,11 @@ L_LDRV:
         NEXT;
     }
 L_STRV:
+    FP_GUARD();
     mem_write(c, reg_xsp(c, e->rn) + e->imm, e->rm, c->v[e->rd].d[0]); NEXT;
 L_LDRQPRE:
     {
+        FP_GUARD();
         u64 va = reg_xsp(c, e->rn) + e->imm;
         V128 v;
         if (!mem_read128(c, va, &v)) NEXT;
@@ -986,6 +1071,7 @@ L_LDRQPRE:
     }
 L_LDRQPOST:
     {
+        FP_GUARD();
         u64 base = reg_xsp(c, e->rn);
         V128 v;
         if (!mem_read128(c, base, &v)) NEXT;
@@ -994,6 +1080,7 @@ L_LDRQPOST:
     }
 L_STRQPRE:
     {
+        FP_GUARD();
         u64 va = reg_xsp(c, e->rn) + e->imm;
         if (!mem_write128(c, va, &c->v[e->rd])) NEXT;
         set_xsp(c, e->rn, va);
@@ -1001,6 +1088,7 @@ L_STRQPRE:
     }
 L_STRQPOST:
     {
+        FP_GUARD();
         u64 base = reg_xsp(c, e->rn);
         if (!mem_write128(c, base, &c->v[e->rd])) NEXT;
         set_xsp(c, e->rn, base + e->imm);
@@ -1011,6 +1099,7 @@ L_STRQPOST:
      * second faults — matches decode.c's vreg_load ordering) ---- */
 L_LDPQ:
     {
+        FP_GUARD();
         bool post = (e->op == PD_LDPQPOST);
         bool wb = post || e->op == PD_LDPQPRE;
         u64 base = reg_xsp(c, e->rn);
@@ -1025,6 +1114,7 @@ L_LDPQ:
     }
 L_STPQ:
     {
+        FP_GUARD();
         bool post = (e->op == PD_STPQPOST);
         bool wb = post || e->op == PD_STPQPRE;
         u64 base = reg_xsp(c, e->rn);
@@ -1036,6 +1126,7 @@ L_STPQ:
     }
 L_LDPD:
     {
+        FP_GUARD();
         bool post = (e->op == PD_LDPDPOST);
         bool wb = post || e->op == PD_LDPDPRE;
         u64 base = reg_xsp(c, e->rn);
@@ -1050,6 +1141,7 @@ L_LDPD:
     }
 L_STPD:
     {
+        FP_GUARD();
         bool post = (e->op == PD_STPDPOST);
         bool wb = post || e->op == PD_STPDPRE;
         u64 base = reg_xsp(c, e->rn);
@@ -1060,5 +1152,6 @@ L_STPD:
         NEXT;
     }
 
+#undef FP_GUARD
 #undef NEXT
 }

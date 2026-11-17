@@ -28,11 +28,13 @@ extern int g_jit;
  * (x86-64 or AArch64; other hosts run the interpreter). */
 int jit_backend_available(void);
 
-/* Run translated code for up to `slice` retired instructions (the caller's
- * machine_tick cadence), honoring cpu_step's preamble contract (stop, IRQ/FIQ
- * delivery, WFI). When max_insn is near, falls back to cpu_step so -maxinsn
- * stops at the exact instruction. Returns STEP_HALT iff the machine stopped. */
-StepResult jit_step(CPU *c, u64 slice, u64 max_insn);
+/* The longest block: translated code checks the deadline at block entries,
+ * so it can retire up to this many instructions past it. */
+#define JIT_MAX_BLOCK_INSNS 128
+
+/* Run translated code until the CPU asks for attention or icount reaches
+ * `deadline` (cpu.h, "Run control"), the latter up to a block late. */
+void jit_run(CPU *c, u64 deadline);
 
 /* ---- Coherence hooks (all cheap no-ops when -jit is off) ---- */
 
@@ -42,10 +44,6 @@ void jit_invalidate_phys_range(u64 pa, u64 len);
 
 /* PSCI warm reboot (machine_reset): drop all translations and reset state. */
 void jit_reset(void);
-
-/* Called from the host signal catcher (async-signal-safe: one store): make
- * generated code exit at the next block entry. */
-void jit_request_exit(void);
 
 /* Flush the ARM64EMU_JIT_STATS report if enabled. No-op otherwise. */
 void jit_stats_flush(void);

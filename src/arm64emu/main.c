@@ -13,7 +13,8 @@
 #include "fdt/fdt.h"
 #include "tty.h"
 #include "jit/jit.h"
-#include "jit/pdrun.h"
+#include "pdrun.h"
+#include "diag.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,29 @@ static void on_signal(int sig) {
     prof_dump();
     jit_stats_flush();     /* _exit skips atexit; flush ARM64EMU_JIT_STATS if on */
     _exit(0);
+}
+
+/* Run the selected engine for up to `slice` instructions (the tick cadence),
+ * never past --max-insn: the predecoded tier stops exactly at a deadline, the
+ * JIT up to a block late, so near the limit it single-steps instead and below
+ * it is given a deadline a block short. The plain interpreter is one step. */
+static void run_engine(CPU *c, u64 slice, u64 max_insn) {
+    if (g_jit) {
+        if (max_insn && max_insn - c->icount < 2 * JIT_MAX_BLOCK_INSNS) {
+            cpu_step(c);
+            return;
+        }
+        u64 deadline = c->icount + slice;
+        if (max_insn && deadline > max_insn - JIT_MAX_BLOCK_INSNS)
+            deadline = max_insn - JIT_MAX_BLOCK_INSNS;
+        jit_run(c, deadline);
+    } else if (g_pd) {
+        u64 deadline = c->icount + slice;
+        if (max_insn && deadline > max_insn) deadline = max_insn;
+        pd_run(c, deadline);
+    } else {
+        cpu_step(c);
+    }
 }
 
 /* Devices / platform wiring (added in M3). Declared weakly here so M0/M1 link. */
@@ -745,12 +769,13 @@ int main(int argc, char **argv)
     if (getenv("ARM64EMU_RTCLOCK")) g_rtclock = atoi(getenv("ARM64EMU_RTCLOCK"));
     if (getenv("ARM64EMU_VAW")) { g_vawatch = strtoull(getenv("ARM64EMU_VAW"), 0, 0); g_ring = 1; }
     if (getenv("ARM64EMU_SYS")) g_systrace = atoi(getenv("ARM64EMU_SYS"));
-    if (getenv("ARM64EMU_HEAP")) { g_heaptrack = atoi(getenv("ARM64EMU_HEAP")); g_ring = 1; heaptrack_init(); }
+    if (getenv("ARM64EMU_HEAP")) { g_heaptrack = atoi(getenv("ARM64EMU_HEAP")); g_ring = 1; }
     if (getenv("ARM64EMU_HEAP_AT")) g_heap_at = strtoull(getenv("ARM64EMU_HEAP_AT"), 0, 0);
     if (getenv("ARM64EMU_COV")) { g_ring = 1; cov_load(getenv("ARM64EMU_COV")); }
     /* Any per-instruction debug facility routes through the single hot-path guard.
-     * (g_ring is also set by ARM64EMU_COV, so the coverage finder is covered too.) */
-    g_debug_hooks = g_trace | g_rtrace | g_prof | g_ring | (g_tpc != 0);
+     * (g_ring is also set by ARM64EMU_COV, so the coverage finder is covered too;
+     * the mm-syscall and heap tracers are step hooks, diag.c.) */
+    g_debug_hooks = g_trace | g_rtrace | g_prof | g_ring | (g_tpc != 0) | diag_install();
 
     /* The JIT batches instructions, so anything per-instruction forces the
      * interpreter: debug hooks (trace/rtrace/prof/ring/tpc/ARM64EMU_COV) and the
@@ -849,15 +874,20 @@ int main(int argc, char **argv)
     unsigned long ticker = 0;
     unsigned long tick_mask = 0x3ff;     /* ARM64EMU_TICK: IRQ-poll granularity (debug) */
     if (getenv("ARM64EMU_TICK")) tick_mask = strtoul(getenv("ARM64EMU_TICK"), 0, 0);
+    CPU *c = &m.cpu;
     for (;;) {
         /* --jit / predecoded tier: one step covers up to a tick-slice of
          * instructions, so tick on every return; --no-pd (the plain
          * interpreter) ticks every 1024 steps. */
         if (machine_tick && (g_jit || g_pd || (++ticker & tick_mask) == 0)) machine_tick(&m);
-        StepResult r = g_jit ? jit_step(&m.cpu, tick_mask + 1, max_insn)
-                     : g_pd  ? pd_step(&m.cpu, tick_mask + 1, max_insn)
-                             : cpu_step(&m.cpu);
-        if (r == STEP_HALT) {
+        /* One step of the machine: what the CPU asked for attention for is
+         * all looked at here (cpu.h, "Run control") -- a stop, an interrupt
+         * to take (which is the step), a halt to wait out below -- so the
+         * request is dropped first, and only then does guest code run. */
+        cpu_attn_clear(c);
+        if (!c->stop && !cpu_take_interrupt(c) && !c->halted)
+            run_engine(c, tick_mask + 1, max_insn);
+        if (c->stop) {
             if (m.cpu.reset && machine_reset) {   /* PSCI SYSTEM_RESET: warm reboot */
                 jit_reset();                      /* drop all translations */
                 machine_reset(&m, entry, (unsigned)reset_el);
@@ -869,7 +899,7 @@ int main(int argc, char **argv)
             }
             break;
         }
-        if (m.cpu.halted) {
+        if (c->halted) {
             if (!machine_wait_for_event) break;
             machine_wait_for_event(&m);
             if (m.deadlock) {   /* halted for good: see Machine.deadlock */

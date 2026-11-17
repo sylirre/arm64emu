@@ -31,6 +31,9 @@
  * mprotect invalidates every thread's cached translations at their next
  * access. tlb_flush_all forces the calling thread's caches to re-sync. */
 void as_cpu_attach(CPU *c);
+/* Ask for the attention of the CPU the calling thread runs, if it has one
+ * yet (cpu.h, cpu_attn). Async-signal-safe. */
+void as_cpu_attn(void);
 
 /* ---- host bus-error recovery (mem.c) ----
  * A file truncated from outside this address space leaves PTEs pointing at

@@ -28,6 +28,7 @@ void gic_update(GIC *g) {
         fprintf(stderr, "[gic] assert irq best=%d pri=%d pmr=%d dctlr=%x cctlr=%x\n",
                 best, g->priority[best], g->pmr, g->d_ctlr, g->c_ctlr);
     g->cpu->irq_line = now;
+    cpu_irq_poll(g->cpu);      /* raised and unmasked: the run loop takes it */
 }
 
 void gic_set_irq(GIC *g, int intid, int level) {

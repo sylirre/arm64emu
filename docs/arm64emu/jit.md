@@ -38,7 +38,7 @@ is a copy of this repo's). Its `docs/arm64chroot/jit.md` describes the pipeline 
 depth — predecode classifier (`lib/arm64/predecode.c`) → linear IR
 (`lib/arm64/jit/ir.h`, built by `lib/arm64/jit/frontend.c`) → single-pass backend with
 per-block greedy register allocation and lazy NZCV in host flags
-(`src/arm64emu/jit/backend_*.c`) — plus block chaining, the bump-allocated code
+(`lib/arm64/jit/backend_*.c`) — plus block chaining, the bump-allocated code
 cache, and the W^X fallback (RWX mmap → dual-mapped memfd → interpreter).
 This document covers what is *different* here.
 
@@ -117,14 +117,17 @@ full-flushing on each cost ~43% of total runtime before this was made
 precise. A page rewritten in a tight loop trips the thrash guard and
 runs interpreted until control leaves it.
 
-**Interrupts and time.** `jit_step` replicates `cpu_step`'s preamble
-(stop → FIQ/IRQ vs DAIF → WFI) exactly, then dispatches blocks until an
-icount deadline one tick-slice ahead. The block-entry safepoint in
-generated code checks `env->interrupt` and the deadline, so chained hot
-loops return to the run loop at `machine_tick` cadence; IRQ lines raised
-mid-slice by synchronous MMIO are re-checked between blocks. `--max-insn`
-is exact: the deadline is capped a block short of the limit and the last
-stretch single-steps through `cpu_step`.
+**Interrupts and time.** The run loop does for `jit_run` what it does for
+every engine (stop → FIQ/IRQ vs DAIF → WFI, `cpu_take_interrupt`), then
+hands it an icount deadline one tick-slice ahead; `jit_run` dispatches
+blocks until the deadline or until the CPU asks for attention (cpu.h,
+"Run control"). The block-entry safepoint in generated code checks
+`env->interrupt` and the deadline, so chained hot loops return to the run
+loop at `machine_tick` cadence; an IRQ line raised mid-slice by
+synchronous MMIO raises the CPU's attention, which the dispatcher checks
+between blocks. `--max-insn` is exact: the run loop caps the deadline a
+block short of the limit and single-steps the last stretch through
+`cpu_step`.
 
 **System instructions.** Hints, DMB/DSB (no-ops in an in-order
 interpreter), `DC ZVA` (eight probed zero stores, mirroring sysreg.c),
@@ -179,8 +182,9 @@ decode.c remains authoritative for it.
   tail run to the block end (≤128 instructions) — architecturally
   permitted without IC IVAU+ISB, and unobservable for cross-page SMC
   (module loads, kernel alternatives, DMA), which is exact.
-- **Debug facilities force the interpreter**: `--trace`, `--reg-trace`, ARM64EMU_PROF,
-  ARM64EMU_RING, ARM64EMU_TPC, ARM64EMU_COV, ARM64EMU_WATCH, ARM64EMU_VAW (per-instruction hooks; the
+- **Debug facilities force the interpreter**: `--trace`, `--reg-trace`,
+  ARM64EMU_PROF, ARM64EMU_RING, ARM64EMU_TPC, ARM64EMU_COV, ARM64EMU_SYS,
+  ARM64EMU_HEAP, ARM64EMU_WATCH, ARM64EMU_VAW (per-instruction hooks; the
   watchpoints also need every access on the slow path). `--jit` prints a
   notice and clears itself.
 

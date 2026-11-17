@@ -24,11 +24,11 @@
 #include "machine.h"
 #include "thread.h"
 #include "jit.h"
+#include "pdrun.h"
 #include "guest_abi.h"
 #include "ptrace.h"
 #include "sys.h"
 
-extern int g_predecode;   /* pdrun.c: decoded-instruction cache enable */
 
 /* The version is the repository's, defined once in its VERSION file, which
  * the Makefile passes in. */
@@ -304,6 +304,9 @@ static void help(void) {
         {"ARM64CHROOT_JIT_NOFP16", "Disable FP16 native codegen (AArch64 backend)."},
         {"ARM64CHROOT_JIT_NOVRA", "Disable the V-register cache."},
         {"ARM64CHROOT_JIT_SSE=2", "Force SSE2-baseline capability answers (x86-64)."},
+        {"ARM64CHROOT_PD_MAX=N", "Dispatch only predecode ops with id <= N natively "
+                        "in the predecoded tier (0 = pure interpreter); the "
+                        "analogue of ARM64CHROOT_JIT_PDMAX."},
         {"ARM64CHROOT_PROCSTAT_FORCE_SYNTH", "Force the synthetic /proc/stat fallback."},
         {"ARM64CHROOT_PROCFS_FORCE_OLD", "Hide from the host's /proc what a kernel "
                         "older than the advertised one does not have -- stat "
@@ -785,7 +788,7 @@ int main(int argc, char **argv)
             else if (!strcmp(n, "strace-full"))   { if (val) opt_no_value(arg); m->strace = 1; m->strace_full = 1; }
             else if (!strcmp(n, "debug"))        { if (val) opt_no_value(arg); g_trace = 1; g_debug_hooks = 1; }
             else if (!strcmp(n, "jit"))          { if (val) opt_no_value(arg); g_jit = 1; }
-            else if (!strcmp(n, "no-predecode")) { if (val) opt_no_value(arg); g_predecode = 0; }
+            else if (!strcmp(n, "no-predecode")) { if (val) opt_no_value(arg); g_pd = 0; }
             else if (!strcmp(n, "link2symlink")) { if (val) opt_no_value(arg); m->link2symlink = 1; }
             else if (!strcmp(n, "shared-proc"))  { if (val) opt_no_value(arg); m->shared_proc = 1; }
             else if (!strcmp(n, "no-dev"))       { if (val) opt_no_value(arg); m->no_dev = 1; }

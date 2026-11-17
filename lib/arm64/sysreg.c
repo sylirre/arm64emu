@@ -125,6 +125,7 @@ static void msr_immediate(CPU *c, u32 insn) {
             fprintf(stderr, "[pstate] IRQ unmasked (DAIFClr #%u) pc=0x%llx\n",
                     crm, (unsigned long long)c->cur_insn_pc);
         c->daif &= ~((u32)(crm & 0xf) << 6);
+        cpu_irq_poll(c);                        /* a raised line, now unmasked */
     }
     /* PAN/UAO/DIT/etc: ignored */
 }
@@ -306,7 +307,10 @@ static void do_msr(CPU *c, unsigned key, unsigned Rt) {
 
         case KEY(3,0,4,2,0): c->sp_sel = v & 1; break;                 /* SPSel */
         case KEY(3,3,4,2,0): c->nzcv = (u32)(v & 0xf0000000); break;   /* NZCV */
-        case KEY(3,3,4,2,1): c->daif = (u32)(v & (PS_D|PS_A|PS_I|PS_F)); break; /* DAIF */
+        case KEY(3,3,4,2,1):                                           /* DAIF */
+            c->daif = (u32)(v & (PS_D|PS_A|PS_I|PS_F));
+            cpu_irq_poll(c);
+            break;
         case KEY(3,3,4,4,0):                                           /* FPCR */
             if (c->fp_trapped) { cpu_fp_trap(c); return; }
             c->fpcr = (u32)v; break;

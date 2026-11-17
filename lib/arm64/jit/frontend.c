@@ -2168,7 +2168,7 @@ u32 jit_fe_block(CPU *c, u64 pc, IRBlock *ir, u32 max_insns) {
     ir->ctx_spx = (u8)(c->sp_sel ? c->el : 0);
     ir->fptrap = c->fp_trapped;     /* ctx bit 4: see fe_insn's FP gate */
     ir->el0 = c->el == 0;           /* ctx bit 0: see fe_sys_el0_refused */
-    ir->spchk = c->eng.sys || ((c->sctlr[1] >> 4) & 1);   /* SCTLR_EL1.SA0 */
+    ir->spchk = cpu_sp_chk_possible(c);  /* SCTLR_EL1.SA/SA0 */
     ir->c = c;
     u32 guest_n = 0;
     u64 p = pc;

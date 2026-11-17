@@ -32,7 +32,8 @@
  *  - IRQ/timer: the block-entry safepoint exits when c->icount reaches
  *    env->icount_deadline, so chained hot loops return to the run loop at
  *    machine_tick cadence; IRQ lines are only raised by machine_tick /
- *    synchronous MMIO, and the dispatcher re-checks them between blocks.
+ *    synchronous MMIO, and the dispatcher re-checks the CPU's attention
+ *    (which a deliverable one raises) between blocks.
  *  - D-TLB: helper-path accesses go through mem_read/mem_write, whose probe
  *    tags carry g_tlb_gen — TLBI correctness is inherited from the
  *    interpreter, with no separate JIT resync protocol. */
@@ -94,10 +95,6 @@ int be_vop_ok(unsigned vclass, u32 insn) {
 #endif
 
 int jit_backend_available(void) { return be_available(); }
-
-void jit_request_exit(void) {
-    g_jit_env.interrupt = 1;        /* single store: async-signal-safe */
-}
 
 /* ---- optional helper-call profiler (ARM64EMU_JIT_STATS=1 or =/path) ----
  * Ranks the exact instruction words still executed through the exec_a64
@@ -468,14 +465,15 @@ static void jit_drop_page(JitEnv *env, u64 pa_page) {
 /* Execute one instruction with interpreter semantics; mirrors cpu_step's
  * ordering exactly (icount++ runs even when exec_a64 raised an abort).
  * Returns nonzero when the block must stop: control transfer (including a
- * synchronous exception vectoring), stop, or WFI/WFE halt. */
+ * synchronous exception vectoring), or the CPU asking for attention (stop,
+ * WFI/WFE halt, an interrupt it unmasked). */
 u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
     c->cur_insn_pc = pc;
     c->pc = pc + 4;
     exec_a64(c, insn);
     c->icount++;
     if (UNLIKELY(g_jit_stats > 0)) jstat_bump(insn);
-    if (UNLIKELY(c->stop || c->halted)) return 1;
+    if (UNLIKELY(cpu_attn_pending(c))) return 1;
     /* MSR FPCR lands here (the system group is never inlined). Where the host
      * carries the mode, follow it immediately -- generated code chained after
      * this one must flush as the guest now asks. Where it does not, a mode
@@ -739,51 +737,29 @@ static int resolve_code_page(CPU *c, u64 pc, const u8 **host, u64 *pa_page) {
     return 1;
 }
 
-StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
+void jit_run(CPU *c, u64 deadline) {
     JitEnv *env = &g_jit_env;
     if (UNLIKELY(!env->active)) {
         if (jit_env_init(env, c) < 0) {
             fprintf(stderr, "arm64emu: cannot allocate JIT code cache, "
                             "using interpreter\n");
             g_jit = 0;
-            return cpu_step(c);
+            return;
         }
     }
 
-    /* cpu_step's preamble, kept in lockstep with cpu.c. */
-    if (c->stop) return STEP_HALT;
-    if (c->fiq_line && !(c->daif & PS_F)) {
-        exception_take(c, EXC_FIQ, 0, 0, c->pc);
-        return STEP_OK;
-    }
-    if (c->irq_line && !(c->daif & PS_I)) {
-        exception_take(c, EXC_IRQ, 0, 0, c->pc);
-        return STEP_OK;
-    }
-    if (c->halted) return STEP_OK;
-
-    /* Interpret-tail: near -maxinsn, single-step so the stop is exact. */
-    if (max_insn && max_insn - c->icount < 2 * JIT_MAX_BLOCK_INSNS)
-        return cpu_step(c);
-
-    u64 deadline = c->icount + slice;
-    /* Blocks entered below the deadline retire up to a full block past it:
-     * pull the deadline in so -maxinsn is never crossed natively (the
-     * interpret-tail above then single-steps to the exact boundary). */
-    if (max_insn && deadline > max_insn - JIT_MAX_BLOCK_INSNS)
-        deadline = max_insn - JIT_MAX_BLOCK_INSNS;
     env->icount_deadline = deadline;
     u32 flush_seen = env->flush_count;
     JBlock *prev = NULL;                /* chainable exit awaiting a target */
     int prev_slot = 0;
 
-    while (LIKELY(!c->stop && !c->halted && c->icount < deadline)) {
-        /* IRQ lines can be raised mid-slice by guest MMIO writes (GIC/timer
-         * are updated synchronously): let the next jit_step deliver. */
-        if (UNLIKELY((c->irq_line && !(c->daif & PS_I)) ||
-                     (c->fiq_line && !(c->daif & PS_F))))
-            break;
-        if (UNLIKELY(env->interrupt)) { env->interrupt = 0; break; }
+    /* Before every block: the run loop's attention -- stop, halt, an IRQ
+     * line raised mid-slice by a guest MMIO write (GIC/timer are updated
+     * synchronously) -- and the deadline (cpu.h, "Run control"). The lines
+     * are asked directly as well: generated code unmasks inline (MSR DAIF,
+     * DAIFClr: frontend.c), without the poll the interpreter's unmask makes. */
+    while (LIKELY(!cpu_attn_pending(c) && !cpu_irq_pending(c) &&
+                  c->icount < deadline)) {
         if (UNLIKELY(env->pending_flush)) {
             env->pending_flush = 0;
             jit_flush_all(env);
@@ -857,7 +833,8 @@ StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
             prev = NULL;
             do {
                 cpu_step(c);
-            } while (!c->stop && !c->halted && c->icount < deadline &&
+            } while (!cpu_attn_pending(c) && !cpu_irq_pending(c) &&
+                     c->icount < deadline &&
                      (c->pc & ~0xfffULL) == (pc & ~0xfffULL));
             continue;
         }
@@ -877,7 +854,7 @@ StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
                 prev = NULL;
             }
             if (!b) {
-                if (!g_jit) return cpu_step(c);  /* JIT disabled itself */
+                if (!g_jit) return;     /* JIT disabled itself */
                 prev = NULL;            /* mid-block fetch fault: vector */
                 continue;
             }
@@ -927,5 +904,4 @@ StepResult jit_step(CPU *c, u64 slice, u64 max_insn) {
             prev_slot = (int)(eid & 1);
         }
     }
-    return c->stop ? STEP_HALT : STEP_OK;
 }

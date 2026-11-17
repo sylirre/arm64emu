@@ -110,15 +110,10 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
 
 /* Does the run loop have to act for this thread before any more guest code
  * runs: a signal to deliver, a tracer's kick to serve (ptrace_service_kick),
- * an execve's call-out to answer (stop_gen)? All three raise g_sig_npend, the
- * engines' way out of guest code; this is the question behind it. The
- * interpreter asks the flag before every instruction and cannot miss one. The
- * JIT asks a flag of its own at block entries -- the one the capture handler
- * raises beside g_sig_npend -- and clears it before each block it enters, so
- * one raised while the thread was out here, after the loop's delivery point
- * had looked, was gone by the time a block could see it: a thread spinning in
- * a block chained to itself went on spinning, its signal undelivered until
- * another arrived. jit_run asks this before entering a block.
+ * an execve's call-out to answer (stop_gen)? All three raise g_sig_npend and,
+ * with it, the CPU's attention (sig_npend_raise), the engines' way out of
+ * guest code; this is the question behind the flag, which a signal the guest
+ * blocks leaves set. The SVC dispatch below asks it before running a call.
  *
  * `at` is where a frame for the signal would say the thread was: none is
  * delivered on the rt_sigreturn trampoline (sig_deliver_pending), so a
@@ -174,15 +169,16 @@ int emu_loop(CPU *c) {
             stepped = 1;
         } else if (UNLIKELY(jit_on())) {
             /* -jit: run translated blocks; same return contract as pd_run. */
-            jit_run(c);
-        } else if (LIKELY(g_predecode)) {
+            jit_run(c, ~0ULL);
+        } else if (LIKELY(g_pd)) {
             /* Threaded fast path: executes instructions back-to-back through
-             * the decode cache, returning when this loop must intervene. */
-            pd_run(c);
+             * the decode cache, returning when the CPU asks for attention.
+             * No deadline: nothing here is paced by instruction count. */
+            pd_run(c, ~0ULL);
         } else {
-            /* -nopd: single-step fast path — cpu_step minus the IRQ/FIQ-line
-             * and halted checks (nothing drives the interrupt lines in
-             * linux-user; halted is cleared below before the next step). */
+            /* -nopd: single-step fast path -- cpu_step minus its stop and
+             * halted checks (the top of this loop made the first; halted is
+             * cleared below before the next step). */
             c->cur_insn_pc = c->pc;
             u32 insn;
             if (LIKELY(mem_ifetch(c, c->pc, &insn))) {
@@ -193,6 +189,12 @@ int emu_loop(CPU *c) {
         }
         }
         as_bus_disarm();
+
+        /* What the CPU asked for attention for is looked at from here on, so
+         * the request is dropped first: one raised while this iteration acts
+         * (a signal caught after its look) brings the next engine straight
+         * back here instead of being lost (cpu.h, "Run control"). */
+        cpu_attn_clear(c);
 
         /* WFE/WFI at EL0: treat as yield. */
         if (UNLIKELY(c->halted)) c->halted = false;

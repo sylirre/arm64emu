@@ -14,11 +14,11 @@
 
 /* Inline-exclusives emitter: compiled out (see backend_x86_64.c note). */
 
-/* Basic-block budget: capped length, and a translation never crosses a 4 KB
- * guest page boundary (invalidation is page-granular). JIT_INSN_MAX_BYTES is
+/* Basic-block budget: capped length (JIT_MAX_BLOCK_INSNS, jit.h), and a
+ * translation never crosses a 4 KB guest page boundary (invalidation is
+ * page-granular). JIT_INSN_MAX_BYTES is
  * the worst-case emitted host bytes per guest instruction across backends;
  * translate() reserves the full budget up front so emission cannot overrun. */
-#define JIT_MAX_BLOCK_INSNS 128
 #define JIT_INSN_MAX_BYTES  64
 #define JIT_BLOCK_MAX_BYTES (JIT_MAX_BLOCK_INSNS * JIT_INSN_MAX_BYTES + 256)
 

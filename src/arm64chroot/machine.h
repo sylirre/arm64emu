@@ -549,6 +549,10 @@ static inline u32 fnv1a32(const char *s) {
 
 /* loop.c */
 int  emu_loop(CPU *c);
+/* Must the run loop act for this thread before more guest code runs (a
+ * deliverable signal, a tracer's kick, an execve call-out)? `at` is the pc a
+ * signal frame would record. */
+int  emu_callout_due(CPU *c, u64 at);
 /* Deliver a fatal-by-default signal for a guest fault (M1: restore host
  * default disposition and re-raise so the exit status is correct). */
 void force_sig_fault(CPU *c, int sig, int code, u64 addr);
@@ -639,6 +643,12 @@ int  guest_stop_pending(struct Machine *m);
 /* signal.c */
 /* Host-caught signals queued on this thread (per-thread ring; see signal.c). */
 extern __thread volatile sig_atomic_t g_sig_npend;
+/* Raise it, and with it the attention of the CPU this thread runs (cpu.h,
+ * "Run control"): the flag says the run loop has something to act on for
+ * this thread, the attention gets an engine out of guest code to it. Every
+ * reason the loop serves this way raises both -- a caught signal, a tracer's
+ * kick, an execve's call-out. Async-signal-safe. */
+void sig_npend_raise(void);
 /* Set when the reserved signal arrived on the emulator's own business (see
  * sig_kick_net): the EINTR it inflicted is ours, not the guest's, and the
  * syscall it hit is restarted rather than reported. */

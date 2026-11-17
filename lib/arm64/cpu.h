@@ -99,6 +99,10 @@ typedef struct CpuEngine {
      *      executed by one host thread in program order, where a plain
      *      read-modify-write is atomic and a barrier orders nothing more. */
     u8 sys, smp;
+    /* The predecoded tier's decode cache (pdrun.h), allocated by its first
+     * run. Belongs to the host thread running the CPU, like everything here:
+     * a CPU copied to start another thread must not take it along. */
+    struct PDEnt *pd;
 } CpuEngine;
 
 typedef struct CPU {
@@ -184,6 +188,10 @@ typedef struct CPU {
     bool stop;         /* machine should terminate */
     bool reset;        /* PSCI SYSTEM_RESET: warm-reboot the machine, don't exit */
     bool event;        /* WFE event register: set by SEV/SEVL, consumed by WFE */
+    /* Attention: the program's run loop has something to act on before more
+     * guest code runs. The engines poll this one byte where they would
+     * otherwise test every reason for it (cpu_attn below has the contract). */
+    u8   attn;
     u64  icount;       /* retired instruction count */
     u64  cur_insn_pc;  /* address of the instruction currently executing */
 
@@ -265,16 +273,74 @@ static inline void cpu_refresh_el_state(CPU *c) {
     }
 }
 
+/* Whether this CPU may ever have to check SP alignment (SCTLR_EL1.SA/SA0):
+ * in a full system the guest kernel can turn either on at any time; in user
+ * mode SA0 is what sysreg_init gave it, for good. The engines that decide
+ * ahead of execution (the decode cache, the JIT) ask this whether an SP-based
+ * access needs the check at all. */
+static inline bool cpu_sp_chk_possible(const CPU *c) {
+    return c->eng.sys || ((c->sctlr[1] >> 4) & 1);
+}
+
 /* Raise the EC 0x07 FP/SIMD-access trap (A64 ISS: CV=1, COND=0b1110).
  * sysreg.c. */
 void cpu_fp_trap(CPU *c);
 
+/* ---- Run control: the engines' contract with the program's run loop -----
+ *
+ * An engine (cpu_step, pd_run, jit_run) runs guest code until the CPU asks
+ * for attention or, for the two that run more than one instruction, its
+ * icount reaches the deadline the loop gave it. Whatever needs the loop
+ * before more guest code runs raises attention: a stop or a halt (cpu_stop,
+ * cpu_halt), an interrupt that became deliverable (cpu_irq_poll), and
+ * whatever the program has of its own -- in user mode an exception it records
+ * rather than vectors, or a signal it caught. The engines read the one byte
+ * at each instruction boundary they check; the loop clears it before it
+ * looks at the reasons, so one raised while it does is seen next time rather
+ * than lost.
+ *
+ * Raised from wherever the reason arises: the CPU's own thread, a signal
+ * handler on that thread, or another thread. Hence the relaxed atomics: one
+ * plain byte access each, which the compiler may neither cache in a register
+ * across an engine's loop nor drop. */
+static inline void cpu_attn(CPU *c) {
+    __atomic_store_n(&c->attn, 1, __ATOMIC_RELAXED);
+}
+static inline bool cpu_attn_pending(const CPU *c) {
+    return __atomic_load_n(&c->attn, __ATOMIC_RELAXED) != 0;
+}
+static inline void cpu_attn_clear(CPU *c) {
+    __atomic_store_n(&c->attn, 0, __ATOMIC_RELAXED);
+}
+static inline void cpu_stop(CPU *c) { c->stop = true; cpu_attn(c); }
+static inline void cpu_halt(CPU *c) { c->halted = true; cpu_attn(c); }
+
+/* An interrupt the CPU would take now: its line raised and PSTATE not masking
+ * it. cpu_irq_poll asks for attention when there is one, and runs wherever
+ * either side changes -- the interrupt controller driving a line, and an
+ * instruction unmasking DAIF (MSR DAIF/DAIFClr, ERET). In user mode nothing
+ * drives the lines, and it never fires. */
+static inline bool cpu_irq_pending(const CPU *c) {
+    return (c->irq_line && !(c->daif & PS_I)) ||
+           (c->fiq_line && !(c->daif & PS_F));
+}
+static inline void cpu_irq_poll(CPU *c) {
+    if (cpu_irq_pending(c)) cpu_attn(c);
+}
+
 /* ---- Core API ---- */
 void cpu_reset(CPU *c, u64 entry, unsigned reset_el);
-StepResult cpu_step(CPU *c);                 /* fetch/decode/execute one instruction */
+/* Fetch, decode and execute one instruction: nothing while the CPU is
+ * stopped (STEP_HALT) or halted. Interrupts are the run loop's to deliver
+ * between steps, cpu_take_interrupt. */
+StepResult cpu_step(CPU *c);
+/* Take the pending interrupt, FIQ before IRQ, if there is one to take now;
+ * returns whether it did. */
+bool cpu_take_interrupt(CPU *c);
 
-/* Take an exception of `kind` to EL1 (we route all exceptions to EL1).
- * ret_addr is the value placed in ELR_EL1. */
+/* Exception entry, the program's own: a full system vectors to EL1 (ret_addr
+ * becomes ELR_EL1); user mode records the exception for its run loop, which
+ * plays the kernel's part. */
 void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr);
 
 /* Raise a synchronous exception (ELR = address of the faulting instruction). */
@@ -289,32 +355,31 @@ void exec_a64(CPU *c, u32 insn);
 /* Condition code evaluation (cond 0..15) using current NZCV. */
 bool cond_holds(CPU *c, unsigned cond);
 
-/* Global trace flags (set from CLI). The environment knobs named below are
- * arm64emu's; arm64chroot defines the variables (its cpu.c) but leaves the
- * diagnostics among them unwired, at 0. */
+/* The step driver's diagnostics (cpu.c), set by the program from its command
+ * line and environment; all off by default. Every per-instruction one runs
+ * only in cpu_step, so the program also sets g_debug_hooks when any is on and
+ * keeps the batching engines out of the way. */
 extern int g_trace;        /* per-instruction trace */
 extern int g_singlestep;   /* unused placeholder for parity with QEMU */
-extern int g_dbg;          /* targeted device/IRQ debug (env ARM64EMU_DBG) */
+extern int g_dbg;          /* targeted device/IRQ debug */
 extern int g_rtrace;       /* compact register trace for differential debugging */
-extern int g_prof;         /* hot-PC profiler (env ARM64EMU_PROF) */
+extern int g_prof;         /* hot-PC profiler */
 void prof_dump(void);      /* print the hottest PCs (no-op unless g_prof) */
-extern u64 g_tpc;          /* env ARM64EMU_TPC: dump CPU state when pc == this */
-extern int g_ring;         /* env ARM64EMU_RING: ring-buffer recent steps */
+extern u64 g_tpc;          /* dump CPU state when pc == this */
+extern int g_ring;         /* ring-buffer recent steps */
 void ring_dump(void);      /* print the recent-instruction ring buffer */
-extern u64 g_watch;        /* env ARM64EMU_WATCH: log writes to [g_watch, g_watch+8) */
+extern u64 g_watch;        /* log writes to [g_watch, g_watch+8) */
 extern int g_debug_hooks;  /* OR of all per-step debug facilities (perf guard) */
-extern int g_iabort_log;   /* env ARM64EMU_IABORT: log instruction aborts */
-extern int g_rtclock;      /* env ARM64EMU_RTCLOCK: drive the generic timer + RTC from the
-                              host clock (default); ARM64EMU_RTCLOCK=0 selects the
-                              deterministic instruction-count clock (debug) */
-extern u64 g_vawatch;      /* env ARM64EMU_VAW: log writes whose range covers this VA */
-extern int g_systrace;     /* env ARM64EMU_SYS: trace mm syscalls (mmap/brk/munmap/...) */
-void systrace_svc(CPU *c); /* record an in-flight mm syscall for return logging */
-extern int g_heaptrack;    /* env ARM64EMU_HEAP: musl malloc/free/realloc double-alloc finder */
-extern u64 g_heap_at;      /* env ARM64EMU_HEAP_AT: log every alloc/free touching this VA */
-void heaptrack_init(void); /* allocate the heap-tracker tables (call once at startup) */
-void heaptrack_report(void); /* print heap-tracker stats (call once at exit) */
-void heaptrack_query(CPU *c, u64 va); /* report which live block (if any) contains va */
+extern int g_iabort_log;   /* log instruction aborts */
+extern int g_rtclock;      /* drive the generic timer + RTC from the host clock
+                              (default); 0 selects the deterministic
+                              instruction-count clock (debug) */
+extern u64 g_vawatch;      /* log writes whose range covers this VA */
 void cov_load(const char *path);  /* load QEMU coverage PC set (divergence finder) */
+/* The program's own per-instruction diagnostics, when it sets them:
+ * cpu_step_hook runs in cpu_step for every instruction, before it executes
+ * (with g_debug_hooks set), cpu_svc_hook before every SVC. */
+extern void (*cpu_step_hook)(CPU *c, u32 insn);
+extern void (*cpu_svc_hook)(CPU *c);
 
 #endif /* A64_CPU_H */

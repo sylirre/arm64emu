@@ -3,27 +3,26 @@
 ## The core / new-code split
 
 `arm64chroot` is built around a decode/execute core it shares with its sibling,
-the arm64emu full-system emulator. What is already identical in both lives once,
-in `lib/arm64/` (`types.h`, `cpu.h`, `decode.c`, `sysreg.c`, `exec_fpsimd.c`,
-`esr.h`), and every CPU runs it in user mode (`as_cpu_attach` sets the CPU's
+the arm64emu full-system emulator. It lives once, in `lib/arm64/` (`types.h`,
+`cpu.h`, `cpu.c`, `decode.c`, `sysreg.c`, `exec_fpsimd.c`, `esr.h`, and the
+predecoded tier, `pdrun.c`), and every CPU runs it in user mode (`as_cpu_attach` sets the CPU's
 mode, `c->eng`: `sys` 0 has `sysreg_init` set EL1 up as Linux does, so the
 EL1-only instructions and checks are what they are at EL0 under Linux --
 UNDEFINED, or never enabled; `smp` 1 makes LSE atomics, exclusives,
 LDAR/STLR and barriers host atomics and fences, since guest threads run
-concurrently);
-the rest of the core, in `src/arm64chroot/core/`, is kept **diffable**
-against arm64emu's copy so fixes flow both ways until the two are merged into
-`lib/arm64/`. Everything below the memory seam and above the exception seam is
-rewritten for user mode.
+concurrently). The JIT runtime (`src/arm64chroot/jit/jit.c`) is kept
+**diffable** against arm64emu's copy so fixes flow both ways until the two are
+merged into `lib/arm64/`. Everything below the memory seam and above the
+exception seam is rewritten for user mode.
 
 ```
-    shared (lib/arm64/, src/arm64chroot/core/)            new (src/arm64chroot/)
+    shared (lib/arm64/)                                    new (src/arm64chroot/)
  ┌───────────────────────────────────────────────┐   ┌──────────────────────────────┐
  │ types.h esr.h cpu.h sysreg.h                   │   │ loop.c   run loop + dispatch │
  │ decode.c      A64 integer/branch/load-store,   │   │ syscall.c + sys_*.c  (~190)  │
  │               LSE atomics, exclusives          │   │ path.c   rootfs containment  │
  │ exec_fpsimd.c FP / Advanced-SIMD / crypto      │   │ signal.c guest sigframes     │
- │ cpu.c         fetch/decode/execute driver      │   │ elf.c    loader + stack/auxv │
+ │ cpu.c pdrun.c the step driver, the pd tier     │   │ elf.c    loader + stack/auxv │
  │ sysreg.c      MRS/MSR, FPCR/FPSR, DC ZVA, CNT* │   │ main.c   CLI                 │
  └───────┬───────────────────────────────┬───────┘   └──────────────────────────────┘
    mem_read/write/128, mem_ifetch         │ exception_take()
@@ -71,8 +70,8 @@ void exception_take(CPU*, ExcKind, u64 esr, u64 far, u64 ret_addr);
 
 In the system emulator this banks SPSR/ELR/ESR/FAR and vectors to the EL1 handler.
 In user mode there is no guest kernel, so the rewritten `exception.c` **records**
-the pending exception into thread-local state and returns; the run loop dispatches
-it. The CPU stays at EL0 for the process's entire life, and the core holds it to
+the pending exception into thread-local state, asks for the CPU's attention and
+returns; the run loop dispatches it. The CPU stays at EL0 for the process's entire life, and the core holds it to
 EL0's rules: a system instruction EL1 has not opened to it (`el0_allowed` in
 `sysreg.c`, judged on `SCTLR_EL1`/`CNTKCTL_EL1`, which `sysreg_init` sets as
 Linux does: `DZE`, `UCT`, `UCI` and the virtual counter, never `UMA`), `ERET`,
@@ -91,11 +90,12 @@ void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
     g_tls.pend_exc.far = far;
     c->pc = ret_addr;      // SVC: next insn; faults: the faulting insn
     c->excl_valid = false;
+    cpu_attn(c);           // the engine returns to the run loop
 }
 ```
 
-`cpu_raise_sync` (undefined/BRK/alignment) is a thin wrapper that passes
-`cur_insn_pc` as the return address.
+`cpu_raise_sync` (undefined/BRK/alignment, `lib/arm64/cpu.c`) is a thin wrapper
+that passes `cur_insn_pc` as the return address.
 
 ### The `struct Machine` trick
 
@@ -103,17 +103,17 @@ void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
 The system emulator defines it as the board (RAM, devices). Here `machine.h`
 redefines it as the **linux-user task state** — address space, fd bookkeeping,
 cwd/rootfs, signal dispositions, fake-id credentials. Because the core only holds
-an opaque pointer, the copied files never change even though `Machine` means
+an opaque pointer, the shared files never change even though `Machine` means
 something completely different.
 
 ## Control flow
 
-### One instruction (threaded fast path, `pd_run` in `src/arm64chroot/pdrun.c`)
+### One instruction (threaded fast path, `pd_run` in `lib/arm64/pdrun.c`)
 
 1. `cur_insn_pc = pc`.
 2. `mem_ifetch(pc, &insn)` — fast path reads through a per-thread single-page
    host-pointer cache; a miss or fault takes `mem_ifetch_slow`.
-3. Decode-cache lookup: a per-thread, per-PC cache of the *decoded* form
+3. Decode-cache lookup: a per-CPU (so per-thread), per-PC cache of the *decoded* form
    (dense opcode id + pre-extracted operands, 16 B/entry). The entry is a pure
    function of the instruction word, so comparing it against the live fetched
    word fully validates a hit — self-modifying/remapped code needs no flushes.
@@ -122,14 +122,15 @@ something completely different.
    inline (transcribed from decode.c); everything else is `PD_GENERIC` →
    `exec_a64(insn)` — 4-bit top-level switch → group decoder → execute.
 5. `icount++`; each handler then fetches and dispatches the *next* instruction
-   itself (direct threading), so instructions run back-to-back until something
-   rare — a recorded exception, pending signal, stop/halt, fetch fault —
-   returns control to `emu_loop`.
+   itself (direct threading), so instructions run back-to-back until the CPU
+   asks for attention — a recorded exception, a pending signal or call-out
+   (`sig_npend_raise`), stop/halt — or a fetch faults, and control returns to
+   `emu_loop`, which drops the request before it looks at the reasons (lib/arm64
+   `cpu.h`, "Run control").
 
 When any per-instruction debug facility is active (`g_debug_hooks`) the loop
-instead calls the full `cpu_step` (`src/arm64chroot/core/cpu.c`), which adds the debug
-hooks and the system emulator's IRQ/FIQ-line checks (never taken in
-linux-user). `--no-predecode` selects a plain fetch → `exec_a64` step (diagnostic mode
+instead calls the full `cpu_step` (`lib/arm64/cpu.c`), which adds the debug
+hooks. `--no-predecode` selects a plain fetch → `exec_a64` step (diagnostic mode
 for bisecting decode-cache suspicions).
 
 **The classifier owes the decoder its guards.** `pd_fill` is a transcription of
@@ -179,6 +180,7 @@ debug ladder still wins, so `-d` forces the interpreter. See [jit.md](jit.md).
 emu_loop:
   if c->stop: return
   run instructions (pd_run burst; cpu_step under debug; plain step under --no-predecode)
+  drop the CPU's attention request
   if g_tls.pend_exc.valid:
       switch on ESR.EC:
         EC_SVC64            -> syscall_dispatch(c)          // x8=nr, x0..x5 args, x0=ret
@@ -200,14 +202,14 @@ into `sys_*.c` by area; unknown numbers return `-ENOSYS` with a one-shot warning
 |------|----------------|
 | `lib/arm64/decode.c` | A64 integer/branch/load-store decode+exec; LSE atomics; exclusives as host CAS (`c->eng.smp`). |
 | `lib/arm64/exec_fpsimd.c` | Scalar FP, Advanced-SIMD, crypto; FPCR rounding; 32-bit-host-safe (no `__int128` in the hot paths). |
-| `src/arm64chroot/core/cpu.c` | `cpu_step` fetch/decode/execute driver; register/condition helpers; debug trace. |
-| `lib/arm64/cpu.h` | CPU state (one struct for both emulators), register helpers, core API. |
+| `lib/arm64/cpu.c` | `cpu_step` fetch/decode/execute driver; SPSR pack/unpack; condition helpers; debug trace. |
+| `lib/arm64/cpu.h` | CPU state (one struct for both emulators), register helpers, core API, run control (the engines' contract with the run loop). |
 | `lib/arm64/sysreg.c` | `MRS`/`MSR`, ID registers, `FPCR`/`FPSR`, `DC ZVA`, generic-timer reads; which of them EL0 may execute. |
 | `src/arm64chroot/mmu.h`, `src/arm64chroot/mem.c` | Guest address space + the `mem_*` seam. |
 | `src/arm64chroot/exception.c` | Pending-exception recorder (the exception seam). |
 | `src/arm64chroot/loop.c` | Run loop + exception dispatch + signal delivery point; the kernel's EL0 `MRS` emulation of the ID registers. |
 | `lib/arm64/predecode.h`, `lib/arm64/predecode.c` | The classifier: an instruction word -> `PDEnt` (dense op id + operands), `PD_GENERIC` for anything uncertain; also the JIT frontend's decoder. |
-| `src/arm64chroot/pdrun.h`, `src/arm64chroot/pdrun.c` | Decoded-instruction cache + direct-threaded dispatch of ~200 hot forms; `PD_GENERIC` falls back to `exec_a64`. |
+| `lib/arm64/pdrun.h`, `lib/arm64/pdrun.c` | Decoded-instruction cache + direct-threaded dispatch of ~200 hot forms; `PD_GENERIC` falls back to `exec_a64`. |
 | `src/arm64chroot/elf.c` | ELF64 loader, `PT_INTERP`, initial stack/auxv/HWCAP, sigreturn trampoline page. |
 | `src/arm64chroot/path.c` | Rootfs containment resolver; `/proc` and `/dev` special-casing. |
 | `src/arm64chroot/syscall.c` + `src/arm64chroot/sys_*.c` | Syscall dispatcher and per-area handlers (~190). |

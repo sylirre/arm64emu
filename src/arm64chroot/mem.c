@@ -89,6 +89,11 @@ void as_cpu_attach(CPU *c) {
     t_cpu = c;
 }
 
+void as_cpu_attn(void) {
+    CPU *c = t_cpu;
+    if (c) cpu_attn(c);
+}
+
 static void as_gen_bump(void) {
     __atomic_fetch_add(&g_as_gen, 1, __ATOMIC_RELEASE);
     /* JIT threads skip the per-access generation check in their inlined fast
@@ -2992,6 +2997,7 @@ void bus_tls_prewarm(void) {
     (void)*(volatile char *)&g_bus_jb;
     (void)*(volatile char *)&g_bus_copy_jb;
     (void)*(volatile CPU *volatile *)&g_bus_cpu;
+    (void)*(CPU *volatile *)&t_cpu;   /* as_cpu_attn, and the repair's reset */
     /* The repair below takes as_lock, which counts itself in these two. */
     (void)*(volatile int *)&g_emu_as_depth;
     (void)*(volatile unsigned *)&g_emu_lk_held;

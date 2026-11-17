@@ -603,7 +603,7 @@ static void pt_self_detach(void) {
     if (__atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE)) {
         g_tls.jc_seen = __atomic_load_n(&g_machine.jc_gseq, __ATOMIC_ACQUIRE) - 1;
         g_ptrace_kick = 1;
-        g_sig_npend = 1;
+        sig_npend_raise();
     }
     /* Last one out re-mirrors dispositions, and hands a group stop over. */
     if (was && pt_traced_dec(&g_machine)) sig_jc_untraced(&g_machine);
@@ -857,7 +857,7 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
                         __atomic_load_n(&g_self_link->trap_notify, __ATOMIC_ACQUIRE) ||
                         pt_jc_due())) {
         g_ptrace_kick = 1;
-        g_sig_npend = 1;
+        sig_npend_raise();
     }
     if (ns && si) {
         if ((u32)ns != pt_r32(si, 0)) {
@@ -1409,7 +1409,7 @@ void ptrace_fork_child(CPU *c, void *slot) {
                   ? pt_find(getpid()) : NULL;
         if (e && __atomic_load_n(&e->attach_pending, __ATOMIC_ACQUIRE)) {
             g_ptrace_kick = 1;
-            g_sig_npend = 1;               /* out of the fast path to adopt it */
+            sig_npend_raise();               /* out of the fast path to adopt it */
         }
         return;
     }

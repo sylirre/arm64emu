@@ -31,8 +31,7 @@ SHA-1/2/3/512, PMULL) implementations follow the pseudocode published in the
 Arm Architecture Reference Manual; no third-party source code is included or
 distributed with this project.
 
-The instruction decode/execute core (lib/arm64, src/arm64chroot/core) is
-shared with arm64emu.
+The instruction decode/execute core (lib/arm64) is shared with arm64emu.
 
 qemu-aarch64 is used only as a differential-testing oracle (see
 tests/arm64chroot) and as the reference for a handful of AArch64 ID-register

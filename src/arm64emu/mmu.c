@@ -5,6 +5,7 @@
 #include "mmu.h"
 #include "machine.h"
 #include "esr.h"
+#include "diag.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>

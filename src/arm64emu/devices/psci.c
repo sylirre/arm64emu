@@ -34,7 +34,7 @@ bool smccc_conduit(CPU *c, bool is_hvc) {
         case PSCI_CPU_SUSPEND64:
             /* Low-power suspend. We model only standby/retention: halt until an
              * interrupt (WFI semantics) and return success to the caller. */
-            c->halted = true;
+            cpu_halt(c);
             ret = PSCI_OK;
             break;
         case PSCI_AFFINITY_INFO64:   ret = (c->x[1] == 0) ? 0 /*ON*/ : 1 /*OFF*/; break;
@@ -43,12 +43,12 @@ bool smccc_conduit(CPU *c, bool is_hvc) {
         case PSCI_CPU_OFF:           ret = PSCI_NOT_SUPPORTED; break;
         case PSCI_SYSTEM_OFF:
             fprintf(stderr, "\n[PSCI SYSTEM_OFF]\n");
-            c->stop = true; return true;
+            cpu_stop(c); return true;
         case PSCI_SYSTEM_RESET:
             fprintf(stderr, "\n[PSCI SYSTEM_RESET]\n");
             /* Warm reboot: stop the current run-loop pass; main() sees c->reset
              * and rebuilds machine state instead of exiting. */
-            c->reset = true; c->stop = true; return true;
+            c->reset = true; cpu_stop(c); return true;
         default:
             ret = PSCI_NOT_SUPPORTED;
             break;

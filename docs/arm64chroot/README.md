@@ -356,12 +356,17 @@ host-portability pitfalls.
 ```
 lib/arm64/      AArch64 emulation shared with arm64emu:
   types.h cpu.h fixed-width types; CPU state + core interpreter API, the
-                CPU's mode (here: user mode, guest threads running at once)
+                CPU's mode (here: user mode, guest threads running at once),
+                run control (the engines' contract with the run loop)
+  cpu.c         step driver, reset, SPSR pack/unpack, condition codes, debug dump
   mem.h         guest memory as the core reaches it: typed accesses, fetch and
                 mem_host_ptr inline over the CPU's translation caches (D-TLB,
                 fetch cache); the slow paths are the program's
   decode.c      A64 decoder/executor (+ LSE atomics, host-atomic exclusives)
   predecode.{h,c}  the pre-decode classifier: word -> PDEnt (op id + operands)
+  pdrun.{h,c}   decoded-instruction cache (per CPU): direct-threaded fast path
+                over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the
+                default engine)
   jit/          the JIT translator: ir.h, frontend.c (per-block decode ->
                 linear IR -> liveness / flag fusion), backend_a64.c and
                 backend_x86_64.c (register-allocating single-pass emitters)
@@ -370,9 +375,6 @@ lib/arm64/      AArch64 emulation shared with arm64emu:
   exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
   arm64_config.h  how lib/arm64 is built here (its knob prefix)
-  core/         the user-mode variant of the rest of arm64emu's core, kept
-                diffable against it until the two are merged into lib/arm64:
-    cpu.c       step driver, reset, condition codes, debug dump
   mmu.h mem.c   NEW guest address space: 2-level software page table
                 (guest 4 KB page -> host pointer | prot) behind lib/arm64's
                 mem.h (its slow paths, each thread's translation caches), guest
@@ -380,13 +382,11 @@ src/arm64chroot/
                 transfer's backing handed to the host syscall, pinned). Portable
                 to 32-bit hosts: guest VAs never become host pointers except
                 through the table.
-  exception.c   pending-exception recorder (SVC/abort/undef/BRK -> run loop)
+  exception.c   pending-exception recorder (SVC/abort/undef/BRK -> run loop,
+                through the CPU's attention)
   loop.c        run loop + exception dispatch + signal delivery point +
                 the thread call-out safepoint (stop_gen) + EL0's view of the
                 ID registers (the kernel's MRS emulation)
-  pdrun.c       decoded-instruction cache: direct-threaded fast path over ~200
-                hot forms (classified by lib/arm64's predecode.c); PD_GENERIC
-                falls back to exec_a64 (the default engine)
   jit/          optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
     (ir.h frontend.c backend_a64.c backend_x86_64.c are lib/arm64/jit's)
     backend_x86_32.c backend_arm32.c   ILP32 emitters: guest 64-bit values as
@@ -478,5 +478,5 @@ arm64chroot is original, clean-room C11 code (libc/POSIX only). The instruction
 set, FP/Advanced-SIMD, reciprocal estimates, and cryptographic extensions are
 implemented from the *Arm Architecture Reference Manual* pseudocode;
 `qemu-aarch64` is used only as a differential-testing oracle and is neither
-included nor linked. The interpreter core (`lib/arm64`, `src/arm64chroot/core/`)
-is shared with the sibling [arm64emu](../arm64emu/README.md) system emulator.
+included nor linked. The interpreter core (`lib/arm64`) is shared with the
+sibling [arm64emu](../arm64emu/README.md) system emulator.

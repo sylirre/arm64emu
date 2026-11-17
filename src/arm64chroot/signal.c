@@ -172,6 +172,11 @@ static __thread u64 sigq_gated;
 #define SIGQ_GATE 8   /* free slots kept in hand for the gate to shut in */
 __thread volatile sig_atomic_t g_sig_npend;
 
+void sig_npend_raise(void) {
+    g_sig_npend = 1;
+    as_cpu_attn();   /* after: the loop the engine returns to reads the flag */
+}
+
 /* Read one of those counts. Atomic for the compiler's sake as much as the
  * CPU's: a plain load can be hoisted out of a poll loop, and the store that
  * would end the loop comes from a signal handler the optimizer cannot see. */
@@ -454,7 +459,7 @@ static int sigq_push(const PendSig *p, void *uctx) {
     if (p->ptraced) __atomic_fetch_add(&sigq_ninj, 1, __ATOMIC_RELAXED);
     if (p->thr) __atomic_fetch_add(&sigq_nthr, 1, __ATOMIC_RELAXED);
     sigq_head = next;
-    g_sig_npend = 1;
+    sig_npend_raise();
     /* Room for SIGQ_GATE more and no consumer in sight: shut the gate now,
      * while this handler still has a frame to shut it in. Shutting it again
      * on every later arrival costs nothing -- the mask bits are already set,
@@ -494,15 +499,16 @@ static int sig_callout_waiting(void) {
  * the consumer; it writes the entry, moves the head and then raises the flag,
  * so one that landed between the consumer's look and a plain store of 0 left
  * its entry queued behind a lowered flag. Nothing then brought the thread to
- * the delivery point (the interpreter tests only the flag, and a standard
- * signal already queued is not queued, or flagged, again), and a thread
+ * the delivery point (the engines leave guest code for the attention the
+ * raise brings, and a standard signal already queued is not queued, or
+ * flagged, again), and a thread
  * flooded with two standard signals stranded both and never ran a handler
  * again. Lowered first, a capture after the store raises it again, and one
  * before is in the queue the second look sees. */
 static void sigq_lower_npend(void) {
     g_sig_npend = 0;
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    if (sigq_tail != sigq_head || sig_callout_waiting()) g_sig_npend = 1;
+    if (sigq_tail != sigq_head || sig_callout_waiting()) sig_npend_raise();
 }
 
 /* Remove queue slot `t`, keeping the rest in arrival order: the entries older
@@ -1578,7 +1584,7 @@ static void jc_rp_continue(void) {
     } else {
         return;
     }
-    g_sig_npend = 1;   /* this thread takes signals next */
+    sig_npend_raise();   /* this thread takes signals next */
 }
 
 /* The notice a SIGCONT left (get_signal's SIGNAL_CLD_MASK): to the parent,
@@ -1676,7 +1682,7 @@ void sig_jc_park(CPU *c) {
         if (guest_stop_pending(m)) return;
     }
     /* Running again: a SIGCONT's notice may be ours to send. */
-    if (__atomic_load_n(&m->jc_rp_notify, __ATOMIC_ACQUIRE)) g_sig_npend = 1;
+    if (__atomic_load_n(&m->jc_rp_notify, __ATOMIC_ACQUIRE)) sig_npend_raise();
 }
 
 /* The last traced thread of the process is gone -- detached, or its tracer
@@ -2431,7 +2437,7 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
     if (si->si_code == SI_QUEUE && si->si_value.sival_int == PT_KICK_MAGIC) {
         g_ptrace_kick = 1;
         sig_selfintr();         /* ours: the guest must not see this EINTR */
-        g_sig_npend = 1;            /* make the run loop exit its fast path */
+        sig_npend_raise();            /* make the run loop exit its fast path */
         jit_signal_interrupt();
         if (g_sig_in_syscall) sig_kick_timer_arm();
         return;
@@ -2453,7 +2459,7 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
          * interrupts nothing of ours. */
         if (!g_kick_armed) return;
         sig_selfintr();
-        g_sig_npend = 1;
+        sig_npend_raise();
         jit_signal_interrupt();
         return;
     }
@@ -2485,7 +2491,7 @@ static void sig_kick_net(int sig, siginfo_t *si, void *uctx) {
          * how a thread running guest code leaves the interpreter/JIT fast
          * path, which never returns for the counter's sake alone. */
         sig_selfintr();
-        g_sig_npend = 1;
+        sig_npend_raise();
         jit_signal_interrupt();
         if (g_sig_in_syscall) sig_kick_timer_arm();
         return;

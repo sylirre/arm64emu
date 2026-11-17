@@ -69,23 +69,22 @@ full on real armv7 silicon.
 ```
 Makefile                             (repository root) `make arm64chroot` -> build/arm64chroot; also arm64chroot32 (ILP32 host) and arm64chroot_asim (Android behavior)
 lib/arm64/                           Shared with arm64emu (compiled into both):
-  types.h cpu.h                      Fixed-width types; CPU state + core interpreter API
+  types.h cpu.h                      Fixed-width types; CPU state + core interpreter API, and run control: the engines' contract with the run loop (the CPU's attention byte)
+  cpu.c                              Step driver, reset, interrupt delivery, SPSR pack/unpack, condition codes, debug dump and the per-step diagnostics
   mem.h                              Guest memory as the core reaches it: typed accesses, fetch and mem_host_ptr, inline over the CPU's translation caches (c->eng: the D-TLB, whose entry layout the JIT probes inline, and the fetch cache); the slow paths and cache maintenance are the program's
   decode.c                           A64 decoder/executor (+ LSE atomics, host-atomic exclusives where guest threads run concurrently, c->eng.smp)
   jit/ir.h jit/frontend.c            JIT translator: per-block decode -> linear IR -> liveness / flag fusion
   jit/backend_a64.c jit/backend_x86_64.c  Register-allocating single-pass emitters (the 32-bit hosts' two stay in src/arm64chroot/jit)
   predecode.h predecode.c            Pre-decode classifier: instruction word -> PDEnt (dense op id + operands), PD_GENERIC when uncertain; the tier's and the JIT frontend's decoder
+  pdrun.c pdrun.h                    Decoded-instruction cache (per CPU): direct-threaded fast path over ~200 hot forms; PD_GENERIC falls back to exec_a64 (the default engine)
   sysreg.h sysreg.c                  MSR/MRS incl. FPCR/FPSR, DC ZVA, CNT*, ID registers (sysreg_id_read), what EL0 may run
   esr.h                              ESR exception classes + syndrome construction
   exec_fpsimd.c                      FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
-  arm64_config.h                     How lib/arm64 is built here: the ARM64CHROOT_JIT_ knob prefix (the CPU's mode -- user mode, guest threads running concurrently -- is set by as_cpu_attach)
-  core/                              The user-mode variant of the rest of arm64emu's core, kept diffable against src/arm64emu until merged into lib/arm64:
-    cpu.c                            Step driver, reset, condition codes, debug dump
+  arm64_config.h                     How lib/arm64 is built here: the ARM64CHROOT_ knob prefix (the CPU's mode -- user mode, guest threads running concurrently -- is set by as_cpu_attach)
   mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot) behind lib/arm64's mem.h (its slow paths; each thread's translation caches, attached to the CPU it runs by as_cpu_attach), guest mmap/brk/mprotect, copy_to/from_guest, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
-  exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop)
+  exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop, through the CPU's attention)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
-  pdrun.c pdrun.h                    Decoded-instruction cache: direct-threaded fast path over ~200 hot forms (classified by lib/arm64 predecode.c); PD_GENERIC falls back to exec_a64 (the default engine)
   jit/                               Optional --jit translator (AArch64, x86-64, i686 & ARM32 hosts):
     jit.h jit_priv.h                 Public API + internals shared by the runtime and host backends (the JitEnv ABI lib/arm64/jit compiles against)
     backend_x86_32.c backend_arm32.c ILP32 emitters: guest 64-bit values as host register-pair halves
@@ -125,7 +124,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the code and documentation (`docs/arm64chroot/`).
 * Keep in sync the file structure in design section of `docs/arm64chroot/README.md` and structure section of this file.
 * New implemented syscalls must also be defined in `src/arm64chroot/strace.c` argdefs, so they can be decoded by `--strace-full`.
-* The step driver (`cpu.c`), the predecoded tier's executor and the JIT runtime (`jit/jit.c`) have near-verbatim twins in arm64emu (`src/arm64emu/`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); `lib/arm64/` is already shared.
+* The JIT runtime (`jit/jit.c`) has a near-verbatim twin in arm64emu (`src/arm64emu/jit/jit.c`). Mirror a fix to the twin, or say why it does not apply (system-mode-only and user-mode-only differences are deliberate); the step driver and the predecoded tier are already shared (`lib/arm64/`).
 
 ## Testing
 
@@ -185,6 +184,7 @@ JIT debugging environment variables:
 * `ARM64CHROOT_JIT_STATS`: at exit, ranks the instruction words still falling back to the exec_a64 interpreter helper (i.e. what the JIT couldn't translate). ARM64CHROOT_JIT_STATS=/path dumps the ranking to a file instead of stderr.
 * `ARM64CHROOT_JIT_DUMP=PREFIX`: writes each translated block to a sparse code-cache image `PREFIX.<pid>.<tid>.code` plus a .map, so you can disassemble the native code the JIT produced.
 * `ARM64CHROOT_JIT_PDMAX=N`: forces predecode ops with id > N through the interpreter helper. This is the bisection knob: sweep N to pin a codegen bug down to one instruction class.
+* `ARM64CHROOT_PD_MAX=N`: the predecoded tier's analogue: only predecode ops with id <= N keep their native handlers, everything above runs through exec_a64 (0 = the plain interpreter).
 * `ARM64CHROOT_JIT_SLOWMEM`: forces every inline memory access down its slow helper branch, isolating fast-path memory codegen bugs.
 * `ARM64CHROOT_JIT_NOFUSE`: disables instruction / D-TLB-probe fusion (all backends).
 * `ARM64CHROOT_JIT_NOFP16`: disables FP16 native codegen on the AArch64 backend (falls back to helper).
@@ -232,4 +232,4 @@ Tuning:
 * `ARM64CHROOT_JIT_MB`: per-thread JIT code-cache size in MiB (default 32, clamped 1–128).
 * `XDG_RUNTIME_DIR`, `TMPDIR`: first writable one holds the backing directories of emulated tmpfs mounts (removed when the session ends; a session killed before it could clean up is swept by the next one), plus the --shared-proc *fallback* registry file and the System V shm segment backings when the diskless broker (memfd) is unavailable and /dev/shm isn't writable (Termux). The shm backings are unlinked the moment they are created (the broker hands attachers the descriptor, never a name), so only the registry file has one — and it is refused unless it is a regular file owned by this user that nobody else can reach.
 
-Note: `src/arm64chroot/core/cpu.c` / `lib/arm64/cpu.h` still document several source-inherited hooks — g_rtrace (compact register trace), g_prof/ARM64EMU_PROF (hot-PC profiler), g_ring/ARM64EMU_RING (recent-step ring buffer), g_tpc/ARM64EMU_TPC (dump state at a target PC), and g_cov/ARM64EMU_COV (coverage-divergence finder) — carried over from arm64emu's core (`src/arm64emu/cpu.c`). This codebase never wires those env vars up. They stay 0 unless you edit the source and rebuild.
+Note: the shared step driver (`lib/arm64/cpu.c`) carries several per-step diagnostics — g_rtrace (compact register trace), g_prof (hot-PC profiler), g_ring (recent-step ring buffer), g_tpc (dump state at a target PC), and the coverage-divergence finder (cov_load) — that arm64emu sets from its ARM64EMU_* environment. arm64chroot never wires them up: they stay 0 unless you edit the source and rebuild.

@@ -34,11 +34,11 @@ docs/<program>/        each program's documentation; README.md is its user guide
 build/                 everything the build makes (gitignored, see below)
 ```
 
-The parts of the emulation core that still differ between the two emulators
-(step driver, the predecoded tier's executor, the JIT runtime) live in each emulator's tree for now and
-are kept diffable against each other; they move into `lib/` as they are
-unified. A file in `lib/` is compiled into every program that uses it, with
-that program's flags, so a change there must pass every such program's suites.
+The one part of the emulation core that still differs between the two
+emulators, the JIT runtime, lives in each emulator's tree for now, kept
+diffable against its twin; it moves into `lib/` once unified. A file in
+`lib/` is compiled into every program that uses it, with that program's
+flags, so a change there must pass every such program's suites.
 
 What differs between the programs is configured, not forked, and decided at
 run time, not at build time: each CPU carries the mode the program runs it in
@@ -47,10 +47,15 @@ where the guest never leaves EL0; `c->eng.smp`: 1 where guest threads run
 concurrently on host threads, arm64chroot's case, so atomics and barriers
 must be host ones). The interpreter's EL1-only checks are the architecture's
 own, decided by the EL and the reset values `sysreg_init` gives each mode; the
-JIT makes its choices as it translates, so generated code carries none.
+JIT makes its choices as it translates, so generated code carries none. The
+engines (`cpu_step`, the predecoded tier's `pd_run`, the JIT's `jit_run`)
+share one contract with the program's run loop (`cpu.h`, "Run control"):
+they run guest code until the CPU asks for attention -- a stop, a halt, an
+interrupt it can take, whatever the program raises of its own -- or reach the
+deadline the loop gives them.
 `lib/arm64` takes one header from the program, found on its include path:
-`arm64_config.h`, how the library is built there (the prefix of the
-environment knobs it reads). Guest memory is the library's own interface,
+`arm64_config.h`, how the library is built there (`ARM64_ENV`, the prefix
+of the environment knobs it reads). Guest memory is the library's own interface,
 `lib/arm64/mem.h`: the typed accesses, instruction fetch and `mem_host_ptr`,
 inline over the translation caches part of every CPU (`c->eng`: one
 D-TLB entry layout and one fetch cache for both programs), with slow paths and

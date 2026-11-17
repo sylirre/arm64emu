@@ -17,7 +17,7 @@ top-level [`README.md`](README.md).
 ## One-paragraph summary
 
 The AArch64 decode/execute core is shared with the sibling arm64emu full-system
-emulator (`lib/arm64/`, plus the near-verbatim copies in `src/arm64chroot/core/`). It reaches the outside
+emulator (`lib/arm64/`). It reaches the outside
 world through exactly two narrow seams: **memory** (four `mem_*` functions plus
 an instruction-fetch inline) and **exceptions** (`exception_take`). Everything
 else — a portable software address space, an ELF loader, a ~190-syscall layer,

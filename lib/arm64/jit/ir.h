@@ -3,10 +3,10 @@
 /* JIT intermediate representation. One guest instruction becomes 1..
  * IR_MAX_OPS_PER_INSN linear IR ops; the backends emit host code from them
  * with per-block register allocation. The frontend (frontend.c) is a
- * transcription of the predecode handler semantics (each program's pdrun.c,
- * itself checked against decode.c by the differential suites) — XZR/SP resolution, width truncation, pre-decoded
- * immediates and writeback ordering are all resolved HERE, never in a
- * backend.
+ * transcription of the predecode handler semantics (pdrun.c, itself checked
+ * against decode.c by the differential suites) — XZR/SP resolution, width
+ * truncation, pre-decoded immediates and writeback ordering are all resolved
+ * HERE, never in a backend.
  *
  * Virtual registers: 0..30 = guest x0..x30, 31 = guest SP (sp_el[0]),
  * 32..34 = block-local temps, 35 = the zero register (reads as 0, writes

@@ -9,9 +9,10 @@ otherwise; what an ILP32 host does differently is its own section at the end. Th
 does not handle natively is executed by calling `exec_a64`, and the whole
 differential test suite must pass with `--jit` on (`make test-arm64chroot-jit`).
 
-The core (`src/arm64chroot/core/`) is a diffable copy of the sibling system emulator and is
-**not** touched. The JIT lives entirely in `src/arm64chroot/jit/` plus a handful of small
-hooks in the editable files (run-loop rung, option parsing, mm invalidation
+The core (`lib/arm64/`) is shared with the sibling system emulator. The JIT's
+translator is too (`lib/arm64/jit/`); its runtime lives in `src/arm64chroot/jit/`,
+kept diffable against the sibling's, plus a handful of small hooks in the
+program's files (run-loop rung, option parsing, mm invalidation
 hooks, the signal catcher, thread/fork lifecycle).
 
 ## What you get
@@ -57,7 +58,7 @@ branches (`BR`/`BLR`/`RET`) probe a per-thread guest-pc → host-code cache.
 **Per-thread everything.** Each guest thread has its own `JitEnv`: code cache,
 block table, chain-edge list, jump cache, and D-TLB view. There are no locks in
 the JIT runtime and generated code is never written by another thread. This
-mirrors the interpreter's per-thread `g_pdcache` / D-TLB design; the cost is
+mirrors the interpreter's per-CPU decode cache / D-TLB design; the cost is
 that a heavily-threaded guest re-translates hot code per thread.
 
 **Registers and flags.** Guest GPRs live in the `CPU` struct between blocks and
@@ -280,18 +281,20 @@ exact `cur_insn_pc`/`pc` baked as an immediate. In particular, a block's
 entry **safepoint restores `c->pc` to the block start** before exiting, because
 a direct chain jump into the block bypassed the predecessor's PC write.
 
-**Signals.** The host catcher enqueues the guest signal and sets the thread's
-`interrupt` flag (async-signal-safe: one TLS store). Generated code checks that
-flag at every block entry, so delivery latency is bounded by one block; the
-actual delivery happens only from `emu_loop`, from consistent state, so
-`rt_sigreturn` and `sigaltstack` are unchanged. `jit_run` clears the flag
-before it enters a block, so it first asks what the flag stood for
-(`emu_callout_due`: a deliverable signal, a tracer's kick, an `execve`
-call-out) and returns to the loop if the answer is yes. A signal caught while
-the thread was in the emulator's own code, after the loop's delivery point had
-looked, used to be cleared away with the flag, and a thread spinning in a block
-chained to itself then went on spinning until some other signal arrived
-(`tests/arm64chroot/c/sigpaced.c`).
+**Signals.** The host catcher enqueues the guest signal, raises the CPU's
+attention (`sig_npend_raise`) and sets the thread's JIT `interrupt` flag
+(async-signal-safe: two stores). Generated code checks the flag at every block
+entry, so delivery latency is bounded by one block; the actual delivery
+happens only from `emu_loop`, from consistent state, so `rt_sigreturn` and
+`sigaltstack` are unchanged. `jit_run` clears the flag before it enters a
+block, but the attention stays raised until the loop drops it, and the
+dispatcher looks at it before every block -- after clearing the flag, never
+before: a signal caught while the thread was in the emulator's own code, after
+the loop's delivery point had looked, used to be cleared away with the flag,
+and a thread spinning in a block chained to itself then went on spinning until
+some other signal arrived (`tests/arm64chroot/c/sigpaced.c`); and one caught
+between a look and the clear would do the same, deaf to its own signal
+arriving again, which is queued once (`tests/arm64chroot/fixtures/sigtramp.c`).
 
 **Self-modifying / remapped code.** The guest must execute `IC IVAU` before
 running written code (this CPU advertises `CTR_EL0.{DIC,IDC}=0`), so the JIT

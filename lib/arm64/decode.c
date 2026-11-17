@@ -1732,7 +1732,7 @@ static void branch_system(CPU *c, u32 insn) {
     if (BITS(31, 24) == 0xd4) {                                           /* exception generation */
         unsigned opc = BITS(23, 21), ll = BITS(1, 0), imm16 = BITS(20, 5);
         if (opc == 0 && ll == 1) {                                        /* SVC */
-            systrace_svc(c);
+            if (UNLIKELY(cpu_svc_hook != NULL)) cpu_svc_hook(c);
             exception_take(c, EXC_SYNC, esr_make(EC_SVC64, imm16), 0, c->pc);
         } else if (opc == 0 && ll == 2) {                                 /* HVC */
             /* HVC is UNDEFINED at EL0 — guest userspace must not reach the PSCI
@@ -1750,7 +1750,7 @@ static void branch_system(CPU *c, u32 insn) {
         } else if (opc == 2 && ll == 0 && c->el != 0) {                   /* HLT: stop machine (test exit); EL0 may not halt */
             fprintf(stderr, "[HLT #%u] x0=0x%llx icount=%llu\n", imm16,
                     (unsigned long long)c->x[0], (unsigned long long)c->icount);
-            c->stop = true;
+            cpu_stop(c);
         } else undefined(c, insn);
         return;
     }
@@ -1786,7 +1786,7 @@ static void branch_system(CPU *c, u32 insn) {
                  * a no-op. */
                 if (c->event) c->event = false;
                 else if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWE)) wfx_trap(c, 1);
-                else c->halted = true;
+                else cpu_halt(c);
             }
             else if (CRm == 0 && op2 == 3) {                  /* WFI */
                 /* ...and a WFI unless SCTLR_EL1.nTWI does: Linux leaves it
@@ -1794,7 +1794,7 @@ static void branch_system(CPU *c, u32 insn) {
                  * idle the CPU. User mode sets it (sysreg_init) and the
                  * halt comes to the same thing. */
                 if (c->el == 0 && !(c->sctlr[1] & SCTLR_nTWI)) wfx_trap(c, 0);
-                else c->halted = true;
+                else cpu_halt(c);
             }
             else if (CRm == 0 && (op2 == 4 || op2 == 5)) c->event = true;  /* SEV / SEVL */
             /* NOP/YIELD/DGH/etc -> no-op */

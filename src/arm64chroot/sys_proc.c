@@ -28,6 +28,7 @@
 #include "sys.h"
 #include "sys_netlink.h"
 #include "jit.h"
+#include "pdrun.h"
 #include "ptrace.h"
 
 /* Older libc headers (and some NDK levels) predate these prctl operations. */
@@ -118,6 +119,7 @@ static void leader_park(CPU *c) {
     sig_thread_exit();
     jit_thread_exit();   /* hand back the code cache; jit_run builds a fresh
                           * one if this thread is ever revived */
+    pd_cache_free(c);    /* and the decode cache, which pd_run rebuilds */
     g_tls.sc_ret_eintr = 0;   /* exit(2) is not a syscall to be restarted */
     while (__atomic_load_n(&m->leader_parked, __ATOMIC_ACQUIRE)) {
         if (guest_stop_pending(m)) { guest_stop_point(c); continue; }
@@ -148,7 +150,7 @@ SYSDEF(exit) {
     if (g_tls.tid != getpid()) {
         ptrace_report_exit_stop(c, ws);
         ptrace_report_exit(c, ws);
-        c->stop = true;
+        cpu_stop(c);
         return 0;
     }
 
@@ -824,11 +826,14 @@ static void futex_wake_addr(CPU *c, u64 va) {
 
 /* Give c, the CPU of the calling thread, `from`'s state: a struct copy, less
  * what belongs to the host thread c runs on rather than to the program --
- * its translation caches (as_cpu_attach) and what its FPCR mirrors, which the
- * copy would claim were `from`'s host thread's (fpcr_host_sync). */
+ * its translation caches (as_cpu_attach), the decode cache it keeps
+ * (pd_run's), and what its FPCR mirrors, which the copy would claim were
+ * `from`'s host thread's (fpcr_host_sync). */
 static void cpu_adopt(CPU *c, const CPU *from) {
+    struct PDEnt *pd = c->eng.pd;
     *c = *from;
     as_cpu_attach(c);
+    c->eng.pd = pd;
     c->host_fzmode = HOST_FZMODE_UNKNOWN;
 }
 
@@ -897,6 +902,7 @@ static void *thread_entry(void *arg) {
      * with it (exit_ptrace), however long its process goes on. */
     ptrace_tracer_thread_exit();
     jit_thread_exit();
+    pd_cache_free(c);
     sig_thread_exit();   /* what it caught for the process, to another thread */
     sig_tls_release();   /* and whatever this thread's signal queue grew into */
     sig_kick_timer_fini();
@@ -2953,7 +2959,7 @@ static void dethread_join(CPU *c) {
         g_tls.clear_child_tid = 0;
         g_tls.pers_pub = 0;   /* the exec took back every personality the old
                                * image's threads published (do_execve) */
-        c->stop = true;
+        cpu_stop(c);
         return;
     }
     /* The main thread: wait for the image, then take it over. */
@@ -3047,7 +3053,7 @@ void guest_stop_point(CPU *c) {
         g_tls.clear_child_tid = 0;
         g_tls.pers_pub = 0;   /* the exec took back every personality the old
                                * image's threads published (do_execve) */
-        c->stop = true;
+        cpu_stop(c);
         return;
     }
     s32 req = __atomic_load_n(&m->dethread_req, __ATOMIC_ACQUIRE);

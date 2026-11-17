@@ -632,16 +632,16 @@ void jit_stats_flush(void) {
 /* ---- helpers called from generated code ---- */
 
 /* Execute one instruction with interpreter semantics. Returns nonzero when
- * the block must stop: control transfer, recorded exception, stop/halt, or
- * a pending signal (bounds delivery latency mid-block). */
+ * the block must stop: control transfer, or the CPU asking for attention (a
+ * recorded exception, stop/halt, a pending signal: bounds delivery latency
+ * mid-block). */
 u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
     c->cur_insn_pc = pc;
     c->pc = pc + 4;
     exec_a64(c, insn);
     c->icount++;
     if (UNLIKELY(__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) > 0)) jstat_bump(insn);
-    if (UNLIKELY(g_tls.pend_exc.valid || c->stop || c->halted || g_sig_npend))
-        return 1;
+    if (UNLIKELY(cpu_attn_pending(c))) return 1;
     /* MSR FPCR lands here (the system group is never inlined). Where the host
      * carries the mode, follow it immediately -- generated code chained after
      * this one must flush as the guest now asks. Where it does not, a mode
@@ -903,7 +903,7 @@ static void jit_service_interrupt(JitEnv *env) {
     }
 }
 
-void jit_run(CPU *c) {
+void jit_run(CPU *c, u64 deadline) {
     JitEnv *env = &g_jit_env;
     if (UNLIKELY(!env->active)) {
         if (jit_env_init(env, c) < 0) {
@@ -921,16 +921,23 @@ void jit_run(CPU *c) {
     JBlock *prev = NULL;                /* chainable exit awaiting a target */
     int prev_slot = 0;
     u32 flush_seen = env->flush_count;
+    /* Before every block, in this order: the JIT's own `interrupt` -- the
+     * flag generated code checks at every block entry -- is cleared and what
+     * it asked for done; then the run loop's attention and the deadline are
+     * looked at (cpu.h, "Run control"). Whatever raised the flag with
+     * something for the loop to answer raised the attention too, which only
+     * the loop drops, so a request is seen here or, raised after this look,
+     * raises the flag again and ends the block it lands in. The other order
+     * left a window: a signal caught between the look and the clear lost its
+     * flag and kept its attention unseen, and a block chained to itself then
+     * spun on, deaf to the same signals arriving again, which are queued
+     * once (tests/arm64chroot/fixtures/sigtramp.c). */
     for (;;) {
-        if (UNLIKELY(g_tls.pend_exc.valid || c->stop)) return;
-        if (UNLIKELY(env->interrupt)) jit_service_interrupt(env);
-        /* The flag just cleared is the only one generated code reads, so what
-         * it stood for has to be answered here: a signal caught while this
-         * thread was outside generated code, with nothing left to raise the
-         * flag again, would otherwise wait in a block that loops on itself.
-         * Only what the loop would act on -- a signal the guest blocks leaves
-         * g_sig_npend set, and returning for it would run nothing at all. */
-        if (UNLIKELY(g_sig_npend) && emu_callout_due(c, c->pc)) return;
+        if (UNLIKELY(env->interrupt)) {
+            jit_service_interrupt(env);
+            __atomic_signal_fence(__ATOMIC_SEQ_CST);   /* clear, then look */
+        }
+        if (UNLIKELY(cpu_attn_pending(c) || c->icount >= deadline)) return;
         if (UNLIKELY(env->flush_count != flush_seen)) {
             flush_seen = env->flush_count;
             prev = NULL;                /* arena reset: pointer is stale */
@@ -966,8 +973,7 @@ void jit_run(CPU *c) {
                 c->pc = pc + 4;
                 exec_a64(c, insn);
                 c->icount++;
-                if (g_tls.pend_exc.valid || g_sig_npend || c->stop || c->halted)
-                    return;
+                if (cpu_attn_pending(c)) return;
             } while (thrash_hot(env, c->pc));
             continue;
         }
@@ -1007,12 +1013,5 @@ void jit_run(CPU *c) {
             prev = &env->arena[eid >> 1];
             prev_slot = (int)(eid & 1);
         }
-        /* Rare-event checks come AFTER the block, mirroring pd_run: at least
-         * one instruction executes per emu_loop round trip. Checking
-         * g_sig_npend up front would spin forever when the queued signal is
-         * blocked by the guest (delivery leaves the flag set). */
-        if (UNLIKELY(g_tls.pend_exc.valid || g_sig_npend || c->stop ||
-                     c->halted))
-            return;
     }
 }

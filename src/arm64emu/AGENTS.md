@@ -40,7 +40,14 @@ lib/arm64/                shared with arm64chroot (compiled into both):
                           program's arm64_config.h first
   cpu.h                   CPU state struct, PSTATE bits, core interpreter API;
                           the CPU's mode (c->eng.sys/smp: a full system or
-                          user mode, one CPU or concurrent guest threads)
+                          user mode, one CPU or concurrent guest threads);
+                          run control: the engines' contract with the run
+                          loop (the attention byte, cpu_irq_poll)
+  cpu.c                   reset, cpu_step (fetch/decode/execute driver),
+                          interrupt delivery (cpu_take_interrupt), SPSR
+                          pack/unpack, condition codes, cpu_dump, and the
+                          step diagnostics: coverage-divergence finder, PC
+                          ring buffer, hot-PC profiler, the program's hooks
   mem.h                   guest memory as the core reaches it: typed accesses,
                           fetch and mem_host_ptr, inline over the CPU's
                           translation caches (c->eng: the D-TLB, whose entry
@@ -63,6 +70,8 @@ lib/arm64/                shared with arm64chroot (compiled into both):
   predecode.c             the pre-decode classifier (mirrors decode.c; anything
                           uncertain stays PD_GENERIC -> exec_a64), the
                           predecoded tier's and the JIT frontend's decoder
+  pdrun.h, pdrun.c        pd_run, the default computed-goto tier over the
+                          CPU's decode cache of PDEnts (pinned to -O2 here)
   jit/                    the JIT's translator (both emulators; the runtime,
                           jit.c, stays in each program):
     ir.h                  the IR: op set, virtual registers, block layout
@@ -80,15 +89,13 @@ src/arm64emu/
   main.c                  entry point: CLI parsing, --help text (the option and
                           env-var reference), image loading, the run loop,
                           signal-flush of diagnostics, ARM64EMU_* debug env vars
-  arm64_config.h          how lib/arm64 is built here: the ARM64EMU_JIT_ knob
+  arm64_config.h          how lib/arm64 is built here: the ARM64EMU_ knob
                           prefix, and the -DANDROID_JNI exit -> _exit shadow
-  cpu.c                   reset, cpu_step (fetch/decode/execute driver),
-                          condition codes, cpu_dump, and the diagnostics:
-                          SVC syscall trace, musl-heap tracker (ARM64EMU_HEAP),
-                          ARM64EMU_COV coverage-divergence finder, PC ring buffer,
-                          hot-PC profiler
-  exception.c             exception entry/return: VBAR vectors, ESR/FAR/ELR/
-                          SPSR banking, DAIF masking, ERET
+  diag.h, diag.c          guest-kernel diagnostics on the step driver's hooks:
+                          the mm-syscall trace (ARM64EMU_SYS) and the musl-heap
+                          tracker (ARM64EMU_HEAP)
+  exception.c             exception entry: VBAR vectors, ESR/FAR/ELR/SPSR
+                          banking, DAIF masking
   mmu.h                   the MMU behind lib/arm64's mem.h: translation, the
                           CPU's caches (mmu_cpu_init: a 4096-entry D-TLB
                           tagged with the TLB flush generation)
@@ -127,9 +134,7 @@ src/arm64emu/
                           never hand-edit
     fdt.h, fdt.c          minimal in-place FDT editing: sizes the /memory node
                           to --memory, in the built-in tree and in a --dtb file
-  jit/                    accelerated engines (predecoded tier + --jit)
-    pdrun.h, pdrun.c      pd_step, the default computed-goto tier over a
-                          decode cache of PDEnts (pinned to -O2)
+  jit/                    the JIT runtime (--jit)
     jit.h                 public JIT interface (--jit, off by default)
     jit_priv.h            internals shared between runtime and backends: the
                           JitEnv ABI lib/arm64/jit compiles against
@@ -211,7 +216,7 @@ In addition to the root `AGENTS.md`:
 * Keep in sync the interpreter and JIT parts of emulator where possible.
 * Keep in sync the code and documentation (`docs/arm64emu/`).
 * Keep in sync the file structure in architecture section of `docs/arm64emu/README.md` and structure section of this file.
-* The step driver (`cpu.c`), the predecoded tier's executor and the JIT runtime have near-verbatim twins in arm64chroot (`src/arm64chroot/core/cpu.c`, `src/arm64chroot/pdrun.c`, `src/arm64chroot/jit/jit.c`). Mirror a fix to the twin, or say why it does not apply; `lib/arm64/` is already shared.
+* The JIT runtime (`jit/jit.c`) has a near-verbatim twin in arm64chroot (`src/arm64chroot/jit/jit.c`). Mirror a fix to the twin, or say why it does not apply; the step driver and the predecoded tier are already shared (`lib/arm64/`).
 
 ## Testing
 

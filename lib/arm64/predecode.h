@@ -3,15 +3,14 @@
 /* Operand pre-decode: classify one instruction word into a dense opcode id
  * plus pre-extracted operand fields (a PDEnt). Entries are a pure function of
  * the instruction word (PC-relative forms add c->cur_insn_pc at execute time).
- * Two engines consume them in each emulator: the predecoded tier (each
- * program's pdrun.c: a per-PC decode cache executed by direct-threaded
- * dispatch), and the --jit translator, which consumes PDEnts instead of
- * re-deriving fields from the raw word. Everything classified PD_GENERIC is
- * executed by calling exec_a64, which stays the source of truth. The engines
- * do not want quite the same classification — arm64emu's tier applies one
- * extra demotion (pd_fill_tier), for SP-based memory ops it cannot
- * alignment-check itself — so pd_fill stays pure classification and each
- * engine adds what it needs on top.
+ * Two engines consume them: the predecoded tier (pdrun.c: a per-PC decode
+ * cache executed by direct-threaded dispatch), and the JIT translator, which
+ * consumes PDEnts instead of re-deriving fields from the raw word. Everything
+ * classified PD_GENERIC is executed by calling exec_a64, which stays the
+ * source of truth. The engines do not want quite the same classification --
+ * the tier applies one extra demotion (pd_fill_tier), for SP-based memory ops
+ * it cannot alignment-check itself -- so pd_fill stays pure classification
+ * and each engine adds what it needs on top.
  *
  * Coverage rule: pd_fill must never classify an encoding decode.c does not
  * implement (or implements differently) in the program that compiles it —
@@ -23,7 +22,7 @@
 
 #include "cpu.h"
 
-typedef struct {
+typedef struct PDEnt {
     u32 insn;      /* the classified word; also the decode cache's validation
                     * tag (a live fetch whose word differs re-fills the entry,
                     * so the cache is self-modifying- and address-space-safe;

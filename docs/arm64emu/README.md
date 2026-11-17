@@ -162,11 +162,11 @@ comparison.
 src/arm64emu/
   main.c        CLI, image loading, the run loop, signal-flush of diagnostics
   arm64_config.h  how lib/arm64 is built here (knob prefix; embedded _exit)
-  cpu.c         fetch/decode/execute driver, condition codes, dump,
-                hot-PC profiler / ring buffer / coverage-divergence finder
+  diag.{h,c}    guest-kernel diagnostics on the step driver's hooks: the
+                mm-syscall trace and the musl-heap tracker
   mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB, and the
                 slow paths of lib/arm64's mem.h (D-TLB and fetch-cache fills)
-  exception.c   exception entry/return (VBAR vectors, ESR/FAR/ELR/SPSR, ERET)
+  exception.c   exception entry (VBAR vectors, ESR/FAR/ELR/SPSR, DAIF masking)
   memory.c      physical bus: RAM + NOR-flash CFI command set + MMIO dispatch
   tty.c         raw-terminal serial console via termios
   console.c     host endpoints the console devices speak through: the shared
@@ -176,18 +176,22 @@ src/arm64emu/
                 virtio_net (--net), virtio_9p (--virtfs), virtio_console (--console)
   fdt/          device tree: virt.dts (QEMU virt tree; compiled to virt_dtb.h,
                 embedded) + fdt.c, which sizes its /memory node to --memory
-  jit/          accelerated engines: pdrun.{h,c} (the default direct-threaded
-                tier), jit.c runtime (the translator is lib/arm64/jit)
+  jit/          the JIT runtime, jit.c (the translator is lib/arm64/jit)
   net/          usernet, the built-in user-mode NAT stack behind virtio-net
                 (core/udp/tcp; no TAP, TUN, privileges or external libraries)
 lib/arm64/      AArch64 emulation shared with arm64chroot:
   types.h       fixed-width types and small helpers
-  cpu.h         CPU state, PSTATE bits, core interpreter API
+  cpu.h         CPU state, PSTATE bits, core interpreter API, run control
+                (the engines' contract with the run loop)
+  cpu.c         fetch/decode/execute driver, interrupt delivery, SPSR
+                pack/unpack (ERET), condition codes, dump, hot-PC profiler /
+                ring buffer / coverage-divergence finder
   mem.h         guest memory as the core reaches it: typed accesses, fetch and
                 mem_host_ptr inline over the CPU's translation caches (D-TLB,
                 fetch cache); the slow paths are the program's
   decode.c      A64 decoder: integer/branch/load-store, CRC32, AdvSIMD ld/st
   predecode.{h,c}  the pre-decode classifier (word -> PDEnt) both engines use
+  pdrun.{h,c}   the predecoded tier, the default direct-threaded engine
   jit/          the JIT translator: ir.h, frontend.c, backend_x86_64.c,
                 backend_a64.c
   sysreg.{h,c}  MSR/MRS, ID registers, generic-timer registers, DC ZVA, TLBI, AT

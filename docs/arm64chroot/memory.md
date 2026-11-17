@@ -1100,7 +1100,7 @@ model; the emulator must reproduce that model on the host — including on
 **weakly-ordered hosts (ARM)**, where the naive "just `memcpy`" approach lets the
 host CPU reorder accesses that the guest ordered.
 
-Four rules, all in `src/arm64chroot/core/decode.c`:
+Four rules, all in `lib/arm64/decode.c`:
 
 1. **Barriers are real fences.** Guest `DMB`/`DSB` emit
    `__atomic_thread_fence(__ATOMIC_SEQ_CST)`. Without this, a weak host reorders
