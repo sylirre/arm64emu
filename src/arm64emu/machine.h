@@ -155,6 +155,10 @@ typedef struct Machine {
 void machine_init(Machine *m, u64 ram_size);
 void machine_free(Machine *m);
 
+/* Exception entry (exception.c): every exception is taken to EL1, ret_addr
+ * becoming ELR_EL1. The CPU's ops make it the core's exception_take. */
+void exception_vector(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr);
+
 /* Return the NOR flash CFI command state machine to read-array/ready (reset). */
 void flash_cfi_reset(Machine *m);
 void machine_add_device(Machine *m, u64 base, u64 size, mmio_read_fn r,

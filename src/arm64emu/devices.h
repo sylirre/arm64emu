@@ -48,10 +48,20 @@ typedef struct ARMTimer {
     u64 deadline;   /* cached next-fire count (phys domain), ~0 = none armed */
 } ARMTimer;
 ARMTimer *gtimer_create(Machine *m);
+/* The count CNTPCT_EL0 reads (CNTVCT_EL0 with virt): the host clock, or the
+ * instruction count (g_rtclock). */
+u64  gt_count(CPU *c, bool virt);
 void timer_update(Machine *m);
+/* timer_update for the CPU's ops, which run it after every CNT* register
+ * write (cpu.h, CpuOps.timer_update). */
+void timer_cpu_update(CPU *c);
 void timer_check(Machine *m);   /* per-tick: one compare, full update when due */
 u64  timer_next_deadline_ns(Machine *m);     /* host-ns until next fire, or ~0 */
 u64  timer_next_deadline_ticks(Machine *m);  /* instructions until next fire, or ~0 */
+
+/* ---- PSCI over the SMC/HVC conduit (psci.c) ---- */
+/* An HVC or SMC at EL1: true if it was a PSCI call, now served. */
+bool smccc_conduit(CPU *c, bool is_hvc);
 
 /* ---- PL011 UART ---- */
 typedef struct PL011 {

@@ -42,8 +42,8 @@ per-block greedy register allocation and lazy NZCV in host flags
 cache, and the W^X fallback (RWX mmap → dual-mapped memfd → interpreter), all
 in the runtime (`lib/arm64/jit/jit.c`). This document covers what is
 *different* in a full system, where the JIT's coherence with guest memory is
-this program's (`src/arm64emu/jit/coherence.c`, the runtime's `jit_mode_*`
-hooks).
+this program's (`src/arm64emu/jit/coherence.c`, the `JitCoherence` its
+CPU's ops give the runtime).
 
 One invariant worth restating because it is easy to break silently: a guest
 instruction expands to at most `IR_MAX_OPS_PER_INSN` IR ops (`ir.h`), and

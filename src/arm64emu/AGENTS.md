@@ -35,12 +35,16 @@ Packages required to compile the program and run test suite:
 Makefile                  (repository root) `make arm64emu` -> build/arm64emu;
                           C11 + libc/POSIX + -lm only, no external deps.
                           CC/CFLAGS/ARM64EMU_OPT overridable
-lib/arm64/                shared with arm64chroot (compiled into both):
-  types.h                 u8..u64 / bool / small helpers; includes the
-                          program's arm64_config.h first
+lib/arm64/                shared with arm64chroot (compiled once, linked into
+                          both; includes no program header):
+  types.h                 u8..u64 / bool / small helpers
   cpu.h                   CPU state struct, PSTATE bits, core interpreter API;
                           the CPU's mode (c->eng.sys/smp: a full system or
-                          user mode, one CPU or concurrent guest threads);
+                          user mode, one CPU or concurrent guest threads) and
+                          ops (c->eng.ops, CpuOps: what the library asks of
+                          the program -- exception entry, the memory slow
+                          paths, the timer, PSCI, the JIT's coherence);
+                          g_env_prefix/arm64_getenv (the knobs' prefix);
                           run control: the engines' contract with the run
                           loop (the attention byte, cpu_irq_poll)
   cpu.c                   reset, cpu_step (fetch/decode/execute driver),
@@ -53,8 +57,8 @@ lib/arm64/                shared with arm64chroot (compiled into both):
                           translation caches (c->eng: the D-TLB, whose entry
                           layout the JIT probes inline, and the fetch cache);
                           the slow paths and TLB maintenance are the program's
-  sysreg.h                MSR/MRS + SMCCC hooks (smccc_conduit weak: only
-                          arm64emu has PSCI)
+                          (its ops)
+  sysreg.h                MSR/MRS/SYS
   sysreg.c                system-register file: MSR/MRS/SYS/MSR-immediate, ID
                           registers (what features the guest kernel probes),
                           generic-timer registers, DC ZVA, TLBI, AT, CPACR FP
@@ -74,12 +78,12 @@ lib/arm64/                shared with arm64chroot (compiled into both):
                           CPU's decode cache of PDEnts (pinned to -O2 here)
   jit/                    the JIT (--jit, off by default):
     jit.h                 public interface: jit_run, the program's uses of a
-                          CPU's JIT, and the jit_mode_* hooks it defines
+                          CPU's JIT, and the JitCoherence it supplies
     jit_priv.h            internals shared by the runtime, the backends and
                           the program's hooks: JitEnv, the block tables
     jit.c                 the runtime: per-CPU code cache, block tables,
                           dispatch loop, chaining, jump cache, memory slow
-                          paths, the ARM64EMU_JIT_* knobs
+                          paths, the <prefix>JIT_* knobs (ARM64EMU_JIT_* here)
     ir.h                  the IR: op set, virtual registers, block layout
     frontend.c            basic-block discovery + PDEnt -> IR translation
                           (guest-shaped concerns are all resolved here)
@@ -96,19 +100,21 @@ src/arm64emu/
   main.c                  entry point: CLI parsing, --help text (the option and
                           env-var reference), image loading, the run loop,
                           signal-flush of diagnostics, ARM64EMU_* debug env vars
-  arm64_config.h          how lib/arm64 is built here: the ARM64EMU_ knob
-                          prefix, and the -DANDROID_JNI exit -> _exit shadow
+  embed.h                 the -DANDROID_JNI build's exit -> _exit shadow,
+                          forced into its every unit (-include)
   diag.h, diag.c          guest-kernel diagnostics on the step driver's hooks:
                           the mm-syscall trace (ARM64EMU_SYS) and the musl-heap
                           tracker (ARM64EMU_HEAP)
-  exception.c             exception entry: VBAR vectors, ESR/FAR/ELR/SPSR
+  exception.c             exception entry (exception_vector, the ops'
+                          exception_take): VBAR vectors, ESR/FAR/ELR/SPSR
                           banking, DAIF masking
   mmu.h                   the MMU behind lib/arm64's mem.h: translation, the
-                          CPU's caches (mmu_cpu_init: a 4096-entry D-TLB
-                          tagged with the TLB flush generation)
+                          CPU's mode, ops and caches (mmu_cpu_init: a
+                          4096-entry D-TLB tagged with the TLB flush
+                          generation)
   mmu.c                   stage-1 walk (EL1&0, 4 KB granule), software TLB,
                           mem.h's slow paths (D-TLB/fetch-cache fills, the
-                          bus), TLBI/AT
+                          bus), TLBI/AT; the machine's CpuOps (system_ops)
   machine.h               Machine struct + virt platform constants
                           (FLASH/RAM base and size, device windows)
   memory.c                physical bus: RAM, Intel CFI NOR flash command set,
@@ -143,7 +149,8 @@ src/arm64emu/
                           to --memory, in the built-in tree and in a --dtb file
   jit/
     coherence.c           the JIT's coherence with physical memory (lib/arm64
-                          jit.h's jit_mode_*): the code-page bitmap that keeps
+                          jit.h's JitCoherence, jit_phys_coherence): the
+                          code-page bitmap that keeps
                           stores to translated pages off the D-TLB fast path,
                           IC IVAU by physical address, warm reboot
   net/                    usernet: built-in user-mode NAT stack (no libslirp)

@@ -18,8 +18,10 @@ top-level [`README.md`](README.md).
 
 The AArch64 decode/execute core is shared with the sibling arm64emu full-system
 emulator (`lib/arm64/`). It reaches the outside
-world through exactly two narrow seams: **memory** (four `mem_*` functions plus
-an instruction-fetch inline) and **exceptions** (`exception_take`). Everything
+world through exactly two narrow seams, both entries of the operations table
+the program gives each CPU (`CpuOps`): **memory** (the `mem_*` slow paths
+behind the inline accesses and instruction fetch) and **exceptions**
+(`exception_take`). Everything
 else — a portable software address space, an ELF loader, a ~190-syscall layer,
 rootfs path containment, guest signal delivery, and a fake-identity mode — is new
 code written for user mode. The core is driven by a predecode direct-threaded

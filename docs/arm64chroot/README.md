@@ -378,7 +378,6 @@ lib/arm64/      AArch64 emulation shared with arm64emu:
   esr.h         ESR exception classes + syndrome construction
   exec_fpsimd.c FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
-  arm64_config.h  how lib/arm64 is built here (its knob prefix)
   mmu.h mem.c   NEW guest address space: 2-level software page table
                 (guest 4 KB page -> host pointer | prot) behind lib/arm64's
                 mem.h (its slow paths, each thread's translation caches), guest

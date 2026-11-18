@@ -68,12 +68,12 @@ full on real armv7 silicon.
 
 ```
 Makefile                             (repository root) `make arm64chroot` -> build/arm64chroot; also arm64chroot32 (ILP32 host) and arm64chroot_asim (Android behavior)
-lib/arm64/                           Shared with arm64emu (compiled into both):
-  types.h cpu.h                      Fixed-width types; CPU state + core interpreter API, and run control: the engines' contract with the run loop (the CPU's attention byte)
+lib/arm64/                           Shared with arm64emu (compiled once, linked into both; includes no program header):
+  types.h cpu.h                      Fixed-width types; CPU state + core interpreter API, the CPU's mode and ops (c->eng.ops, CpuOps: what the library asks of the program -- exception entry, the memory slow paths, the timer, the JIT's coherence), g_env_prefix/arm64_getenv (the knobs' prefix), and run control: the engines' contract with the run loop (the CPU's attention byte)
   cpu.c                              Step driver, reset, interrupt delivery, SPSR pack/unpack, condition codes, debug dump and the per-step diagnostics
-  mem.h                              Guest memory as the core reaches it: typed accesses, fetch and mem_host_ptr, inline over the CPU's translation caches (c->eng: the D-TLB, whose entry layout the JIT probes inline, and the fetch cache); the slow paths and cache maintenance are the program's
+  mem.h                              Guest memory as the core reaches it: typed accesses, fetch and mem_host_ptr, inline over the CPU's translation caches (c->eng: the D-TLB, whose entry layout the JIT probes inline, and the fetch cache); the slow paths and cache maintenance are the program's (its ops)
   decode.c                           A64 decoder/executor (+ LSE atomics, host-atomic exclusives where guest threads run concurrently, c->eng.smp)
-  jit/jit.h jit/jit_priv.h           JIT public API (jit_run, the program's uses of a CPU's JIT, the jit_mode_* hooks it defines) + internals shared by the runtime, the backends and those hooks (JitEnv)
+  jit/jit.h jit/jit_priv.h           JIT public API (jit_run, the program's uses of a CPU's JIT, the JitCoherence it supplies) + internals shared by the runtime, the backends and those hooks (JitEnv)
   jit/jit.c                          JIT runtime: per-CPU code cache, block chaining, jump cache, invalidation by page, W^X/memfd fallback
   jit/ir.h jit/frontend.c            JIT translator: per-block decode -> linear IR -> liveness / flag fusion
   jit/backend_a64.c jit/backend_x86_64.c  Register-allocating single-pass emitters
@@ -84,12 +84,11 @@ lib/arm64/                           Shared with arm64emu (compiled into both):
   esr.h                              ESR exception classes + syndrome construction
   exec_fpsimd.c                      FP/Advanced-SIMD/crypto (+ FPCR rounding, 32-bit-host-safe)
 src/arm64chroot/
-  arm64_config.h                     How lib/arm64 is built here: the ARM64CHROOT_ knob prefix (the CPU's mode -- user mode, guest threads running concurrently -- is set by as_cpu_attach)
-  mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot) behind lib/arm64's mem.h (its slow paths; each thread's translation caches, attached to the CPU it runs by as_cpu_attach), guest mmap/brk/mprotect, copy_to/from_guest, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
-  exception.c                        Pending-exception recorder (SVC/abort/undef/BRK -> run loop, through the CPU's attention)
+  mmu.h mem.c                        NEW guest address space: 2-level software page table (guest 4 KB page -> host pointer | prot) behind lib/arm64's mem.h (its slow paths; each thread's CPU set up by as_cpu_attach: its mode -- user mode, guest threads running concurrently --, the process's CpuOps (user_ops) and translation caches), guest mmap/brk/mprotect, copy_to/from_guest, guest_lend (a large transfer's backing handed to the host syscall, pinned). Portable to 32-bit hosts: guest VAs never become host pointers except through the table.
+  exception.c                        Pending-exception recorder (exception_record, the ops' exception_take: SVC/abort/undef/BRK -> run loop, through the CPU's attention)
   loop.c                             Run loop + exception dispatch + signal delivery point + the thread call-out safepoint (stop_gen) + EL0's view of the ID registers (the kernel's MRS emulation)
   jit/                               The optional --jit's coherence with the guest address space (AArch64, x86-64, i686 & ARM32 hosts):
-    coherence.c coherence.h          lib/arm64 jit.h's jit_mode_* hooks: the thread registry and cross-thread interrupt, the sticky code-page map, invalidation by VA range (munmap/mprotect/IC IVAU), execve/fork
+    coherence.c coherence.h          lib/arm64 jit.h's JitCoherence (jit_va_coherence): the thread registry and cross-thread interrupt, the sticky code-page map, invalidation by VA range (munmap/mprotect/IC IVAU), execve/fork
   elf.c                              ELF64 loader, PT_INTERP, initial stack/auxv/HWCAP, sigtramp page
   path.c                             Rootfs containment resolver: the walk, plus the pin that hands each syscall a parent-directory fd + final component instead of a path string the host would re-resolve (no concurrent rename can redirect it); bind table (mount/umount/pivot_root; process-shared, private per faked mount namespace), tmpfs backing dirs, /proc & /dev special cases
   l2s.c                              --link2symlink: the host the shared engine (lib/link2symlink) runs on -- every host path it names mapped back to its guest name and pinned like a guest path

@@ -3,18 +3,16 @@
 /* pd_run: the predecoded interpreter tier, the default engine in both modes --
  * a per-CPU decode cache of PDEnts (classified by pd_fill, on a miss)
  * executed by direct-threaded dispatch. Kept in its own TU so it never
- * perturbs decode.c's codegen; arm64emu pins it to -O2 (the Makefile says
- * why). */
+ * perturbs decode.c's codegen; the Makefile pins it to -O2 and says why. */
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "arm64_config.h"
 #include "mem.h"
 #include "pdrun.h"
 
 int g_pd = 1;          /* the tier is on unless the program turns it off */
 
-/* ARM64_ENV("PD_MAX")=N, a bisection knob: only PD ops <= N keep their
+/* <prefix>PD_MAX=N, a bisection knob: only PD ops <= N keep their
  * native handlers, everything above runs through exec_a64 (L_GENERIC); 0 is
  * the pure-interpreter floor. -1 is no limit; read once, by whichever CPU
  * fills an entry first (every thread computes the same answer). */
@@ -22,7 +20,7 @@ static int pd_max_op(void) {
     static int max = -2;               /* -2: not read yet */
     int m = __atomic_load_n(&max, __ATOMIC_RELAXED);
     if (UNLIKELY(m == -2)) {
-        const char *s = getenv(ARM64_ENV("PD_MAX"));
+        const char *s = arm64_getenv("PD_MAX");
         m = s ? atoi(s) : -1;
         if (m < -1) m = -1;
         __atomic_store_n(&max, m, __ATOMIC_RELAXED);

@@ -756,6 +756,7 @@ static int enter_guest_cwd(struct Machine *m, const char *canon) {
 int main(int argc, char **argv)
 #endif
 {
+    g_env_prefix = "ARM64CHROOT_";       /* lib/arm64's knobs are ours */
     struct Machine *m = &g_machine;
     const char *argv0 = NULL;
     const char *work_dir = NULL;

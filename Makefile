@@ -8,9 +8,9 @@
 #   chroot-ng    in-process chroot for AArch64 hosts       src/chroot-ng
 #
 # and of the code they share in lib/: lib/arm64 is the AArch64 emulation both
-# emulators link. A library is compiled once per program that links it, with
-# that program's flags — there is no separately built archive, because the
-# programs are built for different targets with different language modes.
+# emulators link, compiled once per host compiler and linked into each of
+# them; lib/link2symlink, shared by arm64chroot and chroot-ng, is compiled
+# into each with that program's flags, since chroot-ng is freestanding.
 #
 # Everything this file produces lands under build/ (and nowhere else):
 #   build/<program>          the programs, plus arm64chroot32 and arm64chroot_asim
@@ -25,7 +25,8 @@
 # lists the rest.
 #
 # Variables: CC, CFLAGS and LDFLAGS are the host compiler and extra flags for
-# the two emulators. Everything specific to one program carries its prefix:
+# the two emulators and the lib/arm64 they share (`make CFLAGS="-O3 -flto=8"`
+# optimizes all of it). Everything specific to one program carries its prefix:
 # ARM64EMU_*, ARM64CHROOT_*, CHROOTNG_* (chroot-ng is cross-built, so it has a
 # compiler and flags of its own: CHROOTNG_CC, CHROOTNG_CFLAGS, CHROOTNG_LDFLAGS).
 
@@ -75,6 +76,31 @@ DEPFLAGS := -MMD -MP
 .DEFAULT_GOAL := all
 
 # ============================================================================
+# lib/arm64 — the AArch64 emulation, compiled once and linked into both
+# emulators. It includes no program header and names no program function (a
+# program reaches it through the CPU's ops, cpu.h), so its objects are the
+# same whichever program links them; built with the two emulators' own CC and
+# CFLAGS. The ILP32 variant of arm64chroot has a compiler of its own, and so
+# a copy of the library of its own (ARM64CHROOT_M32CC, below).
+# ============================================================================
+
+LIB_ARM64_FLAGS = -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno \
+                  -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 \
+                  -Ilib/arm64 -Ilib/arm64/jit $(LIB_ARM64_NOATOMICWARN) $(CFLAGS)
+LIB_ARM64_OBJ  := $(LIB_ARM64:%.c=$(OBJDIR)/arm64/native/%.o)
+LIB_ARM64_CFG   = $(call cfgstamp,arm64/native,$(CC) $(LIB_ARM64_FLAGS))
+
+$(OBJDIR)/arm64/native/%.o: %.c $(LIB_ARM64_CFG)
+	@mkdir -p $(@D)
+	$(CC) $(LIB_ARM64_FLAGS) $(LIB_ARM64_PIN) $(DEPFLAGS) -c -o $@ $<
+# The predecoded tier's computed-goto dispatch regresses ~20% under -O3 and
+# LTO (the survey below): its TU stays at plain -O2 whatever CFLAGS asks.
+LIB_ARM64_PINNED := lib/arm64/pdrun.o
+$(addprefix $(OBJDIR)/arm64/native/,$(LIB_ARM64_PINNED)): LIB_ARM64_PIN := -O2 -fno-lto
+
+-include $(LIB_ARM64_OBJ:.o=.d)
+
+# ============================================================================
 # arm64emu — AArch64 full-system emulator. C11 + libc/POSIX only; networking
 # through the built-in usernet stack (src/arm64emu/net/), no external libraries.
 # ============================================================================
@@ -89,10 +115,12 @@ DEPFLAGS := -MMD -MP
 # -O3/-flto is ~5% faster for --jit and neutral for the interpreter, but the
 # predecoded tier's computed-goto dispatch TU regresses ~20% under it, and
 # -flto spellings aren't portable across gcc/clang — so the default stays plain
-# -O2 and `make ARM64EMU_OPT="-O3 -flto=8"` is the supported opt-in fast recipe.
-# The pin on lib/arm64/pdrun.c below keeps it at -O2 in that case (a no-op for
-# the default build). -mtune=native measured neutral; PGO not pursued (adds a
-# two-phase build for a workload-specific gain).
+# -O2 and `make CFLAGS="-O3 -flto=8"` is the supported opt-in fast recipe: it
+# reaches lib/arm64, where the emulation is, and arm64emu's own sources alike.
+# The pin on lib/arm64/pdrun.c above keeps that TU at -O2 (a no-op for the
+# default build). ARM64EMU_OPT is the level of arm64emu's own sources alone.
+# -mtune=native measured neutral; PGO not pursued (adds a two-phase build for
+# a workload-specific gain).
 ARM64EMU_OPT    ?= -O2
 ARM64EMU_FLAGS   = -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter \
                    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
@@ -100,7 +128,7 @@ ARM64EMU_FLAGS   = -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter 
                    -fno-math-errno -g $(LIB_ARM64_NOATOMICWARN) $(CFLAGS)
 ARM64EMU_SRC    := $(wildcard src/arm64emu/*.c src/arm64emu/devices/*.c \
                      src/arm64emu/fdt/*.c src/arm64emu/net/*.c \
-                     src/arm64emu/jit/*.c) $(LIB_ARM64)
+                     src/arm64emu/jit/*.c)
 ARM64EMU_OBJ    := $(ARM64EMU_SRC:%.c=$(OBJDIR)/arm64emu/%.o)
 # The guest-RAM model and the JIT use __int128, so only a 64-bit host builds it.
 ARM64EMU_HOST64 := $(shell printf '__SIZEOF_POINTER__\n' | \
@@ -110,34 +138,36 @@ ARM64EMU_CFG     = $(call cfgstamp,arm64emu,$(CC) $(ARM64EMU_FLAGS))
 $(OBJDIR)/arm64emu/%.o: %.c $(ARM64EMU_CFG)
 	@mkdir -p $(@D)
 	$(CC) $(ARM64EMU_FLAGS) $(DEPFLAGS) -c -o $@ $<
-$(OBJDIR)/arm64emu/lib/arm64/pdrun.o: override ARM64EMU_OPT := -O2
 
 ARM64EMU_VERSIONED := $(addprefix $(OBJDIR)/arm64emu/,src/arm64emu/main.o) \
                       $(addprefix $(OBJDIR)/arm64emu-embed/,src/arm64emu/main.o)
 $(ARM64EMU_VERSIONED): VERSION
 $(ARM64EMU_VERSIONED): ARM64EMU_FLAGS += $(VERSION_DEFINE)
+$(ARM64EMU_VERSIONED): ARM64EMU_EMBED_FLAGS += $(VERSION_DEFINE)
 
-$(BUILD)/arm64emu: $(ARM64EMU_OBJ)
+$(BUILD)/arm64emu: $(ARM64EMU_OBJ) $(LIB_ARM64_OBJ)
 	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ -lm $(call lib_arm64_atomic,$(CC),$(ARM64EMU_FLAGS))
 
 # Embedded configuration. An app that links the emulator in builds it with
 # -DANDROID_JNI: main() becomes arm64emu_main() so the host can call it after
 # fork(), and fatal paths leave through _exit() so they never run the host's
-# atexit handlers. Its own object tree, since the flags differ; the stub main
+# atexit handlers (src/arm64emu/embed.h, forced into every unit). arm64emu's
+# sources get an object tree of their own, since the flags differ; lib/arm64
+# is the same code here, as it never leaves the process itself. The stub main
 # stands in for the caller a real embedder supplies.
-ARM64EMU_EMBED_OBJ := $(ARM64EMU_SRC:%.c=$(OBJDIR)/arm64emu-embed/%.o)
-ARM64EMU_EMBED_CFG  = $(call cfgstamp,arm64emu-embed,$(CC) $(ARM64EMU_FLAGS) -DANDROID_JNI)
+ARM64EMU_EMBED_FLAGS = $(ARM64EMU_FLAGS) -DANDROID_JNI -include src/arm64emu/embed.h
+ARM64EMU_EMBED_OBJ  := $(ARM64EMU_SRC:%.c=$(OBJDIR)/arm64emu-embed/%.o)
+ARM64EMU_EMBED_CFG   = $(call cfgstamp,arm64emu-embed,$(CC) $(ARM64EMU_EMBED_FLAGS))
 
 $(OBJDIR)/arm64emu-embed/%.o: %.c $(ARM64EMU_EMBED_CFG)
 	@mkdir -p $(@D)
-	$(CC) $(ARM64EMU_FLAGS) -DANDROID_JNI $(DEPFLAGS) -c -o $@ $<
-$(OBJDIR)/arm64emu-embed/lib/arm64/pdrun.o: override ARM64EMU_OPT := -O2
+	$(CC) $(ARM64EMU_EMBED_FLAGS) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/arm64emu-embed/stub.c:
 	@mkdir -p $(@D)
 	printf 'extern int arm64emu_main(int, char **);\nint main(int c, char **v) { return arm64emu_main(c, v); }\n' > $@
 
-$(BUILD)/arm64emu-embed: $(ARM64EMU_EMBED_OBJ) $(OBJDIR)/arm64emu-embed/stub.c
+$(BUILD)/arm64emu-embed: $(ARM64EMU_EMBED_OBJ) $(LIB_ARM64_OBJ) $(OBJDIR)/arm64emu-embed/stub.c
 	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ -lm $(call lib_arm64_atomic,$(CC),$(ARM64EMU_FLAGS))
 
 # AArch64-backend validation without ARM hardware: a static aarch64 build
@@ -147,11 +177,11 @@ ARM64EMU_A64_CC      ?= clang --target=aarch64-linux-gnu -nostdlibinc \
                         -I$(ARM64EMU_A64_SYSROOT)/include -fuse-ld=lld -static \
                         -L$(ARM64EMU_A64_SYSROOT)/lib -B$(ARM64EMU_A64_SYSROOT)/lib
 
-$(BUILD)/arm64emu-a64: $(ARM64EMU_SRC) VERSION
+$(BUILD)/arm64emu-a64: $(ARM64EMU_SRC) $(LIB_ARM64) VERSION
 	$(ARM64EMU_A64_CC) -std=c11 $(ARM64EMU_OPT) -Wall -Wextra -Wno-unused-parameter \
 	    -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc/arm64emu -Isrc/arm64emu/jit \
 	    -Ilib/arm64 -Ilib/arm64/jit \
-	    -fno-math-errno $(VERSION_DEFINE) -o $@ $(ARM64EMU_SRC) -lm \
+	    -fno-math-errno $(VERSION_DEFINE) -o $@ $(ARM64EMU_SRC) $(LIB_ARM64) -lm \
 	    $(call lib_arm64_atomic,$(ARM64EMU_A64_CC),)
 
 -include $(ARM64EMU_OBJ:.o=.d) $(ARM64EMU_EMBED_OBJ:.o=.d)
@@ -161,10 +191,11 @@ $(BUILD)/arm64emu-a64: $(ARM64EMU_SRC) VERSION
 # C11 + libc only; builds on x86_64/i386/arm/aarch64 Linux with GCC or Clang.
 # ============================================================================
 
-# LTO (opt-in: `make ARM64CHROOT_LTO=-flto`). It measured ~28% faster before
-# the data-TLB and merged run loop landed, but those capture the same cross-TU
-# seam in source; on top of them LTO measures slightly slower, so it is off by
-# default.
+# LTO of arm64chroot's own sources (opt-in: `make ARM64CHROOT_LTO=-flto`;
+# lib/arm64 takes CFLAGS, `make CFLAGS=-flto` for all of it). It measured
+# ~28% faster before the data-TLB and merged run loop landed, but those
+# capture the same cross-TU seam in source; on top of them LTO measures
+# slightly slower, so it is off by default.
 ARM64CHROOT_LTO ?=
 # -fno-math-errno: the FP core wants __builtin_sqrt to BE the hardware
 # instruction (exec_fpsimd.c says so, and its exception flags are the guest's).
@@ -205,15 +236,24 @@ endif
 ARM64CHROOT_ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
                          -DA64_LINK2SYMLINK -DA64_L2S_FORCE
 
-ARM64CHROOT_SRC := $(LIB_ARM64) $(LIB_L2S) \
+ARM64CHROOT_SRC := $(LIB_L2S) \
     src/arm64chroot/jit/coherence.c \
     $(addprefix src/arm64chroot/,mem.c exception.c loop.c elf.c path.c l2s.c \
       signal.c syscall.c strace.c sys_file.c sys_mm.c sys_ipc.c sys_proc.c \
       sys_sig.c sys_time.c sys_misc.c sys_net.c sys_netlink.c sys_procfs.c \
       sys_ptrace.c sys_seccomp.c proctab.c ptracetab.c main.c)
-# (The JIT backends, lib/arm64/jit's, self-select by host #ifdef — empty TUs
-# elsewhere — so the list is host-independent, and a host with none gets the
-# runtime's inert stubs.)
+# (lib/arm64 is linked in, compiled once: see its section above. The JIT
+# backends, lib/arm64/jit's, self-select by host #ifdef — empty TUs elsewhere —
+# so the list is host-independent, and a host with none gets the runtime's
+# inert stubs.)
+
+# The ILP32 variant's own copy of lib/arm64, built by its own compiler.
+LIB_ARM64_M32_OBJ := $(LIB_ARM64:%.c=$(OBJDIR)/arm64/m32/%.o)
+LIB_ARM64_M32_CFG  = $(call cfgstamp,arm64/m32,$(ARM64CHROOT_M32CC) $(LIB_ARM64_FLAGS) $(ARM64CHROOT_M32FLAGS))
+$(OBJDIR)/arm64/m32/%.o: %.c $(LIB_ARM64_M32_CFG)
+	@mkdir -p $(@D)
+	$(ARM64CHROOT_M32CC) $(LIB_ARM64_FLAGS) $(ARM64CHROOT_M32FLAGS) $(LIB_ARM64_PIN) $(DEPFLAGS) -c -o $@ $<
+$(addprefix $(OBJDIR)/arm64/m32/,$(LIB_ARM64_PINNED)): LIB_ARM64_PIN := -O2 -fno-lto
 
 ARM64CHROOT_OBJ      := $(ARM64CHROOT_SRC:%.c=$(OBJDIR)/arm64chroot/native/%.o)
 ARM64CHROOT_M32_OBJ  := $(ARM64CHROOT_SRC:%.c=$(OBJDIR)/arm64chroot/m32/%.o)
@@ -236,17 +276,18 @@ ARM64CHROOT_VERSIONED := $(foreach v,native m32 asim,$(OBJDIR)/arm64chroot/$(v)/
 $(ARM64CHROOT_VERSIONED): VERSION
 $(ARM64CHROOT_VERSIONED): ARM64CHROOT_FLAGS += $(VERSION_DEFINE)
 
-$(BUILD)/arm64chroot: $(ARM64CHROOT_OBJ)
+$(BUILD)/arm64chroot: $(ARM64CHROOT_OBJ) $(LIB_ARM64_OBJ)
 	$(CC) $(ARM64CHROOT_FLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread \
 	    $(call lib_arm64_atomic,$(CC),$(ARM64CHROOT_FLAGS))
-$(BUILD)/arm64chroot32: $(ARM64CHROOT_M32_OBJ)
+$(BUILD)/arm64chroot32: $(ARM64CHROOT_M32_OBJ) $(LIB_ARM64_M32_OBJ)
 	$(ARM64CHROOT_M32CC) $(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread \
 	    $(call lib_arm64_atomic,$(ARM64CHROOT_M32CC),$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_M32FLAGS))
-$(BUILD)/arm64chroot_asim: $(ARM64CHROOT_ASIM_OBJ)
+$(BUILD)/arm64chroot_asim: $(ARM64CHROOT_ASIM_OBJ) $(LIB_ARM64_OBJ)
 	$(CC) $(ARM64CHROOT_FLAGS) $(ARM64CHROOT_ASIMFLAGS) -o $@ $^ $(LDFLAGS) -lm -lpthread \
 	    $(call lib_arm64_atomic,$(CC),$(ARM64CHROOT_FLAGS) $(ARM64CHROOT_ASIMFLAGS))
 
--include $(ARM64CHROOT_OBJ:.o=.d) $(ARM64CHROOT_M32_OBJ:.o=.d) $(ARM64CHROOT_ASIM_OBJ:.o=.d)
+-include $(ARM64CHROOT_OBJ:.o=.d) $(ARM64CHROOT_M32_OBJ:.o=.d) $(ARM64CHROOT_ASIM_OBJ:.o=.d) \
+         $(LIB_ARM64_M32_OBJ:.o=.d)
 
 # ============================================================================
 # chroot-ng — ptrace-free chroot/bind emulation for rootless Android (AArch64).

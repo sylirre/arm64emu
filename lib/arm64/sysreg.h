@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* System register / SMCCC hooks. All but smccc_conduit are sysreg.c's. */
+/* System registers: sysreg.c. */
 #ifndef A64_SYSREG_H
 #define A64_SYSREG_H
 
@@ -22,10 +22,5 @@ void sysreg_init(CPU *c);
  * implements, before a kernel sanitizes EL0's view of it (arm64chroot's
  * loop.c, playing that kernel, builds EL0's view from it). */
 u64 sysreg_id_read(CPU *c, unsigned CRm, unsigned op2);
-
-/* Handle an SMC/HVC conduit call (PSCI / SMCCC). Returns true if handled.
- * arm64emu's (devices/psci.c); arm64chroot has none, so it is weak and called
- * only under a NULL check. */
-bool smccc_conduit(CPU *c, bool is_hvc) __attribute__((weak));
 
 #endif /* A64_SYSREG_H */

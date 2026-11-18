@@ -17,9 +17,10 @@
 #include "ptrace.h"
 #include "sysreg.h"
 
-/* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (sysreg.c hook):
- * host monotonic clock scaled to the advertised 24 MHz counter frequency. */
-u64 gt_count(CPU *c, bool virt) {
+/* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (the CPU's ops,
+ * CpuOps.gt_count): host monotonic clock scaled to the advertised 24 MHz
+ * counter frequency. */
+u64 host_gt_count(CPU *c, bool virt) {
     (void)c; (void)virt;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

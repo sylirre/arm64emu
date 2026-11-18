@@ -661,6 +661,7 @@ int arm64emu_main(int argc, char **argv)
 int main(int argc, char **argv)
 #endif
 {
+    g_env_prefix = "ARM64EMU_";          /* lib/arm64's knobs are ours */
     const char *bios = NULL, *kernel = NULL, *initrd = NULL, *append = "";
     const char *binfile = NULL, *dtbfile = NULL;
     Drive drives[MAX_DRIVES]; int n_drives = 0;

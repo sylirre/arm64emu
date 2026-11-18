@@ -2,7 +2,8 @@
 /* Copyright 2026 Sylirre */
 /* The JIT's coherence with a full system's memory: the runtime is
  * lib/arm64/jit's; this is what it asks of the program (jit.h's
- * jit_mode_*), and the program's own entry points into it.
+ * JitCoherence: jit_phys_coherence), and the program's own entry points
+ * into it.
  *
  * Translations are keyed by physical page (FetchCache.pa_page), and code
  * changes reach them through stores, not IC IVAU: pages holding
@@ -54,7 +55,7 @@ static int bitmap_test(Machine *m, u64 pa_page) {
     return 0;
 }
 
-int jit_mode_attach(CPU *c, JitEnv *env) {
+static int phys_attach(CPU *c, JitEnv *env) {
     (void)env;
     if (g_code_bitmap) return 0;
     g_code_bitmap_bits = c->m->ram_size >> 12;
@@ -64,13 +65,11 @@ int jit_mode_attach(CPU *c, JitEnv *env) {
     return 0;
 }
 
-void jit_mode_detach(CPU *c, JitEnv *env) { (void)c; (void)env; }
-
 /* First translation on a physical page: mark it and strip the W bit from
  * any D-TLB entry already pointing at it, so future stores take the slow
  * path and hit the invalidation hook. (The host page pointer identifies the
  * physical page across all VA aliases.) */
-void jit_mode_translated(CPU *c, const JBlock *b) {
+static void phys_translated(CPU *c, const JBlock *b) {
     if (bitmap_test(c->m, b->page)) return;
     bitmap_set(c->m, b->page);
     DTlbEnt *dt = c->eng.dtlb;
@@ -86,16 +85,19 @@ void jit_mode_translated(CPU *c, const JBlock *b) {
  * sysreg.c and never faults -- stay bug-compatible) and drop that one page's
  * surviving blocks. jit_invalidate_phys_range is bitmap-gated and in-helper-
  * safe, so this must never escalate to a full flush. */
-void jit_mode_ic_ivau(CPU *c, u64 va) {
+static void phys_ic_ivau(CPU *c, u64 va) {
     u64 pa;
     if (mmu_probe_pa(c, va, &pa)) jit_invalidate_phys_range(c->m, pa, 1);
 }
 
-/* Nothing raises the flag here: one CPU, and every change of guest memory
- * reaches the JIT through the hooks above, on the CPU's own thread. */
-int jit_mode_resync(CPU *c, JitEnv *env) { (void)c; (void)env; return 0; }
-
-void jit_mode_private_fd(int enter) { (void)enter; }
+/* No resync: nothing raises the flag here -- one CPU, and every change of
+ * guest memory reaches the JIT through the hooks above, on the CPU's own
+ * thread. No descriptor to keep from a guest either. */
+const JitCoherence jit_phys_coherence = {
+    .attach     = phys_attach,
+    .translated = phys_translated,
+    .ic_ivau    = phys_ic_ivau,
+};
 
 void jit_invalidate_phys_range(Machine *m, u64 pa, u64 len) {
     if (!jit_on() || !len) return;

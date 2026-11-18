@@ -9,6 +9,9 @@
 
 #include "jit.h"
 
+/* What the JIT runtime asks of the program (jit.h), for its CpuOps. */
+extern const JitCoherence jit_va_coherence;
+
 /* A guest range was unmapped/remapped/reprotected, or guest IC IVAU hit it:
  * drop the calling thread's translations for the affected pages and
  * interrupt other threads (they conservatively flush at their next

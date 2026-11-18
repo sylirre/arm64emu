@@ -25,6 +25,41 @@ u64 g_vawatch = 0;   /* log writes whose range covers this VA (debug) */
 void (*cpu_step_hook)(CPU *c, u32 insn);
 void (*cpu_svc_hook)(CPU *c);
 
+/* ---- the CPU's ops, as the library calls them (cpu.h, mem.h) ---- */
+void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
+    c->eng.ops->exception_take(c, kind, esr, far, ret_addr);
+}
+bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
+    return c->eng.ops->read_slow(c, va, size, out);
+}
+bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
+    return c->eng.ops->write_slow(c, va, size, val);
+}
+bool mem_read128_slow(CPU *c, u64 va, V128 *out) {
+    return c->eng.ops->read128_slow(c, va, out);
+}
+bool mem_write128_slow(CPU *c, u64 va, const V128 *val) {
+    return c->eng.ops->write128_slow(c, va, val);
+}
+bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
+    return c->eng.ops->ifetch_slow(c, va, insn_out);
+}
+void *mem_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
+    return c->eng.ops->host_ptr_slow(c, va, size, acc);
+}
+void tlb_flush_all(CPU *c) { c->eng.ops->tlb_flush_all(c); }
+void tlb_flush_page(CPU *c, u64 va) { c->eng.ops->tlb_flush_page(c, va); }
+
+const char *g_env_prefix;
+
+const char *arm64_getenv(const char *name) {
+    char full[64];
+    if (!g_env_prefix) return NULL;
+    int n = snprintf(full, sizeof full, "%s%s", g_env_prefix, name);
+    if (n < 0 || (size_t)n >= sizeof full) return NULL;
+    return getenv(full);
+}
+
 /* Coverage-divergence finder (cov_load): a sorted set of PCs QEMU is known
  * to execute. The first PC our run executes that is NOT in this set marks where
  * we left QEMU's path — i.e. at/just after the first control-flow divergence. */

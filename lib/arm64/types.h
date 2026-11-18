@@ -4,15 +4,6 @@
 #ifndef A64_TYPES_H
 #define A64_TYPES_H
 
-/* How the program compiling this library builds it (the prefix of the
- * environment knobs it reads, ...): each program has its own arm64_config.h
- * in its source tree. Included first, by the header every other one
- * includes, so all of the library and of the program see one configuration.
- * What the CPU emulates -- a full system or user mode, one CPU or guest
- * threads running concurrently -- is not part of it: that is the CPU's mode,
- * set at run time (cpu.h, CpuEngine). */
-#include "arm64_config.h"
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>

@@ -12,7 +12,8 @@ differential test suite must pass with `--jit` on (`make test-arm64chroot-jit`).
 The core (`lib/arm64/`) is shared with the sibling system emulator, and so is
 the whole JIT (`lib/arm64/jit/`: translator, runtime, backends). What is this
 program's is the JIT's coherence with the guest address space
-(`src/arm64chroot/jit/coherence.c`, the runtime's `jit_mode_*` hooks) plus a
+(`src/arm64chroot/jit/coherence.c`, the `JitCoherence` its CPUs' ops give the
+runtime) plus a
 handful of small hooks in the program's files (run-loop rung, option parsing,
 mm invalidation hooks, the signal catcher, thread/fork lifecycle).
 

@@ -3,7 +3,7 @@
 /* JIT runtime: a CPU's code cache and block tables, the dispatch loop, the
  * helpers generated code calls, and the coherence both modes share. What
  * each mode adds -- how a page's translations learn that its code changed --
- * is the program's (the jit_mode_* hooks, jit.h).
+ * is the program's (its JitCoherence, jit.h).
  *
  * Translation unit is a basic block (ends at any branch/system instruction,
  * capped, never crossing a 4 KB guest page). Anything not translated inline
@@ -37,7 +37,7 @@
  *    maintenance is inherited from the interpreter. Generated code's inline
  *    probe skips what an interpreter access checks lazily (CpuEngine.gen_src);
  *    where another thread can change the mappings, the program raises
- *    `interrupt` and resyncs the D-TLB at the safepoint (jit_mode_resync).
+ *    `interrupt` and resyncs the D-TLB at the safepoint (JitCoherence.resync).
  *  - IRQ/timer (a full system): the block-entry safepoint exits when
  *    c->icount reaches env->icount_deadline, so chained hot loops return to
  *    the run loop at its cadence; the dispatcher checks the CPU's attention
@@ -56,7 +56,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include "arm64_config.h"
 #include "esr.h"
 #include "predecode.h"
 #include "jit_priv.h"
@@ -144,7 +143,7 @@ const void *jit_fault_fixup(CPU *c, const void *pc) {
     return env->cache_rx + f->slow;
 }
 
-/* ---- optional helper-call profiler (ARM64_JIT_ENV("STATS")=1 or =/path) ----
+/* ---- optional helper-call profiler (<prefix>JIT_STATS=1 or =/path) ----
  * Ranks the exact instruction words still executed through the exec_a64
  * helper, so inlining work can be aimed at what a workload actually runs
  * (feed the words to a disassembler). Each CPU counts into an open-addressed
@@ -290,7 +289,7 @@ void jit_stats_flush(void) {
 static void jstat_settle(void) {
     pthread_mutex_lock(&g_jstat_mu);
     if (__atomic_load_n(&g_jit_stats, __ATOMIC_RELAXED) < 0) {
-        const char *s = getenv(ARM64_JIT_ENV("STATS"));
+        const char *s = arm64_getenv("JIT_STATS");
         __atomic_store_n(&g_jit_stats, s != NULL, __ATOMIC_RELAXED);
         if (s) {
             if (s[0] == '/') g_jstat_path = s;
@@ -304,12 +303,13 @@ static void jstat_settle(void) {
     pthread_mutex_unlock(&g_jstat_mu);
 }
 
-/* ---- optional per-block code dump (ARM64_JIT_ENV("DUMP")=<prefix> or =1) ----
+/* ---- optional per-block code dump (<prefix>JIT_DUMP=<path> or =1) ----
  * Every translated block's host bytes are pwritten into
- * <prefix>.<pid>.<tid>.code at the block's code-cache offset -- the file is
+ * <path>.<pid>.<tid>.code at the block's code-cache offset -- the file is
  * a sparse image of the cache, so chain/thunk jump targets in a disassembly
  * line up with file offsets -- plus one text line per block in
- * <prefix>.<pid>.<tid>.map (pc, offset, length, the guest words).
+ * <path>.<pid>.<tid>.map (pc, offset, length, the guest words). <path> is
+ * "jit-dump" for =1.
  * Disassemble a block with:
  *   objdump -D -b binary -m i386:x86-64 (or aarch64) \
  *     --start-address=0x<off> --stop-address=0x<off+len> <...>.code
@@ -318,7 +318,7 @@ static const char *jdump_prefix(void) {
     static const char *prefix;
     static int read;
     if (!__atomic_load_n(&read, __ATOMIC_ACQUIRE)) {
-        const char *d = getenv(ARM64_JIT_ENV("DUMP"));
+        const char *d = arm64_getenv("JIT_DUMP");
         prefix = d ? ((d[0] && strcmp(d, "1") != 0) ? d : "jit-dump") : NULL;
         __atomic_store_n(&read, 1, __ATOMIC_RELEASE);
     }
@@ -361,7 +361,7 @@ static void jdump_block(JitEnv *env, CPU *c, JBlock *b, const u8 *rw_end,
 /* ---- code cache ---- */
 
 static size_t jit_cache_size(void) {
-    const char *s = getenv(ARM64_JIT_ENV("MB"));
+    const char *s = arm64_getenv("JIT_MB");
     long mb = s ? atol(s) : 32;
     if (mb < 1) mb = 1;
     /* A backend's direct branch must span the whole cache (block -> epilogue,
@@ -373,7 +373,7 @@ static size_t jit_cache_size(void) {
 /* RWX if the host allows it; else a dual-mapped memfd (RW + RX views of the
  * same pages) for W^X hosts. memfd_create may itself be unavailable or
  * blocked -- then the JIT degrades to the interpreter. */
-static int cache_alloc(JitEnv *env) {
+static int cache_alloc(CPU *c, JitEnv *env) {
     size_t size = jit_cache_size();
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -384,10 +384,11 @@ static int cache_alloc(JitEnv *env) {
     }
 #ifdef SYS_memfd_create
     /* The descriptor lives only until both views are mapped: the mappings
-     * keep the pages. Its whole life is one jit_mode_private_fd bracket (in
+     * keep the pages. Its whole life is one JitCoherence.private_fd bracket (in
      * user mode the guest shares the descriptor table, and must neither see
      * it nor have a sibling's fork hand its child a copy). */
-    jit_mode_private_fd(1);
+    const JitCoherence *jc = c->eng.ops->jit;
+    if (jc->private_fd) jc->private_fd(1);
     int fd = (int)syscall(SYS_memfd_create, "a64-jit", 1 /*MFD_CLOEXEC*/);
     void *rw = MAP_FAILED, *rx = MAP_FAILED;
     if (fd >= 0 && ftruncate(fd, (off_t)size) == 0) {
@@ -395,7 +396,7 @@ static int cache_alloc(JitEnv *env) {
         rx = mmap(NULL, size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
     }
     if (fd >= 0) close(fd);
-    jit_mode_private_fd(0);
+    if (jc->private_fd) jc->private_fd(0);
     if (rw != MAP_FAILED && rx != MAP_FAILED) {
         env->cache_rw = rw;
         env->cache_rx = rx;
@@ -494,11 +495,11 @@ static JitEnv *jit_env_new(CPU *c) {
     env->helper_stv = (void *)jit_stv;
     env->helper_spchk = (void *)jit_sp_check;
     env->dtlb = c->eng.dtlb;
-    env->slowmem = getenv(ARM64_JIT_ENV("SLOWMEM")) != NULL;
+    env->slowmem = arm64_getenv("JIT_SLOWMEM") != NULL;
     env->jc_epoch = c->eng.code_epoch;
     env->el0cfg = jit_el0cfg(c);
     jstat_settle();
-    if (cache_alloc(env) < 0) { free(env); return NULL; }
+    if (cache_alloc(c, env) < 0) { free(env); return NULL; }
     env->hash = calloc(JIT_HASH_SIZE, sizeof *env->hash);
     env->pages = calloc(JIT_PAGE_TBL, sizeof *env->pages);
     env->arena = malloc(JIT_MAX_BLOCKS * sizeof *env->arena);
@@ -522,7 +523,7 @@ static JitEnv *jit_env_new(CPU *c) {
     env->ptr = env->blocks_start_rw;
     env->end = env->cache_rw + env->cache_size;
     jcache_reset(env);                  /* needs jc_miss_rx, from the thunks */
-    if (jit_mode_attach(c, env) != 0) { jit_env_destroy(env); return NULL; }
+    if (c->eng.ops->jit->attach(c, env) != 0) { jit_env_destroy(env); return NULL; }
     env->active = 1;
     t_jstat_env = env;
     return env;
@@ -628,7 +629,7 @@ void jit_cpu_release(CPU *c) {
     JitEnv *env = c->eng.jit;
     if (!env) return;
     if (jstat_on()) jstat_merge(env);
-    jit_mode_detach(c, env);
+    if (c->eng.ops->jit->detach) c->eng.ops->jit->detach(c, env);
     /* Withdrawn before it goes: a signal handler on this thread that loads
      * the pointer after this sees none, one that loaded it before has done
      * its store by the time this thread runs on. */
@@ -694,7 +695,7 @@ u32 jit_exec1(CPU *c, u64 pc, u32 insn) {
 u32 jit_exec1_ic(CPU *c, u64 pc, u32 insn) {
     u64 va = reg_x(c, insn & 31);
     jit_exec1(c, pc, insn);
-    jit_mode_ic_ivau(c, va);
+    c->eng.ops->jit->ic_ivau(c, va);
     return 1;
 }
 
@@ -707,7 +708,7 @@ u32 jit_exec1_ic(CPU *c, u64 pc, u32 insn) {
  * Generated code calls these once its own inline D-TLB probe has missed, so
  * they go straight to mem.h's slow paths instead of probing the same entry
  * again; the slow paths are whole accesses, hits included, so this also
- * holds under ARM64_JIT_ENV("SLOWMEM"), which skips the inline probe. */
+ * holds under <prefix>JIT_SLOWMEM, which skips the inline probe. */
 
 /* SP-alignment check (SCTLR_EL1.SA/SA0). Generated code calls this only when the
  * SP base is already known-misaligned (low 4 bits set). Raises an SP-alignment
@@ -729,7 +730,7 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), sz = 1u << MDESC_SZLOG(desc);
     u64 v;
-    if (!mem_read_slow(c, va, sz, &v)) { c->icount++; return 1; }
+    if (!c->eng.ops->read_slow(c, va, sz, &v)) { c->icount++; return 1; }
     if (MDESC_SIGN(desc)) {
         unsigned b = sz * 8;
         v = (u64)((s64)(v << (64 - b)) >> (64 - b));
@@ -742,7 +743,7 @@ u32 jit_ld(CPU *c, u64 va, u64 pc, u32 desc) {
 
 u32 jit_st(CPU *c, u64 va, u64 val, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
-    if (!mem_write_slow(c, va, 1u << MDESC_SZLOG(desc), val)) {
+    if (!c->eng.ops->write_slow(c, va, 1u << MDESC_SZLOG(desc), val)) {
         c->icount++;
         return 1;
     }
@@ -754,11 +755,11 @@ u32 jit_ldv(CPU *c, u64 va, u64 pc, u32 desc) {
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
     if (bytes == 16) {
         V128 v;
-        if (!mem_read128_slow(c, va, &v)) { c->icount++; return 1; }
+        if (!c->eng.ops->read128_slow(c, va, &v)) { c->icount++; return 1; }
         c->v[rt] = v;
     } else {
         u64 t;
-        if (!mem_read_slow(c, va, bytes, &t)) { c->icount++; return 1; }  /* zero-extended */
+        if (!c->eng.ops->read_slow(c, va, bytes, &t)) { c->icount++; return 1; }  /* zero-extended */
         c->v[rt].d[0] = t;
         c->v[rt].d[1] = 0;
     }
@@ -769,10 +770,10 @@ u32 jit_stv(CPU *c, u64 va, u64 pc, u32 desc) {
     c->cur_insn_pc = pc;
     unsigned rt = MDESC_RT(desc), bytes = 1u << MDESC_VSZL(desc);
     if (bytes == 16) {
-        if (!mem_write128_slow(c, va, &c->v[rt])) { c->icount++; return 1; }
+        if (!c->eng.ops->write128_slow(c, va, &c->v[rt])) { c->icount++; return 1; }
         return 0;
     }
-    if (!mem_write_slow(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
+    if (!c->eng.ops->write_slow(c, va, bytes, c->v[rt].d[0])) { c->icount++; return 1; }
     return 0;
 }
 
@@ -828,7 +829,7 @@ retry:
     JBlock **ph = &env->pages[(u32)(page >> 12) & (JIT_PAGE_TBL - 1)];
     b->page_next = *ph;
     *ph = b;
-    jit_mode_translated(c, b);
+    c->eng.ops->jit->translated(c, b);
 
     be_flush_icache(b->code, env->ptr, (size_t)(e.rw - env->ptr));
     const char *dump = jdump_prefix();
@@ -869,7 +870,7 @@ static int resolve_code_page(CPU *c, u64 pc, const u8 **host, u64 *page) {
     if (!(f->host && f->page == vpage)) {
         u32 w0;
         c->cur_insn_pc = pc;             /* precise IABORT ELR */
-        if (!mem_ifetch_slow(c, pc, &w0)) return 0;   /* abort taken */
+        if (!c->eng.ops->ifetch_slow(c, pc, &w0)) return 0;   /* abort taken */
         if (!(f->host && f->page == vpage)) {
             *host = NULL;                /* executing from MMIO */
             return 1;
@@ -920,7 +921,8 @@ void jit_run(CPU *c, u64 deadline) {
         if (UNLIKELY(env->interrupt)) {
             __atomic_store_n(&env->interrupt, 0, __ATOMIC_RELAXED);
             __atomic_signal_fence(__ATOMIC_SEQ_CST);   /* clear, then look */
-            if (jit_mode_resync(c, env)) jit_flush_all(env);
+            const JitCoherence *jc = c->eng.ops->jit;
+            if (jc->resync && jc->resync(c, env)) jit_flush_all(env);
         }
         if (UNLIKELY(cpu_attn_pending(c) || cpu_irq_pending(c) ||
                      c->icount >= deadline))

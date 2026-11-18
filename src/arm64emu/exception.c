@@ -2,11 +2,11 @@
 /* Copyright 2026 Sylirre */
 /* Exception entry: every exception is taken to EL1 (we model EL0/EL1).
  * Return (ERET, cpu_unpack_spsr) is lib/arm64's cpu.c. */
-#include "cpu.h"
+#include "machine.h"
 #include "esr.h"
 #include <stdio.h>
 
-void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
+void exception_vector(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
     unsigned tel = 1;            /* route to EL1 */
     if (c->el > tel) tel = c->el;
 

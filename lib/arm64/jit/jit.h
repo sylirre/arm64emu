@@ -10,8 +10,8 @@
  * like the decode cache and the D-TLB: there are no locks in the JIT runtime
  * and never any cross-thread writes to generated code. What each mode must
  * add to stay coherent with the memory it models -- learning that code
- * changed under a translation -- is the program's, behind the jit_mode_*
- * hooks below; another thread asks for it through the CPU's interrupt flag,
+ * changed under a translation -- is the program's, behind the hooks of
+ * its JitCoherence below; another thread asks for it through the CPU's interrupt flag,
  * checked at every block entry (safepoint). */
 #ifndef A64_JIT_H
 #define A64_JIT_H
@@ -58,7 +58,7 @@ void jit_run(CPU *c, u64 deadline);
  * All of these are no-ops for a CPU whose JIT was never set up. */
 
 /* Make generated code leave at its next block entry, the dispatcher then
- * asking the program to resync (jit_mode_resync). Async-signal-safe, and
+ * asking the program to resync (JitCoherence.resync). Async-signal-safe, and
  * callable from any thread. */
 void jit_interrupt(CPU *c);
 /* Drop the CPU's translations on one page (by the key JBlock.page goes by:
@@ -90,7 +90,7 @@ int jit_pc_in_generated(CPU *c, const void *pc);
  * can fault on the host at all (user mode). Async-signal-safe. */
 const void *jit_fault_fixup(CPU *c, const void *pc);
 
-/* ARM64_JIT_ENV("STATS"): write the report now -- the process is about to
+/* <prefix>JIT_STATS: write the report now -- the process is about to
  * leave through _exit, which skips the atexit handler that otherwise does.
  * No-op when the knob is off. */
 void jit_stats_flush(void);
@@ -101,25 +101,32 @@ void jit_locks_drop(void);
 void jit_locks_reinit(void);
 
 /* ---- the program's part of the runtime ----
- * Defined by the program, for the memory it models. */
+ * What the runtime asks of the program, for the memory it models: the
+ * table a CPU's ops point to (CpuOps.jit, cpu.h). Entries marked optional
+ * may be NULL. */
 struct JitEnv;
 struct JBlock;
-/* A CPU's JIT has just been set up (its env, not yet in use): set up the
- * program's share. Nonzero refuses it -- the JIT then turns itself off. */
-int  jit_mode_attach(CPU *c, struct JitEnv *env);
-/* ...and is about to be released (jit_cpu_release). */
-void jit_mode_detach(CPU *c, struct JitEnv *env);
-/* A block was translated: from now on a write to its page must reach
- * jit_drop_page. */
-void jit_mode_translated(CPU *c, const struct JBlock *b);
-/* The guest ran IC IVAU for the line at `va` (Xt, as the guest gave it). */
-void jit_mode_ic_ivau(CPU *c, u64 va);
-/* env->interrupt was raised: resync what generated code reads behind the
- * interpreter's back before another block runs. Nonzero: drop every
- * translation first. */
-int  jit_mode_resync(CPU *c, struct JitEnv *env);
-/* Brackets the life of a descriptor the runtime opens for itself (the W^X
- * fallback's memfd, closed again once mapped): enter 1, then 0. */
-void jit_mode_private_fd(int enter);
+typedef struct JitCoherence {
+    /* A CPU's JIT has just been set up (its env, not yet in use): set up
+     * the program's share. Nonzero refuses it -- the JIT then turns itself
+     * off. */
+    int  (*attach)(CPU *c, struct JitEnv *env);
+    /* (optional) ...and is about to be released (jit_cpu_release). */
+    void (*detach)(CPU *c, struct JitEnv *env);
+    /* A block was translated: from now on a write to its page must reach
+     * jit_drop_page. */
+    void (*translated)(CPU *c, const struct JBlock *b);
+    /* The guest ran IC IVAU for the line at `va` (Xt, as the guest gave
+     * it). */
+    void (*ic_ivau)(CPU *c, u64 va);
+    /* (optional) env->interrupt was raised: resync what generated code
+     * reads behind the interpreter's back before another block runs.
+     * Nonzero: drop every translation first. */
+    int  (*resync)(CPU *c, struct JitEnv *env);
+    /* (optional) Brackets the life of a descriptor the runtime opens for
+     * itself (the W^X fallback's memfd, closed again once mapped): enter 1,
+     * then 0. */
+    void (*private_fd)(int enter);
+} JitCoherence;
 
 #endif /* A64_JIT_H */

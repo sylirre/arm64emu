@@ -6,6 +6,7 @@
 #include "machine.h"
 #include "esr.h"
 #include "diag.h"
+#include "devices.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,16 +29,6 @@ static TLBEntry tlb[TLB_ENTRIES];
 u32 g_tlb_gen = 1;
 static DTlbEnt g_dtlb[DTLB_SIZE];
 
-void mmu_cpu_init(CPU *c) {
-    memset(&c->eng, 0, sizeof c->eng);
-    c->eng.dtlb = g_dtlb;
-    c->eng.dtlb_mask = DTLB_SIZE - 1;
-    c->eng.genbits = (u64)(g_tlb_gen & 0x3ff) << 2;
-    c->eng.fetch_el0 = c->el == 0;
-    c->eng.sys = 1;                     /* a full system, */
-    c->eng.smp = 0;                     /* one CPU on one host thread */
-    cpu_refresh_dtlb_ctx(c);
-}
 const u8 *g_jit_code_bitmap;
 
 /* Union range of all block-mapped (2 MB/1 GB) translations cached since the
@@ -67,7 +58,7 @@ static void lp_record(u64 va, unsigned blk_shift) {
  * carry the generation in their tags). Boot flushes this on every TLBI and
  * TTBR/TCR/SCTLR write — ~1600 times per 4M instructions — so the previous
  * full memset of the 4096-entry TLB was ~14% of boot time. */
-void tlb_flush_all(CPU *c) {
+static void mmu_tlb_flush_all(CPU *c) {
     CpuEngine *e = &c->eng;
     ++g_tlb_gen;
     if ((g_tlb_gen & 0x3ff) == 0) {
@@ -86,8 +77,8 @@ void tlb_flush_all(CPU *c) {
     e->code_epoch++;             /* and VA->code bindings may have moved */
 }
 
-void tlb_flush_page(CPU *c, u64 va) {
-    if ((VA_NOTAG(va) & lp_mask) == lp_base) { tlb_flush_all(c); return; }
+static void mmu_tlb_flush_page(CPU *c, u64 va) {
+    if ((VA_NOTAG(va) & lp_mask) == lp_base) { mmu_tlb_flush_all(c); return; }
     /* One direct-mapped slot per structure can hold this page: clear by index,
      * no tag compare (a TBI-tagged fill of the same page carries a different
      * tag; evicting an unrelated collider is just a refill). A zeroed D-TLB
@@ -290,7 +281,7 @@ static void dtlb_fill(CPU *c, u64 va, u64 pa) {
     de->pte = (u64)(uintptr_t)(m->ram + (pa_page - m->ram_base)) | r | w;
 }
 
-bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
+static bool mmu_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
     u64 off = va & 0xfffULL;
     if (off + size > 0x1000 && (c->sctlr[1] & 1)) {       /* spans two pages */
         unsigned first = 0x1000u - (unsigned)off;
@@ -313,7 +304,7 @@ bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
     return true;
 }
 
-bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
+static bool mmu_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
     if (__builtin_expect(g_vawatch != 0, 0) &&    /* #16: single hook guard */
         va < g_vawatch + 8 && va + size > g_vawatch) {
         static int vn = 0;
@@ -332,7 +323,7 @@ bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
         if (!mem_write(c, va + first, size - first, val >> (first * 8))) return false;
         return true;
     }
-    u64 pa;                       /* page crossing with the MMU off: see mem_read_slow */
+    u64 pa;                       /* page crossing with the MMU off: see mmu_read_slow */
     if (!mmu_translate(c, va, ACC_WRITE, &pa)) return false;
     phys_write(c->m, pa, size, val);
     if (c->m->last_bus_status != BUS_OK) return raise_abort(c, va, ACC_WRITE, FSC_EXTERNAL);
@@ -383,7 +374,7 @@ bool mmu_probe_pa(CPU *c, u64 va, u64 *pa_out) {
  * PAR_EL1 (F==0): PA[47:12], ATTR[63:56] = the MAIR byte the leaf's AttrIndx
  * selects, SH[8:7] from the descriptor, NS[9] = 1 (non-secure-only machine).
  * PAR_EL1 (F==1): FST[6:1], PTW=0, S=0 (stage 1), bit 11 RES1. */
-u64 mmu_at_s1(CPU *c, u64 va, bool is_write, bool as_el0) {
+static u64 mmu_at_s1(CPU *c, u64 va, bool is_write, bool as_el0) {
     /* Stage 1 disabled: flat translation (attributes: ATTR/SH left 0). */
     if ((c->sctlr[1] & 1) == 0)
         return (va & 0x0000FFFFFFFFF000ULL) | (1ULL << 9);
@@ -408,7 +399,7 @@ static u8 *host_page_ptr(Machine *m, u64 pa_page) {
     return NULL;
 }
 
-bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
+static bool mmu_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
     if (va & 3) {                       /* PC-alignment fault (EC 0x22), no ISS */
         cpu_raise_sync(c, esr_make(EC_PC_ALIGN, 0), va);
         return false;
@@ -436,7 +427,7 @@ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
  * for every case it skips (page-crossing, MMIO, watchpoint runs -- the D-TLB
  * is empty then -- and JIT code pages, whose W bit the D-TLB refuses): both
  * write/read the same bytes and fault at the same split VA. */
-bool mem_read128_slow(CPU *c, u64 va, V128 *out) {
+static bool mmu_read128_slow(CPU *c, u64 va, V128 *out) {
     u64 lo, hi;
     if (!mem_read(c, va, 8, &lo)) return false;
     if (!mem_read(c, va + 8, 8, &hi)) return false;
@@ -444,7 +435,7 @@ bool mem_read128_slow(CPU *c, u64 va, V128 *out) {
     return true;
 }
 
-bool mem_write128_slow(CPU *c, u64 va, const V128 *val) {
+static bool mmu_write128_slow(CPU *c, u64 va, const V128 *val) {
     if (!mem_write(c, va, 8, val->d[0])) return false;
     if (!mem_write(c, va + 8, 8, val->d[1])) return false;
     return true;
@@ -454,7 +445,37 @@ bool mem_write128_slow(CPU *c, u64 va, const V128 *val) {
  * is as atomic as one through a host pointer, so a D-TLB miss is answered
  * NULL rather than resolved (mem.h's contract allows it). The MOPS copies then
  * run through the typed accesses until their pages are cached. */
-void *mem_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
+static void *mmu_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
     (void)c; (void)va; (void)size; (void)acc;
     return NULL;
+}
+
+/* What the shared core asks of this machine (cpu.h, CpuOps). */
+static const CpuOps system_ops = {
+    .exception_take = exception_vector,
+    .read_slow      = mmu_read_slow,
+    .write_slow     = mmu_write_slow,
+    .read128_slow   = mmu_read128_slow,
+    .write128_slow  = mmu_write128_slow,
+    .ifetch_slow    = mmu_ifetch_slow,
+    .host_ptr_slow  = mmu_host_ptr_slow,
+    .tlb_flush_all  = mmu_tlb_flush_all,
+    .tlb_flush_page = mmu_tlb_flush_page,
+    .at_s1          = mmu_at_s1,
+    .gt_count       = gt_count,
+    .timer_update   = timer_cpu_update,
+    .smccc          = smccc_conduit,
+    .jit            = &jit_phys_coherence,
+};
+
+void mmu_cpu_init(CPU *c) {
+    memset(&c->eng, 0, sizeof c->eng);
+    c->eng.dtlb = g_dtlb;
+    c->eng.dtlb_mask = DTLB_SIZE - 1;
+    c->eng.genbits = (u64)(g_tlb_gen & 0x3ff) << 2;
+    c->eng.fetch_el0 = c->el == 0;
+    c->eng.sys = 1;                     /* a full system, */
+    c->eng.smp = 0;                     /* one CPU on one host thread */
+    c->eng.ops = &system_ops;
+    cpu_refresh_dtlb_ctx(c);
 }

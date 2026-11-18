@@ -76,6 +76,8 @@ _Static_assert(PTE_R == DTLB_R && PTE_W == DTLB_W && PTE_X == DTLB_X,
  * out empty (generation 0 is "flushed"), whatever this thread last cached.
  * The first access to the block is made here, in ordinary context, not by a
  * signal handler (sig_tls_prewarm says why that matters on Bionic). */
+static const CpuOps user_ops;             /* below, with the slow paths */
+
 void as_cpu_attach(CPU *c) {
     CpuEngine *e = &c->eng;
     memset(e, 0, sizeof *e);
@@ -85,6 +87,7 @@ void as_cpu_attach(CPU *c) {
     e->fetch_el0 = c->el == 0;
     e->sys = 0;                            /* user mode, */
     e->smp = 1;                            /* guest threads on host threads */
+    e->ops = &user_ops;
     cpu_refresh_dtlb_ctx(c);
     t_cpu = c;
 }
@@ -110,7 +113,7 @@ static void cpu_caches_flush(CpuEngine *e) {
     e->fetch[0].host = e->fetch[1].host = NULL;
     e->gen = 0;
 }
-void tlb_flush_all(CPU *c) {
+static void as_tlb_flush_all(CPU *c) {
     cpu_caches_flush(&c->eng);
     cpu_refresh_dtlb_ctx(c);
 }
@@ -118,11 +121,11 @@ void tlb_flush_all(CPU *c) {
  * EL0 (sysreg.c's el0_allowed), the only EL this guest runs at, so these are
  * never reached; they answer what a translation regime with nothing of its
  * own to invalidate or report would. */
-void tlb_flush_page(CPU *c, u64 va) {
+static void as_tlb_flush_page(CPU *c, u64 va) {
     (void)va;
-    tlb_flush_all(c);
+    as_tlb_flush_all(c);
 }
-u64 mmu_at_s1(CPU *c, u64 va, bool is_write, bool as_el0) {
+static u64 as_at_s1(CPU *c, u64 va, bool is_write, bool as_el0) {
     (void)c; (void)va; (void)is_write; (void)as_el0;
     return 1;                                  /* PAR_EL1.F: did not translate */
 }
@@ -473,7 +476,7 @@ void as_unlock(void) { g_emu_as_depth--; pthread_mutex_unlock(&g_as_lock); }
  * that instant crosses into the child locked, owned by a thread that does not
  * exist there -- and the next acquirer waits forever. It cost a real hang:
  * tests/c/timers.c forks while a 5 ms timer is live and libc's SIGEV_THREAD
- * helper thread is running, and the child wedged in mem_ifetch_slow ->
+ * helper thread is running, and the child wedged in as_ifetch_slow ->
  * translate() -> as_lock() on a lock its dead sibling still owned.
  *
  * The cure is a pthread_atfork triple. `prepare` takes the lock, which also
@@ -3189,7 +3192,7 @@ static inline u8 *translate(CPU *c, u64 va, u32 need, bool *perm_fault) {
     return (u8 *)(pte & ~(uintptr_t)PTE_FLAGS) + (va & GUEST_PAGE_MASK);
 }
 
-bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
+static bool as_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
     /* Split accesses that cross a page boundary (unaligned in-page accesses
      * are plain memcpy — EL0 Linux semantics, SCTLR.A clear). */
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) {
@@ -3207,7 +3210,7 @@ bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out) {
     return true;
 }
 
-bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
+static bool as_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) {
         unsigned first = (unsigned)(GUEST_PAGE_SIZE - (va & GUEST_PAGE_MASK));
         if (!mem_write(c, va, first, val)) return false;
@@ -3220,7 +3223,7 @@ bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
     return true;
 }
 
-bool mem_read128_slow(CPU *c, u64 va, V128 *out) {
+static bool as_read128_slow(CPU *c, u64 va, V128 *out) {
     if (((va & GUEST_PAGE_MASK) + 16) > GUEST_PAGE_SIZE)
         return mem_read(c, va, 8, &out->d[0]) && mem_read(c, va + 8, 8, &out->d[1]);
     bool perm;
@@ -3230,7 +3233,7 @@ bool mem_read128_slow(CPU *c, u64 va, V128 *out) {
     return true;
 }
 
-bool mem_write128_slow(CPU *c, u64 va, const V128 *val) {
+static bool as_write128_slow(CPU *c, u64 va, const V128 *val) {
     if (((va & GUEST_PAGE_MASK) + 16) > GUEST_PAGE_SIZE)
         return mem_write(c, va, 8, val->d[0]) && mem_write(c, va + 8, 8, val->d[1]);
     bool perm;
@@ -3259,7 +3262,7 @@ bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out) {
     return true;
 }
 
-bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
+static bool as_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
     if (va & 3) {
         cpu_raise_sync(c, esr_make(EC_PC_ALIGN, 0), va);
         return false;
@@ -3368,7 +3371,7 @@ int mem_stack_touch(CPU *c, u64 va, AccType acc) {
     return p != NULL;
 }
 
-void *mem_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
+static void *as_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
     if (((va & GUEST_PAGE_MASK) + size) > GUEST_PAGE_SIZE) return NULL;
     if (uaddr_tag_refused(va)) return NULL;
     u32 need = (acc == ACC_WRITE) ? PTE_W : (acc == ACC_EXEC) ? PTE_X : PTE_R;
@@ -3379,6 +3382,23 @@ void *mem_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc) {
      * good. */
     return translate(c, va, need, &perm);
 }
+
+/* What the shared core asks of the process the guest runs in (cpu.h,
+ * CpuOps): as_cpu_attach gives every thread's CPU this table. */
+static const CpuOps user_ops = {
+    .exception_take = exception_record,
+    .read_slow      = as_read_slow,
+    .write_slow     = as_write_slow,
+    .read128_slow   = as_read128_slow,
+    .write128_slow  = as_write128_slow,
+    .ifetch_slow    = as_ifetch_slow,
+    .host_ptr_slow  = as_host_ptr_slow,
+    .tlb_flush_all  = as_tlb_flush_all,
+    .tlb_flush_page = as_tlb_flush_page,
+    .at_s1          = as_at_s1,
+    .gt_count       = host_gt_count,
+    .jit            = &jit_va_coherence,
+};
 
 /* ---- lending guest memory to a host syscall (mmu.h) ---- */
 

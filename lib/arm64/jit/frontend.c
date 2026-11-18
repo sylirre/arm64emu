@@ -18,7 +18,7 @@
 
 /* Stage gates for the inline families, all enabled; a gated family falls
  * through to IRO_CALL1/exec_a64, which is always correct. They remain for
- * <prefix>_JIT_PDMAX bisection (fe_gated). */
+ * <prefix>JIT_PDMAX bisection (fe_gated). */
 #define JIT_FE_ATOMICS    1
 #define JIT_FE_FPSIMD     1
 #define JIT_FE_LDST_EXTRA 1
@@ -26,13 +26,13 @@
 
 enum { FE_CONT, FE_END };
 
-/* Debug bisection knob: <prefix>_JIT_PDMAX=N (ARM64EMU_, ARM64CHROOT_)
- * translates only PD ops <= N natively (branches always native); everything
- * else goes through the exec_a64 helper. Used to localize a codegen bug to one handler class. */
+/* Debug bisection knob: <prefix>JIT_PDMAX=N translates only PD ops <= N
+ * natively (branches always native); everything else goes through the
+ * exec_a64 helper. Used to localize a codegen bug to one handler class. */
 static int fe_pdmax(void) {
     static int v = -2;
     if (v == -2) {
-        const char *s = getenv(ARM64_JIT_ENV("PDMAX"));
+        const char *s = arm64_getenv("JIT_PDMAX");
         v = s ? atoi(s) : -1;
     }
     return v;
@@ -1748,7 +1748,7 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
          * interpreter helper ---- */
         default: {
             /* The fe_* families decode raw words (no PD id), so each gets a
-             * pseudo-id above PD_NOPS_ for <prefix>_JIT_PDMAX bisection:
+             * pseudo-id above PD_NOPS_ for <prefix>JIT_PDMAX bisection:
              *   +0 fe_atomic  +1 fe_fpsimd  +2 fe_ldst_extra  +3 fe_bitfield
              *   +4 fe_ld1     +5 RBIT idiom +6 ADC/SBC family */
             if (JIT_FE_ATOMICS && e->op == PD_GENERIC &&

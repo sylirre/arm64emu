@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* JIT internals shared between the runtime (jit.c), the host backends and
- * the program's part of the runtime (its jit_mode_* hooks, jit.h). One
+ * the program's part of the runtime (its JitCoherence, jit.h). One
  * backend compiles per host (self-selected by #ifdef in backend_*.c); jit.c
  * provides inert stubs on hosts without one, so the runtime links -- and
  * stays ILP32-clean -- everywhere. */
@@ -108,7 +108,7 @@ typedef struct JitEnv {
     CPU *c;                     /* pinned second register loads this (offset 0) */
     /* Block-entry safepoint flag: generated code leaves at the next block
      * entry while it is set, and the dispatcher asks the program to resync
-     * (jit_mode_resync) before it runs another block. Raised by the
+     * (JitCoherence.resync) before it runs another block. Raised by the
      * program: a caught signal, another thread's mapping change. */
     volatile u32 interrupt;
     u32 active;
@@ -146,7 +146,7 @@ typedef struct JitEnv {
                                  * code stores a translate-time constant here
                                  * and movdqu-loads it (x86 pshufb LUTs and
                                  * byte-shift masks; no RIP-relative pools) */
-    u32 slowmem;                /* ARM64_JIT_ENV("SLOWMEM"): every mem op takes
+    u32 slowmem;                /* <prefix>JIT_SLOWMEM: every mem op takes
                                  * the helper path (fast-path codegen bisection) */
     /* Sticky union of the FP modes (FPMODE_*) this CPU's guest has asked
      * for; what it costs the inline FP surface is ir.h's vop_fpcr_blocked.
@@ -215,10 +215,10 @@ typedef struct JitEnv {
     u16 jc_dirty[JIT_JC_DIRTY_MAX];
     u32 jc_ndirty;
     unsigned long mode_gen;     /* the program's own coherence state
-                                 * (jit_mode_attach/resync) */
+                                 * (JitCoherence.attach/resync) */
     struct IRBlock *ir;         /* the translator's scratch block (~17 KB) */
 
-    /* ARM64_JIT_ENV("STATS") and ("DUMP"), jit.c: this CPU's share */
+    /* <prefix>JIT_STATS and JIT_DUMP, jit.c: this CPU's share */
     struct JStat *jstat;        /* helper-call histogram, merged at release */
     u64 jstat_lost;
     u64 ntrans, ndisp;          /* translations, dispatcher round trips */

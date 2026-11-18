@@ -547,8 +547,14 @@ static inline u32 fnv1a32(const char *s) {
     return h;
 }
 
+/* exception.c: the core's exception entry (the CPU's ops, cpu.h), which
+ * here records the exception for the run loop and asks for its attention. */
+void exception_record(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr);
+
 /* loop.c */
 int  emu_loop(CPU *c);
+/* The generic timer's count, the host's clock (the CPU's ops). */
+u64  host_gt_count(CPU *c, bool virt);
 /* Must the run loop act for this thread before more guest code runs (a
  * deliverable signal, a tracer's kick, an execve call-out)? `at` is the pc a
  * signal frame would record. */

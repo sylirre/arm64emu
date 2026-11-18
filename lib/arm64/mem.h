@@ -4,10 +4,10 @@
  *
  * The library's own memory interface: the typed accesses decode.c and the
  * engines make, their hit paths over the CPU's translation caches (inline,
- * here), and the slow paths behind them, which each program
- * defines for the memory it models -- arm64emu a stage-1 MMU over a physical
- * bus, arm64chroot a software page table over the host's address space.
- * Everything a program keeps beyond that stays in its own mmu.h.
+ * here), and the slow paths behind them, which the program that runs the
+ * CPU supplies (its CpuOps, cpu.h) for the memory it models -- a stage-1
+ * MMU over a physical bus in a full system, a software page table over the
+ * host's address space in user mode.
  *
  * The caches are part of the CPU (c->eng, cpu.h), never thread-local
  * storage: every guest load, store and instruction fetch starts here, and
@@ -22,8 +22,6 @@
 
 #define GUEST_PAGE_SIZE 4096ULL
 #define GUEST_PAGE_MASK (GUEST_PAGE_SIZE - 1)
-
-typedef enum { ACC_READ, ACC_WRITE, ACC_EXEC } AccType;
 
 /* ---- the data-side TLB ------------------------------------------------------
  * A direct-mapped cache of VA page -> host page, probed before the slow path;
@@ -73,9 +71,18 @@ static inline u8 *dtlb_hit(CPU *c, u64 va, unsigned size, u64 need) {
 }
 
 /* ---- the slow paths: the program's ------------------------------------------
+ * The program's ops supply them (cpu.h, CpuOps), for the memory it models.
  * Each is the whole access -- page-crossing splits, translation, faults,
  * MMIO, refilling the caches -- and returns false after raising the
- * architectural fault. */
+ * architectural fault.
+ *
+ * These are calls through the CPU's table kept out of line (cpu.c), a jump
+ * on, so that the accesses below, inlined at hundreds of sites in the
+ * engines, stay plain calls: a call through the table at each of them
+ * reshapes the code around it, and the predecoded tier's dispatch (pd_run)
+ * measured 0.3 to 3% slower for it, the fetch's single site included. Code
+ * that is not inlined that way -- the JIT runtime's helpers -- calls through
+ * the table itself. */
 bool mem_read_slow(CPU *c, u64 va, unsigned size, u64 *out);
 bool mem_write_slow(CPU *c, u64 va, unsigned size, u64 val);
 bool mem_read128_slow(CPU *c, u64 va, V128 *out);
@@ -87,15 +94,11 @@ bool mem_ifetch_slow(CPU *c, u64 va, u32 *insn_out);
  * program resolves the page here rather than answering NULL for a mere
  * miss, so that an atomic access is never demoted to a plain one. */
 void *mem_host_ptr_slow(CPU *c, u64 va, unsigned size, AccType acc);
-/* Non-faulting read for diagnostics: false if the VA does not translate. */
-bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out);
 
 /* Invalidate the CPU's translation caches (TLBI and the writes to the
  * registers translation depends on), or one page of them (VA-form TLBI). */
 void tlb_flush_all(CPU *c);
 void tlb_flush_page(CPU *c, u64 va);
-/* AT S1E1R/W, S1E0R/W: the PAR_EL1 value for va. Never faults. */
-u64  mmu_at_s1(CPU *c, u64 va, bool is_write, bool as_el0);
 
 /* ---- typed accesses -----------------------------------------------------------
  * Return false if a fault was raised (the caller abandons the instruction and

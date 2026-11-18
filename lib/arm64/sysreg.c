@@ -11,11 +11,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Generic-timer hooks. gt_count is the program's (arm64emu devices/timer.c,
- * arm64chroot loop.c). timer_update is arm64emu's timer device; arm64chroot
- * has none, so it is weak and called only under a NULL check. */
-u64 gt_count(CPU *c, bool virt);
-void timer_update(struct Machine *m) __attribute__((weak));
 
 /* FPSR cumulative-flag fold (exec_fpsimd.c): host FP flags and the
  * software-raised bits accumulate lazily and are only folded into c->fpsr
@@ -24,7 +19,7 @@ void timer_update(struct Machine *m) __attribute__((weak));
 void fpsr_sync(CPU *c) __attribute__((weak));
 
 static u64 timer_count(CPU *c, bool virt) {
-    return gt_count(c, virt);
+    return c->eng.ops->gt_count(c, virt);
 }
 
 #define KEY(op0, op1, crn, crm, op2) \
@@ -149,7 +144,7 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
     }
     if (CRn == 7) {
         if (CRm == 8 && op1 == 0 && op2 <= 3) {          /* AT S1E1R/W, S1E0R/W */
-            c->par_el1 = mmu_at_s1(c, reg_x(c, Rt), op2 & 1, op2 >= 2);
+            c->par_el1 = c->eng.ops->at_s1(c, reg_x(c, Rt), op2 & 1, op2 >= 2);
             return;
         }
         if (CRm == 4 && op2 == 1) {                      /* DC ZVA: zero 64 bytes */
@@ -340,7 +335,7 @@ static void do_msr(CPU *c, unsigned key, unsigned Rt) {
     /* Re-evaluate the generic timer immediately on any CNT* (CRn==14) write so
      * the interrupt line tracks a reprogrammed compare value without waiting for
      * the next periodic tick (avoids a spurious timer-IRQ storm). */
-    if (((key >> 9) & 0xf) == 14 && timer_update) timer_update(c->m);
+    if (((key >> 9) & 0xf) == 14 && c->eng.ops->timer_update) c->eng.ops->timer_update(c);
 }
 
 void sysreg_exec(CPU *c, u32 insn) {

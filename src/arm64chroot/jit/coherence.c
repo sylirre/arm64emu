@@ -2,7 +2,8 @@
 /* Copyright 2026 Sylirre */
 /* The JIT's coherence with the guest address space: the runtime is
  * lib/arm64/jit's; this is what it asks of the program (jit.h's
- * jit_mode_*), and the program's own entry points into it (coherence.h).
+ * JitCoherence: jit_va_coherence), and the program's own entry points into
+ * it (coherence.h).
  *
  * Each guest thread runs its own CPU, so each has its own translations; the
  * per-CPU caches make all of this lock-free:
@@ -13,7 +14,7 @@
  *    bumped and every registered thread's `interrupt` flag is set -- they
  *    conservatively flush their own cache at the next safepoint.
  *  - Self-modifying code: the guest's mandatory IC IVAU (CTR_EL0 advertises
- *    DIC=0/IDC=0) reaches jit_mode_ic_ivau, which invalidates the written
+ *    DIC=0/IDC=0) reaches va_ic_ivau, which invalidates the written
  *    line's page. Plain stores are not instrumented: skipping IC on this CPU
  *    is architecturally undefined, exactly as on hardware.
  *  - D-TLB: generated code probes this thread's D-TLB (mem.h's layout, the
@@ -50,7 +51,7 @@ static unsigned long g_jit_inval_gen = 1;
  * reprotected or rewritten -- silently executing stale native code. Falling
  * back to the interpreter is slow; running the wrong instructions is not a
  * trade we get to make. */
-int jit_mode_attach(CPU *c, JitEnv *env) {
+static int va_attach(CPU *c, JitEnv *env) {
     (void)c;
     int ok = -1;
     env->mode_gen = __atomic_load_n(&g_jit_inval_gen, __ATOMIC_ACQUIRE);
@@ -62,7 +63,7 @@ int jit_mode_attach(CPU *c, JitEnv *env) {
     return ok;
 }
 
-void jit_mode_detach(CPU *c, JitEnv *env) {
+static void va_detach(CPU *c, JitEnv *env) {
     (void)c;
     as_lock();
     for (int i = 0; i < JIT_ENVS_MAX; i++) {
@@ -90,7 +91,7 @@ void jit_signal_interrupt(void) {
  * paths skip the per-access generation check translate() performs, so empty
  * the D-TLB eagerly rather than lazily), and start over if another thread
  * invalidated code since. */
-int jit_mode_resync(CPU *c, JitEnv *env) {
+static int va_resync(CPU *c, JitEnv *env) {
     (void)c;
     jit_dtlb_reset();
     unsigned long g = __atomic_load_n(&g_jit_inval_gen, __ATOMIC_ACQUIRE);
@@ -102,7 +103,7 @@ int jit_mode_resync(CPU *c, JitEnv *env) {
 /* The guest shares the descriptor table: the runtime's own memfd lives in
  * one fd window (machine.h, "the emulator's own descriptors"), so the guest
  * never sees its number and a sibling's fork cannot hand its child a copy. */
-void jit_mode_private_fd(int enter) {
+static void va_private_fd(int enter) {
     if (enter) fdwin_enter(); else fdwin_leave();
 }
 
@@ -149,7 +150,7 @@ static int codemap_test(u64 pc) {
     return (__atomic_load_n(&map[bit >> 3], __ATOMIC_ACQUIRE) >> (bit & 7)) & 1;
 }
 
-void jit_mode_translated(CPU *c, const JBlock *b) {
+static void va_translated(CPU *c, const JBlock *b) {
     (void)c;
     codemap_mark(b->pc);
 }
@@ -157,11 +158,20 @@ void jit_mode_translated(CPU *c, const JBlock *b) {
 /* IC IVAU, Xt. TBI0: cache maintenance by VA ignores the address's top byte,
  * exactly as a data access does (mem.c's translate()), so a tagged code
  * pointer still names the page it really lives on. */
-void jit_mode_ic_ivau(CPU *c, u64 va) {
+static void va_ic_ivau(CPU *c, u64 va) {
     (void)c;
     va &= A64_TBI_MASK;
     jit_invalidate_range(va & ~63ULL, 64);
 }
+
+const JitCoherence jit_va_coherence = {
+    .attach      = va_attach,
+    .detach      = va_detach,
+    .translated  = va_translated,
+    .ic_ivau     = va_ic_ivau,
+    .resync      = va_resync,
+    .private_fd  = va_private_fd,
+};
 
 /* ---- coherence entry points ---- */
 

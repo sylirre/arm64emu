@@ -8,7 +8,7 @@
  * the configuration sysreg_init gives it, they decide what Linux's would;
  * where guest threads run concurrently (smp) the LSE atomics, exclusives,
  * LDAR/STLR and barriers are host-atomic ones. Guest memory is reached
- * through mem.h, whose slow paths the program defines. */
+ * through mem.h, whose slow paths are the program's (the CPU's ops). */
 #include "cpu.h"
 #include <string.h>
 #include "mem.h"
@@ -1739,11 +1739,11 @@ static void branch_system(CPU *c, u32 insn) {
              * conduit (it could otherwise power off / reboot the machine).
              * A user-mode guest is always at EL0. */
             if (c->el == 0) { undefined(c, insn); return; }
-            if (smccc_conduit && smccc_conduit(c, true)) return;
+            if (c->eng.ops->smccc && c->eng.ops->smccc(c, true)) return;
             undefined(c, insn);
         } else if (opc == 0 && ll == 3) {                                 /* SMC */
             if (c->el == 0) { undefined(c, insn); return; }
-            if (smccc_conduit && smccc_conduit(c, false)) return;
+            if (c->eng.ops->smccc && c->eng.ops->smccc(c, false)) return;
             undefined(c, insn);
         } else if (opc == 1 && ll == 0) {                                 /* BRK */
             cpu_raise_sync(c, esr_make(EC_BRK64, imm16), 0);

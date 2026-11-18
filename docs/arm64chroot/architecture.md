@@ -68,7 +68,9 @@ undefined instructions, `BRK` — by calling:
 void exception_take(CPU*, ExcKind, u64 esr, u64 far, u64 ret_addr);
 ```
 
-In the system emulator this banks SPSR/ELR/ESR/FAR and vectors to the EL1 handler.
+which is the program's, the entry of that name in the ops the program gives
+each CPU (`cpu.h`, `CpuOps`). In the system emulator this banks
+SPSR/ELR/ESR/FAR and vectors to the EL1 handler.
 In user mode there is no guest kernel, so the rewritten `exception.c` **records**
 the pending exception into thread-local state, asks for the CPU's attention and
 returns; the run loop dispatches it. The CPU stays at EL0 for the process's entire life, and the core holds it to
@@ -84,7 +86,7 @@ value, AArch64 only at EL0 and EL1) and advertises that it does with
 `HWCAP_CPUID` (`tests/arm64chroot/c/idregs.c`, `tests/arm64chroot/fixtures/idregs.c`).
 
 ```c
-void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
+void exception_record(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr) {
     g_tls.pend_exc.valid = true;
     g_tls.pend_exc.esr = esr;
     g_tls.pend_exc.far = far;

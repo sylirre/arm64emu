@@ -9,6 +9,7 @@
 #include "types.h"
 
 struct Machine;
+struct CpuOps;
 
 /* PSTATE condition flag bit positions (matching SPSR_ELx / NZCV layout). */
 #define PS_N (1u << 31)
@@ -29,6 +30,9 @@ typedef enum {
     EXC_FIQ  = 2,
     EXC_SERROR = 3,
 } ExcKind;
+
+/* Guest memory access kinds (mem.h). */
+typedef enum { ACC_READ, ACC_WRITE, ACC_EXEC } AccType;
 
 /* CPU.host_fzmode before the host FPCR has been synced: no FZ/FZ16 value. */
 #define HOST_FZMODE_UNKNOWN 0xffffffffu
@@ -106,6 +110,9 @@ typedef struct CpuEngine {
      *      executed by one host thread in program order, where a plain
      *      read-modify-write is atomic and a barrier orders nothing more. */
     u8 sys, smp;
+    /* The rest of the mode: what the library asks of the program that runs
+     * this CPU (CpuOps, below), set up with the two above. */
+    const struct CpuOps *ops;
     /* The engines' own state, allocated by their first run: the predecoded
      * tier's decode cache (pdrun.h) and the JIT's code cache and tables
      * (jit.h). They belong to the host thread running the CPU, like
@@ -348,9 +355,48 @@ StepResult cpu_step(CPU *c);
  * returns whether it did. */
 bool cpu_take_interrupt(CPU *c);
 
-/* Exception entry, the program's own: a full system vectors to EL1 (ret_addr
- * becomes ELR_EL1); user mode records the exception for its run loop, which
- * plays the kernel's part. */
+/* ---- The program's side of the mode ----
+ * What the library cannot do for itself it asks the program that runs the
+ * CPU, through the table the program sets up each CPU with (c->eng.ops,
+ * beside sys and smp): exception entry, the guest memory it models behind
+ * the CPU's caches (mem.h), its timer and firmware, and the JIT's
+ * coherence with that memory (jit.h). The library names no program
+ * function, so one build of it serves a program that runs CPUs of either
+ * mode. Entries marked optional may be NULL. */
+struct JitCoherence;
+typedef struct CpuOps {
+    /* Exception entry: a full system vectors to EL1 (ret_addr becomes
+     * ELR_EL1); user mode records the exception for its run loop, which
+     * plays the kernel's part. The library calls it exception_take. */
+    void (*exception_take)(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr);
+    /* Guest memory behind the caches, and their maintenance: mem.h's slow
+     * paths, tlb_flush_all and tlb_flush_page, under those names. at_s1 is
+     * AT S1E1R/W, S1E0R/W: the PAR_EL1 value for va, never a fault. */
+    bool (*read_slow)(CPU *c, u64 va, unsigned size, u64 *out);
+    bool (*write_slow)(CPU *c, u64 va, unsigned size, u64 val);
+    bool (*read128_slow)(CPU *c, u64 va, V128 *out);
+    bool (*write128_slow)(CPU *c, u64 va, const V128 *val);
+    bool (*ifetch_slow)(CPU *c, u64 va, u32 *insn_out);
+    void *(*host_ptr_slow)(CPU *c, u64 va, unsigned size, AccType acc);
+    void (*tlb_flush_all)(CPU *c);
+    void (*tlb_flush_page)(CPU *c, u64 va);
+    u64  (*at_s1)(CPU *c, u64 va, bool is_write, bool as_el0);
+    /* The generic timer's count (CNTPCT, or CNTVCT with virt), and
+     * (optional) the timer device's re-evaluation after a CNT* register
+     * write, so its interrupt line tracks a reprogrammed compare value. */
+    u64  (*gt_count)(CPU *c, bool virt);
+    void (*timer_update)(CPU *c);
+    /* (optional) An HVC or SMC at EL1 for the firmware the program plays
+     * (PSCI): true if it was served, else the instruction is UNDEFINED. */
+    bool (*smccc)(CPU *c, bool is_hvc);
+    /* The JIT's coherence with the memory modelled (jit.h). */
+    const struct JitCoherence *jit;
+} CpuOps;
+
+/* The library's calls through the CPU's ops that code inlined at many sites
+ * makes are out of line (cpu.c), so those sites stay plain calls:
+ * exception_take here, mem.h's slow paths and TLB maintenance (mem.h says
+ * why). */
 void exception_take(CPU *c, ExcKind kind, u64 esr, u64 far, u64 ret_addr);
 
 /* Raise a synchronous exception (ELR = address of the faulting instruction). */
@@ -391,5 +437,12 @@ void cov_load(const char *path);  /* load QEMU coverage PC set (divergence finde
  * (with g_debug_hooks set), cpu_svc_hook before every SVC. */
 extern void (*cpu_step_hook)(CPU *c, u32 insn);
 extern void (*cpu_svc_hook)(CPU *c);
+
+/* The library's environment knobs (the predecoded tier's PD_MAX, the JIT's
+ * JIT_*) are named <prefix><name>, after the program running it: it sets
+ * g_env_prefix ("ARM64EMU_", ...) before it starts a CPU. arm64_getenv is
+ * getenv of such a name, NULL while no prefix is set. */
+extern const char *g_env_prefix;
+const char *arm64_getenv(const char *name);
 
 #endif /* A64_CPU_H */

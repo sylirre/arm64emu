@@ -35,9 +35,10 @@ build/                 everything the build makes (gitignored, see below)
 ```
 
 The whole emulation core is shared: the interpreter, the predecoded tier and
-the JIT. A file in `lib/` is compiled into every program that uses it, with
-that program's flags, so a change there must pass every such program's
-suites.
+the JIT. `lib/arm64` is compiled once (per host compiler) and linked into both
+emulators; `lib/link2symlink` is compiled into each program that uses it, with
+that program's flags. Either way a change there must pass every such
+program's suites.
 
 What differs between the programs is configured, not forked, and decided at
 run time, not at build time: each CPU carries the mode the program runs it in
@@ -52,19 +53,22 @@ share one contract with the program's run loop (`cpu.h`, "Run control"):
 they run guest code until the CPU asks for attention -- a stop, a halt, an
 interrupt it can take, whatever the program raises of its own -- or reach the
 deadline the loop gives them.
-`lib/arm64` takes one header from the program, found on its include path:
-`arm64_config.h`, how the library is built there (`ARM64_ENV`, the prefix
-of the environment knobs it reads). Guest memory is the library's own interface,
-`lib/arm64/mem.h`: the typed accesses, instruction fetch and `mem_host_ptr`,
-inline over the translation caches part of every CPU (`c->eng`: one
-D-TLB entry layout and one fetch cache for both programs), with slow paths and
-cache maintenance (`mem_read_slow`, ..., `tlb_flush_all`) the program defines
-for the memory it models. The JIT's coherence with that memory is the
-program's too: the runtime asks it through the `jit_mode_*` hooks
-(`lib/arm64/jit/jit.h`) what a translated page's change looks like there --
-a store to a code page in a full system, an munmap or IC IVAU in user mode.
-Beyond those it calls functions the program defines (`exception_take`,
-`gt_count`, ...). It includes no other program header.
+`lib/arm64` includes no program header and names no program function: what
+it cannot do itself it asks the program through the table of operations each
+CPU carries beside its mode (`c->eng.ops`, `struct CpuOps` in `cpu.h`),
+which the program sets up with the CPU. Guest memory is the library's own
+interface, `lib/arm64/mem.h`: the typed accesses, instruction fetch and
+`mem_host_ptr`, inline over the translation caches part of every CPU
+(`c->eng`: one D-TLB entry layout and one fetch cache for both programs),
+with slow paths and cache maintenance (`mem_read_slow`, ...,
+`tlb_flush_all`) the program's ops supply for the memory it models. The
+JIT's coherence with that memory is the program's too: the runtime asks it
+through the ops' `JitCoherence` (`lib/arm64/jit/jit.h`) what a translated
+page's change looks like there -- a store to a code page in a full system,
+an munmap or IC IVAU in user mode. Exception entry (`exception_take`), the
+generic timer and the firmware's HVC/SMC are ops as well. The environment
+knobs the library reads carry the prefix the program sets in
+`g_env_prefix` (`arm64_getenv`).
 
 `lib/link2symlink` includes no program header at all: it reaches the host only
 through the table of operations the program defines as `l2s_host` (`struct
@@ -86,8 +90,9 @@ objects in `build/obj/<flavour>/`, the programs the suites build in
 `make clean-testenv` removes it.
 
 `CC`, `CFLAGS` and `LDFLAGS` are the host compiler and extra flags of the two
-emulators. Every other build variable belongs to one program and carries its
-prefix: `ARM64EMU_OPT`, `ARM64CHROOT_M32CC`, `CHROOTNG_CC`,
+emulators and of the `lib/arm64` they share (`make CFLAGS="-O3 -flto=8"` is
+the fast recipe). Every other build variable belongs to one program and
+carries its prefix: `ARM64EMU_OPT`, `ARM64CHROOT_M32CC`, `CHROOTNG_CC`,
 `CHROOTNG_CFLAGS`, ...
 
 ## Testing
@@ -108,8 +113,9 @@ JIT; a change to `lib/link2symlink/` by both arm64chroot's and chroot-ng's.
 Every environment variable a program or its test harness reads carries that
 program's prefix: `ARM64EMU_` (`ARM64EMU_JIT_` for JIT knobs), `ARM64CHROOT_`
 (`ARM64CHROOT_JIT_`), `CHROOTNG_`. Shared code takes the prefix from the program
-that compiles it. New variables must also be added to the program's built-in
-help.
+that runs it (`lib/arm64`'s `g_env_prefix`, `lib/link2symlink`'s from the
+program that compiles it). New variables must also be added to the program's
+built-in help.
 
 ## Versioning
 

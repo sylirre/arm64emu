@@ -21,7 +21,6 @@ static u64 host_ns(void) {
     return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
 }
 
-/* Strong definition; overrides the weak fallback in sysreg.c. */
 u64 gt_count(CPU *c, bool virt) {
     u64 ticks;
     if (g_rtclock) {
@@ -73,6 +72,8 @@ void timer_update(Machine *m) {
      * each tick (today's behavior) until the guest reprograms the timer. */
     if (m->timer) m->timer->deadline = deadline_count(c);
 }
+
+void timer_cpu_update(CPU *c) { timer_update(c->m); }
 
 /* The per-tick path: a single compare against the cached deadline. The cache
  * cannot go stale: every CNT* register write funnels through timer_update

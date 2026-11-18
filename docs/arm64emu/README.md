@@ -161,7 +161,7 @@ comparison.
 ```
 src/arm64emu/
   main.c        CLI, image loading, the run loop, signal-flush of diagnostics
-  arm64_config.h  how lib/arm64 is built here (knob prefix; embedded _exit)
+  embed.h       the embedded build's exit -> _exit shadow
   diag.{h,c}    guest-kernel diagnostics on the step driver's hooks: the
                 mm-syscall trace and the musl-heap tracker
   mmu.c         AArch64 stage-1 walk (4 KB granule) + software TLB, and the

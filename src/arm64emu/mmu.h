@@ -9,6 +9,9 @@
 #include "cpu.h"
 #include "mem.h"
 
+/* Non-faulting read for diagnostics: false if the VA does not translate. */
+bool mem_peek(CPU *c, u64 va, unsigned size, u64 *out);
+
 /* Translate VA->PA for the current EL/state. On fault, raises the appropriate
  * synchronous exception (data/instruction abort) and returns false. */
 bool mmu_translate(CPU *c, u64 va, AccType acc, u64 *pa_out);
@@ -18,9 +21,10 @@ bool mmu_translate(CPU *c, u64 va, AccType acc, u64 *pa_out);
  * translations to drop. */
 bool mmu_probe_pa(CPU *c, u64 va, u64 *pa_out);
 
-/* The CPU's mode (a full system, one CPU) and translation caches (cpu.h's
- * CpuEngine), which mmu_cpu_init sets up for it -- machine_init calls it
- * once, before the first cpu_reset; cpu_reset keeps them.
+/* The CPU's mode (a full system, one CPU, this machine's CpuOps) and
+ * translation caches (cpu.h's CpuEngine), which mmu_cpu_init sets up for it
+ * -- machine_init calls it once, before the first cpu_reset; cpu_reset keeps
+ * them.
  *
  * The D-TLB holds RAM pages only: flash (CFI command state) and MMIO (side
  * effects) are never inserted, so they always take the bus path. Its tags
@@ -53,5 +57,7 @@ extern const u8 *g_jit_code_bitmap;
 struct Machine;
 void jit_invalidate_phys_range(struct Machine *m, u64 pa, u64 len);
 void jit_reset(struct Machine *m);
+/* What the JIT runtime asks of this machine (jit.h), for its CpuOps. */
+extern const struct JitCoherence jit_phys_coherence;
 
 #endif /* A64_MMU_H */
