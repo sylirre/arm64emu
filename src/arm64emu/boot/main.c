@@ -33,8 +33,8 @@ static CPU *g_sig_cpu;
 static void on_signal(int sig) {
     (void)sig;
     tty_raw_disable();
-    if (g_sig_cpu) { cpu_dump(g_sig_cpu); ring_dump(); }
-    prof_dump();
+    if (g_sig_cpu) { cpu_dump(g_sig_cpu); ring_dump(g_sig_cpu); }
+    prof_dump(NULL);
     jit_stats_flush();     /* _exit skips atexit; flush ARM64EMU_JIT_STATS if on */
     _exit(0);
 }
@@ -42,17 +42,13 @@ static void on_signal(int sig) {
 /* Run the selected engine for up to `slice` instructions (the tick cadence),
  * never past --max-insn: the predecoded tier stops exactly at a deadline, the
  * JIT up to a block late, so near the limit it single-steps instead and below
- * it is given a deadline a block short. The plain interpreter is one step. */
+ * it is given a deadline a block short (jit_deadline). The plain interpreter
+ * is one step. */
 static void run_engine(CPU *c, u64 slice, u64 max_insn) {
     if (g_jit) {
-        if (max_insn && max_insn - c->icount < 2 * JIT_MAX_BLOCK_INSNS) {
-            cpu_step(c);
-            return;
-        }
-        u64 deadline = c->icount + slice;
-        if (max_insn && deadline > max_insn - JIT_MAX_BLOCK_INSNS)
-            deadline = max_insn - JIT_MAX_BLOCK_INSNS;
-        jit_run(c, deadline);
+        u64 deadline = jit_deadline(c, c->icount + slice, max_insn);
+        if (deadline) jit_run(c, deadline);
+        else cpu_step(c);
     } else if (g_pd) {
         u64 deadline = c->icount + slice;
         if (max_insn && deadline > max_insn) deadline = max_insn;
@@ -167,11 +163,9 @@ static void help(void) {
                         "base) and reset there (bare-metal tests)."},
         {"    --entry ADDR", "Override the reset PC."},
         {"    --el N",  "Exception level at reset. Default 1."},
-        {"    --max-insn N", "Stop after N instructions and dump the CPU "
-                        "state. 0 = unlimited (default)."},
+        HELP_OPT_MAX_INSN,
         HELP_OPT_DEBUG,
-        {"    --reg-trace", "Compact per-instruction register trace for "
-                        "differential debugging; forces the interpreter."},
+        HELP_OPT_REG_TRACE,
         HELP_OPT_JIT,
         HELP_OPT_NO_PREDECODE,
         {"    --",      "Stop option parsing (boot mode takes no positional "
@@ -186,14 +180,9 @@ static void help(void) {
                         "0x3ff (poll every 1024 steps)."},
     };
     static const struct help_def env_diag[] = {
+        HELP_ENV_STEP_DIAG,
         {"ARM64EMU_DBG=N",     "Targeted device/IRQ debug logging (GIC, timer, "
                         "fw_cfg, flash)."},
-        {"ARM64EMU_PROF=1",    "Hot-PC profiler; the ranking is dumped at exit or on "
-                        "SIGINT."},
-        {"ARM64EMU_RING=1",    "Ring buffer of recent instructions, dumped on "
-                        "abort/exit."},
-        {"ARM64EMU_TPC=0xPC",  "Dump the CPU state each time the pc hits this "
-                        "address."},
         {"ARM64EMU_WATCH=0xADDR", "Log writes touching the 8 bytes at physical "
                         "ADDR."},
         {"ARM64EMU_VAW=0xVA",  "Log writes whose range covers this virtual address "
@@ -204,8 +193,6 @@ static void help(void) {
         {"ARM64EMU_HEAP=1",    "musl-heap double-alloc finder (implies ARM64EMU_RING=1)."},
         {"ARM64EMU_HEAP_AT=0xVA", "Log every alloc/free touching this virtual "
                         "address."},
-        {"ARM64EMU_COV=FILE",  "Coverage-divergence finder: compare executed PCs "
-                        "against a QEMU PC-set file."},
         HELP_ENV_DIAG,
     };
     static const char *const examples[] = {
@@ -455,7 +442,6 @@ int boot_main(int argc, char **argv)
     u64 entry = 0;
     int reset_el = 1;
     u64 bin_addr = RAM_BASE;
-    u64 max_insn = 0;     /* 0 = unlimited */
 
     /* GNU-style options: single-letter short (-j), --word long. Value-taking
      * options accept "--opt VAL"/"--opt=VAL" and "-m VAL"/"-mVAL"; no-arg
@@ -472,8 +458,7 @@ int boot_main(int argc, char **argv)
             const char *n = arg + 2;
             if      (!strcmp(n, "help"))      { if (val) opt_no_value(arg); help(); }
             else if (!strcmp(n, "version"))   { if (val) opt_no_value(arg); version(); }
-            else if (engine_long_opt(n, val, arg)) ;
-            else if (!strcmp(n, "reg-trace")) { if (val) opt_no_value(arg); g_rtrace = 1; }
+            else if (engine_long_opt(n, val, arg, argv, argc, &i)) ;
             else if (!strcmp(n, "net"))       { if (val) opt_no_value(arg); net_enabled = true; }
             else if (!strcmp(n, "bios"))     bios    = long_value("--bios", val, argv, argc, &i);
             else if (!strcmp(n, "kernel"))   kernel  = long_value("--kernel", val, argv, argc, &i);
@@ -483,7 +468,6 @@ int boot_main(int argc, char **argv)
             else if (!strcmp(n, "memory"))   ram_mb  = strtoull(long_value("--memory", val, argv, argc, &i), 0, 0);
             else if (!strcmp(n, "entry"))    entry   = strtoull(long_value("--entry", val, argv, argc, &i), 0, 0);
             else if (!strcmp(n, "el"))       reset_el = atoi(long_value("--el", val, argv, argc, &i));
-            else if (!strcmp(n, "max-insn")) max_insn = strtoull(long_value("--max-insn", val, argv, argc, &i), 0, 0);
             else if (!strcmp(n, "drive"))    add_drive(drives, &n_drives, long_value("--drive", val, argv, argc, &i));
             else if (!strcmp(n, "virtfs"))   add_virtfs(shares, &n_shares, long_value("--virtfs", val, argv, argc, &i));
             else if (!strcmp(n, "netfwd"))   add_netfwd(net_fwds, &n_net_fwds, long_value("--netfwd", val, argv, argc, &i));
@@ -535,10 +519,8 @@ int boot_main(int argc, char **argv)
     /* Binding hvcN says the console exists; no need to also state the count. */
     if (n_hvc_bound > n_consoles) n_consoles = n_hvc_bound;
 
+    step_diag_env();      /* ARM64EMU_PROF, RING, TPC, COV (../cli.c) */
     if (getenv("ARM64EMU_DBG")) g_dbg = atoi(getenv("ARM64EMU_DBG"));
-    if (getenv("ARM64EMU_PROF")) g_prof = atoi(getenv("ARM64EMU_PROF"));
-    if (getenv("ARM64EMU_TPC")) g_tpc = strtoull(getenv("ARM64EMU_TPC"), 0, 0);
-    if (getenv("ARM64EMU_RING")) g_ring = atoi(getenv("ARM64EMU_RING"));
     if (getenv("ARM64EMU_WATCH")) g_watch = strtoull(getenv("ARM64EMU_WATCH"), 0, 0);
     if (getenv("ARM64EMU_IABORT")) g_iabort_log = atoi(getenv("ARM64EMU_IABORT"));
     if (getenv("ARM64EMU_RTCLOCK")) g_rtclock = atoi(getenv("ARM64EMU_RTCLOCK"));
@@ -546,11 +528,11 @@ int boot_main(int argc, char **argv)
     if (getenv("ARM64EMU_SYS")) g_systrace = atoi(getenv("ARM64EMU_SYS"));
     if (getenv("ARM64EMU_HEAP")) { g_heaptrack = atoi(getenv("ARM64EMU_HEAP")); g_ring = 1; }
     if (getenv("ARM64EMU_HEAP_AT")) g_heap_at = strtoull(getenv("ARM64EMU_HEAP_AT"), 0, 0);
-    if (getenv("ARM64EMU_COV")) { g_ring = 1; cov_load(getenv("ARM64EMU_COV")); }
     /* Any per-instruction debug facility routes through the single hot-path guard.
-     * (g_ring is also set by ARM64EMU_COV, so the coverage finder is covered too;
-     * the mm-syscall and heap tracers are step hooks, diag.c.) */
-    g_debug_hooks = g_trace | g_rtrace | g_prof | g_ring | (g_tpc != 0) | diag_install();
+     * (g_ring is also set by ARM64EMU_COV, VAW and HEAP, so the coverage finder
+     * is covered too; the mm-syscall and heap tracers are step hooks, diag.c.) */
+    bool diag_hooks = diag_install();   /* installs them: always called */
+    g_debug_hooks = cpu_step_diag_on() || diag_hooks;
 
     /* The JIT and the predecoded tier batch instructions, so anything
      * per-instruction forces the plain interpreter: the debug hooks
@@ -648,7 +630,7 @@ int boot_main(int argc, char **argv)
          * request is dropped first, and only then does guest code run. */
         cpu_attn_clear(c);
         if (!c->stop && !cpu_take_interrupt(c) && !c->halted)
-            run_engine(c, tick_mask + 1, max_insn);
+            run_engine(c, tick_mask + 1, g_max_insn);
         if (c->stop) {
             if (m.cpu.reset && machine_reset) {   /* PSCI SYSTEM_RESET: warm reboot */
                 jit_reset(&m);                    /* drop all translations */
@@ -668,21 +650,21 @@ int boot_main(int argc, char **argv)
                 fprintf(stderr, "[halted with no wake source at icount=%llu]\n",
                         (unsigned long long)m.cpu.icount);
                 cpu_dump(&m.cpu);
-                ring_dump();
+                ring_dump(&m.cpu);
                 break;
             }
         }
-        if (max_insn && m.cpu.icount >= max_insn) {
+        if (g_max_insn && m.cpu.icount >= g_max_insn) {
             fprintf(stderr, "[maxinsn reached at icount=%llu]\n",
                     (unsigned long long)m.cpu.icount);
             cpu_dump(&m.cpu);
-            ring_dump();
+            ring_dump(&m.cpu);
             break;
         }
     }
 
     tty_raw_disable();
-    prof_dump();
+    prof_dump(NULL);
     if (g_heaptrack) heaptrack_report();
     machine_free(&m);
     return 0;

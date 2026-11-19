@@ -16,6 +16,7 @@
 #include "jit.h"
 #include "ptrace.h"
 #include "sysreg.h"
+#include "cli.h"
 
 /* Generic-timer count for CNTVCT_EL0/CNTPCT_EL0 reads (the CPU's ops,
  * CpuOps.gt_count): host monotonic clock scaled to the advertised 24 MHz
@@ -126,6 +127,46 @@ int emu_callout_due(CPU *c, u64 at) {
            (!sig_on_trampoline(c->m, at) && sig_pending_deliverable(c->m));
 }
 
+/* ARM64EMU_PROF's ranking for the program this process runs, which ends here
+ * -- an execve replaces it, or the process ends -- headed by whose it is; the
+ * next program's starts empty. One per program, not per process: across an
+ * execve the old image's PCs would mean nothing in the new one's. */
+void diag_prof_flush(struct Machine *m) {
+    if (!g_prof) return;
+    char title[sizeof m->exec_path + 32];
+    snprintf(title, sizeof title, "pid %d %s", (int)getpid(), m->exec_path);
+    prof_dump(title);
+    prof_reset();
+}
+
+/* What the diagnostics have to say as a fatal signal ends the process: the
+ * dying thread's ring (unless the coverage finder printed it as it stopped
+ * the CPU), the program's profile, and the JIT statistics, which the exit
+ * path flushes but a signal death would lose. */
+void diag_death(CPU *c) {
+    if (!c->diag_stop) ring_dump(c);
+    diag_prof_flush(c->m);
+    jit_stats_flush();
+}
+
+/* This thread reached --max-insn, or a step diagnostic stopped its CPU
+ * (ARM64EMU_COV's first foreign PC): the run ends here, and the process with
+ * it, as a SIGKILL would end it -- its parent must not take a program cut
+ * short for one that succeeded. The fatal-signal teardown prints the ring
+ * and the profile (diag_death). Once per process: a sibling that reaches its
+ * own limit meanwhile waits for the kill rather than report a second time. */
+static _Noreturn void diag_cut(CPU *c) {
+    static int cut;
+    if (__atomic_exchange_n(&cut, 1, __ATOMIC_ACQ_REL))
+        for (;;) pause();
+    if (!c->diag_stop) {
+        fprintf(stderr, "[maxinsn reached at icount=%llu]\n",
+                (unsigned long long)c->icount);
+        cpu_dump(c);
+    }
+    guest_terminate_by_signal(c, SIGKILL);
+}
+
 int emu_loop(CPU *c) {
     for (;;) {
         if (UNLIKELY(c->stop)) return 0;
@@ -169,13 +210,18 @@ int emu_loop(CPU *c) {
             cpu_step(c);
             stepped = 1;
         } else if (UNLIKELY(jit_on())) {
-            /* -jit: run translated blocks; same return contract as pd_run. */
-            jit_run(c, ~0ULL);
+            /* -jit: run translated blocks; same return contract as pd_run.
+             * Under --max-insn, to a block short of the limit and then step
+             * by step, which stops at it exactly (jit_deadline). */
+            u64 deadline = jit_deadline(c, ~0ULL, g_max_insn);
+            if (LIKELY(deadline)) jit_run(c, deadline);
+            else cpu_step(c);
         } else if (LIKELY(g_pd)) {
             /* Threaded fast path: executes instructions back-to-back through
              * the decode cache, returning when the CPU asks for attention.
-             * No deadline: nothing here is paced by instruction count. */
-            pd_run(c, ~0ULL);
+             * No deadline but --max-insn's, at which it stops exactly:
+             * nothing else here is paced by instruction count. */
+            pd_run(c, g_max_insn ? g_max_insn : ~0ULL);
         } else {
             /* -nopd: single-step fast path -- cpu_step minus its stop and
              * halted checks (the top of this loop made the first; halted is
@@ -190,6 +236,13 @@ int emu_loop(CPU *c) {
         }
         }
         as_bus_disarm();
+
+        /* --max-insn, counted per thread (its icount, from the start of the
+         * program it runs), or the coverage finder's stop: before the loop
+         * acts on anything the last instruction left it, a syscall included,
+         * so every engine stops in the same state. */
+        if (UNLIKELY(g_max_insn) && c->icount >= g_max_insn) diag_cut(c);
+        if (UNLIKELY(c->diag_stop)) diag_cut(c);
 
         /* What the CPU asked for attention for is looked at from here on, so
          * the request is dropped first: one raised while this iteration acts

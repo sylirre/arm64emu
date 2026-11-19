@@ -1511,6 +1511,144 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- the step diagnostics: --max-insn, --reg-trace, ARM64EMU_PROF/RING/TPC/
+# COV (lib/arm64 cpu.c; loop.c here). Self-checking -- nothing an oracle could
+# answer -- against counts the two fixtures fix (each says how):
+# stepdiag.S, libc-free, so its state at --max-insn N is the same in every run
+# and compared byte for byte; stepdiag_mt.c, whose spin loop's PCs retire a
+# known number of times in threads, a fork child and across an execve.
+# --max-insn stops every engine at N exactly -- the JIT too, whose chained
+# blocks would run past it unseen -- and ends the process as SIGKILL does;
+# the per-instruction facilities force the interpreter. (Under the --jit
+# suites the wrapper's --jit wins over the engine flags given here.) ----
+if [ -n "$AGCC" ]; then
+    SD=build/tests/arm64emu/chroot/fixtures/stepdiag.bin
+    SDMT=build/tests/arm64emu/chroot/fixtures/stepdiag_mt.bin
+    if "$AGCC" -nostdlib -static -o "$SD" tests/arm64emu/chroot/fixtures/stepdiag.S 2>/dev/null &&
+       "$AGCC" -static -O2 -pthread -o "$SDMT" tests/arm64emu/chroot/fixtures/stepdiag_mt.c 2>/dev/null; then
+        sd_row() {   # sd_row <label> <failure detail, empty for a pass>
+            if [ -z "$2" ]; then
+                pass=$((pass+1)); echo "PASS stepdiag: $1"
+            else
+                fail=$((fail+1)); echo "FAIL stepdiag: $1"; printf '    %s\n' "$2"
+            fi
+        }
+        sd_run() {   # sd_run <env/emulator args...>: stdout, stderr, status in sd_out/sd_err/sd_rc
+            sd_out=$(timeout -k 5 60 env "$@" 2>"$TMPD_SD/err"); sd_rc=$?
+            sd_err=$(cat "$TMPD_SD/err")
+        }
+        TMPD_SD=$(mktemp -d)
+
+        # --max-insn: the same stdout, state and status from every engine, at
+        # a point inside the self-chained inner loop, just past a write's svc
+        # (the call not yet made: two dots out, not three) and further on.
+        bad=""
+        for n in 700 3026 7777; do
+            ref=""
+            for eng in "" "--no-predecode" "--jit"; do
+                sd_run "$EMU" chroot $eng --max-insn $n / "$SD"
+                got="rc=$sd_rc out=$sd_out
+$sd_err"
+                [ "$sd_rc" = 137 ] && printf '%s\n' "$sd_err" | grep -q "^\[maxinsn reached at icount=$n\]$" ||
+                    bad="$bad n=$n ${eng:-pd}(rc=$sd_rc)"
+                if [ -z "$ref" ]; then ref=$got
+                elif [ "$got" != "$ref" ]; then bad="$bad n=$n ${eng:-pd}(state differs)"; fi
+            done
+            [ $n = 3026 ] && [ "${ref#rc=137 out=..
+}" = "$ref" ] && bad="$bad n=3026(stdout not '..')"
+        done
+        sd_row "--max-insn stops every engine at N, in the same state" "$bad"
+
+        # --reg-trace: one whole line per instruction.
+        sd_run "$EMU" chroot --reg-trace --max-insn 700 / "$SD"
+        n_ok=$(printf '%s\n' "$sd_err" | grep -cE '^P[0-9a-f]+( [0-9a-f]+){31} S[0-9a-f]+$')
+        sd_row "--reg-trace prints a line per instruction" \
+            "$([ "$n_ok" = 700 ] || echo "$n_ok well-formed lines for 700 instructions")"
+
+        # ARM64EMU_RING: the last 96 instructions, the ones --reg-trace shows.
+        sd_run "$EMU" chroot --reg-trace --max-insn 3026 / "$SD"
+        want=$(printf '%s\n' "$sd_err" | sed -n 's/^P\([0-9a-f]*\) .*/0x\1/p' | tail -96)
+        sd_run ARM64EMU_RING=1 "$EMU" chroot --max-insn 3026 / "$SD"
+        got=$(printf '%s\n' "$sd_err" | sed -n 's/^  pc=\(0x[0-9a-f]*\) .*/\1/p')
+        sd_row "ARM64EMU_RING holds the last 96 instructions" \
+            "$(printf '%s\n' "$sd_err" | grep -q '^\[ring\] last 96 instructions' &&
+               [ "$got" = "$want" ] || echo "ring: $(printf '%s\n' "$got" | wc -l) entries, not the trace's last 96")"
+
+        # ARM64EMU_PROF: each inner-loop PC 2000 times, headed by the program;
+        # ARM64EMU_TPC at one of them fires as often.
+        sd_run ARM64EMU_PROF=1 "$EMU" chroot / "$SD"
+        top=$(printf '%s\n' "$sd_err" | sed -n 's/^\[prof\] pc=\(0x[0-9a-f]*\) hits=2000$/\1/p')
+        bad=""
+        [ "$sd_rc" = 0 ] && [ "$sd_out" = .......... ] || bad="$bad rc=$sd_rc out=$sd_out"
+        printf '%s\n' "$sd_err" | grep -qE '^\[prof\] pid [0-9]+ /.*/stepdiag\.bin$' || bad="$bad no-header"
+        [ "$(printf '%s\n' "$top" | grep -c .)" = 5 ] || bad="$bad top=[$(echo $top)]"
+        pc1=$(printf '%s\n' "$top" | head -1)
+        if [ -n "$pc1" ]; then
+            sd_run ARM64EMU_TPC=$pc1 "$EMU" chroot / "$SD"
+            n_tpc=$(printf '%s\n' "$sd_err" | grep -c "^\[tpc\] pc=$pc1 ")
+            [ "$n_tpc" = 2000 ] || bad="$bad tpc=$n_tpc"
+        fi
+        sd_row "ARM64EMU_PROF counts, ARM64EMU_TPC fires" "$bad"
+
+        # ARM64EMU_COV: with the PCs of the first 1003 instructions, the first
+        # foreign one is the instruction after the first inner loop; with
+        # every PC of the program, none is.
+        bad=""
+        "$EMU" chroot --reg-trace --max-insn 1003 / "$SD" 2>&1 >/dev/null |
+            sed -n 's/^P\([0-9a-f]*\) .*/\1/p' | sort -u > "$TMPD_SD/part.cov"
+        "$EMU" chroot --reg-trace / "$SD" 2>&1 >/dev/null |
+            sed -n 's/^P\([0-9a-f]*\) .*/\1/p' | sort -u > "$TMPD_SD/full.cov"
+        sd_run ARM64EMU_COV="$TMPD_SD/part.cov" "$EMU" chroot / "$SD"
+        [ "$sd_rc" = 137 ] && [ -z "$sd_out" ] &&
+            printf '%s\n' "$sd_err" | grep -qE '^\[cov\] FIRST FOREIGN PC=0x[0-9a-f]+ insn=0xd2800020 icount=1003 el=0$' &&
+            printf '%s\n' "$sd_err" | grep -q '^\[ring\] last 96 instructions' ||
+            bad="$bad part(rc=$sd_rc $(printf '%s\n' "$sd_err" | grep '^\[cov\] FIRST'))"
+        sd_run ARM64EMU_COV="$TMPD_SD/full.cov" "$EMU" chroot / "$SD"
+        [ "$sd_rc" = 0 ] && [ "$sd_out" = .......... ] &&
+            ! printf '%s\n' "$sd_err" | grep -q '^\[cov\] FIRST' || bad="$bad full(rc=$sd_rc)"
+        sd_row "ARM64EMU_COV stops at the first foreign PC" "$bad"
+
+        # Threads: one profile, every thread's hits in it; --max-insn ends the
+        # process at the first thread to reach it, once; TPC lines from four
+        # threads at once come out whole.
+        sd_run ARM64EMU_PROF=1 "$EMU" chroot / "$SDMT" threads 3 200000
+        spc=$(printf '%s\n' "$sd_err" | sed -n 's/^\[prof\] pc=\(0x[0-9a-f]*\) hits=800000$/\1/p' | head -1)
+        sd_row "ARM64EMU_PROF counts every thread" \
+            "$([ "$sd_out" = done ] && [ -n "$spc" ] || echo "rc=$sd_rc out=$sd_out $(printf '%s\n' "$sd_err" | sed -n 2p)")"
+        sd_run "$EMU" chroot --max-insn 2000000 / "$SDMT" threads 3 10000000
+        n_rep=$(printf '%s\n' "$sd_err" | grep -c '^\[maxinsn reached at icount=2000000\]$')
+        sd_row "--max-insn per thread ends the process once" \
+            "$([ "$sd_rc" = 137 ] && [ -z "$sd_out" ] && [ "$n_rep" = 1 ] || echo "rc=$sd_rc out=$sd_out reports=$n_rep")"
+        if [ -n "$spc" ]; then
+            sd_run ARM64EMU_TPC=$spc "$EMU" chroot / "$SDMT" threads 3 2000
+            n_h=$(printf '%s\n' "$sd_err" | grep -c "^\[tpc\] pc=$spc insn=0x[0-9a-f]\{8\} el=0 sp=0x[0-9a-f]*$")
+            n_r=$(printf '%s\n' "$sd_err" | grep -cE '^ x0=0x[0-9a-f]+( x[0-9]+=0x[0-9a-f]+){30}$')
+            n_l=$(printf '%s\n' "$sd_err" | grep -vc '^arm64emu: ')   # --jit's notice aside
+            sd_row "ARM64EMU_TPC from four threads, every line whole" \
+                "$([ "$n_h" = 8000 ] && [ "$n_r" = 8000 ] && [ "$n_l" = 16000 ] || echo "heads=$n_h regs=$n_r lines=$n_l")"
+        else
+            sd_row "ARM64EMU_TPC from four threads, every line whole" "no spin pc from the profile"
+        fi
+
+        # A profile per program: the parent's, the fork child's before its
+        # execve and after -- each the spin's ITER, none inherited or kept.
+        # (The child's new program prints "done", the parent "child 0".)
+        sd_run ARM64EMU_PROF=1 "$EMU" chroot / "$SDMT" exec 200000
+        heads=$(printf '%s\n' "$sd_err" | grep -cE '^\[prof\] pid [0-9]+ /.*/stepdiag_mt\.bin$')
+        tops=$(printf '%s\n' "$sd_err" | grep -A1 -E '^\[prof\] pid ' | grep -c "^\[prof\] pc=$spc hits=200000$")
+        pids=$(printf '%s\n' "$sd_err" | sed -n 's/^\[prof\] pid \([0-9]*\) .*/\1/p' | sort -u | wc -l)
+        sd_row "ARM64EMU_PROF per program, across fork and execve" \
+            "$([ "$sd_out" = "done
+child 0" ] && [ "$heads" = 3 ] && [ "$tops" = 3 ] && [ "$pids" = 2 ] ||
+               echo "out=$sd_out headers=$heads tops=$tops pids=$pids")"
+
+        rm -rf "$TMPD_SD"
+        fx_rm "$SD" "$SDMT"
+    else
+        skip_build "fixtures/stepdiag"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom

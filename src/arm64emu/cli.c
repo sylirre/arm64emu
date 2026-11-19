@@ -190,10 +190,18 @@ char *short_value(const char *opt, char *rest, char **argv, int argc, int *pi) {
 
 /* --- the engine options ------------------------------------------------- */
 
-bool engine_long_opt(const char *name, const char *val, const char *arg) {
+unsigned long long g_max_insn;
+
+bool engine_long_opt(const char *name, char *val, const char *arg,
+                     char **argv, int argc, int *pi) {
+    if (!strcmp(name, "max-insn")) {
+        g_max_insn = strtoull(long_value("--max-insn", val, argv, argc, pi), 0, 0);
+        return true;
+    }
     if      (!strcmp(name, "debug"))        g_trace = 1;
     else if (!strcmp(name, "jit"))          g_jit = 1;
     else if (!strcmp(name, "no-predecode")) g_pd = 0;
+    else if (!strcmp(name, "reg-trace"))    g_rtrace = 1;
     else return false;
     if (val) opt_no_value(arg);
     return true;
@@ -204,6 +212,14 @@ bool engine_short_opt(char c) {
     else if (c == 'j') g_jit = 1;
     else return false;
     return true;
+}
+
+void step_diag_env(void) {
+    const char *v;
+    if ((v = arm64_getenv("PROF"))) g_prof = atoi(v);
+    if ((v = arm64_getenv("TPC")))  g_tpc = strtoull(v, 0, 0);
+    if ((v = arm64_getenv("RING"))) g_ring = atoi(v);
+    if ((v = arm64_getenv("COV")))  { g_ring = 1; cov_load(v); }
 }
 
 void engine_settle(bool per_insn) {

@@ -559,14 +559,23 @@ u64  host_gt_count(CPU *c, bool virt);
  * deliverable signal, a tracer's kick, an execve call-out)? `at` is the pc a
  * signal frame would record. */
 int  emu_callout_due(CPU *c, u64 at);
+/* The step diagnostics' reports (cpu.h; ARM64EMU_PROF, RING) at the ends of
+ * what they describe: diag_prof_flush prints the profile of the program this
+ * process runs and starts the next one empty (at its execve, at the process's
+ * end); diag_death adds the dying thread's ring and the JIT statistics for a
+ * fatal signal (guest_terminate_by_signal). */
+void diag_prof_flush(struct Machine *m);
+void diag_death(CPU *c);
 /* Deliver a fatal-by-default signal for a guest fault (M1: restore host
  * default disposition and re-raise so the exit status is correct). */
 void force_sig_fault(CPU *c, int sig, int code, u64 addr);
-/* Terminate the guest process by a default-fatal signal: report the WIFSIGNALED
- * death to a tracer, drop the /proc slot, then restore the host default and
- * re-raise so the real parent sees the same status. Does not return. Shared by
- * the synchronous fault path (force_sig_fault) and the async delivery path. */
-void guest_terminate_by_signal(CPU *c, int sig);
+/* Terminate the guest process by a default-fatal signal: print what the
+ * diagnostics have (diag_death), report the WIFSIGNALED death to a tracer,
+ * drop the /proc slot, then restore the host default and re-raise so the real
+ * parent sees the same status. Does not return. Shared by the synchronous
+ * fault path (force_sig_fault), the async delivery path, and a run a
+ * diagnostic cuts short (--max-insn, ARM64EMU_COV: SIGKILL). */
+__attribute__((noreturn)) void guest_terminate_by_signal(CPU *c, int sig);
 
 /* syscall.c */
 void syscall_dispatch(CPU *c);

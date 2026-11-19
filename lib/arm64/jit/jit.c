@@ -41,7 +41,9 @@
  *  - IRQ/timer (a full system): the block-entry safepoint exits when
  *    c->icount reaches env->icount_deadline, so chained hot loops return to
  *    the run loop at its cadence; the dispatcher checks the CPU's attention
- *    and the interrupt lines between blocks.
+ *    and the interrupt lines between blocks. User mode's one deadline,
+ *    --max-insn's, is the dispatcher's alone: under it blocks run unchained
+ *    (jit_run).
  *
  * jit_flush_all reuses cache memory; it must only run from jit_run's C loop
  * or code outside generated code (never while a block that could be reached
@@ -899,6 +901,15 @@ void jit_run(CPU *c, u64 deadline) {
     }
 
     env->icount_deadline = deadline;
+    /* Generated code checks the deadline at its block-entry safepoint only in
+     * a full system, whose run loop paces its devices by it; user mode gives
+     * none but --max-insn's. Under that one, blocks are neither chained nor
+     * entered through the jump cache, so each ends back in this loop, which
+     * checks the deadline that chained code would run past unseen. A CPU
+     * that chained or cached blocks before it had one drops them. */
+    bool unchained = !c->eng.sys && deadline != ~0ULL;
+    if (UNLIKELY(unchained) && (env->nedges || env->jc_ndirty))
+        jit_flush_all(env);
     u32 flush_seen = env->flush_count;
     JBlock *prev = NULL;                /* chainable exit awaiting a target */
     int prev_slot = 0;
@@ -1022,7 +1033,7 @@ void jit_run(CPU *c, u64 deadline) {
          * for where that may cross a page). prev ran THIS iteration round,
          * so no guest state changed in between; skip if prev was invalidated
          * meanwhile. */
-        if (prev && prev->exit_pc[prev_slot] == b->pc &&
+        if (prev && !unchained && prev->exit_pc[prev_slot] == b->pc &&
             !prev->patched[prev_slot] &&
             ((prev->tag ^ b->tag) & 0x1f) == 0 &&    /* all 5 ctx bits */
             (!c->eng.sys || ((prev->pc ^ b->pc) & ~0xfffULL) == 0) &&
@@ -1045,13 +1056,15 @@ void jit_run(CPU *c, u64 deadline) {
          * is the one the backends compute (IRBlock.sys): a full system's
          * block tag, never zero-extended pc alone, and the pc in user
          * mode. */
-        u32 jci = jcache_index(pc);
-        env->jcache[jci].tag = c->eng.sys ? tag : pc;
-        env->jcache[jci].code = b->code;
-        if (env->jc_ndirty < JIT_JC_DIRTY_MAX)
-            env->jc_dirty[env->jc_ndirty] = (u16)jci;
-        if (env->jc_ndirty <= JIT_JC_DIRTY_MAX)   /* saturate, don't wrap */
-            env->jc_ndirty++;
+        if (LIKELY(!unchained)) {
+            u32 jci = jcache_index(pc);
+            env->jcache[jci].tag = c->eng.sys ? tag : pc;
+            env->jcache[jci].code = b->code;
+            if (env->jc_ndirty < JIT_JC_DIRTY_MAX)
+                env->jc_dirty[env->jc_ndirty] = (u16)jci;
+            if (env->jc_ndirty <= JIT_JC_DIRTY_MAX)   /* saturate, don't wrap */
+                env->jc_ndirty++;
+        }
 
         u32 eid = env->enter(env, b->code);
         prev = NULL;

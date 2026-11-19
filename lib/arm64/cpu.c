@@ -99,57 +99,91 @@ static bool cov_has(u64 pc) {
     return bsearch(&pc, g_cov, g_cov_n, sizeof(u64), cmp_u64) != NULL;
 }
 
-/* Recent-instruction ring buffer: records (pc, insn, x-snapshot) so a fault can
- * be explained by the basic block that led to it. */
+/* Recent-instruction ring buffer (g_ring): each CPU records (pc, insn,
+ * x-snapshot) of its last RING_N steps, so a fault can be explained by the
+ * basic block that led to it -- the faulting thread's own, where guest
+ * threads run concurrently. Allocated by the CPU's first record. */
 #define RING_N 96
-static struct { u64 pc; u32 insn; u64 x0, x1, x2; } g_ringbuf[RING_N];
-static unsigned g_ringpos;
+struct CpuRing {
+    u64 pos;                                     /* records ever made */
+    struct { u64 pc; u32 insn; u64 x0, x1, x2; } e[RING_N];
+};
 static void ring_record(CPU *c, u32 insn) {
-    unsigned i = g_ringpos++ & (RING_N - 1);
-    g_ringbuf[i].pc = c->pc; g_ringbuf[i].insn = insn;
-    g_ringbuf[i].x0 = c->x[0]; g_ringbuf[i].x1 = c->x[1]; g_ringbuf[i].x2 = c->x[2];
+    struct CpuRing *r = c->eng.ring;
+    if (UNLIKELY(!r) && !(r = c->eng.ring = calloc(1, sizeof *r)))
+        return;                          /* no memory: no record, no dump */
+    unsigned i = (unsigned)(r->pos++ % RING_N);
+    r->e[i].pc = c->pc; r->e[i].insn = insn;
+    r->e[i].x0 = c->x[0]; r->e[i].x1 = c->x[1]; r->e[i].x2 = c->x[2];
 }
-void ring_dump(void) {
-    if (!g_ring) return;
-    fprintf(stderr, "[ring] last %d instructions (oldest first):\n", RING_N);
-    for (int k = 0; k < RING_N; k++) {
-        unsigned i = (g_ringpos + k) & (RING_N - 1);
-        if (g_ringbuf[i].pc == 0) continue;
+void ring_dump(CPU *c) {
+    const struct CpuRing *r = c ? c->eng.ring : NULL;
+    if (!g_ring || !r) return;
+    u64 n = r->pos < RING_N ? r->pos : RING_N;
+    flockfile(stderr);                   /* one dump, whoever else prints */
+    fprintf(stderr, "[ring] last %d instructions (oldest first):\n", (int)n);
+    for (u64 k = r->pos - n; k < r->pos; k++) {
+        unsigned i = (unsigned)(k % RING_N);
         fprintf(stderr, "  pc=0x%llx insn=0x%08x x0=0x%llx x1=0x%llx x2=0x%llx\n",
-                (unsigned long long)g_ringbuf[i].pc, g_ringbuf[i].insn,
-                (unsigned long long)g_ringbuf[i].x0, (unsigned long long)g_ringbuf[i].x1,
-                (unsigned long long)g_ringbuf[i].x2);
+                (unsigned long long)r->e[i].pc, r->e[i].insn,
+                (unsigned long long)r->e[i].x0, (unsigned long long)r->e[i].x1,
+                (unsigned long long)r->e[i].x2);
     }
+    funlockfile(stderr);
+}
+void cpu_diag_release(CPU *c) {
+    free(c->eng.ring);
+    c->eng.ring = NULL;
 }
 
 /* Lightweight hot-PC profiler (g_prof). A direct-mapped histogram that
  * tells whether the CPU is spinning in a tight loop vs. making broad progress.
- * Off by default; one predictable branch in the step loop when enabled. */
+ * Off by default; one predictable branch in the step loop when enabled. One
+ * table per process, which concurrent guest threads update atomically: a slot
+ * is claimed by a compare-and-swap of its key (pc | 1, so 0 marks a free slot
+ * and pc 0 has a key too), its hits are an atomic add. */
 #define PROF_SLOTS 65536
-static struct { u64 pc; u64 hits; } g_prof_tab[PROF_SLOTS];
+static struct { _Alignas(16) u64 key; u64 hits; } g_prof_tab[PROF_SLOTS];
 static void prof_record(u64 pc) {
+    u64 key = pc | 1;
     unsigned i = (unsigned)((pc >> 2) & (PROF_SLOTS - 1));
     /* linear probe a few slots to limit collisions */
     for (int k = 0; k < 8; k++) {
         unsigned j = (i + k) & (PROF_SLOTS - 1);
-        if (g_prof_tab[j].hits == 0 || g_prof_tab[j].pc == pc) {
-            g_prof_tab[j].pc = pc; g_prof_tab[j].hits++; return;
+        u64 cur = __atomic_load_n(&g_prof_tab[j].key, __ATOMIC_RELAXED);
+        if (cur == 0 &&
+            __atomic_compare_exchange_n(&g_prof_tab[j].key, &cur, key, false,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            cur = key;                   /* claimed; else cur is the winner's */
+        if (cur == key) {
+            __atomic_fetch_add(&g_prof_tab[j].hits, 1, __ATOMIC_RELAXED);
+            return;
         }
     }
-    g_prof_tab[i].hits++;   /* collision overflow: still counts */
+    /* collision overflow: still counts */
+    __atomic_fetch_add(&g_prof_tab[i].hits, 1, __ATOMIC_RELAXED);
 }
-void prof_dump(void) {
+void prof_dump(const char *title) {
     if (!g_prof) return;
+    flockfile(stderr);
     /* selection of the top 25 by hits */
     for (int n = 0; n < 25; n++) {
         unsigned best = 0; u64 bh = 0;
-        for (unsigned j = 0; j < PROF_SLOTS; j++)
-            if (g_prof_tab[j].hits > bh) { bh = g_prof_tab[j].hits; best = j; }
+        for (unsigned j = 0; j < PROF_SLOTS; j++) {
+            u64 h = __atomic_load_n(&g_prof_tab[j].hits, __ATOMIC_RELAXED);
+            if (h > bh) { bh = h; best = j; }
+        }
         if (bh == 0) break;
+        if (title && n == 0) fprintf(stderr, "[prof] %s\n", title);
         fprintf(stderr, "[prof] pc=0x%llx hits=%llu\n",
-                (unsigned long long)g_prof_tab[best].pc, (unsigned long long)bh);
-        g_prof_tab[best].hits = 0;   /* consume */
+                (unsigned long long)(g_prof_tab[best].key & ~1ULL),
+                (unsigned long long)bh);
+        __atomic_store_n(&g_prof_tab[best].hits, 0, __ATOMIC_RELAXED); /* consume */
     }
+    funlockfile(stderr);
+}
+void prof_reset(void) {
+    memset(g_prof_tab, 0, sizeof g_prof_tab);
 }
 
 void cpu_reset(CPU *c, u64 entry, unsigned reset_el) {
@@ -199,14 +233,22 @@ bool cond_holds(CPU *c, unsigned cond) {
  * debugging is enabled, preserving interpreter throughput. */
 int g_debug_hooks = 0;
 
+bool cpu_step_diag_on(void) {
+    return g_trace || g_rtrace || g_prof || g_ring || g_tpc != 0;
+}
+
 /* Run the active per-instruction debug facilities. Returns true if execution
  * should stop (the coverage divergence finder hit a foreign PC). Only ever
- * called when g_debug_hooks is set. */
+ * called when g_debug_hooks is set. Each line is printed by one call, which
+ * stdio makes one write: a guest thread's line is never torn by another's. */
 static bool step_debug(CPU *c, u32 insn) {
     if (g_rtrace) {
-        fprintf(stderr, "P%llx", (unsigned long long)c->pc);
-        for (int i = 0; i < 31; i++) fprintf(stderr, " %llx", (unsigned long long)c->x[i]);
-        fprintf(stderr, " S%llx\n", (unsigned long long)*cpu_cur_sp(c));
+        char b[640];
+        int n = snprintf(b, sizeof b, "P%llx", (unsigned long long)c->pc);
+        for (int i = 0; i < 31; i++)
+            n += snprintf(b + n, sizeof b - n, " %llx", (unsigned long long)c->x[i]);
+        snprintf(b + n, sizeof b - n, " S%llx\n", (unsigned long long)*cpu_cur_sp(c));
+        fputs(b, stderr);
     }
     if (g_trace) {
         fprintf(stderr, "%016llx: %08x  [el%u nzcv=%c%c%c%c]\n",
@@ -220,17 +262,21 @@ static bool step_debug(CPU *c, u32 insn) {
     if (g_cov_n && c->icount > 1000 && !cov_has(c->pc)) {
         fprintf(stderr, "[cov] FIRST FOREIGN PC=0x%llx insn=0x%08x icount=%llu el=%u\n",
                 (unsigned long long)c->pc, insn, (unsigned long long)c->icount, c->el);
-        ring_dump();
+        ring_dump(c);
+        c->diag_stop = true;
         cpu_stop(c);
         return true;
     }
     if (g_tpc && c->pc == g_tpc) {
-        fprintf(stderr, "[tpc] pc=0x%llx insn=0x%08x el=%u sp=0x%llx\n",
-                (unsigned long long)c->pc, insn, c->el,
-                (unsigned long long)*cpu_cur_sp(c));
+        char b[1024];
+        int n = snprintf(b, sizeof b, "[tpc] pc=0x%llx insn=0x%08x el=%u sp=0x%llx\n",
+                         (unsigned long long)c->pc, insn, c->el,
+                         (unsigned long long)*cpu_cur_sp(c));
         for (int i = 0; i < 31; i++)
-            fprintf(stderr, " x%d=0x%llx", i, (unsigned long long)c->x[i]);
-        fprintf(stderr, "\n");
+            n += snprintf(b + n, sizeof b - n, " x%d=0x%llx", i,
+                          (unsigned long long)c->x[i]);
+        snprintf(b + n, sizeof b - n, "\n");
+        fputs(b, stderr);
     }
     return false;
 }
@@ -315,7 +361,7 @@ void cpu_raise_sync(CPU *c, u64 esr, u64 far) {
         fprintf(stderr, "[sync] faulting pc=0x%llx esr=0x%llx (ec=0x%llx) far=0x%llx\n",
                 (unsigned long long)c->cur_insn_pc, (unsigned long long)esr,
                 (unsigned long long)(esr >> 26), (unsigned long long)far);
-        ring_dump();
+        ring_dump(c);
     }
     exception_take(c, EXC_SYNC, esr, far, c->cur_insn_pc);
 }

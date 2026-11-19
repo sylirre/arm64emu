@@ -120,6 +120,10 @@ typedef struct CpuEngine {
      * them along. */
     struct PDEnt *pd;
     struct JitEnv *jit;
+    /* The step diagnostics' own: the CPU's recent-instruction ring buffer
+     * (g_ring), allocated by its first record and, like the engines' state,
+     * the host thread's (cpu_diag_release). */
+    struct CpuRing *ring;
 } CpuEngine;
 
 typedef struct CPU {
@@ -205,6 +209,10 @@ typedef struct CPU {
     bool stop;         /* machine should terminate */
     bool reset;        /* PSCI SYSTEM_RESET: warm-reboot the machine, don't exit */
     bool event;        /* WFE event register: set by SEV/SEVL, consumed by WFE */
+    bool diag_stop;    /* a step diagnostic stopped the CPU (stop is set too):
+                        * the coverage finder left QEMU's path, and the run
+                        * ends there, whatever a stop means to the program
+                        * otherwise */
     /* Attention: the program's run loop has something to act on before more
      * guest code runs. The engines poll this one byte where they would
      * otherwise test every reason for it (cpu_attn below has the contract). */
@@ -413,17 +421,25 @@ bool cond_holds(CPU *c, unsigned cond);
 
 /* The step driver's diagnostics (cpu.c), set by the program from its command
  * line and environment; all off by default. Every per-instruction one runs
- * only in cpu_step, so the program also sets g_debug_hooks when any is on and
- * keeps the batching engines out of the way. */
+ * only in cpu_step, so the program also sets g_debug_hooks when any is on
+ * (cpu_step_diag_on) and keeps the batching engines out of the way. They hold
+ * up where guest threads run concurrently: each CPU records its own ring, the
+ * profile is counted atomically, and each line a step prints is one write. */
 extern int g_trace;        /* per-instruction trace */
 extern int g_singlestep;   /* unused placeholder for parity with QEMU */
 extern int g_dbg;          /* targeted device/IRQ debug */
 extern int g_rtrace;       /* compact register trace for differential debugging */
-extern int g_prof;         /* hot-PC profiler */
-void prof_dump(void);      /* print the hottest PCs (no-op unless g_prof) */
+extern int g_prof;         /* hot-PC profiler, one per process */
+/* Print the hottest PCs (no-op unless g_prof), headed by `title` when it is
+ * not NULL and there is anything to print; prof_reset forgets them all. */
+void prof_dump(const char *title);
+void prof_reset(void);
 extern u64 g_tpc;          /* dump CPU state when pc == this */
-extern int g_ring;         /* ring-buffer recent steps */
-void ring_dump(void);      /* print the recent-instruction ring buffer */
+extern int g_ring;         /* ring-buffer recent steps, per CPU */
+void ring_dump(CPU *c);    /* print the CPU's recent-instruction ring buffer */
+void cpu_diag_release(CPU *c);  /* free the CPU's ring (its thread ends) */
+/* Whether any of the step driver's per-instruction diagnostics is on. */
+bool cpu_step_diag_on(void);
 extern u64 g_watch;        /* log writes to [g_watch, g_watch+8) */
 extern int g_debug_hooks;  /* OR of all per-step debug facilities (perf guard) */
 extern int g_iabort_log;   /* log instruction aborts */
@@ -431,7 +447,10 @@ extern int g_rtclock;      /* drive the generic timer + RTC from the host clock
                               (default); 0 selects the deterministic
                               instruction-count clock (debug) */
 extern u64 g_vawatch;      /* log writes whose range covers this VA */
-void cov_load(const char *path);  /* load QEMU coverage PC set (divergence finder) */
+/* Load the coverage-divergence finder's PC set (QEMU's, one hex PC per line):
+ * the first PC past the first 1000 instructions that is not in it prints the
+ * CPU's ring and stops the CPU (diag_stop). */
+void cov_load(const char *path);
 /* The program's own per-instruction diagnostics, when it sets them:
  * cpu_step_hook runs in cpu_step for every instruction, before it executes
  * (with g_debug_hooks set), cpu_svc_hook before every SVC. */

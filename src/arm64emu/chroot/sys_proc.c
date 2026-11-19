@@ -84,6 +84,7 @@ static __attribute__((noreturn)) void process_exit(CPU *c) {
     tmpfs_session_cleanup(m);   /* session root only: drop emulated tmpfs trees */
     proctab_unregister((s32)getpid());
     ptrace_wake_waiters();      /* wake a parent polling in wait4 */
+    diag_prof_flush(m);         /* ARM64EMU_PROF: the program's profile */
     jit_stats_flush();
     _exit(code);                /* terminates the whole process (all threads) */
 }
@@ -866,6 +867,7 @@ static void *thread_entry(void *arg) {
      * synced (fpcr_host_sync). Before the first guest access below. */
     as_cpu_attach(c);
     c->host_fzmode = HOST_FZMODE_UNKNOWN;
+    c->icount = 0;              /* its own count (--max-insn), from its start */
     sig_sync_host_mask(c->m);   /* the creator's mask, as clone gives it -- the
                                  * host thread inherited the creator's host
                                  * mask, gate bits and all; make it this one's */
@@ -905,6 +907,7 @@ static void *thread_entry(void *arg) {
     ptrace_tracer_thread_exit();
     jit_cpu_release(c);
     pd_cache_free(c);
+    cpu_diag_release(c); /* and the step diagnostics' ring */
     sig_thread_exit();   /* what it caught for the process, to another thread */
     sig_tls_release();   /* and whatever this thread's signal queue grew into */
     sig_kick_timer_fini();
@@ -3474,6 +3477,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     }
 
     /* Point of no return: tear down and reload. */
+    diag_prof_flush(m);   /* ARM64EMU_PROF: the replaced program's profile */
     /* The personality the new image runs with: the exec'ing thread's, less
      * what a setuid/setgid exec takes away (begin_new_exec's per_clear, on
      * exactly the bits bprm_fill_uid judged above, whether or not the ids

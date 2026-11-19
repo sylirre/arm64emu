@@ -26,7 +26,8 @@ arm64emu chroot [options] <rootfs> <program> [args...]
 reference — options and environment variables — reflowed to your terminal.
 Options are GNU-style (`--long`, `--opt=VAL`, clustered short ones), and the
 engine options mean the same in both modes: `-j/--jit`, `--no-predecode`,
-`-d/--debug` (a per-instruction trace).
+and the diagnostics `-d/--debug`, `--reg-trace` and `--max-insn N` (see
+[Diagnostics](#diagnostics)).
 
 > **Breaking change (2.0).** arm64emu and arm64chroot used to be two
 > programs; they are one now. `arm64chroot ARGS` is `arm64emu chroot ARGS`,
@@ -110,8 +111,9 @@ read-only and advertises VIRTIO_BLK_F_RO), `--net` user-mode networking
 separate guest terminal, `--console-fd DEV=RFD[:WFD]` bind `ttyAMA0`/`hvcN` to
 inherited descriptors instead of the terminal (with `--ctrl-fd FD` carrying
 their window sizes — see `tests/arm64emu/boot/scripts/console_mux.c`),
-`--bin FILE[@ADDR]` load a flat binary (bare-metal tests), `--reg-trace`
-register trace, `--max-insn N` stop after N instructions.
+`--bin FILE[@ADDR]` load a flat binary (bare-metal tests), and the
+diagnostics both modes have: `--reg-trace` register trace, `--max-insn N`
+stop after N instructions ([Diagnostics](#diagnostics)).
 
 **Several guest terminals (`--console ,count=N`, `--console-fd`).** Each
 virtio-console device is one more guest tty — `hvc0`, `hvc1`, … — and each can
@@ -180,11 +182,15 @@ Getting the login onto hvc0 depends on how you boot:
 Note that host resize events make `virtio` mode as non-deterministic as any
 keyboard input; the default `pl011` path is untouched.
 
-Debug/bring-up env vars (all off by default, no runtime cost when unset):
-`ARM64EMU_DBG=N` device/IRQ + fw_cfg/flash logging, `ARM64EMU_PROF=1` hot-PC profiler,
-`ARM64EMU_RING=1` recent-instruction ring buffer, `ARM64EMU_TPC=0xADDR` dump CPU state at a PC,
-`ARM64EMU_WATCH=0xADDR` watch writes to an address, `ARM64EMU_IABORT=1` log instruction aborts,
-`ARM64EMU_COV=file` coverage-divergence finder (see below).
+Debug/bring-up env vars (all off by default, no runtime cost when unset): the
+step diagnostics both modes have, `ARM64EMU_PROF=1` hot-PC profiler,
+`ARM64EMU_RING=1` recent-instruction ring buffer, `ARM64EMU_TPC=0xADDR` dump CPU
+state at a PC and `ARM64EMU_COV=file` coverage-divergence finder (see below and
+[Diagnostics](#diagnostics)); and boot mode's own, `ARM64EMU_DBG=N` device/IRQ +
+fw_cfg/flash logging, `ARM64EMU_WATCH=0xADDR` watch writes to a physical address,
+`ARM64EMU_VAW=0xVA` to a virtual one, `ARM64EMU_IABORT=1` log instruction aborts,
+`ARM64EMU_SYS=1` trace the guest's mm syscalls, `ARM64EMU_HEAP=1` musl-heap
+double-alloc finder.
 
 The generic timer and PL031 RTC follow the host wall clock by default. Set
 `ARM64EMU_RTCLOCK=0` to switch both to a deterministic instruction-count clock and a
@@ -301,6 +307,11 @@ arm64emu chroot [options] <rootfs> <program> [args...]
                           (symbolic flags, quoted strings, structs, errno)
   -d, --debug             Per-instruction trace (very verbose; forces the
                           interpreter)
+      --reg-trace         Compact per-instruction register trace (forces the
+                          interpreter)
+      --max-insn N        Stop after N instructions and dump the CPU state:
+                          per guest thread, from the start of its program;
+                          the process ends as SIGKILL would
   -j, --jit               Translate hot code to native code (AArch64 /
                           x86-64 / i686 / ARM32 hosts; falls back to the
                           interpreter elsewhere)
@@ -612,6 +623,45 @@ Both modes run one AArch64 CPU (`lib/arm64`):
 What remains unimplemented is deliberately unadvertised (PAuth/BTI/MTE/SVE —
 see [todo/TODO_OPCODES.md](todo/TODO_OPCODES.md)).
 
+### Diagnostics
+
+The CPU's step driver carries diagnostics that work the same in both modes,
+all off by default. All except `--max-insn` run per instruction, so they force
+the plain interpreter (`--jit` says so and steps aside):
+
+- `-d/--debug`: a per-instruction trace, `<pc>: <insn>  [elN nzcv=....]`.
+- `--reg-trace`: a compact one, `P<pc> <x0> … <x30> S<sp>` a line, for
+  diffing against another engine or QEMU.
+- `--max-insn N`: stop after N instructions, dump the CPU state (and the ring
+  buffer), exactly at N in every engine, the JIT included: compare two
+  engines' dumps to find the first instruction where they diverge.
+- `ARM64EMU_PROF=1`: the 25 hottest PCs.
+- `ARM64EMU_RING=1`: each CPU's last 96 instructions, printed when the run is
+  cut short.
+- `ARM64EMU_TPC=0xPC`: the registers, each time the pc hits that address.
+- `ARM64EMU_COV=FILE`: stop at the first PC (after 1000 instructions) missing
+  from a QEMU PC set and print the ring.
+
+In boot mode there is one CPU and one run: the profile is printed at exit and
+on SIGINT/SIGTERM, the ring on those signals, at a halt with no wake source
+and wherever the run stops early.
+
+Chroot mode runs one CPU per guest thread, in as many processes as the guest
+makes:
+
+- `--max-insn` counts per thread, from the start of the program the thread
+  runs. An execve restarts the count, a new thread starts at 0, and a forked
+  child carries on its parent's count.
+- The first thread to reach the limit ends its process as SIGKILL would, so a
+  guest parent never takes a program that was cut short for one that
+  succeeded. The coverage finder ends the process the same way.
+- Each thread keeps its own ring, printed when its process dies of a signal.
+- The profile is one per program, counted across all its threads. It is
+  printed, headed `[prof] pid <pid> <path>`, at the execve that replaces the
+  program and when the process ends, a fatal signal included. A forked child
+  starts with an empty profile.
+- Each trace line is written whole, so concurrent threads never tear one.
+
 ## Embedding
 
 Built with `-DANDROID_JNI`, `main()` becomes `arm64emu_main()`, which takes the
@@ -697,8 +747,9 @@ lib/arm64/        the AArch64 emulation both modes run:
                   threads) and ops (what the library asks of the mode); run
                   control (the engines' contract with the run loop)
   cpu.c           fetch/decode/execute driver, interrupt delivery, SPSR
-                  pack/unpack (ERET), condition codes, dump, hot-PC profiler /
-                  ring buffer / coverage-divergence finder
+                  pack/unpack (ERET), condition codes, dump, the step
+                  diagnostics: register trace, hot-PC profiler, per-CPU ring
+                  buffer, coverage-divergence finder
   mem.h           guest memory as the core reaches it: typed accesses, fetch and
                   mem_host_ptr inline over the CPU's translation caches (D-TLB,
                   fetch cache); the slow paths are the mode's
@@ -721,6 +772,8 @@ lib/arm64/        the AArch64 emulation both modes run:
 src/arm64emu/     what both modes share:
   main.c          the entry: hands the command line to the mode it names
   cli.{h,c}       the help renderer, option helpers, version, engine options
+                  (the diagnostics' --reg-trace, --max-insn and environment
+                  among them)
   embed.h         the embedded build's exit -> _exit shadow
 src/arm64emu/boot/  boot mode:
   main.c          its CLI, image loading, the run loop, signal-flush of
@@ -754,7 +807,9 @@ src/arm64emu/chroot/  chroot mode:
                   through the CPU's attention)
   loop.c          run loop + exception dispatch + signal delivery point +
                   the thread call-out safepoint (stop_gen) + EL0's view of the
-                  ID registers (the kernel's MRS emulation)
+                  ID registers (the kernel's MRS emulation) + the step
+                  diagnostics' ends (--max-insn's stop, the profile per
+                  program, the ring at a fatal signal)
   jit/            the JIT's coherence with the guest address space:
                   coherence.{h,c}, the thread registry, the sticky code-page
                   map, invalidation by VA range, execve/fork

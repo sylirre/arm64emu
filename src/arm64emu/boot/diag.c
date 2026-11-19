@@ -201,7 +201,7 @@ static void heaptrack_step(CPU *c, u32 insn) {
                         (unsigned long long)env, hit_env ? "YES" : "no",
                         hit_live ? "YES" : "no", (unsigned long long)vsz, (unsigned long long)vsite);
                     ht_dump_words(c, ret, 6);
-                    ring_dump();
+                    ring_dump(c);
                 }
                 if (g_heap_at && ret <= g_heap_at && g_heap_at < ret + (ht_call.size ? ht_call.size : 1))
                     fprintf(stderr, "[AT] %s ret=0x%llx size=%llu (AT +0x%llx) callsite=0x%llx ic=%llu ttbr=0x%llx __environ=0x%llx\n",

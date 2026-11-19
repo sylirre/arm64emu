@@ -313,7 +313,7 @@ static bool mmu_write_slow(CPU *c, u64 va, unsigned size, u64 val) {
                     (unsigned long long)va, size, (unsigned long long)val,
                     (unsigned long long)c->cur_insn_pc, c->el, (unsigned long long)c->icount);
             heaptrack_query(c, va);
-            if (c->el == 0) ring_dump();   /* EL0 writes are the suspect ash overrun */
+            if (c->el == 0) ring_dump(c);   /* EL0 writes are the suspect ash overrun */
         }
     }
     u64 off = va & 0xfffULL;

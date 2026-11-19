@@ -54,6 +54,17 @@ int jit_backend_available(void);
  * (jit_on) and the call returns having run nothing. */
 void jit_run(CPU *c, u64 deadline);
 
+/* The deadline to give jit_run, at most `want`, where the run loop must stop
+ * at icount == `limit` exactly (--max-insn; 0: no limit): a block short of
+ * the limit, since a block may overrun its deadline; or 0 within two blocks
+ * of it, where the loop single-steps (cpu_step) instead. The predecoded tier
+ * stops at its deadline exactly and needs none of this. */
+static inline u64 jit_deadline(const CPU *c, u64 want, u64 limit) {
+    if (!limit) return want;
+    if (limit - c->icount < 2 * JIT_MAX_BLOCK_INSNS) return 0;
+    return want < limit - JIT_MAX_BLOCK_INSNS ? want : limit - JIT_MAX_BLOCK_INSNS;
+}
+
 /* ---- the program's use of a CPU's JIT ----
  * All of these are no-ops for a CPU whose JIT was never set up. */
 

@@ -101,8 +101,10 @@ lib/arm64/                the AArch64 emulation both modes run (compiled once
   cpu.c                   reset, cpu_step (fetch/decode/execute driver),
                           interrupt delivery (cpu_take_interrupt), SPSR
                           pack/unpack, condition codes, cpu_dump, and the
-                          step diagnostics: coverage-divergence finder, PC
-                          ring buffer, hot-PC profiler, the program's hooks
+                          step diagnostics: register trace, coverage-
+                          divergence finder, per-CPU ring buffer, hot-PC
+                          profiler (one per process, atomic), the program's
+                          hooks
   mem.h                   guest memory as the core reaches it: typed accesses,
                           fetch and mem_host_ptr, inline over the CPU's
                           translation caches (c->eng: the D-TLB, whose entry
@@ -155,8 +157,10 @@ src/arm64emu/             what both modes share:
                           (-DANDROID_JNI) build
   cli.h, cli.c            both modes' command line: the help renderer, the
                           option helpers, the version, the engine options
-                          (-d/--debug, -j/--jit, --no-predecode) and the
-                          engines' knobs in --help (ARM64EMU_JIT_*, PD_MAX)
+                          (-d/--debug, -j/--jit, --no-predecode, --reg-trace,
+                          --max-insn), the step diagnostics' environment
+                          (ARM64EMU_PROF/RING/TPC/COV) and the engines' knobs
+                          in --help (ARM64EMU_JIT_*, PD_MAX)
   embed.h                 the -DANDROID_JNI build's exit -> _exit shadow,
                           forced into its every unit (-include)
 src/arm64emu/boot/        boot mode: a full system, the QEMU 'virt' machine
@@ -238,6 +242,9 @@ src/arm64emu/chroot/      chroot mode: Linux user space (`arm64emu chroot`)
   loop.c                  Run loop + exception dispatch + signal delivery point
                           + the thread call-out safepoint (stop_gen) + EL0's
                           view of the ID registers (the kernel's MRS emulation)
+                          + the step diagnostics' ends: --max-insn's stop (the
+                          process as SIGKILL ends it), ARM64EMU_PROF per
+                          program, the ring at a fatal signal
   jit/                    The optional --jit's coherence with the guest address
                           space (AArch64, x86-64, i686 & ARM32 hosts):
     coherence.c coherence.h
@@ -489,12 +496,23 @@ No `-E` is needed for these: the guest gets PATH=/usr/local/sbin:/usr/local/bin:
 
 ## Diagnostics
 
-Command line options (`--debug` and `--no-predecode` are both modes'):
+Command line options (all but the two `--strace` ones are both modes'):
 
 * `--strace` (chroot mode): log every guest system call in format `PID name(nr,a0..a5) = ret`, also does a full register dump when the guest dies from a fatal signal.
 * `--strace-full` (chroot mode): the same trace decoded strace-style — symbolic flags, quoted strings, `execve` argv/envp arrays, read/write buffer contents and output strings (`getcwd`, `readlinkat`), errno-named returns, and `{field=...}` common-struct pretty-printing (decoder in `src/arm64emu/chroot/strace.c`). Plain `--strace` keeps its compact qemu-diffable layout.
 * `--debug`: per-instruction trace in format `<pc>: <insn-word>  [elN nzcv=....]`, forces the interpreter.
+* `--reg-trace`: compact per-instruction register trace, `P<pc> <x0> ... <x30> S<sp>` a line, forces the interpreter.
+* `--max-insn N`: stop after N retired instructions and dump the CPU state (and the ring, with `ARM64EMU_RING`), at N exactly in every engine — bisect it to find the first instruction two engines disagree on. In chroot mode each guest thread counts its own from the start of its program (execve restarts it, a new thread starts at 0, a fork child carries on its parent's count), the first to reach N ends its process as SIGKILL would, and the JIT runs unchained meanwhile (generated code checks no deadline in user mode).
 * `--no-predecode`: disable decoded-instruction cache, use it to decide whether a bug lives in the predecode fast path or the real decoder.
+
+The step driver's diagnostics (`lib/arm64/cpu.c`, both modes; all force the interpreter):
+
+* `ARM64EMU_PROF=1`: hot-PC profiler, the 25 hottest PCs. Boot mode prints it at exit and on SIGINT/SIGTERM; chroot mode once per program, headed `[prof] pid <pid> <path>`, at the execve that replaces it and at its process's end (a fatal signal included), counted atomically across the program's threads; a fork child starts empty.
+* `ARM64EMU_RING=1`: each CPU's last 96 instructions (pc, word, x0..x2), printed when the run is cut short: --max-insn, a coverage divergence, SIGINT/SIGTERM or a halt with no wake source in boot mode, a fatal signal in chroot mode (the dying thread's).
+* `ARM64EMU_TPC=0xPC`: dump the registers each time the pc hits this address.
+* `ARM64EMU_COV=FILE`: coverage-divergence finder — the first PC, past the first 1000 instructions, missing from a QEMU PC set (one hex PC per line) prints the ring and stops the run (chroot mode: the process, as SIGKILL would).
+
+Every line these print is one write, so concurrent guest threads never tear one another's.
 
 JIT debugging environment variables:
 
@@ -548,5 +566,3 @@ Tuning:
 
 * `ARM64EMU_JIT_MB`: JIT code-cache size in MiB per guest CPU — per guest thread in chroot mode (default 32, clamped 1–128; 1–32 on ARM32 hosts).
 * `XDG_RUNTIME_DIR`, `TMPDIR`: first writable one holds the backing directories of emulated tmpfs mounts (removed when the session ends; a session killed before it could clean up is swept by the next one), plus the --shared-proc *fallback* registry file and the System V shm segment backings when the diskless broker (memfd) is unavailable and /dev/shm isn't writable (Termux). The shm backings are unlinked the moment they are created (the broker hands attachers the descriptor, never a name), so only the registry file has one — and it is refused unless it is a regular file owned by this user that nobody else can reach.
-
-Note: the shared step driver (`lib/arm64/cpu.c`) carries several per-step diagnostics — g_rtrace (compact register trace), g_prof (hot-PC profiler), g_ring (recent-step ring buffer), g_tpc (dump state at a target PC), and the coverage-divergence finder (cov_load) — that boot mode sets from its options and ARM64EMU_* environment (`--reg-trace`, `--max-insn`, `ARM64EMU_PROF`, ...). Chroot mode does not wire them up yet: they stay 0 there unless you edit the source and rebuild.

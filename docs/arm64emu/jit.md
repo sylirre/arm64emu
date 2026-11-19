@@ -136,7 +136,9 @@ loop at `machine_tick` cadence; an IRQ line raised mid-slice by
 synchronous MMIO raises the CPU's attention, which the dispatcher checks
 between blocks. `--max-insn` is exact: the run loop caps the deadline a
 block short of the limit and single-steps the last stretch through
-`cpu_step`.
+`cpu_step` (`jit_deadline`, jit.h, which chroot mode's loop uses too; there
+generated code checks no deadline, so under one `jit_run` neither chains
+blocks nor fills the jump cache, and every block ends in the dispatcher).
 
 **System instructions.** Hints, DMB/DSB (no-ops in an in-order
 interpreter), `DC ZVA` (eight probed zero stores, mirroring sysreg.c),

@@ -4567,6 +4567,7 @@ s64 sig_timedwait(CPU *c, u64 set, u64 info_va, s64 timeout_ns) {
 }
 
 void guest_terminate_by_signal(CPU *c, int sig) {
+    diag_death(c);                       /* ring, profile, JIT statistics */
     robust_list_exit_group(c);           /* every thread's robust futexes:
                                           * OWNER_DIED, as at any death */
     vfork_child_flush(c);                /* a vfork child's writes reach its

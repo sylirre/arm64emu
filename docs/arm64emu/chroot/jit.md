@@ -62,7 +62,10 @@ branches (`BR`/`BLR`/`RET`) probe a per-thread guest-pc → host-code cache. An
 empty entry of it holds the all-ones key and, as its code, a miss entry that
 returns to the dispatcher, so even a branch that matches one (to the all-ones
 address) cannot reach a stale or NULL code pointer; a dropped block empties
-its own entry (`tests/arm64emu/chroot/c/brdropped.c`).
+its own entry (`tests/arm64emu/chroot/c/brdropped.c`). Neither is used under
+`--max-insn`: generated code here checks no instruction deadline (a full
+system's does, at block entry), so the dispatcher must see every block end to
+stop at the limit exactly.
 
 **Per-thread everything.** Each guest thread runs its own CPU, and each CPU has
 its own `JitEnv` (`c->eng.jit`): code cache, block table, chain-edge list, jump

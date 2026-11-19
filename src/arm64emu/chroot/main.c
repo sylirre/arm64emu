@@ -80,6 +80,8 @@ static void help(void) {
         {"    --strace-full", "Like --strace, but decode arguments strace-style: "
                         "symbolic flags, quoted strings, structs, errno returns."},
         HELP_OPT_DEBUG,
+        HELP_OPT_REG_TRACE,
+        HELP_OPT_MAX_INSN,
         HELP_OPT_JIT,
         HELP_OPT_NO_PREDECODE,
         {"-l, --link2symlink", "Emulate hardlinks with tracked symlinks where "
@@ -127,6 +129,7 @@ static void help(void) {
                         "shm segment files when memfd_create is unavailable."},
     };
     static const struct help_def env_diag[] = {
+        HELP_ENV_STEP_DIAG,
         HELP_ENV_DIAG,
         {"ARM64EMU_PROCSTAT_FORCE_SYNTH", "Force the synthetic /proc/stat fallback."},
         {"ARM64EMU_PROCFS_FORCE_OLD", "Hide from the host's /proc what a kernel "
@@ -289,7 +292,8 @@ static void help(void) {
     fputc('\n', f);
     help_defs(f, env_tune, HELP_N(env_tune), w);
     fputc('\n', f);
-    help_wrap(f, "Diagnostics, for development:", w, 2, 0);
+    help_wrap(f, "Diagnostics, for development (the per-instruction "
+                 "facilities force the interpreter):", w, 2, 0);
     fputc('\n', f);
     help_defs(f, env_diag, HELP_N(env_diag), w);
 
@@ -481,6 +485,7 @@ static void emu_atfork_child(void) {
     netlink_locks_reinit();
     procfs_locks_reinit();
     jit_locks_reinit();
+    prof_reset();            /* ARM64EMU_PROF: the child's own profile */
 }
 static void emu_atfork_init(void) {
     pthread_atfork(emu_atfork_prepare, emu_atfork_parent, emu_atfork_child);
@@ -583,7 +588,7 @@ int chroot_main(int argc, char **argv)
             else if (!strcmp(n, "version"))      { if (val) opt_no_value(arg); version(); }
             else if (!strcmp(n, "strace"))       { if (val) opt_no_value(arg); m->strace = 1; }
             else if (!strcmp(n, "strace-full"))   { if (val) opt_no_value(arg); m->strace = 1; m->strace_full = 1; }
-            else if (engine_long_opt(n, val, arg)) ;
+            else if (engine_long_opt(n, val, arg, argv, argc, &i)) ;
             else if (!strcmp(n, "link2symlink")) { if (val) opt_no_value(arg); m->link2symlink = 1; }
             else if (!strcmp(n, "shared-proc"))  { if (val) opt_no_value(arg); m->shared_proc = 1; }
             else if (!strcmp(n, "no-dev"))       { if (val) opt_no_value(arg); m->no_dev = 1; }
@@ -615,10 +620,12 @@ int chroot_main(int argc, char **argv)
     }
     if (argc - i < 2) usage();
 
-    /* The trace is the one per-instruction facility here; --jit yields to it
-     * and to a host without a code generator, the interpreter being always
-     * the correct fallback. */
-    g_debug_hooks = g_trace;
+    /* The step diagnostics (--debug, --reg-trace, ARM64EMU_PROF/RING/TPC/COV)
+     * are the per-instruction facilities here; --jit yields to them and to a
+     * host without a code generator, the interpreter being always the correct
+     * fallback. --max-insn needs none of that: every engine stops at it. */
+    step_diag_env();
+    g_debug_hooks = cpu_step_diag_on();
     engine_settle(g_debug_hooks);
 
     /* Capture the real invoking identity (stat remap source) and, in fake mode,
