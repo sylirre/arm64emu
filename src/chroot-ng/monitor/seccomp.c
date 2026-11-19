@@ -129,7 +129,7 @@ static const int id_syscalls[] = {
 
 /* System V IPC: always trapped, always emulated (shm.c, sysvipc.c). Android
  * denies the whole family, and trapping them everywhere keeps one guest
- * namespace whatever the host would have allowed — the same choice arm64chroot
+ * namespace whatever the host would have allowed — the same choice arm64emu
  * makes, and the reason a guest cannot reach a host semaphore or have its
  * queues turn up in the host's `ipcs`. */
 static const int ipc_syscalls[] = {
@@ -139,7 +139,7 @@ static const int ipc_syscalls[] = {
 };
 #define NIPC ((int)(sizeof(ipc_syscalls) / sizeof(ipc_syscalls[0])))
 
-/* The designed-ENOSYS set — arm64chroot's `quiet_enosys`, and the one piece of
+/* The designed-ENOSYS set — arm64emu's `quiet_enosys`, and the one piece of
  * policy chroot-ng needs that is not translation. These are syscalls a guest
  * probes and falls back from, which we must refuse rather than let through:
  * every one of them reaches the filesystem by a route the path traps cannot see,
@@ -242,7 +242,7 @@ static const int enosys_syscalls[] = {
      * `ls /dev/mqueue`) and charged against the host's RLIMIT_MSGQUEUE. Android
      * denies all six outright — they predate the app allow-list and Bionic never
      * issues them — so refusing is also what the guest already sees there, and it
-     * is the oracle's answer (arm64chroot has no handler at all). The
+     * is the oracle's answer (arm64emu has no handler at all). The
      * descriptor-taking four are listed with the two name-taking ones: without a
      * queue there is nothing to send on, and a bare mq_getsetattr on some other
      * fd must not half-work. */
@@ -742,7 +742,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
      * dispatcher, which regenerates the content when the read starts at offset
      * 0 — otherwise top and vmstat, which lseek(0)+reread a held fd, would show
      * frozen numbers. The whole read family is covered (read, readv, pread64,
-     * preadv, preadv2), matching the refresh hooks arm64chroot applies.
+     * preadv, preadv2), matching the refresh hooks arm64emu applies.
      * Filtering on "fd >= base" keeps every ordinary read untrapped; a guest
      * fd that happens to land in the range is simply re-issued. The kernel
      * truncates the fd argument to 32 bits, so the low word is exactly what it

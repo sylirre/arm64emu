@@ -1,0 +1,768 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Internal helpers shared by the syscall handler files (sys_*.c). */
+#ifndef A64_SYS_H
+#define A64_SYS_H
+
+#include <errno.h>
+#include <fcntl.h>     /* AT_FDCWD: a pin with nothing to pin (machine.h) */
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>   /* socklen_t (sock_addr_out) */
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>     /* struct iovec (GuestXfer) */
+#include <time.h>
+#include <unistd.h>
+
+#include "machine.h"
+#include "guest_abi.h"
+
+typedef u64 (*sysfn)(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5);
+
+#define SYSDEF(name) \
+    u64 sys_##name(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)
+
+/* Convert the current host errno to a guest return value. The generic errno
+ * values are identical on x86, x86_64, arm and arm64, so this is a sign flip.
+ *
+ * It reads errno as it stands NOW, so a handler that has anything to clean up
+ * has to take the value first and free/close afterwards -- the idiom is
+ *
+ *     u64 e = r < 0 ? host_err() : (u64)r;
+ *     free(buf); if (fd >= 0) close(fd);
+ *     return e;
+ *
+ * close(2) sets errno outright, and free(3) is only required not to touch it
+ * by POSIX-2008 -- which the allocators this builds against honour to varying
+ * degrees, Bionic's releasing pages of its own as it goes. Getting this wrong
+ * hands the guest an errno from the cleanup instead of from its syscall, which
+ * is both wrong and untraceable. */
+static inline u64 host_err(void) { return (u64)(s64)(-errno); }
+
+/* CLOCK_MONOTONIC now, in nanoseconds -- the clock the kernel's own timeouts
+ * run on (poll_select_set_timeout uses ktime_get_ts64): recvmmsg's deadline,
+ * the remainder ppoll/pselect6 write back, the restart accounting. */
+static inline u64 mono_ns(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
+}
+
+/* A relative timespec as nanoseconds, and a deadline made from one -- both
+ * saturating, the way a kernel's timespec64_to_ktime and timespec64_add_safe
+ * saturate. The guest's seconds are 64 bits wide and valid up to the last of
+ * them, so a span past 2^64 ns (some 584 years) means "never": multiplied
+ * out, it wrapped to whatever the product left -- 2^60 seconds is exactly 0,
+ * and a wait of that span ended at once. A saturated deadline compares as
+ * later than any clock reading. */
+static inline u64 span_ns_sat(u64 sec, u64 nsec) {
+    if (sec > (UINT64_MAX - nsec) / 1000000000ULL) return UINT64_MAX;
+    return sec * 1000000000ULL + nsec;
+}
+static inline u64 deadline_sat(u64 now, u64 span) {
+    return span > UINT64_MAX - now ? UINT64_MAX : now + span;
+}
+
+/* ---- one transfer's byte count ------------------------------------------
+ * A read/write count is a guest u64 and this emulator has to turn it into a
+ * host size_t and host memory to move the bytes through (GuestXfer, below),
+ * neither of which the kernel needs: it copies straight between the file and
+ * the caller's own pages.
+ *
+ * rw_count bounds it the way the kernel does. MAX_RW_COUNT is INT_MAX rounded
+ * down to a page, and rw_verify_area clamps a larger request rather than
+ * refusing it, so a guest that asks for more gets a short transfer -- which
+ * read(2) and write(2) are always allowed to return. Clamping before the cast
+ * is what makes it right on both host widths: on an ILP32 host the cast alone
+ * turns a 64-bit count into an unrelated small one and moves the wrong number
+ * of bytes.
+ *
+ * rw_room then measures the guest's own buffer: the run of pages from `va`
+ * that are actually mapped for `acc`, up to `len`. A kernel copies straight
+ * between the file and the caller's pages and faults where they stop, so
+ * nothing past this point can ever be moved, and finding host memory for it
+ * would let a guest name a length (read(fd, buf, 1 TB) with no such buf) that
+ * the emulator, not the guest, has to find room for. What the fault then
+ * MEANS is the file's business, not the emulator's -- a short transfer, an
+ * EFAULT with nothing consumed, a datagram gone, or an answer that never
+ * looks at the buffer at all -- so the part past the room is not dropped but
+ * handed to the host as a fault in the same place (XferCut, below). */
+#define A64_MAX_RW_COUNT 0x7ffff000u
+static inline size_t rw_count(u64 n) {
+    return (size_t)(n > A64_MAX_RW_COUNT ? A64_MAX_RW_COUNT : n);
+}
+/* The kernel's access_ok, for a buffer a transfer names (vfs_read's and
+ * vfs_write's, import_single_range's, import_iovec's per segment): all of it
+ * below the top of the user address space -- the tag of a tagged pointer taken
+ * off first for a thread that enabled the tagged-address ABI, and left on,
+ * failing, for one that has not (thread.h). A kernel checks it before it looks
+ * at the file's data, so a buffer that fails it is EFAULT at once -- after the
+ * descriptor's own checks, and before any wait: a read into no user buffer
+ * from an empty pipe does not block. XferCut.denied hands such a buffer to the
+ * host the same way (xfer_begin). */
+static inline int guest_access_ok(u64 va, u64 len) {
+    if (va >> 56) {
+        if (!(g_tls.tagged_addr_ctrl & 1)) return 0;
+        va = a64_untag(va);
+    }
+    return len <= GUEST_TASK_SIZE && va <= GUEST_TASK_SIZE - len;
+}
+
+static inline size_t rw_room(CPU *c, u64 va, size_t len, AccType acc) {
+    size_t done = 0;
+    while (done < len) {
+        u64 p = va + done;
+        size_t chunk = GUEST_PAGE_SIZE - (size_t)(p & GUEST_PAGE_MASK);
+        if (chunk > len - done) chunk = len - done;
+        if (!mem_reachable(c, p, (unsigned)chunk, acc)) break;
+        done += chunk;
+    }
+    return done;
+}
+
+/* ---- one transfer's bytes, between the guest and a host syscall ----------
+ * The host syscall needs host memory to move a transfer through, and this is
+ * where it comes from. It used to be a bounce buffer the size of the whole
+ * transfer: up to MAX_RW_COUNT per call, committed in full for a write (the
+ * copy in touches every page, even where the guest's own pages were never
+ * touched and cost it nothing), and reserved in full for a receive before the
+ * socket had anything to deliver -- far more than a kernel, which copies
+ * straight between the file and the caller's pages, ever needs.
+ *
+ * Now the bounce is only for small transfers (XFER_BOUNCE_MAX and under),
+ * where it is the cheapest thing to do -- at the guest's own offset into a
+ * page, which an O_DIRECT descriptor's alignment rule judges (xfer_stage). A larger one LENDS the guest's own
+ * backing to the host call (guest_lend, mem.c): the runs of host memory under
+ * the guest's buffer become the host call's iovecs, pinned for the duration,
+ * and the host kernel moves the bytes exactly as the guest's kernel would --
+ * a datagram whole, a regular-file write atomic against its neighbours, a peek
+ * as long as the guest asked for. What little is still staged is capped at
+ * XFER_STAGE_MAX a call:
+ *
+ *   - A guest segment the host can only reach as several runs (a buffer
+ *     straddling two mappings) is lent as several host iovecs. That is the
+ *     same transfer for a regular file, a block device, a pipe, a socket and
+ *     /dev/zero and its kin -- every one of those moves an iovec's bytes the
+ *     same however it is split -- but a file whose host driver has only
+ *     ->read/->write is handed one iovec at a time (do_loop_readv_writev),
+ *     and answers each piece on its own: an inotify event or a timerfd count
+ *     that no longer fits the first piece is EINVAL, and a raw-mode tty that
+ *     filled the first waits for more input to fill the second (sys_file.c,
+ *     xfer_split_ok). For those the whole transfer is staged instead, one
+ *     host iovec per guest segment as before -- capped, so past
+ *     XFER_STAGE_MAX it is a short transfer, which such a file is always
+ *     allowed to make and none of them has a record anywhere near that size
+ *     to lose.
+ *   - Past the XFER_IOV host iovecs one call can take (UIO_MAXIOV; only a
+ *     vector over a thousand separate mappings gets there), the rest is
+ *     staged as one last iovec, capped the same way.
+ *
+ * A buffer the guest cannot back in full is the other thing the host has to
+ * be told about, and it is told by faulting where the guest's kernel would.
+ * The kernel's answer to such a call is not one answer: measured against one,
+ * a regular file reports the short transfer; a pipe or a stream socket reports
+ * the bytes of the pipe buffers or packets it copied whole before the one the
+ * fault landed in, and EFAULT with nothing consumed or sent if that was the
+ * first; a datagram is EFAULT, gone when received and never sent; an eventfd
+ * consumes its count and then faults; and a call that never gets as far as
+ * the copy -- a pipe with no reader, a file at its end, /dev/null -- answers
+ * EPIPE, 0 or the full count, as though the buffer were whole. No rule the
+ * emulator could apply reproduces all of that, and the ones it used to apply
+ * (a short transfer, or an EFAULT decided from the file's type before the
+ * call) each got most of it wrong. The host kernel, handed a fault in the
+ * same place, gives every one of those answers itself. Where that is:
+ *
+ *   - A file that takes an iovec whole (xfer_split_ok: a regular file, a
+ *     block device, a pipe, a socket, the memory devices) sees one stream of
+ *     bytes whatever the iovecs, so the part past the guest's memory goes as
+ *     one more iovec over address 0, which no process maps (vm.mmap_min_addr)
+ *     -- the whole transfer is lent for it. With nothing lent at all, the
+ *     empty segments ahead of it go too: they are nothing to such a file,
+ *     and an interposer between the emulator and the kernel -- qemu-user,
+ *     the ARM32 tier's host -- faults only on the FIRST iovec it cannot lock,
+ *     and drops a later one.
+ *   - Any other file may be served by a driver with only ->read/->write,
+ *     called once per iovec with the iovec's own length, so the segment the
+ *     guest's memory stops in has to reach it as ONE host iovec of that
+ *     length, faulting where the guest's does: the transfer is staged in
+ *     front of a guard (guardbuf_map, below) that runs on for the rest of the
+ *     segment, and the segments after it go as an iovec over address 0,
+ *     which no such driver reaches past a fault. Staged, so capped like the
+ *     rest: past XFER_STAGE_MAX of backed bytes the transfer is short, which
+ *     such a file is always allowed to make, and never reaches the fault.
+ *
+ * The same holds for a guest buffer that goes away while the host call is
+ * being set up (a sibling's munmap): on a file of the first kind the lent
+ * part ends where it went, and the fault follows it there.
+ *
+ * xfer_begin takes the guest vector as the caller has already judged it --
+ * clamped to MAX_RW_COUNT, cut where the guest's memory stops (rw_room),
+ * with what the guest named past that in `cut` (NULL: nothing) -- and sets
+ * up x->iov[0..x->n) for the host call; `to_guest` says the host call writes
+ * guest memory. `iov_store` (XFER_IOV entries, or NULL) is the caller's own
+ * array, used instead of an allocation where it will do. With XFER_LEND the
+ * transfer is lent however small it is, and x->stage says whether any of it
+ * had to be staged regardless (MSG_ZEROCOPY: the kernel keeps referencing the
+ * pages it was handed after the call returns, which a freed bounce buffer
+ * must not be). Returns 0 or -errno; x->total is what the host call covers of
+ * the guest's own memory, which is less than the vector only where a cap
+ * above applied. xfer_end then hands staged bytes the host call wrote back to
+ * the guest (`done` of them, the call's result) and releases everything: 0,
+ * or -EFAULT when the guest's memory went away meanwhile. */
+#define XFER_BOUNCE_MAX (64u << 10)
+#define XFER_STAGE_MAX  (2u << 20)
+#define XFER_IOV        1024
+#define XFER_LEND       1
+
+/* What the guest named past where its memory stops: the rest of the segment
+ * the cut is in (the last one of the vector handed to xfer_begin), and the
+ * segments after it, whole. Zero and zero is no cut. */
+typedef struct XferCut {
+    size_t seg;
+    size_t after;
+    int denied;       /* the vector fails access_ok (guest_access_ok): the host
+                       * is handed it at an address its own access_ok refuses,
+                       * so it answers as the kernel does -- EFAULT, after the
+                       * descriptor's checks, before anything is moved */
+} XferCut;
+
+/* Host memory for a value the host kernel has to be handed in one piece --
+ * an option value, a FIEMAP buffer, the segment a transfer's fault lands in
+ * -- when the guest's is not: it straddles two mappings, or is not all there,
+ * or is too large to stage. `head` bytes, placed so the byte after them is
+ * the first of a PROT_NONE guard running on to `len`. A kernel that reads or
+ * writes no further than the head sees what it would have seen in the
+ * guest's own buffer, and one that goes further faults on the guard with
+ * EFAULT -- as it would on the guest's own unmapped tail -- instead of
+ * touching anything of the emulator's. The guard is address space alone
+ * (MAP_NORESERVE, never touched). NULL when the host cannot map it;
+ * guardbuf_free releases it. */
+typedef struct { u8 *map; size_t maplen; } GuardBuf;
+u8  *guardbuf_map(GuardBuf *o, size_t head, size_t len);
+void guardbuf_free(GuardBuf *o);
+
+/* A run of a transfer in a stack's hole (mmu.h, mem_stack_hole): handed to
+ * the host as memory of ours -- staging, or for an O_DIRECT descriptor the
+ * hole under a growsdown mapping of the host's own (xfer_scratch) -- and
+ * grown over by xfer_end as far as the host got, as a kernel's copy grows it
+ * when it touches the run. */
+typedef struct XferHole {
+    u64 va;                       /* the run's first byte: what a copy touches first */
+    size_t len;
+    size_t at;                    /* its offset into the transfer */
+    u8 *buf;                      /* where the host has it; NULL: inside x->stage */
+    void *mem;                    /* ...in this staging of ours, or */
+    void *map;                    /* ...below this host growsdown mapping (O_DIRECT) */
+    size_t maplen;
+} XferHole;
+
+typedef struct GuestXfer {
+    struct iovec *iov;            /* what the host call is handed */
+    HostMap **pin;                /* the allocation under each lent run */
+    int n;                        /* entries of iov[] in use */
+    int npin;                     /* ...the first npin of them lent runs */
+    int to_guest;                 /* the host call writes guest memory */
+    const GIovec *seg;            /* the guest vector the bytes belong to */
+    int nseg;
+    u8 *stage;                    /* the bytes staged rather than lent... */
+    void *stage_mem;              /* (the allocation they lie in) */
+    size_t stage_len;
+    int stage_seg;                /* ...from here in the guest vector... */
+    u64 stage_off;
+    size_t stage_at;              /* ...at this offset into the transfer */
+    size_t total;                 /* bytes the host call covers */
+    void *heap;                   /* iov[] and pin[] when allocated */
+    GuardBuf guard;               /* the staging, when it is guarded */
+    int guarded;
+    struct iovec iov1;            /* iov[] for a one-piece staged transfer */
+    int fd;                       /* the descriptor the transfer is for */
+    int odirect;                  /* ...opened O_DIRECT: -1 until asked */
+    XferHole *hole;               /* the runs in a stack's hole, in order */
+    int nhole, caphole;
+} GuestXfer;
+
+int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
+               int flags, const XferCut *cut, struct iovec *iov_store,
+               GuestXfer *x);
+int xfer_end(CPU *c, GuestXfer *x, size_t done);
+/* The host call's answer once the transfer is settled: its own errno taken
+ * first (host_err above), then xfer_end with the bytes it moved -- and EFAULT
+ * if what it read could not be handed back into guest memory that went away
+ * meanwhile. */
+u64 xfer_finish(CPU *c, GuestXfer *x, ssize_t n);
+/* The first min(len, cap) bytes of a guest vector, copied out into `out`:
+ * what a hook that looks at a transfer's head needs (the /proc id maps, the
+ * rtnetlink note). Returns the bytes copied. */
+size_t gvec_head(CPU *c, const GIovec *seg, int nseg, void *out, size_t cap);
+/* ...and back: the first `len` bytes of the vector written from `in`. */
+size_t gvec_put(CPU *c, const GIovec *seg, int nseg, const void *in, size_t len);
+
+/* ---- the guest's own descriptor ceiling ---------------------------------
+ * RLIMIT_NOFILE is the one limit where the guest and the emulator compete for
+ * the same table, because guest fd IS host fd. Containment names a path target
+ * by a DESCRIPTOR rather than by a name (path.c), so a path syscall holds one
+ * of its own while it runs -- two for the calls that pin the final component as
+ * well (chmod, truncate, statfs) -- and the kernel charges those to the very
+ * soft limit the guest's descriptors come out of. Handed straight to the host,
+ * as it used to be, that limit therefore cost the guest a descriptor: at
+ * saturation it opened one fewer file than a kernel allows, and chmod/statfs/
+ * truncate answered EMFILE with one slot free, where a kernel needs no
+ * descriptor at all.
+ *
+ * So NOFILE joins the limits answered from the guest's own table (rlim_virtual,
+ * sys_misc.c). The host runs at its hard limit and the guest's soft limit is
+ * enforced HERE: since the kernel hands out the lowest free descriptor, a
+ * number at or above the guest's limit is one that a kernel with that limit
+ * would have refused -- so it is closed and the call answers EMFILE, which is
+ * exactly when a kernel answers it. Everything the emulator takes for itself
+ * then lives above the highest number the guest can ever hold.
+ *
+ * The hard limit is not ours to raise, so a host whose hard limit equals its
+ * soft one -- or a guest that has raised its own limit to the hard ceiling --
+ * has no headroom to take and is back to one descriptor tighter than a kernel.
+ * That is the old behaviour, not a new failure, and it is the only case left.
+ */
+
+/* The guest's soft RLIMIT_NOFILE as an fd number: the first one it may not
+ * have. INT_MAX when it has no limit worth enforcing. */
+static inline int fd_nofile_cap(const struct Machine *m) {
+    u64 n = m->rlim[G_RLIMIT_NOFILE].rlim_cur;
+    return (n == G_RLIM_INFINITY || n > (u64)INT_MAX) ? INT_MAX : (int)n;
+}
+
+/* An fd the emulator is about to hand the guest. Returns 1 when it is the
+ * guest's to keep; otherwise the descriptor has been closed and the caller must
+ * answer -EMFILE, which is what the kernel would have answered instead of
+ * allocating it. */
+static inline int fd_within_limit(CPU *c, int fd) {
+    if (fd < fd_nofile_cap(c->m)) return 1;
+    close(fd);
+    return 0;
+}
+
+/* The same for a call that allocates a pair (pipe2, socketpair). The kernel
+ * releases the one it got when the second will not fit, so neither survives. */
+static inline int fd_pair_within_limit(CPU *c, int a, int b) {
+    int cap = fd_nofile_cap(c->m);
+    if (a < cap && b < cap) return 1;
+    close(a);
+    close(b);
+    return 0;
+}
+
+/* vm.mmap_min_addr (sys_mm.c): no fixed mapping below it, a hint below it
+ * raised to it. */
+u64 mmap_min_addr(void);
+
+/* Anonymous backing fd (path.c): memfd_create, or an unlinked temp file where
+ * the host kernel predates it (< 3.17 — Android 7 devices). */
+int a64_anonfd(const char *name);
+int a64_mfdfile(int cloexec);
+
+/* ---- descriptors the emulator tracks by NUMBER ---------------------------
+ * Four classes of fd are served, in whole or in part, from emulator state
+ * rather than from the host object under them: a signalfd (sys_sig.c), a
+ * written-through or time-varying synthesized /proc file (sys_procfs.c), a
+ * substituted netlink socket (sys_netlink.c), and a fallback-tier memfd
+ * (sys_misc.c). Each keeps a per-process table keyed by fd number, and every
+ * route by which a NUMBER comes to name a description, or stops naming one,
+ * has to tell all four: an untracked second name reaches the bare host object
+ * (a signalfd's eventfd, an id map's backing memfd, the AF_UNIX stand-in). The
+ * two helpers below (sys_file.c) are those routes' single point of contact.
+ *
+ * fd_track_dup: newfd is now a second name for oldfd's description (dup,
+ * fcntl F_DUPFD, a successful dup3). Returns 0, or -ENOMEM when a table could
+ * not grow to hold the name -- in which case the caller must not hand newfd
+ * to the guest, since it would be one of the untracked names above.
+ * fd_track_close: fd no longer names what it did (close, dup3's replacement,
+ * execve's close-on-exec walk).
+ *
+ * Both also carry the guest path a descriptor was opened under (path.c,
+ * fdname_*): not a class of fd -- it changes what a descriptor is CALLED,
+ * never what it does -- but it is keyed by number and goes the same routes. */
+int  fd_track_dup(struct Machine *m, int oldfd, int newfd);
+void fd_track_close(struct Machine *m, int fd);
+
+/* Room for one more entry in one of those tables -- malloc'd arrays of `esz`-
+ * byte entries that fork copies with the heap -- doubling it when full.
+ * Returns the (possibly moved) table, or NULL with the old one intact when
+ * the host is out of memory. Caller holds the table's lock. */
+static inline void *fd_table_room(void *tab, int count, int *cap, size_t esz) {
+    if (count < *cap) return tab;
+    int ncap = *cap ? *cap * 2 : 8;
+    void *n = realloc(tab, (size_t)ncap * esz);
+    if (n) *cap = ncap;
+    return n;
+}
+
+/* ---- memfd_create fallback tier (sys_misc.c) ----------------------------
+ * Client side of the broker seal registry: a per-process fd classification
+ * cache plus the seal policy the host kernel cannot apply. The cache's only
+ * writers are the sites that can introduce a tier memfd into this process --
+ * creation, SCM_RIGHTS receipt, dup -- so a process that never sees one pays
+ * a single flag test. mfd_resolve answers the fd's CURRENT seal mask (>= 0)
+ * with its backing identity, or -1 for anything that is not a tier memfd. */
+#define G_F_SEAL_SEAL         0x1u
+#define G_F_SEAL_SHRINK       0x2u
+#define G_F_SEAL_GROW         0x4u
+#define G_F_SEAL_WRITE        0x8u
+#define G_F_SEAL_FUTURE_WRITE 0x10u
+#define G_F_SEAL_EXEC         0x20u
+#define G_F_SEAL_ALL          0x3fu
+s32  mfd_resolve(CPU *c, int fd, u64 *dev, u64 *ino, char *name_out /*MFD_NAME_MAX or NULL*/);
+void mfd_track_create(int fd, u64 dev, u64 ino);
+void mfd_track_recv(int fd);            /* SCM_RIGHTS arrival: class unknown */
+void mfd_track_dup(int oldfd, int newfd);
+void mfd_track_close(int fd);
+int  mfd_write_denied(CPU *c, int fd);  /* write-family: F_SEAL_WRITE|FUTURE_WRITE */
+int  mfd_ftruncate_denied(CPU *c, int fd, u64 newsize);
+int  mfd_fallocate_denied(CPU *c, int fd, int mode, u64 off, u64 len);
+int  mfd_fcntl(CPU *c, int fd, int cmd, u64 arg, u64 *ret); /* 1 = handled */
+int  mfd_link_rewrite(CPU *c, const char *hostlink, char *buf /*PATH_MAX*/);
+void mfd_track_native(int fd, u64 dev, u64 ino);   /* a real kernel memfd */
+
+/* ---- a write-sealed memfd, mapped read-only and shared --------------------
+ * F_SEAL_WRITE takes a deny-writable reference on the inode's address space,
+ * and a kernel older than 6.x counts EVERY shared mapping against it before
+ * asking whether that mapping could write at all -- so a read-only MAP_SHARED
+ * view of a sealed memfd is refused with EPERM there, however it was asked
+ * for. The kernel this emulator's uname claims admits it and strips
+ * VM_MAYWRITE instead (mprotect back to writable is then EACCES), which is
+ * what sys_mm.c serves the guest on either host. These two are how it tells
+ * the two apart: the seal is the KERNEL's, so a tier memfd (whose seals are
+ * the broker's, and whose backing the host will map either way) answers no,
+ * and so does every ordinary file. */
+int  mfd_kernel_write_sealed(int fd);
+int  mfd_seal_map_force_old(void);   /* ARM64EMU_MEMFD_SEAL_FORCE_OLD */
+
+/* ---- the mode of a memfd a host will not let the guest change -------------
+ * Android's SELinux policy refuses an app every mode change on a memfd, so a
+ * guest that takes the execute bit off one of its own is told EACCES by a
+ * call Linux allows, and the exec check then judges the 0777 the kernel
+ * handed out. The mode moves into the broker registry there (proctab.c),
+ * beside the seals, and these three are how the rest of the emulator sees it.
+ * mfd_chmod_blocked() is the gate: false on an ordinary host, where no
+ * override can exist and none of this costs anything. */
+int  mfd_chmod_blocked(void);
+int  mfd_chmod_hold(struct Machine *m, int fd, u32 mode);  /* 1 = we hold it */
+void mfd_stat_fixup(struct Machine *m, int fd, struct stat *st);
+
+/* Copy a guest path string and resolve it against the rootfs.
+ * rflags: PATH_NOFOLLOW_LAST etc. Returns 0 or -errno. */
+static inline int resolve_at(CPU *c, int dirfd, u64 path_va, unsigned rflags,
+                             char *host_out, char *canon_out) {
+    char gpath[PATH_MAX];
+    long n = copy_str_from_guest(c, gpath, path_va, sizeof gpath);
+    if (n < 0) return (int)n;
+    return path_resolve(c->m, dirfd, gpath, rflags, host_out, canon_out);
+}
+
+/* The same, then pinned for the syscall about to run: `pin` carries a parent
+ * directory descriptor and the final component instead of a path the kernel
+ * would resolve a second time (machine.h, PathPin). The caller must
+ * path_unpin() before it returns. `canon_out` is optional. */
+static inline int resolve_pin(CPU *c, int dirfd, u64 path_va, unsigned rflags,
+                              PathPin *pin, char *canon_out) {
+    char gpath[PATH_MAX];
+    long n = copy_str_from_guest(c, gpath, path_va, sizeof gpath);
+#ifdef L2S_ENABLED
+    /* --link2symlink: the emulation's own files are not there for the guest. */
+    if (n >= 0 && c->m->link2symlink && l2s_guest_denied(c->m, dirfd, gpath)) n = -ENOENT;
+#endif
+    if (n < 0) {
+        pin->dfd = AT_FDCWD; pin->pinned = 0; pin->l2s_ro = 0;
+        pin->name = pin->host; pin->host[0] = 0;
+        return (int)n;
+    }
+    int r = path_resolve_pin(c->m, dirfd, gpath, rflags, pin, canon_out);
+#ifdef L2S_ENABLED
+    if (r == 0 && c->m->link2symlink) l2s_pin_ro(c->m, dirfd, gpath, rflags, pin);
+#endif
+    return r;
+}
+
+/* Resolve, pin, and spell the target as a path for the syscalls that have no
+ * *at form at all (the xattr family, inotify_add_watch): the pinned parent is
+ * named by its own descriptor, so only the final component is resolved by name
+ * -- and the caller must still tell the host not to follow it, which for these
+ * means the l* variant or IN_DONT_FOLLOW. `spell` is >= PATH_MAX. The caller
+ * must path_unpin() before it returns. */
+static inline int resolve_at_spell(CPU *c, int dirfd, u64 path_va, unsigned rflags,
+                                   PathPin *pin, char *spell) {
+    int r = resolve_pin(c, dirfd, path_va, rflags, pin, NULL);
+    if (r < 0) return r;
+    r = path_pin_spell(pin, spell);
+    if (r < 0) path_unpin(pin);
+    return r;
+}
+
+/* resolve_at_spell for the calls that never follow the final component -- the
+ * l* xattr family, and inotify_add_watch under IN_DONT_FOLLOW. An emulated
+ * hardlink is a symlink to the host and a regular file to the guest, so the
+ * pin is aimed at the group's backing before the spelling is built: xattrs and
+ * watches belong to the data every name of the group shares, and the l*
+ * spelling would otherwise reach the stand-in symlink -- which for a user.*
+ * xattr means EPERM, a refusal no hardlink has ever earned. Where the scheme
+ * is not in force l2s_deref_pin does nothing at all. */
+static inline int resolve_at_spell_nofollow(CPU *c, int dirfd, u64 path_va,
+                                            PathPin *pin, char *spell) {
+    int r = resolve_pin(c, dirfd, path_va, PATH_NOFOLLOW_LAST, pin, NULL);
+    if (r < 0) return r;
+    l2s_deref_pin(c->m, pin);
+    r = path_pin_spell(pin, spell);
+    if (r < 0) path_unpin(pin);
+    return r;
+}
+
+/* faccessat(2) the syscall takes no flags -- only faccessat2 (Linux 5.8) does,
+ * and AT_SYMLINK_NOFOLLOW is the one a pin needs, since the final component
+ * must not be followed. Try the newer call first.
+ *
+ * Where the host has no faccessat2 the old one is all there is, and it
+ * FOLLOWS. That host is not a museum piece: Android 7 runs a 3.x kernel, and
+ * Android Oreo's seccomp policy refuses the number outright on kernels that do
+ * have it (the emulator's SIGSYS net turns that into the same ENOSYS). Falling
+ * straight through to the flagless call answered about the wrong file twice
+ * over -- a guest asking about a symlink was told what its TARGET allows, and
+ * one asking about a dangling symlink was told ENOENT about a link plainly
+ * sitting there. So ask what the final component is first, and answer a
+ * symlink for itself.
+ *
+ * That answer is the kernel's own, not an invention: every Linux symlink is
+ * mode 0777 and has no permission operation to override generic_permission,
+ * so read, write and execute are granted to everyone. The one refusal ahead of
+ * the mode is a read-only mount (sb_permission), asked here of the parent
+ * directory -- which holds the symlink and is therefore on its mount.
+ *
+ * The stat also closes what this fallback used to leave open on such a host: a
+ * component that turned into a symlink after the walk is now SEEN as one
+ * rather than followed, which is the containment the pin exists for. */
+static inline int access_pinned(const PathPin *p, int mode) {
+#ifdef SYS_faccessat2
+    if (p->pinned) {
+        long r = syscall(SYS_faccessat2, p->dfd, p->name, mode, AT_SYMLINK_NOFOLLOW);
+        if (r == 0) return 0;
+        if (errno != ENOSYS) return -1;
+    }
+#endif
+    if (p->pinned) {
+        struct stat lst;
+        if (fstatat(p->dfd, p->name, &lst, AT_SYMLINK_NOFOLLOW) < 0) return -1;
+        if (S_ISLNK(lst.st_mode)) {
+            if ((mode & W_OK) && faccessat(p->dfd, ".", W_OK, 0) < 0 &&
+                errno == EROFS)
+                return -1;
+            return 0;
+        }
+    }
+    return faccessat(p->dfd, p->name, mode, 0);
+}
+
+/* The kernel's generic_permission, asked about an explicit credential set
+ * rather than this process's: what the GUEST's identity makes of a file's
+ * guest-visible ownership and mode. `mode` is the access(2) bit set
+ * (F_OK/R_OK/W_OK/X_OK); returns 0 or -EACCES.
+ *
+ * Needed wherever --fake-id is in force, because the host can only answer for
+ * the emulator's own identity, and the owner the guest sees is the remapped
+ * one (remap_uid/remap_gid) it sees in every stat. Root's bypass is the
+ * kernel's own: CAP_DAC_OVERRIDE grants read and write whatever the mode says,
+ * and execute only where at least one execute bit is set. */
+static inline int mode_access_ok(u32 uid, u32 gid, const u32 *groups, int ngroups,
+                                 u32 fowner, u32 fgroup, u32 fmode, int mode) {
+    unsigned want = ((mode & R_OK) ? 4u : 0u) | ((mode & W_OK) ? 2u : 0u) |
+                    ((mode & X_OK) ? 1u : 0u);
+    if (!want) return 0;              /* F_OK: existence, and it was stat'able */
+    if (uid == 0) return ((want & 1u) && !(fmode & 0111u)) ? -EACCES : 0;
+    unsigned grant;
+    if (uid == fowner) grant = (fmode >> 6) & 7u;
+    else {
+        int ingrp = (gid == fgroup);
+        for (int i = 0; !ingrp && i < ngroups; i++) ingrp = groups[i] == fgroup;
+        grant = ingrp ? (fmode >> 3) & 7u : fmode & 7u;
+    }
+    return (want & ~grant) ? -EACCES : 0;
+}
+
+/* access(2) about an OPEN DESCRIPTOR rather than a name -- what execve needs,
+ * since between an answer about a name and the load a rename can put a
+ * different file there (a kernel checks MAY_EXEC on the inode it is opening,
+ * inside do_open_execat, and reads bprm->file from then on).
+ *
+ * The /proc spelling of the descriptor names that exact inode however the tree
+ * changes, and costs no syscall the emulator does not already make everywhere.
+ * Where the spelling itself is refused -- Android's policy for a memfd, a host
+ * with no /proc -- F_OK is what separates "the file is not executable" from
+ * "the link could not be followed", and the answer is then asked of
+ * faccessat2 (Linux 5.8), which takes AT_EMPTY_PATH and needs no path at all.
+ * `no_proc_link` skips the spelling for a caller that already knows it is
+ * refused.
+ *
+ * Returns 0 (allowed), 1 (denied) or -1 (the host could not be asked).
+ * Like access(2) and unlike AT_EACCESS, the question is asked of the real
+ * identity -- which for this process is also the effective one. */
+static inline int access_fd(int fd, int mode, int no_proc_link) {
+    if (!no_proc_link) {
+        char spell[PATH_MAX];
+        path_fd_spell(fd, spell);
+        if (faccessat(AT_FDCWD, spell, mode, 0) == 0) return 0;
+        if (errno == EACCES && faccessat(AT_FDCWD, spell, F_OK, 0) == 0) return 1;
+    }
+#ifdef SYS_faccessat2
+    if (syscall(SYS_faccessat2, fd, "", mode, AT_EMPTY_PATH) == 0) return 0;
+    if (errno == EACCES) return 1;
+#endif
+    return -1;
+}
+
+/* Guest<->host open-flag translation. Most O_* values are shared between
+ * asm-generic (arm64/arm32) and x86; the four below differ on x86/x86_64. */
+int oflags_g2h(int g);
+int oflags_h2g(int h);
+
+/* sys_time.c: POSIX interval-timer table maintenance. execve deletes the
+ * host timers (they must not fire into the new image -- our exec is an
+ * in-process reload); a fork child clears its inherited table copy (the
+ * host already dropped the timers themselves). */
+void ptimers_exec_clear(void);
+void ptimers_fork_clear(void);
+
+/* The kernel identity presented to the guest: sys_uname and the synthesized
+ * /proc/version must agree, so both build from these. */
+#define GUEST_KREL "6.1.0-arm64emu"
+#define GUEST_KVER "#1 SMP arm64emu"
+
+/* sys_procfs.c: synthesized /proc files (maps, cmdline, mounts, mountinfo,
+ * loadavg, uptime, version; stat where the host denies the real file).
+ * If canon names one, returns 1 with *ret = host fd or -errno; else 0. */
+int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret);
+
+/* The host's answer to a stat-like call (stat, statx, access, statfs) on a
+ * resolved path, judged against the synthesized /proc files. `canon` is the
+ * path as procfs_open takes it (NULL for anything outside /proc); `host_rc` is
+ * the host call's result with errno as it left it. When canon names a
+ * synthesized file and the host refused it -- EACCES/EPERM, as Android's
+ * policy does for the very files the open is served -- fills *st with the
+ * attributes of the kernel's own file and returns 1, and the caller treats the
+ * call as having succeeded; otherwise returns 0 with errno unchanged and the
+ * host's answer stands. */
+int procfs_stat_fallback(CPU *c, const char *canon, int nofollow, int host_rc,
+                         struct stat *st);
+
+/* Every synthesized file is a descriptor the emulator tracks by number, with
+ * the access mode the guest opened it in: the backing memfd is O_RDWR
+ * whatever the guest asked, so the mode is enforced here, not by the host --
+ * a read of a write-only id map and a write to a read-only view are EBADF,
+ * as they are on the kernel's own files.
+ *
+ * The time-varying synthesized files (loadavg/uptime/stat) are regenerated
+ * when a read starts at offset 0 — procps opens them once and lseek(0)+reads
+ * every refresh cycle, so an open-time snapshot would freeze top/vmstat.
+ * Call before the host read; off = the explicit pread-family offset, or -1
+ * for the fd's current position (read/readv). Returns 1 with *ret set (an
+ * errno) when the read is refused, 0 to let it proceed. */
+int procfs_pre_read(CPU *c, int fd, s64 off, s64 *ret);
+/* Drop refresh tracking for a closing fd. */
+void procfs_unmark_fd(struct Machine *m, int fd);
+/* newfd is a second name for oldfd's file (fd_track_dup): a written-through
+ * id-map file has to be recognised under it too. 0 or -ENOMEM. */
+int  procfs_track_dup(struct Machine *m, int oldfd, int newfd);
+/* A write to a synthesized /proc file: consumed by the ones that accept one
+ * (the id maps of a faked user namespace), EBADF for a descriptor opened
+ * read-only. `head` holds the first `have` of the `len` bytes being written
+ * -- min(len, PF_WRITE_HEAD), which is all any of them reads (an id map
+ * refuses a write of a page or more before it looks at a byte), or fewer
+ * where the guest's memory stops, which is EFAULT at the point the kernel's
+ * copy would meet it. Returns 1 with *ret set to the guest return value when
+ * it consumed the write, 0 for an ordinary fd. */
+#define PF_WRITE_HEAD 4096
+int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t have, size_t len,
+                     s64 off, s64 *ret);
+/* Is fd a synthesized /proc file? *acc receives the guest's O_ACCMODE. The
+ * kernel's proc files take no splice_write and no mmap, so sendfile, splice
+ * and copy_file_range INTO one, and a mapping of one, are refused by the
+ * callers that ask (EBADF for a read-only descriptor first, as the kernel
+ * checks FMODE_WRITE before anything else). */
+int procfs_fd_synth(struct Machine *m, int fd, int *acc);
+/* The guest's children's usage (sys_proc.c): RUSAGE_CHILDREN as the guest's
+ * own children account for it -- the host's figure less what the emulator's
+ * own reaped helpers charged (proctab.c), and the RSS high-water mark tracked
+ * over the guest's reaped children; the CPU part of that in microseconds
+ * (1 only once a helper was charged, before which the host's fields are
+ * exact); and microseconds to the USER_HZ ticks the stat file counts in. */
+struct rusage;
+void children_rusage(struct rusage *ru);
+int  children_cpu_net(s64 *ut_us, s64 *st_us);
+s64  cpu_us_to_ticks(s64 us);
+/* A parent pid as the guest may see it (sys_proc.c): the number when the
+ * parent is a guest process, 0 for one outside -- the kernel's answer for a
+ * parent outside the caller's pid namespace. getppid, status PPid, stat. */
+s32  proc_ppid_view(s32 ppid);
+/* sys_proc.c: the process a pidfd names ("Pid:" in its fdinfo; -1 once it has
+ * been reaped), or with `procdir_ok` a /proc/<pid> directory too, which only
+ * pidfd_send_signal accepts. 0, or -EBADF for a descriptor that names none. */
+int  pidfd_target(int fd, s32 *pid, int procdir_ok);
+/* mmap of a synthesized /proc file: 0, or the errno the kernel's own file
+ * answers, in do_mmap's order -- EACCES for a mode the mapping needs and the
+ * descriptor lacks (write for a shared writable one, read for any), then
+ * ENODEV for a per-process file (no mmap operation at all) or EIO for a
+ * global one (proc_reg_mmap, whose entry has no proc_mmap). `shared` and
+ * `prot_write` are the mapping's. */
+int procfs_mmap_denied(struct Machine *m, int fd, int shared, int prot_write);
+/* Copy `from`'s recorded id maps into this Machine, for a fork child taking
+ * over its parent's user namespace: maps a parent wrote for us went to the
+ * shared registry, never to the Machine copy we inherit. */
+void procfs_idmap_inherit(struct Machine *m, s32 from);
+
+/* sys_sig.c: signalfd(2). The fd is a host signalfd; read(2) on one goes
+ * through sigfd_fill for the translation of the records it returned (a
+ * carrier back to guest 32/33, a timer's slot index back to its sigval). */
+int sigfd_tracked(struct Machine *m, int fd);
+s64 sigfd_fill(CPU *c, int fd, u8 *out, size_t len);
+void sigfd_unmark_fd(struct Machine *m, int fd);
+int  sigfd_track_dup(struct Machine *m, int oldfd, int newfd);   /* 0 or -ENOMEM */
+
+/* sys_seccomp.c: guest seccomp-BPF. seccomp_gate runs the installed filters
+ * for one guest syscall; it returns 1 when the call must not run (with *ret as
+ * the guest's return value), 2 for that with a SIGSYS to deliver, 0 to
+ * proceed, 3 to proceed with the call as a tracer's PTRACE_EVENT_SECCOMP stop
+ * left it in the registers, and does not return at all for a killing action.
+ * `recheck`: the filters' second look after such a stop, where a RET_TRACE
+ * allows. seccomp_prctl_set backs prctl(PR_SET_SECCOMP). */
+int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int recheck);
+s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va);
+/* This process's seccomp mode (G_SECCOMP_MODE_*) and installed filter count,
+ * for /proc/self/status; seccomp_publish mirrors the same pair into the shared
+ * PID registry, where another process's status read can reach it. */
+int  seccomp_status(struct Machine *m, u32 *nfilters);
+void seccomp_publish(struct Machine *m);
+
+void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st);
+
+/* sys_misc.c: seed the guest's resource limits from the host's, at startup. */
+void rlim_init(struct Machine *m);
+
+/* sys_ipc.c: System V shm attachment bookkeeping across fork/exec/exit.
+ * shm_fork_reattach re-counts every attachment the child inherited (nattch++);
+ * shm_detach_all drops them all and clears the list (execve/exit). */
+void shm_fork_reattach(struct Machine *m);
+void shm_detach_all(struct Machine *m);
+
+/* sys_net.c: write a sockaddr back through a guest (addr, addrlen) pointer
+ * pair with move_addr_to_user's semantics -- addrlen read first (EFAULT if it
+ * cannot be), clamped to the real length, EINVAL if negative, the address
+ * copied only when that leaves something to copy, and the UNtruncated length
+ * reported. `addr_optional` is for the calls that test the address pointer
+ * before touching the pair at all (accept/accept4/recvfrom), where a NULL
+ * address is an ordinary success. Shared so the netlink emulation
+ * (sys_netlink.c), which answers the same pair for its own sockets, cannot
+ * drift from the tier beside it. Returns 0 or -errno. */
+int sock_addr_out(CPU *c, u64 addr_va, u64 len_va, const void *sa,
+                  socklen_t salen, int addr_optional);
+
+/* Fill in x0 (return value) after a handler runs. */
+void syscall_return(CPU *c, u64 ret);
+
+#endif /* A64_SYS_H */

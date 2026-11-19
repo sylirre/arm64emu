@@ -2,7 +2,7 @@
 /* Copyright 2026 Sylirre */
 /* System V shared memory, emulated in-process (see src/chroot-ng/include/cng/shm.h).
  *
- * Ported from arm64chroot's src/arm64chroot/sys_ipc.c. The broker daemon (broker.c) is the
+ * Ported from arm64emu's src/arm64emu/chroot/sys_ipc.c. The broker daemon (broker.c) is the
  * authoritative registry and owns each segment's backing fd; this file is the
  * client that drives it and does the mapping. Because chroot-ng runs the guest
  * in its own address space, an attach is an ordinary MAP_SHARED mmap of the fd

@@ -1,11 +1,12 @@
-# arm64emu: build and run its suites whenever something it is built from
-# changes — its own sources and tests, the AArch64 emulation it shares with
-# arm64chroot (lib/arm64), or the build itself.
+# arm64emu: build it and run its suites, both modes', whenever something it is
+# built from changes — its own sources and tests, the AArch64 emulation it runs
+# (lib/arm64), the hardlink emulation its chroot mode shares with chroot-ng
+# (lib/link2symlink), or the build itself.
 #
-# The firmware + Linux boot gates (the *-consist and full-boot log stages of
-# test-arm64emu-pd / test-arm64emu-jit) want a kernel and initrd that are not
-# in the repository; without them they report SKIP and the asm suites carry
-# the run.
+# Boot mode's firmware + Linux gates (the *-consist and full-boot log stages
+# of test-arm64emu-boot-pd / test-arm64emu-boot-jit) want a kernel and initrd
+# that are not in the repository; without them they report SKIP and the asm
+# suites carry the run.
 
 name: arm64emu
 
@@ -14,6 +15,7 @@ on:
     paths:
       - 'src/arm64emu/**'
       - 'lib/arm64/**'
+      - 'lib/link2symlink/**'
       - 'tests/arm64emu/**'
       - 'Makefile'
       - '.github/workflows/arm64emu.yml'
@@ -21,6 +23,7 @@ on:
     paths:
       - 'src/arm64emu/**'
       - 'lib/arm64/**'
+      - 'lib/link2symlink/**'
       - 'tests/arm64emu/**'
       - 'Makefile'
       - '.github/workflows/arm64emu.yml'
@@ -28,7 +31,8 @@ on:
 
 # A push to a branch that also has an open PR fires BOTH a `push` and a
 # `pull_request` event; one group per branch collapses them (and any
-# superseded run) into a single live run:
+# superseded run) into a single live run, so the suites never execute twice
+# for the same ref:
 #   push         -> head_ref is empty, so ref_name ("my-branch") is used
 #   pull_request -> head_ref is the source branch ("my-branch")
 concurrency:
@@ -39,8 +43,8 @@ permissions:
   contents: read
 
 jobs:
-  build-test:
-    name: build + test (x86_64 host)
+  boot:
+    name: boot mode (x86_64 host)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -52,7 +56,7 @@ jobs:
       #                           link below needs
       # clang, lld, llvm, libc6-dev-arm64-cross, qemu-user
       #                        -> the static aarch64 build of the emulator that
-      #                           test-arm64emu-jit-a64 runs under qemu-user:
+      #                           test-arm64emu-boot-jit-a64 runs under qemu-user:
       #                           the only place the AArch64 JIT backend runs
       #                           on this runner
       - name: Install toolchain
@@ -65,13 +69,13 @@ jobs:
         run: make arm64emu
 
       - name: Interpreter
-        run: make test-arm64emu
+        run: make test-arm64emu-boot
 
       - name: Predecoded tier
-        run: make test-arm64emu-pd
+        run: make test-arm64emu-boot-pd
 
       - name: JIT
-        run: make test-arm64emu-jit
+        run: make test-arm64emu-boot-jit
 
       - name: Embedded configuration
         run: make test-arm64emu-embed
@@ -80,25 +84,171 @@ jobs:
         run: make fuzz-arm64emu
 
       - name: AArch64 JIT backend (qemu-user)
-        run: make test-arm64emu-jit-a64
+        run: make test-arm64emu-boot-jit-a64
 
-  # On a real AArch64 machine the JIT's AArch64 backend runs natively; the
-  # system gcc already targets the guest, so nothing needs installing.
-  build-test-arm64:
-    name: build + test (aarch64 host)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+  chroot:
+    name: chroot mode (x86_64 host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
+
+      # gcc-aarch64-linux-gnu   -> aarch64-linux-gnu-gcc (the suite's $AGCC)
+      # libc6-dev-arm64-cross   -> /usr/aarch64-linux-gnu glibc: static+dynamic
+      #                            linking, and the offline source setup_env.sh
+      #                            copies the glibc test rootfs from
+      # qemu-user               -> qemu-aarch64: the differential oracle, and
+      #                            proot's interpreter for the Alpine rootfs
+      #                            (Ubuntu 26.04 has no qemu-user-static package;
+      #                            the harness falls back to qemu-aarch64)
+      # qemu-user-binfmt        -> the binfmt_misc handler through which the
+      #                            host kernel runs a guest's execve of an
+      #                            AArch64 binary under the qemu oracle (what
+      #                            qemu-user-static used to register); only a
+      #                            Recommends of qemu-user, so named here
+      # proot                   -> Alpine minirootfs bootstrap + shell-test oracle
+      # expect                  -> interactive job-control (PTY) test
+      - name: Install cross toolchain, qemu oracle and rootfs bootstrap tools
+        run: |
+          # Enable i386 before the update so the i386 package index is fetched;
+          # the -m32 test-arm64emu-chroot32 build needs the i386 kernel headers
+          # (see next step).
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            qemu-user qemu-user-binfmt proot expect
+
+      # 32-bit (-m32) multilib bits for the ILP32-host build exercised by
+      # `make test-arm64emu-chroot32`. The gcc-multilib metapackage can't be
+      # used here: it Conflicts with every versioned cross gcc (incl.
+      # gcc-*-aarch64-linux-gnu installed above), so apt reports "held broken
+      # packages". Install the underlying 32-bit dev packages directly instead
+      # — they carry no such conflict and coexist with the cross toolchain. All
+      # three are needed because -m32 uses the i386 include/library search
+      # paths, not the amd64 ones the native build already has:
+      #   libc6-dev-i386     -> 32-bit libc headers (bits/libc-header-start.h)
+      #                         + crt1/crti/crtn and the 32-bit libc
+      #   linux-libc-dev:i386 -> 32-bit kernel headers (asm/unistd.h, pulled in
+      #                         via <sys/syscall.h>); co-installs with the amd64
+      #                         one (linux-libc-dev is Multi-Arch: same)
+      #   lib32gcc-<v>-dev   -> 32-bit crtbegin/crtend + libgcc.a for the host
+      #                         gcc; version-matched to the runner's default gcc
+      #                         so a future ubuntu-latest gcc bump keeps working
+      - name: Install 32-bit multilib libraries (for make test-arm64emu-chroot32)
+        run: |
+          gccv=$(gcc -dumpversion | cut -d. -f1)
+          sudo apt-get install -y --no-install-recommends \
+            libc6-dev-i386 linux-libc-dev:i386 "lib32gcc-${gccv}-dev"
 
       - name: Build
         run: make arm64emu
 
-      - name: Interpreter
-        run: make test-arm64emu
+      # run_tests.sh auto-provisions the Alpine + glibc test rootfs from scratch
+      # into build/cache/arm64emu/chroot (one-time Alpine fetch from the CDN); no
+      # hand-staged $HOME rootfs is required.
+      - name: Interpreter (64-bit host)
+        run: make test-arm64emu-chroot
 
-      - name: Predecoded tier
-        run: make test-arm64emu-pd
+      - name: Interpreter (64-bit, Android seccomp)
+        run: make test-arm64emu-chroot-seccomp
 
-      - name: JIT (aarch64 host)
-        run: make test-arm64emu-jit
+      - name: Interpreter (32-bit host)
+        run: make test-arm64emu-chroot32
+
+      - name: JIT (64-bit host)
+        run: make test-arm64emu-chroot-jit
+
+      # The i686 code generator is compiled in by host #ifdef, so this job is
+      # the only thing anywhere that EXECUTES backend_x86_32.c: the AArch64
+      # runner's 32-bit build is armhf, whose CPU cannot run AArch32 at EL0.
+      - name: JIT (32-bit host)
+        run: make test-arm64emu-chroot32-jit
+
+  # Both modes on a real AArch64 machine, which is a different test in two
+  # ways that the x86 jobs cannot cover however long they run:
+  #   - the JIT's AArch64 backend is compiled in by host #ifdef, so the --jit
+  #     suites here run it natively, and test-arm64emu-chroot-jit is the only
+  #     thing that ever EXECUTES backend_a64.c under a full differential suite;
+  #   - chroot mode's guest binaries run on the CPU rather than under qemu, so
+  #     its oracle is hardware. Deliberately no qemu-user is installed: that
+  #     leaves tests/arm64emu/chroot/hostenv.sh selecting native execution, and
+  #     the suite is then checking the emulator against silicon instead of
+  #     against a second emulator. (Tests that need an optional extension the
+  #     runner's CPU lacks announce it and skip — see the REQUIRES: markers.)
+  # No cross toolchain either: on this host the plain system cc already
+  # targets the guest.
+  arm64:
+    name: both modes (aarch64 host)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      # proot   -> Alpine minirootfs bootstrap + the shell-test oracle. Needs
+      #            no qemu here: proot runs the rootfs binaries natively.
+      # expect  -> interactive job-control (PTY) test
+      - name: Install rootfs bootstrap tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends proot expect
+
+      - name: Build
+        run: make arm64emu
+
+      - name: Boot mode, interpreter
+        run: make test-arm64emu-boot
+
+      - name: Boot mode, predecoded tier
+        run: make test-arm64emu-boot-pd
+
+      - name: Boot mode, JIT (aarch64 host)
+        run: make test-arm64emu-boot-jit
+
+      - name: Chroot mode, interpreter (native oracle)
+        run: make test-arm64emu-chroot
+
+      - name: Chroot mode, interpreter (Android seccomp)
+        run: make test-arm64emu-chroot-seccomp
+
+      # Reports SKIP: AArch32 at EL0 does not exist on server-class ARM cores,
+      # so the 32-bit-host build cannot be run here however it is built.
+      - name: Chroot mode, interpreter (32-bit host)
+        run: make test-arm64emu-chroot32
+
+      - name: Chroot mode, JIT (aarch64 host)
+        run: make test-arm64emu-chroot-jit
+
+  # Chroot mode's suite built with clang, because the compiler is part of what
+  # is under test here. The FP core reads the host's exception flags to build
+  # the guest's FPSR, and how much of that survives optimization is a compiler
+  # decision C does not constrain: clang speculates FP ops out of their guards
+  # and compares NaNs quietly where gcc does neither. Every Termux build is a
+  # clang build, so "gcc is green" was never the same statement as "Android is
+  # green" — and for three FPSR bugs it wasn't. Cheap to keep honest: one job,
+  # which runs boot mode's asm suite on the same build too.
+  clang:
+    name: both modes (clang)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cross toolchain, qemu oracle and rootfs bootstrap tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            qemu-user qemu-user-binfmt proot expect
+
+      - name: Build with clang
+        run: make CC=clang arm64emu
+
+      - name: Boot mode, interpreter (clang build)
+        run: make CC=clang test-arm64emu-boot
+
+      - name: Chroot mode, interpreter (clang build)
+        run: make CC=clang test-arm64emu-chroot
+
+      - name: Chroot mode, JIT (clang build)
+        run: make CC=clang test-arm64emu-chroot-jit

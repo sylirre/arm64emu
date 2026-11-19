@@ -1,0 +1,689 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Boot mode: its command line, image loading, and the run loop.
+ *
+ *   arm64emu boot (--bios FW.fd | --bin FILE[@ADDR]) [options]
+ *
+ * The full option / environment-variable reference lives in help() below
+ * (reachable via -h/--help), which reflows it to the terminal width. Keep the
+ * option strings there and the overview in README.md in sync. The engine
+ * options and the help renderer are both modes' (../cli.c).
+ */
+#include "machine.h"
+#include "cpu.h"
+#include "fdt/fdt.h"
+#include "tty.h"
+#include "jit.h"
+#include "mmu.h"
+#include "pdrun.h"
+#include "diag.h"
+#include "cli.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <limits.h>
+
+/* On SIGINT/SIGTERM (e.g. a wall-clock `timeout` during a long boot), restore
+ * the terminal and flush the diagnostics so a killed run still yields a profile
+ * and the last PC — important since WFI idle makes --max-insn slow in wall time. */
+static CPU *g_sig_cpu;
+static void on_signal(int sig) {
+    (void)sig;
+    tty_raw_disable();
+    if (g_sig_cpu) { cpu_dump(g_sig_cpu); ring_dump(); }
+    prof_dump();
+    jit_stats_flush();     /* _exit skips atexit; flush ARM64EMU_JIT_STATS if on */
+    _exit(0);
+}
+
+/* Run the selected engine for up to `slice` instructions (the tick cadence),
+ * never past --max-insn: the predecoded tier stops exactly at a deadline, the
+ * JIT up to a block late, so near the limit it single-steps instead and below
+ * it is given a deadline a block short. The plain interpreter is one step. */
+static void run_engine(CPU *c, u64 slice, u64 max_insn) {
+    if (g_jit) {
+        if (max_insn && max_insn - c->icount < 2 * JIT_MAX_BLOCK_INSNS) {
+            cpu_step(c);
+            return;
+        }
+        u64 deadline = c->icount + slice;
+        if (max_insn && deadline > max_insn - JIT_MAX_BLOCK_INSNS)
+            deadline = max_insn - JIT_MAX_BLOCK_INSNS;
+        jit_run(c, deadline);
+    } else if (g_pd) {
+        u64 deadline = c->icount + slice;
+        if (max_insn && deadline > max_insn) deadline = max_insn;
+        pd_run(c, deadline);
+    } else {
+        cpu_step(c);
+    }
+}
+
+/* Devices / platform wiring (added in M3). Declared weakly here so M0/M1 link. */
+void platform_build(Machine *m) __attribute__((weak));
+void platform_setup_boot(Machine *m, const char *kernel, const char *initrd,
+                         const char *append) __attribute__((weak));
+void machine_wait_for_event(Machine *m) __attribute__((weak));
+void machine_tick(Machine *m) __attribute__((weak));
+void machine_reset(Machine *m, u64 entry, unsigned reset_el) __attribute__((weak));
+
+static u8 *read_file(const char *path, size_t *len_out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    u8 *buf = malloc(n > 0 ? (size_t)n : 1);
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        fprintf(stderr, "short read on %s\n", path); exit(1);
+    }
+    fclose(f);
+    if (len_out) *len_out = (size_t)n;
+    return buf;
+}
+
+/* --dtb: load the override tree, size its /memory node to the RAM we mapped —
+ * as platform_build does for the built-in tree, because a tree that disagrees
+ * with the actual --memory faults the firmware — and place it at the RAM base.
+ * Repeated after a warm reboot: the previous OS reused that memory. */
+static void place_dtb_override(Machine *m, const char *path) {
+    size_t n;
+    u8 *d = read_file(path, &n);
+    if (fdt_set_memory(d, n, m->ram_base, m->ram_size) != 0)
+        fprintf(stderr, "[fdt] warning: no /memory node in %s; guest RAM size "
+                        "may not match --memory\n", path);
+    phys_write_blk(m, RAM_BASE, d, n);
+    free(d);
+}
+
+/* Terse synopsis for argument errors: one line to stderr, exit 2. The full
+ * reference lives in help() below, reachable via -h/--help. */
+static void usage(void) {
+    fprintf(stderr,
+            "usage: arm64emu boot (--bios FW.fd | --bin FILE[@ADDR]) [options]\n"
+            "try 'arm64emu boot --help' for details\n");
+    exit(2);
+}
+
+/* Full reference help: purpose, usage, every option, environment variables,
+ * and examples. Reflowed to the terminal width. Printed to stdout on
+ * -h/--help, exit 0. */
+static void help(void) {
+    FILE *f = stdout;
+    int w = help_cols();
+
+    static const struct help_def opts[] = {
+        HELP_OPT_HELP,
+        HELP_OPT_VERSION,
+        {"    --bios FILE", "Load firmware FILE into the NOR flash and reset "
+                        "at the flash base (e.g. EDK2 QEMU_EFI.fd)."},
+        {"    --kernel FILE", "Linux kernel image, handed to the firmware over "
+                        "fw_cfg (the EDK2 EFI-stub boot path)."},
+        {"    --initrd FILE", "Initramfs image, handed to the firmware over "
+                        "fw_cfg."},
+        {"    --append CMDLINE", "Kernel command line for --kernel boots. A "
+                        "--drive ISO/GRUB boot ignores it."},
+        {"    --dtb FILE", "Override the embedded device tree with FILE "
+                        "(loaded at the RAM base). Its /memory node is sized to "
+                        "--memory, as the built-in tree's is."},
+        {"-m, --memory MB", "Guest RAM size in MiB. Default 1024. The device "
+                        "tree handed to the guest is sized to match."},
+        {"    --drive IMG[,ro][,rw]", "Attach IMG as a virtio-blk disk "
+                        "(repeatable, up to 8). 'ro' opens the image read-only "
+                        "and advertises a read-only disk; default read-write."},
+        {"    --virtfs DIR[,tag=TAG][,ro]", "Share host directory DIR with the "
+                        "guest over virtio-9p (repeatable, up to 8). 'tag' "
+                        "names the mount, default the directory basename; 'ro' "
+                        "makes the share read-only."},
+        {"    --net",   "User-mode networking (virtio-net through the built-in "
+                        "NAT stack)."},
+        {"    --netfwd tcp|udp:HP:GP", "Forward host port HP to guest port GP "
+                        "(repeatable, up to 16; needs --net)."},
+        {"    --console pl011|virtio[,count=N]", "Guest console device. Default "
+                        "pl011 (ttyAMA0); 'virtio' makes hvc0 the console "
+                        "instead. 'count' creates N virtio-console devices "
+                        "(hvc0..hvcN-1), each a separate guest terminal whose "
+                        "window size tracks its host endpoint — allowed with "
+                        "either kind, so the console can stay on ttyAMA0 while "
+                        "extra hvc terminals exist alongside it. Default 1 for "
+                        "'virtio', 0 for 'pl011'."},
+        {"    --console-fd DEV=RFD[:WFD]", "Bind console device DEV — 'ttyAMA0' "
+                        "or 'hvcN' — to descriptors this process inherited, "
+                        "instead of the shared terminal (repeatable). One "
+                        "descriptor is one bidirectional channel (a socketpair "
+                        "or PTY); two are separate read and write ends. Binding "
+                        "hvcN also creates it, so --console count can be left "
+                        "out. Intended for an embedding process giving each "
+                        "guest terminal its own channel."},
+        {"    --ctrl-fd FD", "Control channel on an inherited descriptor: fixed "
+                        "8-byte little-endian messages (op, dev, cols, rows, "
+                        "reserved) that adjust bound endpoints while the machine "
+                        "runs — currently just the terminal geometry a bound "
+                        "endpoint cannot discover for itself."},
+        {"    --bin FILE[@ADDR]", "Load a flat binary at ADDR (default the RAM "
+                        "base) and reset there (bare-metal tests)."},
+        {"    --entry ADDR", "Override the reset PC."},
+        {"    --el N",  "Exception level at reset. Default 1."},
+        {"    --max-insn N", "Stop after N instructions and dump the CPU "
+                        "state. 0 = unlimited (default)."},
+        HELP_OPT_DEBUG,
+        {"    --reg-trace", "Compact per-instruction register trace for "
+                        "differential debugging; forces the interpreter."},
+        HELP_OPT_JIT,
+        HELP_OPT_NO_PREDECODE,
+        {"    --",      "Stop option parsing (boot mode takes no positional "
+                        "arguments)."},
+    };
+    static const struct help_def env_tune[] = {
+        HELP_ENV_TUNE,
+        {"ARM64EMU_RTCLOCK=0", "Deterministic clock: drive the generic timer and the "
+                        "RTC from the retired-instruction count (reproducible "
+                        "boots) instead of the host clock (the default)."},
+        {"ARM64EMU_TICK=N",    "IRQ-poll granularity mask for the run loop. Default "
+                        "0x3ff (poll every 1024 steps)."},
+    };
+    static const struct help_def env_diag[] = {
+        {"ARM64EMU_DBG=N",     "Targeted device/IRQ debug logging (GIC, timer, "
+                        "fw_cfg, flash)."},
+        {"ARM64EMU_PROF=1",    "Hot-PC profiler; the ranking is dumped at exit or on "
+                        "SIGINT."},
+        {"ARM64EMU_RING=1",    "Ring buffer of recent instructions, dumped on "
+                        "abort/exit."},
+        {"ARM64EMU_TPC=0xPC",  "Dump the CPU state each time the pc hits this "
+                        "address."},
+        {"ARM64EMU_WATCH=0xADDR", "Log writes touching the 8 bytes at physical "
+                        "ADDR."},
+        {"ARM64EMU_VAW=0xVA",  "Log writes whose range covers this virtual address "
+                        "(implies ARM64EMU_RING=1)."},
+        {"ARM64EMU_IABORT=1",  "Log instruction aborts."},
+        {"ARM64EMU_SYS=1",     "Trace guest memory-management syscalls "
+                        "(mmap/brk/munmap/...)."},
+        {"ARM64EMU_HEAP=1",    "musl-heap double-alloc finder (implies ARM64EMU_RING=1)."},
+        {"ARM64EMU_HEAP_AT=0xVA", "Log every alloc/free touching this virtual "
+                        "address."},
+        {"ARM64EMU_COV=FILE",  "Coverage-divergence finder: compare executed PCs "
+                        "against a QEMU PC-set file."},
+        HELP_ENV_DIAG,
+    };
+    static const char *const examples[] = {
+        "arm64emu boot --bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+        "arm64emu boot --bios QEMU_EFI.fd --kernel Image --initrd initramfs "
+            "--append \"console=ttyAMA0 earlycon=pl011,0x9000000\"",
+        "arm64emu boot --jit --net --bios QEMU_EFI.fd --kernel Image "
+            "--initrd initramfs --virtfs /srv/data,tag=data,ro",
+    };
+
+    help_section(f, "USAGE");
+    help_wrap(f, "arm64emu boot --bios FW.fd [--kernel Image --initrd initrd.img] "
+                 "[options]", w, 2, 0);
+    help_wrap(f, "arm64emu boot --bin FILE[@ADDR] [options]", w, 2, 0);
+
+    help_section(f, "DESCRIPTION");
+    help_wrap(f,
+        "Full-system emulation of an AArch64 (ARMv8-A) machine, the QEMU "
+        "'virt' one: GICv2, generic timer, PL011 UART, PL031 RTC, PSCI, fw_cfg, "
+        "CFI NOR flash, and virtio-mmio (blk, net, 9p, console). Boots the "
+        "real EDK2 ArmVirtQemu firmware and Linux to an interactive shell, "
+        "with the serial console on your terminal.\n\n"
+        "One of --bios or --bin is required. The plain interpreter is the "
+        "reference engine; the predecoded tier (the default, --no-predecode "
+        "opts out) and --jit are faster tiers kept byte-identical to it.",
+    w, 2, 0);
+
+    help_section(f, "OPTIONS");
+    help_defs(f, opts, HELP_N(opts), w);
+
+    help_section(f, "ENVIRONMENT");
+    help_wrap(f, "Tuning:", w, 2, 0);
+    fputc('\n', f);
+    help_defs(f, env_tune, HELP_N(env_tune), w);
+    fputc('\n', f);
+    help_wrap(f, "Diagnostics, for development (the per-instruction "
+                 "facilities force the interpreter):", w, 2, 0);
+    fputc('\n', f);
+    help_defs(f, env_diag, HELP_N(env_diag), w);
+
+    help_section(f, "EXAMPLES");
+    help_examples(f, examples, HELP_N(examples), w);
+    fputc('\n', f);   /* trailing blank line so output ends clear of the prompt */
+
+    exit(0);
+}
+
+/* True if host paths a and b name the same file. Compares canonical (realpath)
+ * forms when both resolve; otherwise falls back to string equality so paths that
+ * don't exist yet are still compared (realpath fails on a missing path). */
+static bool same_host_path(const char *a, const char *b) {
+    char ca[PATH_MAX], cb[PATH_MAX];
+    const char *pa = realpath(a, ca) ? ca : a;
+    const char *pb = realpath(b, cb) ? cb : b;
+    return !strcmp(pa, pb);
+}
+
+/* --drive IMG[,ro][,rw]: attach a virtio-blk disk. Default is read-write.
+ * *spec* is an argv token, split in place; drives[].path points into argv. */
+static void add_drive(Drive *drives, int *n_drives, char *spec) {
+    if (*n_drives >= MAX_DRIVES) {
+        fprintf(stderr, "arm64emu: too many --drive disks\n"); exit(2);
+    }
+    char *path = spec;
+    bool ro = false;
+    char *opt = strchr(spec, ',');
+    if (opt) *opt = '\0';                /* terminate IMG at first comma   */
+    while (opt) {                        /* walk the ,opt,opt... suffix    */
+        char *cur = opt + 1;
+        char *nxt = strchr(cur, ',');
+        if (nxt) *nxt = '\0';
+        if      (!strcmp(cur, "ro")) ro = true;
+        else if (!strcmp(cur, "rw")) ro = false;
+        else { fprintf(stderr, "arm64emu: --drive: unknown option '%s'\n", cur); exit(2); }
+        opt = nxt;
+    }
+    if (!path[0]) { fprintf(stderr, "arm64emu: --drive: empty path\n"); exit(2); }
+    for (int d = 0; d < *n_drives; d++)
+        if (same_host_path(drives[d].path, path)) {
+            fprintf(stderr, "arm64emu: --drive: duplicate image '%s'\n", path); exit(2);
+        }
+    drives[*n_drives].path = path;
+    drives[*n_drives].ro   = ro;
+    (*n_drives)++;
+}
+
+/* --virtfs PATH[,tag=TAG][,ro][,rw]: share a host directory over virtio-9p.
+ * Default tag = basename of PATH. Split in place; fields point into argv. */
+static void add_virtfs(VirtFS *shares, int *n_shares, char *spec) {
+    if (*n_shares >= MAX_SHARES) {
+        fprintf(stderr, "arm64emu: too many --virtfs shares\n"); exit(2);
+    }
+    char *path = spec;
+    char *tag = NULL;
+    bool ro = false;
+    char *opt = strchr(spec, ',');
+    if (opt) *opt = '\0';                /* terminate PATH at first comma  */
+    while (opt) {                        /* walk the ,opt,opt... suffix    */
+        char *cur = opt + 1;
+        char *nxt = strchr(cur, ',');
+        if (nxt) *nxt = '\0';
+        if (!strncmp(cur, "tag=", 4)) tag = cur + 4;
+        else if (!strcmp(cur, "ro")) ro = true;
+        else if (!strcmp(cur, "rw")) ro = false;
+        else { fprintf(stderr, "arm64emu: --virtfs: unknown option '%s'\n", cur); exit(2); }
+        opt = nxt;
+    }
+    if (!path[0]) { fprintf(stderr, "arm64emu: --virtfs: empty path\n"); exit(2); }
+    if (!tag) {                          /* default tag = basename(PATH)   */
+        size_t pl = strlen(path);
+        while (pl > 1 && path[pl - 1] == '/') path[--pl] = '\0';  /* trim '/' */
+        char *slash = strrchr(path, '/');
+        tag = (slash && slash[1]) ? slash + 1 : path;
+    }
+    for (int s2 = 0; s2 < *n_shares; s2++) {
+        if (same_host_path(shares[s2].path, path)) {
+            fprintf(stderr, "arm64emu: --virtfs: duplicate path '%s'\n", path); exit(2);
+        }
+        if (!strcmp(shares[s2].tag, tag)) {
+            fprintf(stderr, "arm64emu: --virtfs: duplicate tag '%s'\n", tag); exit(2);
+        }
+    }
+    shares[*n_shares].path = path;
+    shares[*n_shares].tag  = tag;
+    shares[*n_shares].ro   = ro;
+    (*n_shares)++;
+}
+
+/* --console pl011|virtio[,count=N]: which device the guest console is, and how
+ * many virtio-console devices to create. The two are separate knobs — a run can
+ * keep the console on ttyAMA0 and still ask for hvc terminals alongside it, which
+ * is what a host driving several guest terminals wants. *spec is an argv token,
+ * split in place. count = -1 on entry means "unset". */
+static void parse_console(char *spec, bool *virtio, int *count) {
+    char *opt = strchr(spec, ',');
+    if (opt) *opt = '\0';                /* terminate KIND at the first comma */
+    if      (!strcmp(spec, "pl011"))  *virtio = false;
+    else if (!strcmp(spec, "virtio")) *virtio = true;
+    else { fprintf(stderr, "arm64emu: --console: expected pl011|virtio\n"); exit(2); }
+    while (opt) {                        /* walk the ,opt,opt... suffix */
+        char *cur = opt + 1;
+        char *nxt = strchr(cur, ',');
+        if (nxt) *nxt = '\0';
+        if (!strncmp(cur, "count=", 6)) {
+            *count = atoi(cur + 6);
+            if (*count < 0 || *count > MAX_CONSOLES) {
+                fprintf(stderr, "arm64emu: --console: count must be 0..%d\n", MAX_CONSOLES);
+                exit(2);
+            }
+        } else { fprintf(stderr, "arm64emu: --console: unknown option '%s'\n", cur); exit(2); }
+        opt = nxt;
+    }
+}
+
+/* A whole-string non-negative decimal, or -1. Used for descriptor numbers,
+ * where atoi's "0 means both zero and garbage" would silently bind stdin. */
+static int parse_fd(const char *s) {
+    if (!s || !*s) return -1;
+    char *end;
+    long v = strtol(s, &end, 10);
+    return (*end || v < 0 || v > INT_MAX) ? -1 : (int)v;
+}
+
+/* --console-fd DEV=RFD[:WFD]: bind a console device to descriptors this process
+ * inherited, instead of the shared terminal. DEV is "ttyAMA0" or "hvcN". One
+ * descriptor means one bidirectional channel (a socketpair, a PTY); two means
+ * separate read and write ends (a pair of pipes). Binding hvcN implies the
+ * console exists, so it also raises the console count. Split in place. */
+static void parse_console_fd(char *spec, int uart_fd[2], int hvc_fd[][2],
+                             int *n_hvc_seen) {
+    char *eq = strchr(spec, '=');
+    if (!eq) {
+        fprintf(stderr, "arm64emu: --console-fd: expected DEV=RFD[:WFD]\n"); exit(2);
+    }
+    *eq = '\0';
+    char *colon = strchr(eq + 1, ':');
+    if (colon) *colon = '\0';
+    int rfd = parse_fd(eq + 1);
+    int wfd = colon ? parse_fd(colon + 1) : rfd;
+    if (rfd < 0 || wfd < 0) {
+        fprintf(stderr, "arm64emu: --console-fd: '%s' is not a descriptor number\n",
+                eq + 1);
+        exit(2);
+    }
+
+    int *slot;
+    if (!strcmp(spec, "ttyAMA0")) {
+        slot = uart_fd;
+    } else if (!strncmp(spec, "hvc", 3) && spec[3]) {
+        char *end;
+        long idx = strtol(spec + 3, &end, 10);
+        if (*end || idx < 0 || idx >= MAX_CONSOLES) {
+            fprintf(stderr, "arm64emu: --console-fd: hvc index must be 0..%d\n",
+                    MAX_CONSOLES - 1);
+            exit(2);
+        }
+        slot = hvc_fd[idx];
+        if ((int)idx + 1 > *n_hvc_seen) *n_hvc_seen = (int)idx + 1;
+    } else {
+        fprintf(stderr, "arm64emu: --console-fd: unknown device '%s' "
+                        "(expected ttyAMA0 or hvcN)\n", spec);
+        exit(2);
+    }
+    if (slot[0] >= 0) {
+        fprintf(stderr, "arm64emu: --console-fd: '%s' bound twice\n", spec); exit(2);
+    }
+    slot[0] = rfd;
+    slot[1] = wfd;
+}
+
+/* --netfwd tcp:HOST_PORT:GUEST_PORT or udp:HOST_PORT:GUEST_PORT. */
+static void add_netfwd(NetFwd *fwds, int *n_fwds, char *spec) {
+    if (*n_fwds >= 16) {
+        fprintf(stderr, "arm64emu: too many --netfwd rules\n"); exit(2);
+    }
+    char *s = spec;
+    bool is_udp = false;
+    if (!strncmp(s, "tcp:", 4)) { is_udp = false; s += 4; }
+    else if (!strncmp(s, "udp:", 4)) { is_udp = true; s += 4; }
+    else { fprintf(stderr, "arm64emu: --netfwd: expected tcp:HP:GP or udp:HP:GP\n"); exit(2); }
+    char *colon = strchr(s, ':');
+    if (!colon) { fprintf(stderr, "arm64emu: --netfwd: missing guest port\n"); exit(2); }
+    *colon = '\0';
+    fwds[*n_fwds].is_udp     = is_udp;
+    fwds[*n_fwds].host_port  = atoi(s);
+    fwds[*n_fwds].guest_port = atoi(colon + 1);
+    (*n_fwds)++;
+}
+
+/* Boot mode's entry (../main.c): argv[0] is the mode's name. */
+int boot_main(int argc, char **argv)
+{
+    const char *bios = NULL, *kernel = NULL, *initrd = NULL, *append = "";
+    const char *binfile = NULL, *dtbfile = NULL;
+    Drive drives[MAX_DRIVES]; int n_drives = 0;
+    VirtFS shares[MAX_SHARES]; int n_shares = 0;
+    bool net_enabled = false;
+    bool console_virtio = false;         /* --console: false=pl011 (default), true=virtio */
+    int  n_consoles = -1;                /* --console ...,count=N; -1 = unset */
+    int  uart_fd[2] = { -1, -1 };        /* --console-fd bindings: {read, write} */
+    int  hvc_fd[MAX_CONSOLES][2];
+    int  n_hvc_bound = 0;                /* highest hvc index bound, plus one */
+    int  ctrl_fd = -1;                   /* --ctrl-fd */
+    for (int c = 0; c < MAX_CONSOLES; c++) hvc_fd[c][0] = hvc_fd[c][1] = -1;
+    NetFwd net_fwds[16]; int n_net_fwds = 0;
+    u64 ram_mb = 1024;
+    u64 entry = 0;
+    int reset_el = 1;
+    u64 bin_addr = RAM_BASE;
+    u64 max_insn = 0;     /* 0 = unlimited */
+
+    /* GNU-style options: single-letter short (-j), --word long. Value-taking
+     * options accept "--opt VAL"/"--opt=VAL" and "-m VAL"/"-mVAL"; no-arg
+     * shorts bundle ("-dj"). Boot mode takes no positional arguments. */
+    int i = 1;
+    for (; i < argc; i++) {
+        char *arg = argv[i];
+        if (arg[0] != '-' || arg[1] == '\0') break;   /* non-option: error below */
+        if (!strcmp(arg, "--")) { i++; break; }        /* explicit end of options */
+
+        if (arg[1] == '-') {                           /* long option: --name[=val] */
+            char *eq = strchr(arg, '='), *val = NULL;
+            if (eq) { *eq = '\0'; val = eq + 1; }      /* argv is writable */
+            const char *n = arg + 2;
+            if      (!strcmp(n, "help"))      { if (val) opt_no_value(arg); help(); }
+            else if (!strcmp(n, "version"))   { if (val) opt_no_value(arg); version(); }
+            else if (engine_long_opt(n, val, arg)) ;
+            else if (!strcmp(n, "reg-trace")) { if (val) opt_no_value(arg); g_rtrace = 1; }
+            else if (!strcmp(n, "net"))       { if (val) opt_no_value(arg); net_enabled = true; }
+            else if (!strcmp(n, "bios"))     bios    = long_value("--bios", val, argv, argc, &i);
+            else if (!strcmp(n, "kernel"))   kernel  = long_value("--kernel", val, argv, argc, &i);
+            else if (!strcmp(n, "initrd"))   initrd  = long_value("--initrd", val, argv, argc, &i);
+            else if (!strcmp(n, "append"))   append  = long_value("--append", val, argv, argc, &i);
+            else if (!strcmp(n, "dtb"))      dtbfile = long_value("--dtb", val, argv, argc, &i);
+            else if (!strcmp(n, "memory"))   ram_mb  = strtoull(long_value("--memory", val, argv, argc, &i), 0, 0);
+            else if (!strcmp(n, "entry"))    entry   = strtoull(long_value("--entry", val, argv, argc, &i), 0, 0);
+            else if (!strcmp(n, "el"))       reset_el = atoi(long_value("--el", val, argv, argc, &i));
+            else if (!strcmp(n, "max-insn")) max_insn = strtoull(long_value("--max-insn", val, argv, argc, &i), 0, 0);
+            else if (!strcmp(n, "drive"))    add_drive(drives, &n_drives, long_value("--drive", val, argv, argc, &i));
+            else if (!strcmp(n, "virtfs"))   add_virtfs(shares, &n_shares, long_value("--virtfs", val, argv, argc, &i));
+            else if (!strcmp(n, "netfwd"))   add_netfwd(net_fwds, &n_net_fwds, long_value("--netfwd", val, argv, argc, &i));
+            else if (!strcmp(n, "console"))
+                parse_console(long_value("--console", val, argv, argc, &i),
+                              &console_virtio, &n_consoles);
+            else if (!strcmp(n, "console-fd"))
+                parse_console_fd(long_value("--console-fd", val, argv, argc, &i),
+                                 uart_fd, hvc_fd, &n_hvc_bound);
+            else if (!strcmp(n, "ctrl-fd")) {
+                ctrl_fd = parse_fd(long_value("--ctrl-fd", val, argv, argc, &i));
+                if (ctrl_fd < 0) {
+                    fprintf(stderr, "arm64emu: --ctrl-fd: not a descriptor number\n");
+                    exit(2);
+                }
+            }
+            else if (!strcmp(n, "bin")) {              /* FILE or FILE@ADDR */
+                char *s = long_value("--bin", val, argv, argc, &i);
+                char *at = strchr(s, '@');
+                if (at) { *at = 0; bin_addr = strtoull(at + 1, 0, 0); }
+                binfile = s;
+            }
+            else usage();
+        } else {                                       /* short cluster: -abc */
+            for (char *p = arg + 1; *p; ) {
+                char c = *p++;
+                if      (c == 'h') help();
+                else if (c == 'v') version();
+                else if (engine_short_opt(c)) ;
+                else if (c == 'm') { ram_mb = strtoull(short_value("--memory", p, argv, argc, &i), 0, 0); break; }
+                else usage();
+            }
+        }
+    }
+    if (i < argc) {
+        fprintf(stderr, "arm64emu: unexpected argument '%s'\n", argv[i]);
+        usage();
+    }
+    if (ram_mb == 0) { fprintf(stderr, "arm64emu: --memory: invalid size\n"); exit(2); }
+
+    /* Default console count: one for --console virtio (it *is* the console),
+     * none otherwise. An explicit count=0 alongside --console virtio asks for a
+     * guest console on a device that was not created. */
+    if (n_consoles < 0) n_consoles = console_virtio ? 1 : 0;
+    if (console_virtio && n_consoles == 0) {
+        fprintf(stderr, "arm64emu: --console virtio needs count >= 1\n");
+        exit(2);
+    }
+    /* Binding hvcN says the console exists; no need to also state the count. */
+    if (n_hvc_bound > n_consoles) n_consoles = n_hvc_bound;
+
+    if (getenv("ARM64EMU_DBG")) g_dbg = atoi(getenv("ARM64EMU_DBG"));
+    if (getenv("ARM64EMU_PROF")) g_prof = atoi(getenv("ARM64EMU_PROF"));
+    if (getenv("ARM64EMU_TPC")) g_tpc = strtoull(getenv("ARM64EMU_TPC"), 0, 0);
+    if (getenv("ARM64EMU_RING")) g_ring = atoi(getenv("ARM64EMU_RING"));
+    if (getenv("ARM64EMU_WATCH")) g_watch = strtoull(getenv("ARM64EMU_WATCH"), 0, 0);
+    if (getenv("ARM64EMU_IABORT")) g_iabort_log = atoi(getenv("ARM64EMU_IABORT"));
+    if (getenv("ARM64EMU_RTCLOCK")) g_rtclock = atoi(getenv("ARM64EMU_RTCLOCK"));
+    if (getenv("ARM64EMU_VAW")) { g_vawatch = strtoull(getenv("ARM64EMU_VAW"), 0, 0); g_ring = 1; }
+    if (getenv("ARM64EMU_SYS")) g_systrace = atoi(getenv("ARM64EMU_SYS"));
+    if (getenv("ARM64EMU_HEAP")) { g_heaptrack = atoi(getenv("ARM64EMU_HEAP")); g_ring = 1; }
+    if (getenv("ARM64EMU_HEAP_AT")) g_heap_at = strtoull(getenv("ARM64EMU_HEAP_AT"), 0, 0);
+    if (getenv("ARM64EMU_COV")) { g_ring = 1; cov_load(getenv("ARM64EMU_COV")); }
+    /* Any per-instruction debug facility routes through the single hot-path guard.
+     * (g_ring is also set by ARM64EMU_COV, so the coverage finder is covered too;
+     * the mm-syscall and heap tracers are step hooks, diag.c.) */
+    g_debug_hooks = g_trace | g_rtrace | g_prof | g_ring | (g_tpc != 0) | diag_install();
+
+    /* The JIT and the predecoded tier batch instructions, so anything
+     * per-instruction forces the plain interpreter: the debug hooks
+     * (trace/rtrace/prof/ring/tpc/ARM64EMU_COV) and the memory watchpoints
+     * (which also disable the D-TLB fast path). */
+    engine_settle(g_debug_hooks || g_watch || g_vawatch);
+
+    Machine m;
+    machine_init(&m, ram_mb << 20);
+    /* consumed by platform_build (virtio-blk: slots 1,2,3,...; net is slot 0) */
+    if (n_drives) { memcpy(m.drives, drives, n_drives * sizeof(drives[0])); m.n_drives = n_drives; }
+    if (n_shares) { memcpy(m.shares, shares, n_shares * sizeof(shares[0])); m.n_shares = n_shares; }
+    m.net_enabled = net_enabled;
+    m.console_virtio = console_virtio;
+    m.n_consoles_req = n_consoles;
+
+    /* Bind the endpoints named by --console-fd. Anything left unbound speaks
+     * through the process terminal, which is what a plain command-line run
+     * wants; a fully bound run never touches stdio at all, so it also leaves
+     * the embedder's own terminal alone (no raw mode, no SIGWINCH handler). */
+    bool uses_stdio = uart_fd[0] < 0;
+    if (uart_fd[0] >= 0) m.uart_ep = console_open_fd(uart_fd[0], uart_fd[1]);
+    for (int c = 0; c < n_consoles; c++) {
+        if (hvc_fd[c][0] < 0) { uses_stdio = true; continue; }
+        m.vcon_ep[c] = console_open_fd(hvc_fd[c][0], hvc_fd[c][1]);
+    }
+    if (ctrl_fd >= 0 && !(m.ctrl = console_ctrl_open(ctrl_fd))) {
+        fprintf(stderr, "arm64emu: --ctrl-fd: cannot use descriptor %d\n", ctrl_fd);
+        exit(2);
+    }
+    if (console_virtio) {
+        if (kernel) {
+            /* We control the cmdline on the --kernel path: make hvc0 the guest
+             * console (last console= wins) so the login lands on hvc0 and host
+             * I/O is effectively exclusive to the virtio-console. Skipped if the
+             * user already asked for it. (A --drive ISO/GRUB boot ignores
+             * --append, so the guest bootloader must set console=hvc0 itself.) */
+            if (!strstr(append, "console=hvc0")) {
+                static char append_hvc0[2048];
+                snprintf(append_hvc0, sizeof append_hvc0, "%s%sconsole=hvc0", append,
+                         (append[0] && append[strlen(append) - 1] != ' ') ? " " : "");
+                append = append_hvc0;
+            }
+            fprintf(stderr, "[virtio-console] guest console -> hvc0 "
+                            "(console=hvc0 added to the kernel cmdline)\n");
+        } else {
+            fprintf(stderr, "[virtio-console] guest console is hvc0 — set "
+                            "console=hvc0 in the guest bootloader (e.g. GRUB) to use it\n");
+        }
+    }
+    if (n_net_fwds) { memcpy(m.net_fwds, net_fwds, n_net_fwds * sizeof(NetFwd)); m.n_net_fwds = n_net_fwds; }
+
+    if (bios) {
+        size_t n; u8 *fw = read_file(bios, &n);
+        if (n > m.flash_size) n = m.flash_size;
+        memcpy(m.flash, fw, n);
+        free(fw);
+        entry = entry ? entry : FLASH_BASE;   /* firmware resets at flash base */
+    }
+
+    if (binfile) {
+        size_t n; u8 *b = read_file(binfile, &n);
+        phys_write_blk(&m, bin_addr, b, n);
+        free(b);
+        entry = entry ? entry : bin_addr;
+    }
+
+    if (!bios && !binfile) usage();
+
+    if ((bios || kernel) && platform_build) platform_build(&m);
+    if (dtbfile) place_dtb_override(&m, dtbfile);   /* override DTB at RAM base */
+    if (kernel && platform_setup_boot)
+        platform_setup_boot(&m, kernel, initrd, append);
+
+    cpu_reset(&m.cpu, entry, (unsigned)reset_el);
+
+    g_sig_cpu = &m.cpu;
+    if (uses_stdio) tty_raw_enable();
+    /* Register after tty_raw_enable() so these win over tty.c's cleanup-only handlers. */
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    unsigned long ticker = 0;
+    unsigned long tick_mask = 0x3ff;     /* ARM64EMU_TICK: IRQ-poll granularity (debug) */
+    if (getenv("ARM64EMU_TICK")) tick_mask = strtoul(getenv("ARM64EMU_TICK"), 0, 0);
+    CPU *c = &m.cpu;
+    for (;;) {
+        /* --jit / predecoded tier: one step covers up to a tick-slice of
+         * instructions, so tick on every return; --no-predecode (the plain
+         * interpreter) ticks every 1024 steps. */
+        if (machine_tick && (g_jit || g_pd || (++ticker & tick_mask) == 0)) machine_tick(&m);
+        /* One step of the machine: what the CPU asked for attention for is
+         * all looked at here (cpu.h, "Run control") -- a stop, an interrupt
+         * to take (which is the step), a halt to wait out below -- so the
+         * request is dropped first, and only then does guest code run. */
+        cpu_attn_clear(c);
+        if (!c->stop && !cpu_take_interrupt(c) && !c->halted)
+            run_engine(c, tick_mask + 1, max_insn);
+        if (c->stop) {
+            if (m.cpu.reset && machine_reset) {   /* PSCI SYSTEM_RESET: warm reboot */
+                jit_reset(&m);                    /* drop all translations */
+                machine_reset(&m, entry, (unsigned)reset_el);
+                /* machine_reset restores the built-in DTB; re-apply file-based
+                 * overrides that live in RAM, which the previous OS reused. */
+                if (dtbfile) place_dtb_override(&m, dtbfile);
+                if (binfile) { size_t n; u8 *b = read_file(binfile, &n); phys_write_blk(&m, bin_addr, b, n); free(b); }
+                continue;
+            }
+            break;
+        }
+        if (c->halted) {
+            if (!machine_wait_for_event) break;
+            machine_wait_for_event(&m);
+            if (m.deadlock) {   /* halted for good: see Machine.deadlock */
+                fprintf(stderr, "[halted with no wake source at icount=%llu]\n",
+                        (unsigned long long)m.cpu.icount);
+                cpu_dump(&m.cpu);
+                ring_dump();
+                break;
+            }
+        }
+        if (max_insn && m.cpu.icount >= max_insn) {
+            fprintf(stderr, "[maxinsn reached at icount=%llu]\n",
+                    (unsigned long long)m.cpu.icount);
+            cpu_dump(&m.cpu);
+            ring_dump();
+            break;
+        }
+    }
+
+    tty_raw_disable();
+    prof_dump();
+    if (g_heaptrack) heaptrack_report();
+    machine_free(&m);
+    return 0;
+}

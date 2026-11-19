@@ -28,7 +28,7 @@ src/chroot-ng/
   rt/                  the freestanding runtime: _start, the syscall gate (the only svc #0), libc-like helpers
   include/cng/         headers, including the UAPI constants re-declared from the AArch64 syscall ABI
   chroot-ng.ld         linker script: the image lives far above the guest ET_EXEC range
-lib/link2symlink/      (repository root) the -l/--link2symlink engine, shared with arm64chroot;
+lib/link2symlink/      (repository root) the -l/--link2symlink engine, shared with arm64emu's chroot mode;
                        monitor/l2s.c is chroot-ng's host for it (struct l2s_ops) and its stat answers
 tests/chroot-ng/       run.sh + lib.sh (host detection) + one m*.sh per milestone; guests/ are the
                        AArch64 test programs the milestones build
@@ -40,8 +40,9 @@ anywhere in the monitor (`-mgeneral-regs-only`; the Makefile explains why).
 
 ## Testing
 
-* `make test-chroot-ng`: the whole suite. It builds arm64chroot first, the
-  real-hardlink oracle the differential `--link2symlink` legs compare against.
+* `make test-chroot-ng`: the whole suite. It builds arm64emu first, whose chroot
+  mode is the real-hardlink oracle the differential `--link2symlink` legs
+  compare against.
 * `make probe-chroot-ng`: the capability probe on this host.
 
 The suite runs natively on an AArch64 host and under `qemu-aarch64` on any

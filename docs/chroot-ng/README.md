@@ -41,8 +41,9 @@ says so when it does not). Override the compiler/emulator if needed:
 make CHROOTNG_CC=aarch64-linux-gnu-gcc-12 CHROOTNG_QEMU=qemu-aarch64 chroot-ng
 ```
 
-`make test-chroot-ng` also builds [arm64chroot](../arm64chroot/README.md), the
-oracle the differential `--link2symlink` legs compare against.
+`make test-chroot-ng` also builds [arm64emu](../arm64emu/README.md), whose
+chroot mode is the oracle the differential `--link2symlink` legs compare
+against.
 
 The test harness runs on all three hosts and adapts to each: it picks the
 emulator (or none), finds an AArch64 guest toolchain and the link mode that
@@ -251,7 +252,7 @@ design depends on the SELinux `execmem` permission being granted.
 
 chroot-ng is original, freestanding (no libc) AArch64 C and assembly. The
 guest-PID registry, the synthesized `/proc` files, the System V IPC layer, the
-guest `ptrace` model and the help renderer are ported from the sibling
-[arm64chroot](../arm64chroot/README.md) emulator in this repository. chroot-ng is functionally comparable
+guest `ptrace` model and the help renderer are ported from the chroot mode
+of the sibling [arm64emu](../arm64emu/README.md) emulator in this repository. chroot-ng is functionally comparable
 to `proot` but shares no code with it; `qemu-aarch64` is used only as a
 differential-testing oracle and is neither included nor linked.

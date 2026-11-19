@@ -9,7 +9,7 @@
  * therefore emulated the same way every other kernel service here is —
  * by the monitor, from inside the processes involved.
  *
- * Model (ported from arm64chroot's ptracetab.c, which owns the guest register
+ * Model (ported from arm64emu's ptracetab.c, which owns the guest register
  * file; here the register file is the one the kernel handed us at a stop):
  *
  *   - A MAP_SHARED anonymous registry, created before the guest's first fork

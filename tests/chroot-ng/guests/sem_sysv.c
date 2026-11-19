@@ -3,7 +3,7 @@
  * Run once under chroot-ng and once straight under qemu-aarch64, where the same
  * code reaches the host kernel's real semget/semop/semctl and msgget/msgsnd/
  * msgrcv/msgctl. The two must agree byte for byte — the whole point of porting
- * this from arm64chroot rather than inventing it. (Unlike the shm differential,
+ * this from arm64emu rather than inventing it. (Unlike the shm differential,
  * which leans on qemu's own shmat, nothing here is emulated on the reference
  * side: every call is forwarded straight to the kernel.)
  *

@@ -20,7 +20,7 @@
  * removed (EIDRM), or when the caller cancels it because a signal became
  * deliverable (EINTR — SysV IPC waits are never restarted).
  *
- * Ported from arm64chroot's src/arm64chroot/sys_ipc.c and the sem/msg half of its
+ * Ported from arm64emu's src/arm64emu/chroot/sys_ipc.c and the sem/msg half of its
  * proctab.c. The differences are all consequences of running the guest in our
  * own process: guest memory is simply memory (validated, never copied through a
  * bounce), there is no allocator to lean on, and the client half runs inside the

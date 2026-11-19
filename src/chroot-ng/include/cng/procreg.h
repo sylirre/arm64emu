@@ -23,13 +23,13 @@
  * hides it (see cng_procreg_has), and the calls that name a process by pid —
  * process_vm_*, pidfd_open, the signal family — answer ESRCH for it.
  *
- * Ported from arm64chroot's proctab.c. By default the backing is one
+ * Ported from arm64emu's proctab.c. By default the backing is one
  * MAP_SHARED|MAP_ANONYMOUS region inherited across fork() — a guest process
  * tree here is a real fork tree, so that covers every process of one
  * invocation, and two separate invocations on one rootfs hide each other's
  * processes. With --shared-proc the view spans independent invocations
  * (ps/top in one session see the guest processes of another), via the first
- * of these that works (arm64chroot's tiers):
+ * of these that works (arm64emu's tiers):
  *   1. broker — diskless, the normal path: a per-rootfs daemon owns an
  *      anonymous memfd (the table) and an abstract-namespace socket (the
  *      rendezvous) and hands the memfd to every invocation over SCM_RIGHTS.

@@ -4,7 +4,7 @@
  * the detached daemon, and — daemon-side — the System V shared-memory registry,
  * with the libandroid-shmem door that lets host processes attach its segments.
  *
- * Ported from arm64chroot's proctab.c. Freestanding throughout: raw syscalls
+ * Ported from arm64emu's proctab.c. Freestanding throughout: raw syscalls
  * through the gate, no allocator, no libc. Every field of the segment table
  * lives only in the daemon process and is mutated single-threaded from
  * ipc_serve, so nothing here needs locking.
@@ -538,7 +538,7 @@ static void shm_att_del(struct seg *s, s32 pid) {
 
 /* Drop the attaches of every process that died without detaching them.
  *
- * arm64chroot detaches from its exit/exit_group handlers and needs this only
+ * arm64emu detaches from its exit/exit_group handlers and needs this only
  * for a SIGKILL. chroot-ng traps neither exit path (see the note in
  * procreg.c), so here it is the *normal* way an attach goes away, and it has to
  * be accurate enough that a guest reading nattch right after waitpid() sees
@@ -984,7 +984,7 @@ static s32 shm_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
          * unprivileged kernel would be the worse answer: the owner is allowed
          * to lock, and callers treat success as "it will stay resident",
          * which it does unless the host swaps — exactly the guarantee we
-         * could not have strengthened anyway. arm64chroot answers EINVAL
+         * could not have strengthened anyway. arm64emu answers EINVAL
          * here. */
         if (!shm_owner(s, q->uid))
             return -EPERM;
@@ -1018,7 +1018,7 @@ static void shm_free_all(void) {
 /* ---- daemon: main loop -------------------------------------------------- */
 
 /* The procreg table memfd, created on the first CNG_REQ_TAB. Lazy rather than
- * eager (arm64chroot creates it up front for a --shared-proc daemon) so that a
+ * eager (arm64emu creates it up front for a --shared-proc daemon) so that a
  * daemon started by the shm side can still serve a later --shared-proc joiner
  * instead of leaving it to spin and degrade. */
 static int tab_memfd(void **tab_out) {

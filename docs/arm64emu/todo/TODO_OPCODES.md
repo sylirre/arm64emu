@@ -120,7 +120,7 @@ ldst_pair opc3 in **both** halves, RMIF/SETF-as-ADC, FMLAL-space-as-compare/
 FADD, by-element U-field ignores). `m16_laxdecode.S` holds the regression
 battery for everything tightened.
 
-The 2026-08-04 sweep against arm64chroot closed the rest of the known list
+The 2026-08-04 sweep against chroot mode closed the rest of the known list
 and found one more corruption case, which is the reason to keep treating
 "does something plausible" as a severity question rather than polish:
 
@@ -142,7 +142,7 @@ and found one more corruption case, which is the reason to keep treating
   SHA3/SHA512 page shares those bits. BCAX with Rm in {0,1} and Ra % 4 == 2
   executed as REV64 of Vn. See `m7_crypto.S` checks 92-99.
 
-A 2026-09-09 sweep, again against arm64chroot, found one more — and the same
+A 2026-09-09 sweep, again against chroot mode, found one more — and the same
 severity point: it was a shift of a 64-bit value by 64, not merely a wrong
 answer.
 
@@ -203,12 +203,12 @@ What remains, all deliberate:
   dual-mode trick: build the self-test with `-DUSERMODE` (exit code = x0) and
   run it under `qemu-aarch64 -cpu max` to validate every hand-computed constant
   against real semantics before trusting it as the emulator's reference.
-  Regression anchors: `tests/arm64emu/asm/m4_fpsimd.S`, `m8_simd.S`, `m9_simd_int.S`,
+  Regression anchors: `tests/arm64emu/boot/asm/m4_fpsimd.S`, `m8_simd.S`, `m9_simd_int.S`,
   `m10_simd_scalar.S`, `m7_crypto.S`, `m13_lse.S`, `m19_v84ext.S`,
   `m20_ext_simd.S`, **`m21_mops.S`** (per-stage MOPS state pins; the EC 0x27
   ISS checks are emulator-only since qemu-user turns the exception into
   SIGILL), **`m22_fpsr.S`** (FPSR flag battery), and the FP16 battery
-  (arm64chroot `tests/arm64chroot/c/fp16_*`).
+  (chroot mode's `tests/arm64emu/chroot/c/fp16_*`).
   Known oracle flaw: qemu ≤ 8.2 decodes the LDAPUR/STLUR imm9 as unsigned
   (fixed upstream), so those negative-offset checks are emulator-only.
 - Any §2 extension: implement, differential-test the full encoding group, **then**

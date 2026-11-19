@@ -169,7 +169,7 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/chroot-ng/guests/scriptprobe.c; t
     check_contains "and a relative execve under that one resolves" \
         "relexec=SCRIPT-OK" "$out"
 
-    # --- differential against arm64chroot -----------------------------------
+    # --- differential against arm64emu --------------------------------------
     # The oracle is a whole-instruction emulator with a purely virtual cwd, so
     # it never had either bug; its answers are the reference for ours.
     if [ -n "$M19_ORACLE" ] && [ -x "$M19_ORACLE" ]; then
@@ -182,7 +182,7 @@ elif guest_cc_report "$GDIR/scriptprobe" tests/chroot-ng/guests/scriptprobe.c; t
             # shellcheck disable=SC2086
             _got=$(run -R $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
             # shellcheck disable=SC2086
-            _want=$("$M19_ORACLE" $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
+            _want=$("$M19_ORACLE" chroot $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
             if [ -n "$_want" ] && [ "$_got" = "$_want" ]; then
                 pass=$((pass + 1)); printf '  ok   oracle parity: %s\n' "$_d"
             else

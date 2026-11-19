@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* AArch64 CPU state and core interpreter interface, shared by arm64emu and
- * arm64chroot. A field only one of them uses costs the other nothing it would
+/* AArch64 CPU state and core interpreter interface, for both of arm64emu's
+ * modes. A field only one of them uses costs the other nothing it would
  * notice: most sit in padding. */
 #ifndef A64_CPU_H
 #define A64_CPU_H
@@ -59,8 +59,8 @@ typedef struct { u64 tag; u64 pte; } DTlbEnt;
  * and cpu_reset. */
 typedef struct {
     u64  page;      /* VA page base of the cached translation */
-    u64  pa_page;   /* its physical page, where the program has one (JIT block
-                     * identity in arm64emu) */
+    u64  pa_page;   /* its physical page, where the mode has one (JIT block
+                     * identity in a full system) */
     u8  *host;      /* host pointer to the page; NULL = invalid */
 } FetchCache;
 
@@ -148,7 +148,7 @@ typedef struct CPU {
     u32 fpcr, fpsr;
     bool fp_trapped;  /* CPACR_EL1.FPEN traps FP/SIMD at this EL (cpu_refresh_el_state) */
     u8 ldst_unpriv;   /* transient: current data access is LDTR/STTR (EL0 view);
-                         read by arm64emu's MMU */
+                         read by a full system's MMU */
     /* The FP core's lazy state (exec_fpsimd.c): FPCR.FZ/FZ16 latched for the
      * instruction in flight, and the FPSR flags raised in software that
      * fpsr_sync has yet to fold into fpsr. */

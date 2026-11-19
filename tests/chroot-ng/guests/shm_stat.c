@@ -5,7 +5,7 @@
  * which differ between the host's global SysV namespace and chroot-ng's
  * per-invocation one — so this matches the real kernel byte for byte.
  *
- * Ported from arm64chroot's tests/arm64chroot/c/shm_stat.c.
+ * Ported from arm64emu's tests/arm64emu/chroot/c/shm_stat.c.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* SHM_INFO/SHM_STAT + struct shm_info (glibc __USE_MISC) */

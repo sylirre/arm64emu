@@ -1,7 +1,7 @@
 /* System V shared memory from a real guest program, checked against the host
  * kernel's own SysV shm (the same binary run straight under qemu-aarch64).
  *
- * Ported from arm64chroot's tests/arm64chroot/c/shm_sysv.c, which was written for exactly
+ * Ported from arm64emu's tests/arm64emu/chroot/c/shm_sysv.c, which was written for exactly
  * this comparison. It prints only *semantic* outcomes — never shmids, attach
  * addresses or timestamps — so chroot-ng's broker-backed emulation (src/chroot-ng/monitor/
  * shm.c, no host SysV IPC at all) and the real kernel produce byte-identical

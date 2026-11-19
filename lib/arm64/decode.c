@@ -940,8 +940,8 @@ static inline bool sp_align_ok(CPU *c, unsigned Rn) {
 
 /* FEAT_LRCPC2: LDAPUR/STLUR, load-acquire RCpc / store-release with an
  * unscaled 9-bit immediate. The acquire/release ordering takes nothing extra
- * here: arm64emu's single in-order CPU has none to give, and in arm64chroot it
- * piggybacks on the host's ordinary load/store ordering (same as LDAR/LDAPR).
+ * here: a full system's single in-order CPU has none to give, and in user mode
+ * it piggybacks on the host's ordinary load/store ordering (same as LDAR/LDAPR).
  * The access is an ordinary unscaled load/store. No writeback, and no SIMD&FP
  * forms at LRCPC=2. */
 static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
@@ -968,7 +968,7 @@ static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
  * Option A; M does the whole-page middle; E does the sub-page tail and raises
  * the EC 0x27 mismatch exception if it finds a page or more still to do.
  * M/E executed with PSTATE.C set (an Option B state) raise EC 0x27 with the
- * wrong-option bit; in arm64chroot loop.c plays the kernel's role for those
+ * wrong-option bit; in user mode the program plays the kernel's role for those
  * (arm64_mops_reset_regs + restart at the prologue). Restartability across
  * data aborts: P keeps the registers in input format until it completes, M/E
  * fold progress into Xn after every bounded step, so re-executing the faulting
@@ -992,7 +992,7 @@ static u32 mops_iss(u32 insn, bool wrong_option) {
          | (BITS(4, 0) << 10) | (BITS(20, 16) << 5) | BITS(9, 5);
 }
 
-/* At EL0 the family is gated by SCTLR_EL1.MSCEn (UNDEF when clear; arm64chroot's
+/* At EL0 the family is gated by SCTLR_EL1.MSCEn (UNDEF when clear; user mode's
  * kernel-role sysreg_init sets it, as Linux does when it advertises
  * HWCAP2_MOPS); at EL1 it is always enabled (no EL2, so HCRX_EL2.MSCEn doesn't
  * apply). */
@@ -1002,9 +1002,9 @@ static bool mops_enabled_ok(CPU *c, u32 insn) {
 }
 
 /* One bounded memset step: at most to the next page boundary. Fast path is
- * the program's host pointer (mem_host_ptr: in arm64emu a D-TLB hit on a RAM
- * page with W granted — the same fast path mem_write uses, so JIT code-page
- * coherence is preserved; in arm64chroot the translated host pointer, with the
+ * the program's host pointer (mem_host_ptr: in a full system a D-TLB hit on a
+ * RAM page with W granted — the same fast path mem_write uses, so JIT code-page
+ * coherence is preserved; in user mode the translated host pointer, with the
  * coherence of ordinary stores — translated code relies on IC IVAU); on a miss, a single byte through the faulting slow
  * path, which also fills the D-TLB so the next step goes fast. Returns bytes
  * done; 0 means a fault was raised. */

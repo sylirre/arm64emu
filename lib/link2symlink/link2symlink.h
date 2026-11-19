@@ -2,8 +2,9 @@
 /* Copyright 2026 Sylirre */
 /* link2symlink: emulate hardlinks with tracked symlinks + a backing file, for
  * hosts that refuse link(2) (Android/SELinux returns EACCES/EXDEV, some EPERM).
- * Shared by chroot-ng and arm64chroot; each compiles it with its own flags and
- * hands it the host through struct l2s_ops (below), as `l2s_host`.
+ * Shared by chroot-ng and arm64emu's chroot mode; each compiles it with its
+ * own flags and hands it the host through struct l2s_ops (below), as
+ * `l2s_host`.
  *
  * A guest hardlink group lives in the per-rootfs object store "<rootfs>/.l2s":
  *   data   ".l2s.<ino>"          the linked file itself, moved here — a regular
@@ -22,10 +23,10 @@
  * When the store is unusable or the source sits on another filesystem (bind
  * mount: rename returns EXDEV), the group falls back to the pre-store layout —
  * data + marker in the first-linked name's own directory, names as same-
- * directory *relative* symlinks. That legacy format (also what arm64chroot
- * wrote before it used this engine) is still recognized everywhere; absolute
- * targets whose rootfs prefix went stale (the tree was moved or copied)
- * self-heal onto the current store. A link is ours only where its target names
+ * directory *relative* symlinks. That legacy format (also what arm64emu's
+ * chroot mode wrote before it used this engine) is still recognized
+ * everywhere; absolute targets whose rootfs prefix went stale (the tree was
+ * moved or copied) self-heal onto the current store. A link is ours only where its target names
  * a data file the emulation could have written — in a place of the guest's
  * own, or a stale store path — and the guest is not to write a target in the
  * ".l2s." grammar itself (the program refuses its symlinkat: see l2s_hidden).

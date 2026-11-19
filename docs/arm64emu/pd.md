@@ -1,7 +1,7 @@
 # The predecoded interpreter tier (default engine)
 
 The **predecoded tier** is a direct-threaded acceleration of the **interpreter**
-path (the portable, non-JIT engine). It is the **default** engine; `--no-pd`
+path (the portable, non-JIT engine). It is the **default** engine; `--no-predecode`
 opts out to the plain `cpu_step` interpreter, which remains the correctness
 reference. `--jit`, where a native backend is available, supersedes it.
 
@@ -11,7 +11,7 @@ Each instruction is classified once into a `PDEnt` (dense opcode id +
 pre-extracted operands) by `pd_fill` and cached in the CPU's decode cache
 (`c->eng.pd`), a direct-mapped table indexed by `(pc>>2)`. Execution is a
 **computed-goto direct-threaded loop** (`pd_run` in `lib/arm64/pdrun.c`,
-arm64chroot's tier too): each handler ends in a `NEXT` that bumps `icount`,
+both modes' tier): each handler ends in a `NEXT` that bumps `icount`,
 returns to the run loop if the CPU asks for attention (a stop or halt, an
 interrupt line raised and unmasked) or the slice's deadline is reached,
 fetches the next word via `mem_ifetch`, validates the cache entry, and
@@ -45,7 +45,7 @@ Firmware + Linux boot, 400M instructions, min-of-3, this host:
 
 | mode | time | MIPS | vs interp |
 |------|------|------|-----------|
-| plain interpreter (`--no-pd`) | 10.97 s | ~36.5 | 1.0× |
+| plain interpreter (`--no-predecode`) | 10.97 s | ~36.5 | 1.0× |
 | predecoded tier (default) | 4.46 s | ~89.7 | **2.46×** |
 
 `--jit` remains far faster (~370 MIPS) where a native backend is available; the
@@ -55,16 +55,16 @@ backend). `--jit` supersedes it when given.
 ## Correctness / determinism
 
 `icount` is exact (every instruction, including fetch-aborted ones). Verified
-byte-identical against the plain interpreter (`--no-pd`) at 1M/4M/16M/64M/300M via
-`tests/arm64emu/run_pd_consist.sh` (`make test-arm64emu-pd`), across the full asm suite run as the
-default engine, by the full-boot log gate (`make test-arm64emu-pd-full`), and by the
+byte-identical against the plain interpreter (`--no-predecode`) at 1M/4M/16M/64M/300M via
+`tests/arm64emu/boot/run_pd_consist.sh` (`make test-arm64emu-boot-pd`), across the full asm suite run as the
+default engine, by the full-boot log gate (`make test-arm64emu-boot-pd-full`), and by the
 cross-engine fuzzer (`make fuzz-arm64emu`) — see `docs/arm64emu/parity.md`. These gates pin
 the deterministic clock (`ARM64EMU_RTCLOCK=0`); the runtime default is the host wall
 clock (`ARM64EMU_RTCLOCK=1`).
 Like `--jit`, the only accepted deviation is tick-cadence: timer-IRQ delivery
 points can shift printk timestamps deep in a long boot (console *content* stays
 identical). Forced off (falls back to the plain interpreter) when a per-instruction debug
-facility is active (`--trace`/`--reg-trace`/watchpoints), which expects one
+facility is active (`--debug`/`--reg-trace`/watchpoints), which expects one
 `exec_a64` per step. `ARM64EMU_PD_MAX=N` dispatches only PD ops ≤ N natively
 (0 = pure interpreter) — the predecoded-tier bisection knob, analogous to
 `ARM64EMU_JIT_PDMAX`.

@@ -4,7 +4,7 @@
 # seccomp and so runs anywhere. Then guest-shell scenarios under -R with a real
 # Alpine rootfs: those are the ones that would have caught a file describing
 # chroot-ng instead of the guest, since a shell reads them the way a real tool
-# does. Unlike M10 this is not differential against arm64chroot — the sibling
+# does. Unlike M10 this is not differential against arm64emu — the sibling
 # emulator synthesizes a plausibly different mount table (its own pseudo-mount
 # rows and mount IDs), so the assertions are structural instead.
 echo "== M11: /proc emulation =="

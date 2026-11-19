@@ -1099,7 +1099,7 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
      * The group is made here through the l2s API, on host paths, because the
      * bind refuses the linkat that would otherwise make one — which is also
      * how such a tree comes about in practice: linked while writable (or by
-     * arm64chroot), bound read-only afterwards.
+     * arm64emu), bound read-only afterwards.
      *
      * The rw run is the negative control: the same calls must NOT report EROFS
      * there, so a blanket refusal cannot pass both legs. */
@@ -4054,7 +4054,7 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
         fails += !ok;
     }
 
-    /* Legacy per-dir format end to end (what arm64chroot writes, and what a
+    /* Legacy per-dir format end to end (what arm64emu writes, and what a
      * pre-store chroot-ng left behind): stat, same-dir bump keeping the
      * legacy look, cross-dir join via absolute target, decref, readlink. */
     char ogdir[CNG_PATH_MAX], od2[CNG_PATH_MAX], om2[CNG_PATH_MAX],

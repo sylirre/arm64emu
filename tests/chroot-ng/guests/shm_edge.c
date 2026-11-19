@@ -5,7 +5,7 @@
  *   - SHM_EXEC is a *permission* request, not just a mapping flag: attaching a
  *     0600 segment with it must fail EACCES (no execute bit), the way the
  *     kernel checks S_IXUGO. The broker's permission triad had no execute leg.
- *   - SHM_LOCK/SHM_UNLOCK succeed for the segment's owner. arm64chroot answers
+ *   - SHM_LOCK/SHM_UNLOCK succeed for the segment's owner. arm64emu answers
  *     EINVAL; there is nothing to pin here, but refusing is the wrong answer.
  *   - SHM_RND turns an unaligned address into a rounded one, so the failure
  *     that follows is EPERM from the mapping, not EINVAL from the check.

@@ -46,8 +46,7 @@ static u64 timer_count(CPU *c, bool virt) {
  * not implement (DIT, SSBS, TCO, RNDR, ...) -- and the ID registers: without
  * FEAT_IDST (ID_AA64MMFR2_EL1.IDS is 0 here) an EL0 read of one is UNDEFINED,
  * which is what a guest kernel's MRS emulation (Linux's emulate_mrs) is for;
- * in arm64chroot the emulator itself plays that kernel (loop.c, from
- * sysreg_id_read). */
+ * in user mode the emulator itself plays that kernel (from sysreg_id_read). */
 static bool el0_allowed(CPU *c, unsigned L, unsigned op0, unsigned op1,
                         unsigned CRn, unsigned CRm, unsigned op2, unsigned Rt) {
     u64 sctlr = c->sctlr[1], kctl = c->cntkctl_el1;
@@ -151,8 +150,8 @@ static void sys_op(CPU *c, u32 insn, unsigned op1, unsigned CRn, unsigned CRm,
             u64 base = reg_x(c, Rt) & ~63ULL;
             /* One translation covers the line (64-aligned: never crosses a
              * page): a writable host pointer -> memset. Otherwise the 8x
-             * mem_write loop raises the fault identically -- and in arm64emu
-             * handles MMIO, watchpoint runs (the D-TLB is empty then) and
+             * mem_write loop raises the fault identically -- and in a full
+             * system handles MMIO, watchpoint runs (the D-TLB is empty then) and
              * JIT code pages (W refused -> slow path keeps SMC invalidation). */
             void *hp = mem_host_ptr(c, base, 64, ACC_WRITE);
             if (hp) { memset(hp, 0, 64); return; }
@@ -267,7 +266,7 @@ u64 sysreg_id_read(CPU *c, unsigned CRm, unsigned op2) {
  * encoding QEMU uses for trapped-from-AArch64 FP accesses). Shared by the
  * interpreter dispatch guards, the sysreg FPCR/FPSR guards, and the
  * predecoded tier's specialized vector load/store handlers -- all behind
- * fp_trapped, which only arm64emu's guest can set. */
+ * fp_trapped, which only a full system's guest can set. */
 void cpu_fp_trap(CPU *c) {
     cpu_raise_sync(c, esr_make(EC_FP_SIMD_TRAP, 0x01E00000), 0);
 }

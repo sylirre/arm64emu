@@ -16,7 +16,7 @@
  * names the daemon's "/dev/shm/%08x" socket, which serves the backing to host
  * processes of our uid.
  *
- * Ported from arm64chroot's src/arm64chroot/sys_ipc.c. The emulator there had to map into a
+ * Ported from arm64emu's src/arm64emu/chroot/sys_ipc.c. The emulator there had to map into a
  * synthetic guest address space; here the mapping is an ordinary host mmap, so
  * the attach-address rules (SHM_RND/SHM_REMAP/an occupied range) are expressed
  * as mmap flags instead.

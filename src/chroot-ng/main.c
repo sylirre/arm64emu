@@ -12,7 +12,7 @@
  * there and the overview in README.md in sync.
  *
  * The runtime is freestanding (no libc), so the help renderer — ported from the
- * sibling arm64chroot project — is built on the cng_ I/O helpers plus a raw
+ * sibling arm64emu program — is built on the cng_ I/O helpers plus a raw
  * ioctl(TIOCGWINSZ). cng_dprintf has fixed widths only (no "%*s"), so column
  * alignment is done with out_pad().
  */
@@ -167,7 +167,7 @@ static void version(void) {
 }
 
 /* --- help renderer: reflow the reference to the terminal width ------------
- * Layout mirrors arm64chroot's proot-distro-style renderer: UPPERCASE sections
+ * Layout mirrors arm64emu's proot-distro-style renderer: UPPERCASE sections
  * framed by blank lines, a two-column name/description table (one blank line
  * between entries) that collapses to a stacked layout on narrow PTYs. */
 
@@ -741,7 +741,7 @@ static int host_exists(const char *path) {
  * path DST, read-only with a trailing ":ro". SRC is a directory or a single
  * file — `mount --bind` takes either, and the file form is what
  * `-b /etc/resolv.conf:/etc/resolv.conf` is; only existence is required of it
- * here. This is the arm64chroot
+ * here. This is arm64emu's
  * order — host first — and it is the reverse of what chroot-ng accepted before
  * 0.1.0, so a swapped spec is diagnosed explicitly below rather than silently
  * mounting the wrong way round. Host paths may not contain ':'.

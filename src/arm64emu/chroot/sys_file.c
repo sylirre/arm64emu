@@ -1,0 +1,5229 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* File and fd syscalls. Guest fd == host fd (the kernel does the numbering);
+ * every path argument goes through resolve_pin() for rootfs containment: the
+ * syscall names its target by a pinned parent fd, never by a path the host
+ * would resolve a second time (path.c).
+ * Structs are marshalled through explicit guest layouts (guest_abi.h) so the
+ * same code is correct on ILP32 hosts. */
+#include <dirent.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sched.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <sys/file.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/uio.h>
+#include <sys/xattr.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "sys.h"
+#include "sys_netlink.h"
+#include "ptrace.h"
+#include "link2symlink.h"
+
+/* O_* translation: asm-generic (arm64/arm32 guest) vs host. Only these four
+ * differ between asm-generic and x86; the rest pass through. */
+int oflags_g2h(int g) {
+    int h = g & ~(G_O_DIRECTORY | G_O_NOFOLLOW | G_O_DIRECT | G_O_LARGEFILE);
+    if (g & G_O_DIRECTORY) h |= O_DIRECTORY;
+    if (g & G_O_NOFOLLOW)  h |= O_NOFOLLOW;
+#ifdef O_DIRECT
+    if (g & G_O_DIRECT)    h |= O_DIRECT;
+#endif
+    return h;
+}
+int oflags_h2g(int h) {
+    int g = h & ~(O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE
+#ifdef O_DIRECT
+                  | O_DIRECT
+#endif
+                 );
+    if (h & O_DIRECTORY) g |= G_O_DIRECTORY;
+    if (h & O_NOFOLLOW)  g |= G_O_NOFOLLOW;
+#ifdef O_DIRECT
+    if (h & O_DIRECT)    g |= G_O_DIRECT;
+#endif
+    /* The guest is a 64-bit task, and build_open_flags puts O_LARGEFILE on
+     * every open a 64-bit task makes (force_o_largefile), so F_GETFL always
+     * shows it there -- whatever the host's own bit says, which on an ILP32
+     * host is set only when the emulator asked for it. */
+    g |= G_O_LARGEFILE;
+    return g;
+}
+
+#ifdef L2S_ENABLED
+/* Is any bind mount read-only? The --link2symlink :ro questions that cost a
+ * lookup of their own are asked only then. */
+static int any_ro_bind(void) {
+    for (int i = 0, n = bind_count(); i < n; i++)
+        if (bind_ro(i)) return 1;
+    return 0;
+}
+#endif
+
+/* --link2symlink and :ro binds, by descriptor. A descriptor opened through a
+ * name of a group is on the group's data file -- in the store under the
+ * rootfs, which no bind covers -- and which name it came through is not
+ * something a description remembers. What it does remember is its access
+ * mode: a writable one came through a writable name, since every write-open
+ * under a :ro name is refused by name (pin_ro), so it may write; a read-only
+ * or O_PATH one is judged as if it came through a :ro bind, whenever one
+ * exists at all. That over-refuses exactly one shape -- a read-only descriptor
+ * on a hardlinked file opened through a writable name, then written through by
+ * descriptor or reopened for writing through its fd link, while some :ro bind
+ * exists -- and nothing else (chroot-ng draws the same line). `real` is where
+ * the kernel says the description's file is; `fd` is the descriptor, or -1
+ * for another process's, which cannot be asked and is taken as read-only,
+ * the side that refuses. */
+static int l2s_fd_ro(struct Machine *m, const char *real, int fd) {
+#ifdef L2S_ENABLED
+    if (!m->link2symlink || !any_ro_bind()) return 0;
+    const char *b = strrchr(real, '/');
+    if (!l2s_hidden(b ? b + 1 : real)) return 0;
+    int fl = fd >= 0 ? fcntl(fd, F_GETFL) : -1;
+    return fl < 0 || (fl & O_ACCMODE) == O_RDONLY;
+#else
+    (void)m; (void)real; (void)fd;
+    return 0;
+#endif
+}
+
+/* 1 if `host` (a resolved host path) lies under a read-only -bind mount, so a
+ * mutating syscall on it must return -EROFS. bind_of_host matches the bound
+ * host prefix at a '/' boundary; non-bind paths never match.
+ *
+ * A path in the /proc zone passes through the resolver verbatim, and the fd
+ * links there -- /proc/self/fd/N, /proc/<pid>/fd/N, task/<tid>/fd/N, and the
+ * /dev/fd/N and /dev/std* that resolve to them -- name an open description,
+ * which the kernel judges by the MOUNT it was opened through: re-opening one
+ * for writing on a read-only mount is EROFS, and so is truncate, chmod,
+ * chown, utimensat or setxattr named that way. Judged by the bound prefix
+ * alone, "/proc/self/fd/N" matched nothing, so a guest holding a read-only
+ * (or O_PATH) descriptor of a file under a :ro bind re-opened it writable
+ * through its own link -- with O_TRUNC, if it liked. The link is followed
+ * here, once, for every caller -- and a link on a data file of a group is
+ * judged by its access mode as well (l2s_fd_ro). An anonymous target
+ * (pipe:[N]) is nothing a bind can cover. */
+static int host_ro(struct Machine *m, const char *host) {
+    if (bind_count() == 0) return 0;
+    char tgt[PATH_MAX];
+    int link_fd = -2;              /* not an fd link */
+    if (proc_zone_path(host)) {
+        ssize_t n = readlink(host, tgt, sizeof tgt - 1);
+        if (n <= 0) return 0;
+        tgt[n] = 0;
+        if (tgt[0] != '/') return 0;
+        if (proc_fd_link_path(host)) link_fd = proc_own_fd_path(host);
+        host = tgt;
+    }
+    int i = bind_of_host(m, host, NULL);
+    if (i >= 0 && bind_ro(i)) return 1;
+    return link_fd != -2 && l2s_fd_ro(m, host, link_fd);
+}
+
+/* host_ro of the file a pin names, and, for a name of a group, of the name
+ * and of the data as well (PathPin.l2s_ro): the file lives on that mount, and
+ * every name of it is read-only there. */
+static int pin_ro(struct Machine *m, const PathPin *p) {
+    return p->l2s_ro || host_ro(m, p->host);
+}
+
+/* Same question asked of an open fd, for the syscalls that name a file by
+ * descriptor rather than by path. A read-only bind was only ever enforced on
+ * the path-taking calls, so a guest that opened a file -- read-only was enough,
+ * none of these need write access -- could still fchmod, fchown, ftruncate,
+ * fallocate, set xattrs or set the inode's chattr flags on it, straight
+ * through to the host. That includes the calls that reach a file by descriptor
+ * while still looking like path calls: fchownat(fd, "", AT_EMPTY_PATH) and the
+ * FS_IOC_SETFLAGS ioctl. Guest fds are host fds, so the fd's own
+ * /proc/self/fd link is the host path to test.
+ * Skipped entirely when no bind mounts exist, which is the usual case. */
+static int fd_ro(struct Machine *m, int fd) {
+    if (fd < 0 || bind_count() == 0) return 0;
+    char link[64], host[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, host, sizeof host - 1);
+    if (n <= 0 || (size_t)n >= sizeof host) return 0;
+    host[n] = 0;
+    return host_ro(m, host) || (host[0] == '/' && l2s_fd_ro(m, host, fd));
+}
+
+void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
+    memset(g, 0, sizeof *g);
+    g->st_dev = st->st_dev;
+    g->st_ino = st->st_ino;
+    g->st_mode = st->st_mode;
+    g->st_nlink = (u32)st->st_nlink;
+    g->st_uid = remap_uid(m, st->st_uid);   /* fake-id ownership remap */
+    g->st_gid = remap_gid(m, st->st_gid);
+    g->st_rdev = st->st_rdev;
+    g->st_size = st->st_size;
+    g->st_blksize = (s32)st->st_blksize;
+    g->st_blocks = st->st_blocks;
+    g->st_atime_sec = st->st_atim.tv_sec;
+    g->st_atime_nsec = st->st_atim.tv_nsec;
+    g->st_mtime_sec = st->st_mtim.tv_sec;
+    g->st_mtime_nsec = st->st_mtim.tv_nsec;
+    g->st_ctime_sec = st->st_ctim.tv_sec;
+    g->st_ctime_nsec = st->st_ctim.tv_nsec;
+}
+
+/* True when -fake-id is active and the guest's effective uid is root. */
+
+/* Bounded guest-iovec import. Returns the segment count or -errno.
+ *
+ * The guest's own array is read exactly once, and `gout` keeps that one
+ * snapshot for the caller: the segment bases are needed again after the host
+ * syscall (to scatter a read back, or to gather a write's bytes), and a second
+ * copy_from_guest of the same array is a different array. Another guest thread
+ * sharing the address space can rewrite it -- or unmap it -- while the call is
+ * in flight, and then the bases the copy-back used would name memory the
+ * kernel never agreed to touch, paired with lengths from the first read. The
+ * kernel snapshots an iovec array once, in import_iovec, and never looks at
+ * the user's copy again; so does this.
+ *
+ * What comes back in gout[0..count) is the vector as the transfer is to move
+ * it: every length clamped and cut as below, so its sum is the most the call
+ * may move of the guest's own memory, and *cut is what the guest named past
+ * that -- which xfer_begin (sys.h) hands the host as a fault, for the file to
+ * answer as it does. */
+static int iov_import(CPU *c, u64 iov_va, unsigned cnt, GIovec *gout,
+                      int writeback, XferCut *cut) {
+    cut->seg = cut->after = 0;
+    cut->denied = 0;
+    /* `cnt` is deliberately narrow. The guest passes iovcnt in a 64-bit
+     * register and the kernel takes it as `unsigned long`, but it reaches
+     * import_iovec's `unsigned nr_segs` and is truncated there -- so on a real
+     * kernel readv(fd, iov, 1ULL<<32) reads nothing and returns 0, and
+     * readv(fd, iov, (1ULL<<32)+1) is an ordinary one-segment read. Verified
+     * against one; qemu-user is not the oracle for this (it validates the full
+     * 64-bit value and answers EINVAL for both). The callers' (unsigned) cast
+     * reproduces the kernel's, and the UIO_MAXIOV check below then sees the
+     * same number the kernel does. A socket's msg_iovlen is the opposite case:
+     * the kernel checks the whole u64 there (see msg_import in sys_net.c). */
+    if (cnt > 1024) return -EINVAL;
+    if (copy_from_guest(c, gout, iov_va, sizeof(GIovec) * cnt) < 0) return -EFAULT;
+    /* The segment bounds are __import_iovec's own: a length that is negative
+     * as an ssize_t is EINVAL (iovec_from_user refuses it before the vector is
+     * used for anything), and the running total is CLAMPED to MAX_RW_COUNT
+     * rather than refused, so a vector past that is a short transfer and not
+     * an error -- the same rule msg_import follows for the socket calls
+     * (sys_net.c). The flat 1 GiB ceiling that used to stand here refused both
+     * cases, which made a readv of a large buffer EINVAL where a read(2) of
+     * the same buffer on the same fd went through: the scalar path has always
+     * clamped to the same MAX_RW_COUNT (rw_count, sys.h).
+     *
+     * Clamping the snapshot itself, rather than the sum, is what keeps the
+     * short-transfer bookkeeping below honest: a segment the clamp emptied is
+     * a segment the guest is not owed bytes in, which is exactly what a zero
+     * length says, and the cut detection then still means only "the guest
+     * could not back this". */
+    u64 asked = 0;
+    for (unsigned i = 0; i < cnt; i++) {
+        if ((s64)gout[i].iov_len < 0) return -EINVAL;
+        if (gout[i].iov_len > A64_MAX_RW_COUNT - asked)
+            gout[i].iov_len = A64_MAX_RW_COUNT - asked;
+        asked += gout[i].iov_len;
+    }
+    /* Bound every segment by the guest's own memory, as rw_room does for the
+     * scalar calls (sys.h). A kernel copies straight between the file and the
+     * caller's pages and stops at the first address the caller does not have;
+     * this emulator has to find host memory for the transfer first, so
+     * without this it went looking for -- and then really consumed from the
+     * fd -- everything the guest named, only to discover afterwards that the
+     * destination was not there. A guest could name a gigabyte it does not
+     * own and the emulator, not the guest, had to find room for it.
+     *
+     * Cut the vector where the kernel's copy stops, and report the rest in
+     * *cut. What the fault means for the call is the file's to say -- it is
+     * not one answer, and deciding it here from the file's type (EFAULT for
+     * every pipe and socket, before the fd was touched) was wrong for most of
+     * them: sys.h has the list. */
+    AccType acc = writeback ? ACC_WRITE : ACC_READ;
+    /* import_iovec's access_ok, per segment as clamped above: one that fails
+     * it fails the whole call with EFAULT, before the file is asked
+     * anything (sys.h, XferCut.denied). */
+    for (unsigned i = 0; i < cnt; i++)
+        if (!guest_access_ok(gout[i].iov_base, gout[i].iov_len)) cut->denied = 1;
+    unsigned nseg = 0;
+    for (; nseg < cnt; nseg++) {
+        size_t want = (size_t)gout[nseg].iov_len;
+        size_t room = want ? rw_room(c, gout[nseg].iov_base, want, acc) : 0;
+        gout[nseg].iov_len = room;
+        if (room < want) {
+            cut->seg = want - room;
+            for (unsigned i = nseg + 1; i < cnt; i++) cut->after += (size_t)gout[i].iov_len;
+            nseg++;
+            break;
+        }
+    }
+    return (int)nseg;
+}
+
+/* ---- one transfer's bytes, between the guest and a host syscall (sys.h) ---- */
+
+/* Does handing `fd` one host iovec per run, rather than one per guest segment,
+ * move the same bytes? For the files whose host side takes an iovec whole --
+ * a regular file, a block device, a pipe, a socket -- the split cannot show.
+ * A character device or an anonymous inode may be served by a driver with
+ * only ->read/->write, which do_loop_readv_writev calls once per iovec, and
+ * whose answer can depend on where the pieces fall (sys.h): a record that no
+ * longer fits the first piece is EINVAL, and a tty in raw mode, having filled
+ * the first piece, waits for VMIN more characters to fill the second. The
+ * memory devices (major 1: null, zero, full, random, urandom, ...) are the
+ * exception worth making -- each piece is simply as many bytes as asked for
+ * -- all but /dev/kmsg, which hands out one record a read. *cache: -1 until
+ * asked, then the answer. */
+static int xfer_split_ok(int fd, int *cache) {
+    if (*cache < 0) {
+        struct stat st;
+        *cache = fstat(fd, &st) == 0 &&
+                 (S_ISREG(st.st_mode) || S_ISBLK(st.st_mode) ||
+                  S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
+                  (S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 &&
+                   minor(st.st_rdev) != 11));
+    }
+    return *cache;
+}
+
+/* ---- a transfer's runs in a stack's hole (sys.h, XferHole; mmu.h) ----
+ *
+ * A kernel grows a stack over the hole beneath it when its copy touches the
+ * hole -- when a read's copy puts a byte there, or a write's takes one from
+ * there -- and not before the call, and not for one that moves none there: a
+ * read at end-of-file or one whose earlier segments took every byte, a write
+ * to a pipe with no reader or to /dev/null. The emulator grew it as it set
+ * the transfer up -- the lend walk, the copy into a bounce buffer -- so every
+ * such call left the stack grown, as a VmStk and /proc/<pid>/maps showed. So
+ * a run in the hole goes to the host as memory of ours (zeroes, for a write:
+ * what the growth would map), and xfer_end grows the stack over it after the
+ * call, as far as the host got.
+ *
+ * And not for GUP, which has grown no stack since 6.1.37: a filesystem that
+ * really does direct I/O pins an O_DIRECT transfer's pages by it, and a run
+ * in a stack's hole is EFAULT there, while one that falls back to the page
+ * cache (btrfs, tmpfs) copies, and grows the stack -- as do some that pin,
+ * for what the pin left: ext4 redoes a direct write that moved nothing
+ * through the page cache, exfat the rest of a direct read that came up
+ * short. Which one a descriptor does is the host's to know, so the host is
+ * asked by the same deed: an
+ * O_DIRECT transfer's run goes to it as the hole under a growsdown mapping
+ * of its own (xfer_scratch), which its kernel grows or not exactly as the
+ * guest's would grow the stack, and the guest's stack grows if the
+ * scratch did. */
+
+static int xfer_hole_add(GuestXfer *x, const XferHole *h) {
+    if (x->nhole == x->caphole) {
+        int nc = x->caphole ? x->caphole * 2 : 4;
+        XferHole *nh = realloc(x->hole, sizeof *nh * (size_t)nc);
+        if (!nh) return -ENOMEM;
+        x->hole = nh;
+        x->caphole = nc;
+    }
+    x->hole[x->nhole++] = *h;
+    return 0;
+}
+
+/* Release what the runs hold -- their staging, a scratch -- and forget them. */
+static void xfer_holes_drop(GuestXfer *x) {
+    for (int i = 0; i < x->nhole; i++) {
+        if (x->hole[i].map) munmap(x->hole[i].map, x->hole[i].maplen);
+        free(x->hole[i].mem);
+    }
+    x->nhole = 0;
+}
+
+/* Gather `len` guest bytes from `va` -- what a host call that reads them is
+ * handed -- growing no stack: a run in a stack's hole is the zeroes its
+ * growth would map, recorded for xfer_end (`at`: va's offset into the
+ * transfer). -EFAULT at a page that is neither, as copy_from_guest. */
+static int xfer_gather(CPU *c, GuestXfer *x, u8 *dst, u64 va, size_t len, size_t at) {
+    size_t off = 0;
+    while (off < len) {
+        off += copy_from_guest_look(c, dst + off, va + off, len - off);
+        if (off == len) break;
+        size_t h = mem_stack_hole(c, va + off, len - off, ACC_READ);
+        if (!h) return -EFAULT;
+        memset(dst + off, 0, h);
+        XferHole e = { .va = va + off, .len = h, .at = at + off };
+        if (xfer_hole_add(x, &e) < 0) return -ENOMEM;
+        off += h;
+    }
+    return 0;
+}
+
+static int xfer_odirect(GuestXfer *x) {
+    if (x->odirect < 0) {
+        int fl = fcntl(x->fd, F_GETFL);
+        x->odirect = fl >= 0 && (fl & O_DIRECT);
+    }
+    return x->odirect;
+}
+
+/* How long a run of an O_DIRECT transfer one scratch takes: what the host's
+ * own RLIMIT_STACK lets a growsdown mapping grow to, two pages kept back --
+ * the emulator never changes it, the guest's being its own (sys_misc.c) --
+ * and a MiB at most. 0 when it lets none grow at all. */
+static size_t xfer_scratch_max(void) {
+    static size_t v = (size_t)-1;
+    size_t r = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (r == (size_t)-1) {
+        size_t hp = (size_t)sysconf(_SC_PAGESIZE);
+        struct rlimit rl;
+        r = (size_t)1 << 20;
+        if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+            r = rl.rlim_cur > 2 * hp + r ? r
+                : rl.rlim_cur > 2 * hp ? (size_t)(rl.rlim_cur - 2 * hp) & ~(size_t)GUEST_PAGE_MASK
+                : 0;
+        __atomic_store_n(&v, r, __ATOMIC_RELAXED);
+    }
+    return r;
+}
+
+/* The hole under a host growsdown mapping, for the run [va, va+len): a
+ * PROT_NONE floor (no access, so it keeps no guard gap), the run's pages
+ * unmapped above it, and one accessible page on top that grows down over
+ * them when the host's copy touches them -- the run lying in them at its own
+ * offset into a page, as the alignment of an O_DIRECT transfer is judged.
+ * Placed low where it can be, out of the way of the host's own top-down
+ * placement: a mapping made there meanwhile would refuse the growth. NULL
+ * when the host will not map it. */
+static u8 *xfer_scratch(u64 va, size_t len, void **mapp, size_t *maplenp) {
+    size_t hp = (size_t)sysconf(_SC_PAGESIZE);
+    u64 g0 = va & ~(u64)GUEST_PAGE_MASK;
+    u64 g1 = (va + len + GUEST_PAGE_MASK) & ~(u64)GUEST_PAGE_MASK;
+    size_t span = ((size_t)(g1 - g0) + hp - 1) & ~(hp - 1);
+    size_t total = hp + span + hp;
+    void *hint = (void *)(uintptr_t)(sizeof(void *) >= 8 ? 0x10000000UL : 0);
+    u8 *base = mmap(hint, total, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) return NULL;
+    u8 *top = base + hp + span;
+    if (munmap(base + hp, span) != 0 ||
+        mmap(top, hp, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN, -1, 0) != top) {
+        munmap(base, total);
+        return NULL;
+    }
+    *mapp = base;
+    *maplenp = total;
+    return top - (size_t)(g1 - g0) + (size_t)(va - g0);
+}
+
+/* Did the host's copy grow the scratch under run `h` -- is the page its
+ * first byte lies in mapped now? */
+static int xfer_scratch_grew(const XferHole *h) {
+    size_t hp = (size_t)sysconf(_SC_PAGESIZE);
+    unsigned char v;
+    return mincore((void *)((uintptr_t)h->buf & ~(uintptr_t)(hp - 1)), hp, &v) == 0;
+}
+
+/* A run [va, va+len) of a segment in a stack's hole, as the next host iovecs
+ * of the transfer (x->n onward, below `cap`): staging of ours, or for an
+ * O_DIRECT descriptor scratch holes a MiB at most each. 0, -ENOMEM, or 1
+ * when the iovecs ran out first (the rest of it is then the caller's to
+ * stage). */
+static int xfer_hole_run(GuestXfer *x, u64 va, size_t len, int cap) {
+    size_t step = len;
+    int scratch = xfer_odirect(x) && (step = xfer_scratch_max()) != 0;
+    if (!scratch) step = len;
+    for (size_t off = 0; off < len; ) {
+        if (x->n >= cap) return 1;
+        size_t piece = len - off < step ? len - off : step;
+        XferHole h = { .va = va + off, .len = piece, .at = x->total };
+        if (scratch) {
+            h.buf = xfer_scratch(h.va, piece, &h.map, &h.maplen);
+            if (!h.buf) return -ENOMEM;
+        } else {
+            size_t pg = (size_t)(h.va & GUEST_PAGE_MASK);
+            if (posix_memalign(&h.mem, GUEST_PAGE_SIZE, pg + piece) != 0) return -ENOMEM;
+            h.buf = (u8 *)h.mem + pg;
+            memset(h.buf, 0, piece);   /* a write's: what the growth maps */
+        }
+        if (xfer_hole_add(x, &h) < 0) {
+            if (h.map) munmap(h.map, h.maplen);
+            free(h.mem);
+            return -ENOMEM;
+        }
+        x->iov[x->n].iov_base = h.buf;
+        x->iov[x->n].iov_len = piece;
+        x->pin[x->n++] = NULL;
+        x->npin = x->n;
+        x->total += piece;
+        off += piece;
+    }
+    return 0;
+}
+
+/* Stage `len` bytes of the guest vector, from segment `sseg` at `soff`, as
+ * the next part of the transfer: gathered now for a host call that reads
+ * them, handed back by xfer_end for one that writes them. `per_seg` keeps the
+ * guest's segment boundaries in the host iovecs (the whole transfer staged,
+ * possibly for a file that answers per segment); otherwise it is one iovec.
+ *
+ * The staging lies at the same offset into a host page as the guest's bytes
+ * lie into theirs. An O_DIRECT descriptor on a filesystem that really does
+ * direct I/O -- ext4, xfs, f2fs, exfat, a block device; not btrfs or tmpfs,
+ * which fall back to the page cache -- refuses with EINVAL a buffer, or an
+ * iovec, that is not aligned to its logical block (exfat's direct I/O) or to
+ * what its disk can DMA to (ext4's, xfs's), and malloc's sixteen bytes are
+ * not the former: every O_DIRECT transfer of 64 KiB or less, the ones
+ * staged rather than lent (sys.h), was refused there however the guest had
+ * aligned it. A vector whose segments are each aligned to a block of up to a
+ * page and as long as whole blocks stays aligned laid out end to end from
+ * the first one's offset. */
+static int xfer_stage(CPU *c, GuestXfer *x, int sseg, u64 soff, size_t len,
+                      int per_seg) {
+    size_t at = sseg < x->nseg ? (size_t)((x->seg[sseg].iov_base + soff) & GUEST_PAGE_MASK) : 0;
+    void *mem = NULL;
+    if (posix_memalign(&mem, GUEST_PAGE_SIZE, at + (len ? len : 1)) != 0) return -ENOMEM;
+    u8 *b = (u8 *)mem + at;
+    x->stage_mem = mem;
+    x->stage = b;
+    x->stage_len = len;
+    x->stage_seg = sseg;
+    x->stage_off = soff;
+    x->stage_at = x->total;
+    size_t off = 0;
+    for (int i = sseg; i < x->nseg; i++) {
+        if (off == len && x->seg[i].iov_len) break;   /* the cap ends it here */
+        u64 o = i == sseg ? soff : 0;
+        size_t piece = (size_t)(x->seg[i].iov_len - o);
+        if (piece > len - off) piece = len - off;
+        if (per_seg) {
+            x->iov[x->n].iov_base = b + off;
+            x->iov[x->n].iov_len = piece;
+            x->n++;
+        }
+        if (!x->to_guest && piece) {
+            int r = xfer_gather(c, x, b + off, x->seg[i].iov_base + o, piece,
+                                x->stage_at + off);
+            if (r < 0) return r;
+        }
+        off += piece;
+    }
+    if (!per_seg) {
+        x->iov[x->n].iov_base = b;
+        x->iov[x->n].iov_len = len;
+        x->n++;
+    }
+    x->total += len;
+    return 0;
+}
+
+/* The transfer staged whole in front of a guard, for a file that may answer
+ * each iovec on its own (sys.h): the segment the guest's memory stops in goes
+ * as one iovec of the length the guest named for it, the guard beginning
+ * where the guest's memory ends, and the segments after it as an iovec over
+ * address 0. The guard is as long as the rest of that segment -- address
+ * space only -- or, on a host that cannot find that much (an ILP32 one, for
+ * a length near MAX_RW_COUNT), as long as it can find: a driver faults on its
+ * first page all the same, and then merely sees a shorter segment than the
+ * guest named. `want` is the sum of the vector, at most XFER_STAGE_MAX. */
+static int xfer_guard(CPU *c, GuestXfer *x, size_t want, const XferCut *cut,
+                      struct iovec *iov_store) {
+    size_t ps = (size_t)sysconf(_SC_PAGESIZE), g = cut->seg;
+    u8 *b;
+    while (!(b = guardbuf_map(&x->guard, want, want + g))) {
+        if (g <= ps) return -ENOMEM;
+        g = g / 2 > ps ? g / 2 : ps;
+    }
+    x->guarded = 1;
+    x->stage = b;
+    x->stage_len = want;
+    int n = x->nseg + (cut->after ? 1 : 0);
+    x->iov = n <= 1 ? &x->iov1 : iov_store;
+    if (!x->iov) {
+        if (!(x->heap = malloc(sizeof *x->iov * (size_t)n))) return -ENOMEM;
+        x->iov = x->heap;
+    }
+    size_t off = 0;
+    for (int i = 0; i < x->nseg; i++) {
+        size_t len = (size_t)x->seg[i].iov_len;
+        if (!x->to_guest && len) {
+            int r = xfer_gather(c, x, b + off, x->seg[i].iov_base, len, off);
+            if (r < 0) return r;
+        }
+        x->iov[x->n].iov_base = b + off;
+        x->iov[x->n].iov_len = len + (i == x->nseg - 1 ? g : 0);
+        x->n++;
+        off += len;
+    }
+    if (cut->after) {
+        x->iov[x->n].iov_base = NULL;
+        x->iov[x->n].iov_len = cut->after;
+        x->n++;
+    }
+    x->total = want;
+    return 0;
+}
+
+int xfer_begin(CPU *c, int fd, const GIovec *seg, int nseg, int to_guest,
+               int flags, const XferCut *cut, struct iovec *iov_store,
+               GuestXfer *x) {
+    memset(x, 0, sizeof *x);
+    x->seg = seg;
+    x->nseg = nseg;
+    x->to_guest = to_guest;
+    x->fd = fd;
+    x->odirect = -1;
+    /* Bytes in a stack's hole, which the measure of the guest's memory
+     * (rw_room) crossed: an O_DIRECT descriptor's are the host's to judge
+     * (xfer_scratch), which only the lend walk below arranges for. */
+    if (g_tls.xfer_hole) {
+        g_tls.xfer_hole = 0;
+        if (xfer_odirect(x)) flags |= XFER_LEND;
+    }
+    size_t want = 0;
+    for (int i = 0; i < nseg; i++) want += (size_t)seg[i].iov_len;
+    /* A buffer that is no user memory at all (sys.h, XferCut.denied). */
+    if (cut && cut->denied) {
+#if UINTPTR_MAX > 0xffffffffu
+        /* One iovec at the top of the host's address space, which its
+         * access_ok refuses whatever the length, so the host answers in the
+         * kernel's own order -- nothing lent, nothing staged. */
+        x->iov = &x->iov1;
+        x->iov1.iov_base = (void *)(uintptr_t)-4096;
+        x->iov1.iov_len = want + cut->seg + cut->after;
+        x->n = 1;
+        return 0;
+#else
+        /* An ILP32 process on a 64-bit kernel -- the 32-bit build under
+         * x86-64, an armv7 build on an arm64 phone -- has no address the
+         * host's access_ok refuses, and one it does not map would be faulted
+         * on only after the file had been waited on. So the kernel's order is
+         * kept here: the descriptor's own EBADF (none, not open that way, an
+         * O_PATH one), then EFAULT. */
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0) return -EBADF;
+        int am = fl & O_ACCMODE;
+        if ((fl & O_PATH) || am == (to_guest ? O_WRONLY : O_RDONLY)) return -EBADF;
+        return -EFAULT;
+#endif
+    }
+    size_t fault = cut ? cut->seg + cut->after : 0;
+    int split = -1;
+    int r;
+
+    /* Cut short of what the guest named: the host is handed the fault too
+     * (sys.h), after the whole transfer lent, or in front of a guard. */
+    if (fault) {
+        if (!xfer_split_ok(fd, &split)) {
+            if (want <= XFER_STAGE_MAX) {
+                if ((r = xfer_guard(c, x, want, cut, iov_store)) < 0) {
+                    xfer_end(c, x, 0);
+                    return r;
+                }
+                return 0;
+            }
+            fault = 0;   /* moved as any other transfer is, short of it (sys.h) */
+        }
+        flags |= XFER_LEND;
+    }
+
+    if (want <= XFER_BOUNCE_MAX && !(flags & XFER_LEND)) {
+        x->iov = nseg <= 1 ? &x->iov1 : iov_store;
+        if (!x->iov) {
+            if (!(x->heap = malloc(sizeof *x->iov * (size_t)nseg))) return -ENOMEM;
+            x->iov = x->heap;
+        }
+        if ((r = xfer_stage(c, x, 0, 0, want, 1)) < 0) { xfer_end(c, x, 0); return r; }
+        return 0;
+    }
+
+    size_t isz = iov_store ? 0 : sizeof *x->iov * XFER_IOV;
+    if (!(x->heap = malloc(isz + sizeof *x->pin * XFER_IOV))) return -ENOMEM;
+    x->iov = iov_store ? iov_store : x->heap;
+    x->pin = (HostMap **)((u8 *)x->heap + isz);
+    AccType acc = to_guest ? ACC_WRITE : ACC_READ;
+    /* The runs one call can lend: an iovec is left for a staged rest, and
+     * one for the fault. */
+    int cap = XFER_IOV - 2;
+    int gone = 0;   /* the guest's memory went away under the walk */
+    for (int i = 0; i < nseg; i++) {
+        size_t len = (size_t)seg[i].iov_len;
+        if (!len) {
+            /* An empty segment is still a segment to a file that answers
+             * per iovec; nothing to lend, and no pin under it. */
+            if (x->n < cap) {
+                x->iov[x->n].iov_base = NULL;
+                x->iov[x->n].iov_len = 0;
+                x->pin[x->n++] = NULL;
+                x->npin = x->n;
+            }
+            continue;
+        }
+        int before = x->n, why = LEND_ALL;
+        size_t off = 0;
+        while (off < len) {
+            size_t got = guest_lend(c, seg[i].iov_base + off, len - off, acc,
+                                    x->iov, x->pin, &x->n, cap, &why);
+            x->npin = x->n;
+            x->total += got;
+            off += got;
+            if (off == len || why != LEND_CUT) break;
+            /* A run in a stack's hole, which is not lent: memory of ours
+             * instead, and the stack grown over it after the call as far as
+             * the host got (xfer_hole_run, xfer_end). */
+            size_t h = mem_stack_hole(c, seg[i].iov_base + off, len - off, acc);
+            if (!h) break;   /* LEND_CUT proper: the memory went away */
+            size_t t0 = x->total;
+            int hr = xfer_hole_run(x, seg[i].iov_base + off, h, cap);
+            if (hr < 0) { xfer_end(c, x, 0); return hr; }
+            off += x->total - t0;
+            if (hr > 0) { why = LEND_FULL; break; }
+        }
+        if (x->n - before > 1 && !xfer_split_ok(fd, &split)) {
+            /* This segment is more than one run and the file may answer each
+             * run on its own: stage the whole transfer after all, a segment to
+             * an iovec as before, and capped (sys.h). */
+            guest_unlend(c, x->pin, x->npin);
+            xfer_holes_drop(x);
+            x->n = x->npin = 0;
+            x->total = 0;
+            size_t cap = want < XFER_STAGE_MAX ? want : XFER_STAGE_MAX;
+            if ((r = xfer_stage(c, x, 0, 0, cap, 1)) < 0) { xfer_end(c, x, 0); return r; }
+            return 0;
+        }
+        if (off == len) continue;
+        if (why == LEND_FULL) {
+            /* Out of host iovecs: the rest goes as one more, staged. */
+            size_t rest = want - x->total;
+            if (rest > XFER_STAGE_MAX) rest = XFER_STAGE_MAX;
+            if ((r = xfer_stage(c, x, i, off, rest, 0)) < 0) { xfer_end(c, x, 0); return r; }
+        } else {
+            /* LEND_CUT: the guest's memory went away since the caller
+             * measured it, and the transfer ends there, as the kernel's copy
+             * would -- faulting there, where the file can be told. */
+            gone = 1;
+        }
+        break;
+    }
+    /* The fault, where the guest's memory stops: after all of it, or where it
+     * went, and not after a staging cap that ends the transfer short of it.
+     * A file that answers per iovec is only ever handed one by xfer_guard. */
+    if ((gone || (fault && x->total == want)) && xfer_split_ok(fd, &split)) {
+        if (!x->total) x->n = x->npin = 0;   /* nothing lent: the fault leads */
+        x->iov[x->n].iov_base = NULL;
+        x->iov[x->n].iov_len = (want - x->total) + fault;
+        x->n++;
+        return 0;
+    }
+    if (!x->total && want) { xfer_end(c, x, 0); return -EFAULT; }
+    return 0;
+}
+
+/* Does `fd` discard what is written to it without reading it -- /dev/null
+ * and /dev/zero (write_null, write_zero) -- so that a write from a stack's
+ * hole to it touches nothing? */
+static int xfer_discards(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 &&
+           (minor(st.st_rdev) == 3 || minor(st.st_rdev) == 5);
+}
+
+/* The runs in a stack's hole, after the host call moved `done` bytes: each
+ * one the host got as far as is grown over, as the copy that touched it
+ * grows it on a kernel -- a read's bytes then handed over -- and an O_DIRECT
+ * descriptor's scratch says for itself whether the host's copy touched it. */
+static int xfer_holes_settle(CPU *c, GuestXfer *x, size_t done) {
+    int r = 0, discard = -1;
+    for (int i = 0; i < x->nhole && !r; i++) {
+        const XferHole *h = &x->hole[i];
+        size_t got = done > h->at ? done - h->at : 0;
+        if (got > h->len) got = h->len;
+        int grew;
+        if (h->map) {
+            grew = xfer_scratch_grew(h);
+        } else if (!got) {
+            grew = 0;
+        } else if (x->to_guest) {
+            grew = 1;
+        } else {
+            if (discard < 0) discard = xfer_discards(x->fd);
+            grew = !discard;
+        }
+        if (!grew) continue;
+        if (x->to_guest && !h->buf) continue;   /* in the stage: copied back above */
+        if (x->to_guest && got) {
+            if (copy_to_guest(c, h->va, h->buf, got) < 0) r = -EFAULT;
+        } else if (!mem_stack_touch(c, h->va, x->to_guest ? ACC_WRITE : ACC_READ)) {
+            r = -EFAULT;
+        }
+    }
+    return r;
+}
+
+int xfer_end(CPU *c, GuestXfer *x, size_t done) {
+    int r = 0;
+    if (x->stage && x->to_guest && done > x->stage_at) {
+        size_t left = done - x->stage_at, off = 0;
+        if (left > x->stage_len) left = x->stage_len;   /* MSG_TRUNC's length */
+        for (int i = x->stage_seg; i < x->nseg && left; i++) {
+            u64 o = i == x->stage_seg ? x->stage_off : 0;
+            size_t piece = (size_t)(x->seg[i].iov_len - o);
+            if (piece > left) piece = left;
+            if (piece && copy_to_guest(c, x->seg[i].iov_base + o, x->stage + off, piece) < 0) {
+                r = -EFAULT;
+                break;
+            }
+            off += piece;
+            left -= piece;
+        }
+    }
+    if (x->nhole && !r) r = xfer_holes_settle(c, x, done);
+    xfer_holes_drop(x);
+    free(x->hole);
+    x->hole = NULL;
+    x->caphole = 0;
+    guest_unlend(c, x->pin, x->npin);
+    if (x->guarded) guardbuf_free(&x->guard);
+    else free(x->stage_mem);
+    free(x->heap);
+    x->stage = NULL;
+    x->stage_mem = NULL;
+    x->heap = NULL;
+    x->guarded = 0;
+    x->npin = x->n = 0;
+    return r;
+}
+
+size_t gvec_head(CPU *c, const GIovec *seg, int nseg, void *out, size_t cap) {
+    size_t got = 0;
+    for (int i = 0; i < nseg && got < cap; i++) {
+        size_t piece = seg[i].iov_len < cap - got ? (size_t)seg[i].iov_len : cap - got;
+        size_t n = copy_from_guest_partial(c, (u8 *)out + got, seg[i].iov_base, piece);
+        got += n;
+        if (n < piece) break;
+    }
+    return got;
+}
+
+size_t gvec_put(CPU *c, const GIovec *seg, int nseg, const void *in, size_t len) {
+    size_t put = 0;
+    for (int i = 0; i < nseg && put < len; i++) {
+        size_t piece = seg[i].iov_len < len - put ? (size_t)seg[i].iov_len : len - put;
+        size_t n = copy_to_guest_partial(c, seg[i].iov_base, (const u8 *)in + put, piece);
+        put += n;
+        if (n < piece) break;
+    }
+    return put;
+}
+
+u64 xfer_finish(CPU *c, GuestXfer *x, ssize_t n) {
+    u64 e = n < 0 ? host_err() : (u64)n;
+    if (xfer_end(c, x, n > 0 ? (size_t)n : 0) < 0 && n >= 0) return (u64)(s64)-EFAULT;
+    return e;
+}
+
+u8 *guardbuf_map(GuardBuf *o, size_t head, size_t len) {
+    size_t ps = (size_t)sysconf(_SC_PAGESIZE);
+    size_t hb = (head + ps - 1) / ps * ps;
+    size_t gb = (len - head + ps - 1) / ps * ps;
+    if (hb > SIZE_MAX - gb) return NULL;
+    o->maplen = hb + gb ? hb + gb : ps;
+    void *m = mmap(NULL, o->maplen, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) return NULL;
+    o->map = m;
+    if (hb && mprotect(m, hb, PROT_READ | PROT_WRITE) < 0) {
+        munmap(m, o->maplen);
+        return NULL;
+    }
+    return o->map + hb - head;
+}
+
+void guardbuf_free(GuardBuf *o) {
+    munmap(o->map, o->maplen);
+}
+
+/* A write aimed at a synthesized /proc file (procfs_pre_write): the hook
+ * reads no further than PF_WRITE_HEAD into what is being written, so that is
+ * all that is copied out for it -- and only as far as the guest's memory
+ * goes, `seg` being the vector cut there and `len` what the guest named: a
+ * file that copies the write in faults where the copy does, which is after
+ * the checks it makes first. Returns 1 with *ret set when it answered. */
+static int procfs_write_hook(CPU *c, int fd, const GIovec *seg, int nseg,
+                             size_t len, s64 off, s64 *ret) {
+    if (!c->m->pf_fds_count) return 0;       /* the hook's own fast path */
+    u8 head[PF_WRITE_HEAD];
+    size_t want = len < sizeof head ? len : sizeof head;
+    size_t have = gvec_head(c, seg, nseg, head, want);
+    return procfs_pre_write(c, fd, head, have, len, off, ret);
+}
+
+/* A signalfd's records are translated on their way to the guest (sys_sig.c,
+ * sigfd_fill), so they are staged -- a batch at a time: SIGFD_BATCH records'
+ * worth, where a guest naming a larger buffer used to have the whole of it
+ * allocated for what is at most a few pending signals. A read that returns
+ * fewer records than are pending is what a signalfd does whenever the buffer
+ * is short of them, and the next read takes the rest. `seg` is the vector as
+ * far as the guest's memory goes, `tot` what the guest named -- 0 included,
+ * which sigfd_fill answers as the kernel's read(2) does.
+ *
+ * signalfd_read takes its record count from the length named, dequeues a
+ * record and then copies it out, one at a time: a record whose copy faults
+ * has been dequeued all the same, and is lost, the call answering with the
+ * records before it -- or EFAULT, with none. So where the guest's memory
+ * stops short of `tot`, as many records are taken as reach it, plus that one;
+ * sizing the read by the memory alone, as this used to, left it queued, and
+ * answered EINVAL where fewer bytes than one record were mapped. */
+#define SIGFD_BATCH (64u << 10)             /* 512 signalfd_siginfo records */
+static u64 sigfd_read_guest(CPU *c, int fd, const GIovec *seg, int nseg, size_t tot) {
+    const size_t rec = sizeof(GSignalfdSiginfo);
+    size_t room = 0;
+    for (int i = 0; i < nseg; i++) room += (size_t)seg[i].iov_len;
+    size_t len = tot < SIGFD_BATCH ? tot : SIGFD_BATCH;
+    if (room < tot && len > (room / rec + 1) * rec) len = (room / rec + 1) * rec;
+    u8 *buf = malloc(len ? len : 1);
+    if (!buf) return (u64)(s64)-ENOMEM;
+    s64 r = sigfd_fill(c, fd, buf, len);
+    if (r > 0) {
+        size_t put = gvec_put(c, seg, nseg, buf, (size_t)r);
+        if (put < (size_t)r) r = put / rec ? (s64)(put / rec * rec) : -EFAULT;
+    }
+    free(buf);
+    return (u64)r;
+}
+
+/* ---------------------------------------------------------------------------
+ * --link2symlink: emulate hardlinks with tracked symlinks.
+ *
+ * Where the host refuses link(2) -- Android/SELinux returns EXDEV (some configs
+ * EPERM) -- a guest hardlink is faked: the file moves into the rootfs's store
+ * "<rootfs>/.l2s" and every name becomes a symlink to it, its link count kept
+ * in a marker's name, so stat() reports st_nlink and the data is reclaimed
+ * only when the last name goes. One inode, matching st_ino, shared contents --
+ * unlike a copy. The groups proot's own link2symlink made (proot-distro's
+ * rootfs) are read and kept too. The scheme and its engine are
+ * lib/link2symlink (link2symlink.h), shared with chroot-ng; l2s.c is the host
+ * it runs on, and what is here is what the engine leaves to the program: the
+ * stat a name of a group answers, in this host's struct stat, and a listing's
+ * record for one. Compiled only where the host needs it (Android, where
+ * __ANDROID__ is auto-defined) or with -DA64_LINK2SYMLINK for testing; gated
+ * at run time by m->link2symlink (the --link2symlink option).
+ * ------------------------------------------------------------------------- */
+#ifdef L2S_ENABLED      /* machine.h: Android, or -DA64_LINK2SYMLINK */
+
+/* The stat the host path `host` answers as a name of a group -- the data
+ * file's, with the group's count as st_nlink -- or as the data file itself,
+ * which a following walk reaches. 1 (filled), 0 (neither), -errno. */
+static int l2s_name_stat(const char *host, struct stat *st) {
+    char data[PATH_MAX];
+    unsigned long count = 0;
+    int r = l2s_target(host, data, sizeof data, &count);
+    if (r != 1) return r;
+    r = l2s_host_stat(data, st, 0);
+    if (r < 0) return r;
+    st->st_nlink = count ? count : 1;
+    return 1;
+}
+
+/* The same for a pinned name. A name the walk could not pin (the /proc zone)
+ * is none the scheme made. */
+static int l2s_stat(const PathPin *p, struct stat *st) {
+    return p->pinned ? l2s_name_stat(p->host, st) : 0;
+}
+
+/* fstat-by-fd: where the kernel says the fd's file is (/proc/self/fd/N), and
+ * if that is a group's data file, its count as st_nlink. */
+static void l2s_fix_fd(int fd, struct stat *st) {
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof path - 1);
+    if (n < 0) return;
+    path[n] = '\0';
+    unsigned long c;
+    if (l2s_path_count(path, &c)) st->st_nlink = c;
+}
+
+/* Listing side: is the entry `name` of the directory open on `dirfd` (whose
+ * host path is `dhost`) a name of a group? If so, *ino and *type (DT_*) are
+ * what a stat of it answers -- the data file's -- since the record describes
+ * the symlink (DT_LNK, its own inode), and a guest that trusts d_type/d_ino
+ * (find -type f, ls -F, ls -i) would see through the emulation. One readlink
+ * tells an ordinary symlink from a name of a group (l2s_link_text); a name
+ * that is not a symlink at all answers EINVAL, which makes this cheap enough
+ * for a DT_UNKNOWN record too. 1 (filled) or 0 (leave the record). */
+static int l2s_dirent(int dirfd, const char *dhost, const char *name,
+                      u64 *ino, unsigned *type) {
+    char tgt[PATH_MAX];
+    ssize_t n = readlinkat(dirfd, name, tgt, sizeof tgt - 1);
+    if (n <= 0) return 0;
+    tgt[n] = '\0';
+    if (!l2s_link_text(tgt)) return 0;
+    /* The target is asked about directly rather than followed by the host: a
+     * data file is never a symlink, and the link is the guest's to have
+     * pointed anywhere -- which is why an absolute one is asked about only
+     * where the engine would take it as it stands, in a place of the guest's
+     * own. */
+    struct stat st;
+    int sr = -1;
+    if (tgt[0] != '/') sr = fstatat(dirfd, tgt, &st, AT_SYMLINK_NOFOLLOW);
+    else if (l2s_in_place(tgt)) sr = l2s_host_stat(tgt, &st, 0);
+    if (sr < 0 || S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) {
+        if (tgt[0] != '/') return 0;   /* a bare name with no data beside it */
+        /* Not a data file where it says: a stale store path (the rootfs tree
+         * was moved or copied), which a stat self-heals, a member of proot's
+         * (the target is its indirection), or no link of a group at all -- and
+         * the listing must say what the stat after it will. */
+        char host[PATH_MAX];
+        if ((size_t)snprintf(host, sizeof host, "%s/%s", dhost, name) >= sizeof host ||
+            l2s_name_stat(host, &st) != 1)
+            return 0;
+    }
+    *ino = (u64)st.st_ino;
+    *type = (st.st_mode & S_IFMT) >> 12;   /* DT_* is S_IFMT >> 12 */
+    return 1;
+}
+
+/* Does the guest name (dirfd, gp) name the emulation's own files -- a data
+ * or marker basename anywhere, or the store, "/.l2s", and what is under it?
+ * Those do not exist for the guest: its calls are answered ENOENT before any
+ * lookup (resolve_pin). The store is judged by the name as written, made
+ * absolute against the root and the cwd: a walk that FOLLOWS a name of a
+ * group lands in the store, and must. A dirfd-relative name reaches the store
+ * only through "..", which is let be (as chroot-ng does). */
+int l2s_guest_denied(struct Machine *m, int dirfd, const char *gp) {
+    if (!gp[0]) return 0;
+    const char *b = strrchr(gp, '/');
+    if (l2s_hidden(b ? b + 1 : gp)) return 1;
+    if (gp[0] != '/' && dirfd != G_AT_FDCWD) return 0;
+    char abs[PATH_MAX], canon[PATH_MAX];
+    if (gp[0] == '/') croot_get(m, abs);
+    else cwd_get(m, abs);
+    size_t al = strlen(abs);
+    if (al + 1 + strlen(gp) + 1 > sizeof abs) return 0;
+    abs[al] = '/';
+    strcpy(abs + al + 1, gp);
+    /* Lexically: "." and empty components dropped, ".." takes one off. */
+    size_t cl = 0;
+    for (const char *c = abs; *c;) {
+        while (*c == '/') c++;
+        const char *e = c;
+        while (*e && *e != '/') e++;
+        size_t k = (size_t)(e - c);
+        if (k == 2 && c[0] == '.' && c[1] == '.') {
+            while (cl && canon[cl - 1] != '/') cl--;
+            if (cl) cl--;
+        } else if (k && !(k == 1 && c[0] == '.')) {
+            canon[cl++] = '/';
+            memcpy(canon + cl, c, k);
+            cl += k;
+        }
+        c = e;
+    }
+    if (!cl) canon[cl++] = '/';
+    canon[cl] = '\0';
+    return l2s_store_name(canon);
+}
+
+/* PathPin.l2s_ro, for the guest name (dirfd, gpath) just resolved into `pin`.
+ * Where that name is a name of a group, the :ro question is asked about the
+ * name -- to the guest it IS the file, and the mount it sits under governs it
+ * (a real hardlink cannot span mounts, so there is no second mount to argue
+ * for) -- and about where the data is: the file lives on that mount, and
+ * every name of it is read-only there. host_ro of the pin's own path answers
+ * neither once the walk has followed the name into the store, which sits
+ * under the rootfs and no bind covers: a name inside a :ro bind (its data
+ * moved into the store while the bind was writable) resolved to a perfectly
+ * writable file, and every writer went through. Nor does it after
+ * l2s_deref_pin has re-pinned a no-follow call onto the data, or for an
+ * O_NOFOLLOW open, which is asked before the re-pin. The l2s hop is always
+ * the last component -- a link to a file has nothing under it -- so the name
+ * itself is the same walk with the last component not followed. Asked only
+ * when some bind is :ro, so the default path pays nothing for it. */
+void l2s_pin_ro(struct Machine *m, int dirfd, const char *gpath, unsigned rflags,
+                PathPin *pin) {
+    pin->l2s_ro = 0;
+    if (!pin->pinned || !gpath[0] || !any_ro_bind()) return;
+    char hnf[PATH_MAX], data[PATH_MAX];
+    if (rflags & PATH_NOFOLLOW_LAST) strcpy(hnf, pin->host);
+    else if (path_resolve(m, dirfd, gpath, PATH_NOFOLLOW_LAST, hnf, NULL) < 0) return;
+    if (l2s_resolve(hnf, data, sizeof data, NULL) != 1) return;
+    pin->l2s_ro = host_ro(m, hnf) || host_ro(m, data);
+}
+#endif /* L2S_ENABLED */
+
+/* --link2symlink: a name of a group is a regular FILE to the guest, whatever
+ * flags the guest passed. The resolver already hides the symlink from every
+ * caller that follows the final component; this hides it from the ones that
+ * asked NOT to -- which the scheme otherwise left staring at a symlink of mode
+ * 0777 that no hardlink has ever been, so `open(name, O_NOFOLLOW)` answered
+ * ELOOP where the host would have opened the file, `access` granted whatever
+ * the file forbade, and utimensat/fchownat/the l*xattr calls quietly worked on
+ * the link instead of on the data every name of the group shares.
+ *
+ * The pin is replaced by one on the data file, pinned as any path the engine
+ * names is (l2s.c): its directory -- the store, or the name's own for a group
+ * of the older layout, or proot's l2s directory -- walked again from the
+ * guest's places, so nothing the link's text says is followed. `host` becomes
+ * the data file's path, so the :ro test after this judges the mount the data
+ * is on: writing the data is what the call will do.
+ *
+ * NOT for the callers that operate on the name AS a name -- unlink, rename,
+ * link, readlink -- each of which does its own bookkeeping over the group; a
+ * deref would aim them at the shared data instead of the single name asked
+ * about. Returns 1 when the pin was replaced, 0 when there was nothing to do
+ * (including every build and every run where the scheme is not in force). */
+int l2s_deref_pin(struct Machine *m, PathPin *p) {
+#ifdef L2S_ENABLED
+    if (!m->link2symlink || !p->pinned) return 0;
+    char data[PATH_MAX];
+    if (l2s_resolve(p->host, data, sizeof data, NULL) != 1) return 0;
+    PathPin d;
+    if (l2s_host_pin(data, &d) < 0) { path_unpin(&d); return 0; }
+    int ro = p->l2s_ro;                       /* the name's verdict stays (pin_ro) */
+    path_unpin(p);
+    *p = d;
+    p->name = d.pinned ? p->base : p->host;   /* into p's own storage, not d's */
+    p->l2s_ro = ro;
+    return 1;
+#else
+    (void)m; (void)p;
+    return 0;
+#endif
+}
+
+/* Copy `from` into `to`, data extents only. The copy is bounded by what the
+ * guest itself WROTE, not by the size it gave the file: a memfd is sparse, and
+ * a guest can ftruncate one to a terabyte for the price of a syscall. Reading
+ * that through to EOF used to be a terabyte of zeros read and written --
+ * minutes of the emulator's time, and every hole made real in the snapshot,
+ * which is the host's memory, on a request the guest can repeat at will. So
+ * the copy walks the file's data extents (SEEK_DATA/SEEK_HOLE, which shmem
+ * has had since 3.8, and the tier's backing filesystems too), copies those,
+ * and sets the length once at the end, leaving the holes holes. A filesystem
+ * that cannot answer SEEK_DATA (EINVAL) is copied through, as before; ENXIO
+ * is the end of the data. What remains is proportional to the guest's own
+ * writes, which it paid for in the same currency. Returns 0 or -1. */
+static int snapshot_data(int from, int to) {
+    struct stat st;
+    if (fstat(from, &st) < 0) return -1;
+    char buf[65536];
+    off_t off = 0, size = st.st_size;
+    while (off < size) {
+        off_t dstart = lseek(from, off, SEEK_DATA);
+        if (dstart < 0) {
+            if (errno == ENXIO) break;              /* holes to the end */
+            if (errno != EINVAL) return -1;
+            dstart = off;                           /* no extent map: all data */
+        }
+        off_t dend = lseek(from, dstart, SEEK_HOLE);
+        if (dend < 0) {
+            if (errno != EINVAL) return -1;
+            dend = size;
+        }
+        for (off = dstart; off < dend; ) {
+            size_t want = (size_t)(dend - off) < sizeof buf ? (size_t)(dend - off) : sizeof buf;
+            ssize_t rd = pread(from, buf, want, off);
+            if (rd == 0) break;                     /* shrunk under us */
+            if (rd < 0 || pwrite(to, buf, (size_t)rd, off) != rd) return -1;
+            off += rd;
+        }
+        off = dend;
+    }
+    /* The length the guest set, holes included; a file resized meanwhile is
+     * left the length it has now, as a plain copy would have found it. */
+    if (fstat(from, &st) < 0) return -1;
+    return ftruncate(to, st.st_size);
+}
+
+/* Fallback when the host refuses to re-open one of our own fds by path:
+ * Android's SELinux denies opening /proc/self/fd/N when N is a memfd (sealed
+ * or not, EACCES), and apk-tools' triggers are scripts in a sealed memfd that
+ * the interpreter re-opens exactly that way. Read access can still be granted
+ * faithfully: snapshot the contents into a fresh anonymous object and seal it,
+ * so writes keep failing (as they would on apk's own sealed original). Gated
+ * on the link target actually naming a memfd -- a plain file's EACCES stays
+ * the host's answer, keeping normal permission semantics intact.
+ *
+ * BOTH ends of that have to work on a host with no memfd_create, where the
+ * guest's memfds are the fallback tier's unlinked files (sys_misc.c): the link
+ * then names a backing file rather than "/memfd:...", and the snapshot has to
+ * be another such file, whose seals the broker registry holds because the host
+ * cannot. Reading the link into 64 bytes was the other half of that -- a
+ * backing path does not fit, so the tier's own memfds failed the gate on the
+ * spelling alone. *tiered says the returned fd needs the emulator's seal
+ * enforcement, since the host will not refuse a write to a plain file.
+ * Returns the new fd, or -1 with errno for host_err(). */
+static int own_memfd_reopen(CPU *c, int own, int gflags, int *tiered) {
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS (1024 + 9)
+#endif
+    char link[64], tgt[PATH_MAX];
+    *tiered = 0;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", own);
+    ssize_t tn = readlink(link, tgt, sizeof tgt - 1);
+    if (tn < 8) { errno = EACCES; return -1; }
+    tgt[tn] = 0;
+    if (memcmp(tgt, "/memfd:", 7) && !strstr(tgt, "/a64-memfd.")) {
+        errno = EACCES;
+        return -1;
+    }
+    if ((gflags & O_ACCMODE) != O_RDONLY || (gflags & G_O_DIRECTORY)) {
+        errno = EACCES;
+        return -1;
+    }
+    struct stat st;
+    if (fstat(own, &st) < 0 || !S_ISREG(st.st_mode)) { errno = EACCES; return -1; }
+    /* Held while the copy is made -- the guest gets the number only once
+     * the snapshot is complete (machine.h, "the emulator's own
+     * descriptors"); forgotten, not closed, on the way out. */
+    fdwin_enter();
+#if defined(__BIONIC__) && defined(SYS_memfd_create)
+    int nfd = (int)syscall(SYS_memfd_create, "fdreopen", 2 /* MFD_ALLOW_SEALING */);
+#else
+    int nfd = memfd_create("fdreopen", MFD_ALLOW_SEALING);
+#endif
+    if (nfd < 0) {
+        nfd = a64_mfdfile(0);                    /* the tier's own backing */
+        if (nfd < 0) { fdwin_leave(); errno = EACCES; return -1; }
+        *tiered = 1;
+    }
+    fdheld_add(nfd);
+    fdwin_leave();
+    if (snapshot_data(own, nfd) < 0) {
+        fdheld_close(nfd);
+        errno = EACCES;
+        return -1;
+    }
+    if (*tiered) {
+        /* Sealed where the seals live for this tier. Without the registry
+         * there is nothing to enforce them, and handing back a writable
+         * snapshot of a sealed original would be worse than refusing. */
+        if (mfdbroker_reg(c->m, nfd, 0xf /* SEAL|SHRINK|GROW|WRITE */,
+                          "fdreopen") < 0) {
+            fdheld_close(nfd);
+            errno = EACCES;
+            return -1;
+        }
+    } else {
+        /* Seal best-effort: still a correct read-only view if the kernel
+         * refuses. */
+        fcntl(nfd, F_ADD_SEALS, 0xf /* SEAL|SHRINK|GROW|WRITE */);
+    }
+    if (gflags & O_CLOEXEC) fcntl(nfd, F_SETFD, FD_CLOEXEC);
+    return fdheld_forget(nfd);   /* offset 0, like the re-open the host denied */
+}
+
+/* open(2) promises the LOWEST free descriptor, and here the guest's numbers are
+ * the host's -- a shell that closes fd 3 and opens a file expects 3 back. A pin
+ * holds a descriptor of its own while the open runs, so it can take the number
+ * the guest was owed; once the pin is closed, hand the new fd back down to the
+ * lowest free slot. Only needed when the pin sat below it. */
+static int fd_relower(int fd, int cloexec) {
+    int nf = fcntl(fd, cloexec ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
+    if (nf < 0) return fd;
+    if (nf >= fd) { close(nf); return fd; }
+    close(fd);
+    return nf;
+}
+
+/* The spelling under which procfs_open knows a resolved path, when it is in the
+ * /proc zone: the canonical guest path, or -- a sandbox reaches /proc under
+ * another name (/newroot/proc/...) -- the host path such a lookup resolves to,
+ * which is the canonical spelling. NULL outside it. */
+static const char *proc_zone_canon(const char *canon, const char *host) {
+    return !strncmp(canon, "/proc/", 6) ? canon
+         : (proc_zone_path(host) ? host : NULL);
+}
+
+SYSDEF(openat) {
+    PathPin pin;
+    char canon[PATH_MAX];
+    int gflags = (int)a2;
+    unsigned rf = (gflags & G_O_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    if (gflags & O_CREAT) rf |= PATH_CREATING;   /* "/nope/" -> EISDIR, not ENOENT */
+    /* O_CREAT|O_EXCL never follows a final symlink (the kernel's LOOKUP_EXCL):
+     * finding one there is EEXIST, whether or not it points anywhere. Following
+     * it meant a guest could be redirected into creating the link's target --
+     * exactly the race O_EXCL exists to prevent -- and a dangling link made the
+     * open succeed where the kernel refuses it. */
+    if ((gflags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) rf |= PATH_NOFOLLOW_LAST;
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
+    if (r < 0) return (u64)(s64)r;
+    /* The kernel takes the descriptor FIRST (get_unused_fd_flags, ahead of the
+     * lookup), so an open that has no descriptor to return creates nothing.
+     * The pin walk's FIRST allocation is what the kernel would have handed a
+     * guest asking at that moment -- the lowest free number -- so one at or
+     * above the guest's ceiling means the guest holds everything it may have,
+     * and the open has to be refused here, before O_CREAT leaves behind a file
+     * a kernel would never have made. (`lowfd`, not `dfd`: the per-component
+     * tier walks with two descriptors open at once and ends one above where it
+     * started, which would refuse a guest that still had a slot.) */
+    if (pin.pinned && pin.lowfd >= 0 && pin.lowfd >= fd_nofile_cap(c->m)) {
+        path_unpin(&pin);
+        return (u64)(s64)-EMFILE;
+    }
+    const char *host = pin.host;
+    /* Write intent into a :ro bind -> EROFS: an access mode other than
+     * O_RDONLY, or O_TRUNC (which the kernel counts as write access), or a
+     * creation the open would have to perform. O_CREAT/O_TRUNC/O_ACCMODE are
+     * in the pass-through set, so the host bits apply to the guest flags
+     * unchanged.
+     *
+     * O_CREAT on a name that EXISTS is not a write: open_last_lookups drops
+     * the create (its EROFS is remembered only for the case where the lookup
+     * finds nothing) and the open proceeds read-only, so a kernel answers
+     * that open with a descriptor, O_EXCL with EEXIST, and a directory with
+     * EISDIR. Rather than trust a look before the open, the host is never
+     * handed O_CREAT here: a missing name then answers ENOENT, which is the
+     * EROFS a kernel gives for the create it would have had to do. */
+    int hflags = oflags_g2h(gflags);
+    int ro = 0;
+    if ((gflags & (O_ACCMODE | O_CREAT | O_TRUNC)) && (ro = pin_ro(c->m, &pin))) {
+        if ((gflags & O_ACCMODE) != O_RDONLY || (gflags & O_TRUNC)) {
+            path_unpin(&pin);
+            return (u64)(s64)-EROFS;
+        }
+        if (gflags & O_CREAT) {
+            struct stat est;
+            int er = fstatat(pin.dfd, pin.name, &est,
+                             pin.pinned ? AT_SYMLINK_NOFOLLOW : 0) < 0 ? errno : 0;
+            if (er == ENOENT) er = EROFS;
+            else if (!er && (gflags & O_EXCL)) er = EEXIST;
+            else if (!er && S_ISDIR(est.st_mode)) er = EISDIR;
+            if (er) { path_unpin(&pin); return (u64)(s64)-er; }
+            hflags &= ~(O_CREAT | O_EXCL);
+        }
+    }
+    /* maps/cmdline/mounts: the guest view. */
+    const char *pcanon = proc_zone_canon(canon, host);
+    if (pcanon) {
+        s64 pf;
+        if (procfs_open(c, pcanon, gflags, &pf)) {
+            path_unpin(&pin);
+            /* A synthesized view is still a descriptor the guest keeps, so the
+             * guest's own RLIMIT_NOFILE applies to it (sys.h, fd_within_limit).
+             * Written out here rather than through that helper because the
+             * refresh table may have just started tracking this descriptor,
+             * and the tracking has to go BEFORE the descriptor does: once it is
+             * closed the number is anyone's, and an entry left behind would
+             * aim a later refresh's ftruncate at whatever opened next. */
+            if (pf >= 0 && (int)pf >= fd_nofile_cap(c->m)) {
+                procfs_unmark_fd(c->m, (int)pf);
+                close((int)pf);
+                return (u64)(s64)-EMFILE;
+            }
+            return (u64)pf;
+        }
+    }
+    int fd;
+    if (proc_own_fd_denied(host)) { fd = -1; errno = EACCES; }
+    else fd = openat(pin.dfd, pin.name,
+                     /* Pinned means path_resolve already followed the final
+                      * component; a symlink standing there now is the race,
+                      * and O_NOFOLLOW is what refuses to walk into it. */
+                     hflags | (pin.pinned ? O_NOFOLLOW : 0),
+                     (mode_t)a3);
+    /* The name went missing between the look above and the open: still the
+     * create a read-only mount refuses. */
+    if (fd < 0 && errno == ENOENT && ro && (gflags & O_CREAT)) errno = EROFS;
+    /* A guest that passed O_NOFOLLOW about one of the emulated-hardlink
+     * scheme's names has just been told ELOOP about a name that is a regular
+     * file to it, and that a host with real hardlinks would have opened. Only
+     * then is the group looked up, so the ordinary path costs nothing: a guest
+     * that did NOT ask for O_NOFOLLOW never gets here, because the resolver
+     * followed the link and the pin already names the backing. */
+    if (fd < 0 && errno == ELOOP && (gflags & G_O_NOFOLLOW)) {
+        if (l2s_deref_pin(c->m, &pin))
+            fd = openat(pin.dfd, pin.name, hflags | O_NOFOLLOW, (mode_t)a3);
+        else
+            errno = ELOOP;   /* not a group: the lookup's own misses are not the answer */
+    }
+    {   /* Close the pin before anything else allocates a descriptor. */
+        int e = errno, dfd = pin.dfd;
+        path_unpin(&pin);
+        if (fd >= 0 && dfd >= 0 && fd > dfd) fd = fd_relower(fd, gflags & O_CLOEXEC);
+        errno = e;
+    }
+    int snap_tiered = 0;
+    if (fd < 0 && (errno == EACCES || errno == EPERM)) {
+        int e = errno;   /* proc_own_fd_path may probe (access) and clobber it */
+        int own = proc_own_fd_path(host);
+        if (own >= 0) fd = own_memfd_reopen(c, own, gflags, &snap_tiered);
+        else errno = e;
+    }
+    /* Before any bookkeeping is hung on the number: the kernel hands out the
+     * lowest free descriptor, so one at or above the guest's own limit is one
+     * it would have refused to allocate at all (sys.h). */
+    if (fd >= 0 && !fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
+    if (fd >= 0) {
+        mfd_track_close(fd);   /* fresh number: drop any stale class */
+        /* ...and remember the guest path it was opened under, which the host
+         * path cannot tell once there are mounts (path.c). Not for a reopen of
+         * an fd link: that spelling names no place, and the object under it is
+         * whatever the link pointed at. */
+        fdname_note(fd, snap_tiered || proc_fd_link_path(host) ? NULL : canon);
+        /* A path re-open of a tier memfd (through a /proc fd link -- this
+         * process's own, or another's /proc/<pid>/fd/N) hands back a new fd
+         * to the sealed inode; the host would let write(2) through where a
+         * real memfd's seal forbids it, so class the fd for the enforcement
+         * checks. Judged by what was OPENED, from the new descriptor's own
+         * link: the resolver hands the kernel the magic link itself (the
+         * backing is unlinked and has no other name), so the path spelling
+         * never names the backing -- a test on it classed nothing, and a
+         * guest wrote through F_SEAL_WRITE by re-opening /proc/self/fd/N
+         * (tests/fixtures/reflinkobj.c). A tier-backed snapshot from the
+         * fallback above is the same case reached the other way. */
+        if (snap_tiered) {
+            mfd_track_recv(fd);
+        } else if (proc_fd_link_path(host)) {
+            char l[64], t[PATH_MAX];
+            snprintf(l, sizeof l, "/proc/self/fd/%d", fd);
+            ssize_t tn = readlink(l, t, sizeof t - 1);
+            if (tn > 0) {
+                t[tn] = 0;
+                if (strstr(t, "/a64-memfd.")) mfd_track_recv(fd);
+            }
+        }
+    }
+    return fd < 0 ? host_err() : (u64)fd;
+}
+
+/* The two routes by which a descriptor NUMBER starts or stops naming a
+ * description, for the classes tracked by number (sys.h). Every dup site
+ * goes through the first, every close site through the second: a class left
+ * out of one of them is an untracked name, which is the bug both exist to
+ * make impossible. The name is withheld from the guest when a table could not
+ * take it (dup and F_DUPFD close it and answer -ENOMEM; dup3 has already
+ * replaced newfd by then and closes it too -- an honest failure, where the
+ * alternative was a descriptor the emulator would silently misserve). */
+int fd_track_dup(struct Machine *m, int oldfd, int newfd) {
+    int r;
+    if ((r = sigfd_track_dup(m, oldfd, newfd)) < 0 ||
+        (r = procfs_track_dup(m, oldfd, newfd)) < 0 ||
+        (r = nl_track_dup(m, oldfd, newfd)) < 0) {
+        fd_track_close(m, newfd);   /* whatever a class before it recorded */
+        return r;
+    }
+    mfd_track_dup(oldfd, newfd);
+    fdname_dup(oldfd, newfd);   /* opened under the same path (path.c) */
+    return 0;
+}
+
+void fd_track_close(struct Machine *m, int fd) {
+    nl_unmark_fd(m, fd);
+    procfs_unmark_fd(m, fd);
+    sigfd_unmark_fd(m, fd);
+    mfd_track_close(fd);
+    fdname_drop(fd);
+}
+
+SYSDEF(close) {
+    fd_track_close(c->m, (int)a0);   /* whatever bookkeeping this number carried */
+    return close((int)a0) < 0 ? host_err() : 0;
+}
+
+SYSDEF(read) {
+    /* read(2) on a netlink socket is recvfrom(2) with no address. A fake one
+     * answers it from the reply the last request recorded, or falls through so
+     * the read waits on the substitute socket (sys_netlink.c).
+     *
+     * A read of no bytes is neither: sock_read_iter answers 0 before the
+     * socket is consulted at all ("Match SYS5 behaviour"), so the reply stays
+     * queued -- and the substitute socket answers the same 0 the same way.
+     * recvfrom(fd, buf, 0) is the opposite case and goes straight to
+     * sock_recvmsg, which really does take the datagram off the socket and
+     * report the zero; both measured against a kernel.
+     *
+     * A buffer that is no user memory at all (guest_access_ok) is vfs_read's
+     * EFAULT before any of that -- before a fake netlink socket's reply or a
+     * signalfd's record is taken, and before any wait for one; a host file
+     * hears of it from the host (XferCut.denied). */
+    int denied = !guest_access_ok(a1, a2);
+    if (denied && (nl_is_fd(c->m, (int)a0) || sigfd_tracked(c->m, (int)a0)))
+        return (u64)(s64)-EFAULT;
+    u64 nlret;
+    if (a2 != 0 && nl_is_fd(c->m, (int)a0) &&
+        nl_maybe_recvfrom(c, (int)a0, a1, a2, 0, 0, 0, &nlret))
+        return nlret;
+    { s64 pr; if (procfs_pre_read(c, (int)a0, -1, &pr)) return (u64)pr; }
+    /* As far as the guest's memory goes, and the rest handed to the host as a
+     * fault in the same place, for the file to answer as it does (sys.h). */
+    size_t len = rw_count(a2);
+    size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0, denied };
+    /* A signalfd's records are translated on the way out (sys_sig.c). */
+    if (sigfd_tracked(c->m, (int)a0)) return sigfd_read_guest(c, (int)a0, &g, 1, len);
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, &cut, NULL, &x);
+    if (r < 0) return (u64)(s64)r;
+    ssize_t n = x.n == 1 ? read((int)a0, x.iov[0].iov_base, x.iov[0].iov_len)
+                         : readv((int)a0, x.iov, x.n);
+    return xfer_finish(c, &x, n);
+}
+
+SYSDEF(write) {
+    /* As in read: a netlink socket takes a message by write(2) too (busybox's
+     * `ip` sends its dump requests that way), and the AF_UNIX substitute has no
+     * default destination to write to -- it would answer ENOTCONN. */
+    if (nl_is_fd(c->m, (int)a0)) return nl_sendto(c, (int)a0, a1, a2);
+    /* vfs_write's access_ok comes ahead of a seal's EPERM and of whatever a
+     * synthesized /proc file makes of the bytes (read, above). */
+    int denied = !guest_access_ok(a1, a2);
+    if (!denied && mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
+    size_t len = rw_count(a2);   /* as in read */
+    size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0, denied };
+    s64 pr;
+    if (!denied && procfs_write_hook(c, (int)a0, &g, 1, len, -1, &pr)) return (u64)pr;
+    /* A netlink socket needs no destination address, so a reconfiguring
+     * rtnetlink request arrives by write(2) as readily as by sendto -- which
+     * is how busybox's `ip` sends its. Note it here too, or the kernel's
+     * refusal is passed through to a guest whose network namespace was faked
+     * and which is owed the ack (sys_net.c does the same for the socket
+     * calls). Fake-netlink fds never reach this: they were routed above. */
+    nlr_note_gvec(c, (int)a0, &g, 1);
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, &g, 1, 0, 0, &cut, NULL, &x);
+    if (r < 0) return (u64)(s64)r;
+    ssize_t n = x.n == 1 ? write((int)a0, x.iov[0].iov_base, x.iov[0].iov_len)
+                         : writev((int)a0, x.iov, x.n);
+    return xfer_finish(c, &x, n);
+}
+
+SYSDEF(readv) {
+    u64 nlret;   /* fake netlink socket: as in read */
+    /* (unsigned)a2 for the same reason iov_import takes it narrow below:
+     * the kernel's import_iovec truncates the count there too. */
+    if (nl_is_fd(c->m, (int)a0) &&
+        nl_maybe_readv(c, (int)a0, a1, (unsigned)a2, &nlret))
+        return nlret;
+    { s64 pr; if (procfs_pre_read(c, (int)a0, -1, &pr)) return (u64)pr; }
+    struct iovec iov[XFER_IOV];
+    GIovec g[1024];
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 1, &cut);
+    if (cnt < 0) return (u64)(s64)cnt;
+    if (sigfd_tracked(c->m, (int)a0)) {   /* signalfd: records translated */
+        size_t tot = cut.seg + cut.after;
+        for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
+        /* A vector of no bytes never reaches the file at all: do_iter_read
+         * answers 0 the moment the imported total is zero, ahead of every
+         * read handler. Handed to sigfd_fill it became instead the EINVAL a
+         * buffer too small for one signalfd_siginfo earns -- which is the
+         * right answer for read(fd, buf, 0), where vfs_read has no such
+         * shortcut and signalfd_read sees the zero itself, and the wrong one
+         * for readv(fd, iov, 0). Both measured against a kernel. */
+        if (!tot) return 0;
+        return sigfd_read_guest(c, (int)a0, g, cnt, tot);
+    }
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, &cut, iov, &x);
+    if (r < 0) return (u64)(s64)r;
+    return xfer_finish(c, &x, readv((int)a0, x.iov, x.n));
+}
+
+SYSDEF(writev) {
+    /* as in write; (unsigned)a2 as in readv above */
+    if (nl_is_fd(c->m, (int)a0)) return nl_writev(c, (int)a0, a1, (unsigned)a2);
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
+    struct iovec iov[XFER_IOV];
+    GIovec g[1024];
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 0, &cut);
+    if (cnt < 0) return (u64)(s64)cnt;
+    size_t tot = cut.seg + cut.after;
+    for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
+    /* A synthesized file that takes writes (an id map) gets the gathered bytes
+     * as one write, which is the only shape the kernel accepts anyway. */
+    s64 pr;
+    if (procfs_write_hook(c, (int)a0, g, cnt, tot, -1, &pr)) return (u64)pr;
+    /* As in write above: the segments are one message, and the request the
+     * ack rewrite is keyed on is the whole of it. */
+    nlr_note_gvec(c, (int)a0, g, cnt);
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, &cut, iov, &x);
+    if (r < 0) return (u64)(s64)r;
+    return xfer_finish(c, &x, writev((int)a0, x.iov, x.n));
+}
+
+SYSDEF(pread64) {
+    { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }
+    size_t len = rw_count(a2);   /* as in read */
+    size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0, !guest_access_ok(a1, a2) };
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, &g, 1, 1, 0, &cut, NULL, &x);
+    if (r < 0) return (u64)(s64)r;
+    ssize_t n = x.n == 1 ? pread((int)a0, x.iov[0].iov_base, x.iov[0].iov_len, (off_t)a3)
+                         : preadv((int)a0, x.iov, x.n, (off_t)a3);
+    return xfer_finish(c, &x, n);
+}
+
+SYSDEF(pwrite64) {
+    int denied = !guest_access_ok(a1, a2);   /* as in write */
+    if (!denied && mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
+    size_t len = rw_count(a2);   /* as in read */
+    size_t room = len ? rw_room(c, a1, len, ACC_READ) : 0;
+    GIovec g = { a1, room };
+    XferCut cut = { len - room, 0, denied };
+    s64 pr;
+    if (!denied && procfs_write_hook(c, (int)a0, &g, 1, len, (s64)a3, &pr)) return (u64)pr;
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, &g, 1, 0, 0, &cut, NULL, &x);
+    if (r < 0) return (u64)(s64)r;
+    ssize_t n = x.n == 1 ? pwrite((int)a0, x.iov[0].iov_base, x.iov[0].iov_len, (off_t)a3)
+                         : pwritev((int)a0, x.iov, x.n, (off_t)a3);
+    return xfer_finish(c, &x, n);
+}
+
+/* preadv2/pwritev2 (fd, iov, iovcnt, pos_l, pos_h, flags): scatter/gather at
+ * an explicit offset with RWF_* flags. On the 64-bit guest kernel the full
+ * offset rides in pos_l (a3) and pos_from_hilo() drops pos_h (a4), matching
+ * pwrite64 above; the RWF_* flag bits are arch-generic, so a5 passes straight
+ * through. offset == -1 means "use the current file position" (as with
+ * readv/writev), which the host wrapper honors. Bionic (Termux) is LP64 and
+ * historically didn't declare the wrapper, so issue the raw syscall there with
+ * the offset in a single register and pos_h = 0. */
+SYSDEF(preadv2) {
+    { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }   /* -1 = current pos, as here */
+    struct iovec iov[XFER_IOV];
+    GIovec g[1024];
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 1, &cut);
+    if (cnt < 0) return (u64)(s64)cnt;
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, &cut, iov, &x);
+    if (r < 0) return (u64)(s64)r;
+    ssize_t n;
+#if defined(__BIONIC__) && defined(SYS_preadv2)
+    n = syscall(SYS_preadv2, (int)a0, x.iov, x.n, (long)(off_t)a3, 0L, (int)a5);
+#else
+    n = preadv2((int)a0, x.iov, x.n, (off_t)a3, (int)a5);
+#endif
+    return xfer_finish(c, &x, n);
+}
+
+SYSDEF(pwritev2) {
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
+    struct iovec iov[XFER_IOV];
+    GIovec g[1024];
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 0, &cut);
+    if (cnt < 0) return (u64)(s64)cnt;
+    /* A synthesized /proc file takes the gathered bytes through the write
+     * hook, never through the memfd (the id maps of a faked user namespace,
+     * and EBADF for a view opened read-only). */
+    size_t tot = cut.seg + cut.after;
+    for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
+    s64 pr;
+    if (procfs_write_hook(c, (int)a0, g, cnt, tot, (s64)a3, &pr)) return (u64)pr;
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, &cut, iov, &x);
+    if (r < 0) return (u64)(s64)r;
+    ssize_t n;
+#if defined(__BIONIC__) && defined(SYS_pwritev2)
+    n = syscall(SYS_pwritev2, (int)a0, x.iov, x.n, (long)(off_t)a3, 0L, (int)a5);
+#else
+    n = pwritev2((int)a0, x.iov, x.n, (off_t)a3, (int)a5);
+#endif
+    return xfer_finish(c, &x, n);
+}
+
+/* preadv/pwritev (fd, iov, iovcnt, pos_l, pos_h): the v2 calls above minus
+ * the flags argument; the same LP64 note applies, the full offset rides in
+ * pos_l (a3). Unlike the v2 calls there is no offset == -1 "current
+ * position" escape -- the kernel rejects any negative offset with EINVAL --
+ * and the host wrapper reproduces that. */
+SYSDEF(preadv) {
+    { s64 pr; if (procfs_pre_read(c, (int)a0, (s64)a3, &pr)) return (u64)pr; }
+    struct iovec iov[XFER_IOV];
+    GIovec g[1024];
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 1, &cut);
+    if (cnt < 0) return (u64)(s64)cnt;
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, g, cnt, 1, 0, &cut, iov, &x);
+    if (r < 0) return (u64)(s64)r;
+    return xfer_finish(c, &x, preadv((int)a0, x.iov, x.n, (off_t)a3));
+}
+
+SYSDEF(pwritev) {
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;
+    struct iovec iov[XFER_IOV];
+    GIovec g[1024];
+    XferCut cut;
+    int cnt = iov_import(c, a1, (unsigned)a2, g, 0, &cut);
+    if (cnt < 0) return (u64)(s64)cnt;
+    size_t tot = cut.seg + cut.after;
+    for (int i = 0; i < cnt; i++) tot += (size_t)g[i].iov_len;
+    s64 pr;
+    if (procfs_write_hook(c, (int)a0, g, cnt, tot, (s64)a3, &pr)) return (u64)pr;
+    GuestXfer x;
+    int r = xfer_begin(c, (int)a0, g, cnt, 0, 0, &cut, iov, &x);
+    if (r < 0) return (u64)(s64)r;
+    return xfer_finish(c, &x, pwritev((int)a0, x.iov, x.n, (off_t)a3));
+}
+
+SYSDEF(lseek) {
+    off_t r = lseek((int)a0, (off_t)(s64)a1, (int)a2);
+    return r == (off_t)-1 ? host_err() : (u64)r;
+}
+
+SYSDEF(fstat) {
+    struct stat st;
+    if (fstat((int)a0, &st) < 0) return host_err();
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink) l2s_fix_fd((int)a0, &st);
+#endif
+    mfd_stat_fixup(c->m, (int)a0, &st);
+    GStat g;
+    gstat_from_host(c->m, &g, &st);
+    return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
+SYSDEF(newfstatat) {
+    unsigned gf = (unsigned)a3;
+    struct stat st;
+    int r;
+    /* vfs_statx judges the flags before the name is looked up: a bit outside
+     * these is EINVAL ahead of any EFAULT or ENOENT the path would earn. They
+     * used to go unjudged, so fstatat(..., 0x1) answered the stat. */
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_NO_AUTOMOUNT | G_AT_EMPTY_PATH |
+               G_AT_STATX_SYNC_TYPE))
+        return (u64)(s64)-EINVAL;
+    if (gf & G_AT_EMPTY_PATH) {
+        char gpath[PATH_MAX];
+        long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+        if (n == 0 || a1 == 0) {
+            /* stat by descriptor -- and for AT_FDCWD the working directory,
+             * which is what an empty name looks up to there (a plain fstat
+             * of -100 answered EBADF instead) */
+            r = fstatat((int)(s32)a0, "", &st, AT_EMPTY_PATH);
+            if (r < 0) return host_err();
+#ifdef L2S_ENABLED
+            if (c->m->link2symlink) l2s_fix_fd((int)(s32)a0, &st);
+#endif
+            mfd_stat_fixup(c->m, (int)(s32)a0, &st);
+            goto out;
+        }
+        if (n < 0) return (u64)(s64)n;
+    }
+    {
+        PathPin pin;
+        char canon[PATH_MAX];
+        unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+        int rr = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
+        if (rr < 0) return (u64)(s64)rr;
+#ifdef L2S_ENABLED
+        if (c->m->link2symlink) {
+            /* A name of a group (ours or proot's) is the data file to a lstat
+             * as to a stat, and the data file reached by a following walk
+             * carries the group's count. One whose data file is not there (a
+             * chain a killed process left cut) is the dangling symlink it is,
+             * as under proot. */
+            if (l2s_stat(&pin, &st) == 1) { path_unpin(&pin); goto out; }
+        }
+#endif
+        /* Pinned: the walk already followed the final component, so nothing
+         * the host resolves now may follow one (machine.h, PathPin). Unpinned
+         * (the /proc zone) the guest's own flag still decides -- lstat of a
+         * magic link must report the link. */
+        int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+        r = fstatat(pin.dfd, pin.name, &st, hf);
+        /* The path spelling of one of our own fds must agree with the fd's own
+         * stat: a memfd whose mode the registry holds reads the same either
+         * way. (The host answers this stat even where it refuses the open.) */
+        if (r == 0) mfd_stat_fixup(c->m, proc_own_fd_path(pin.host), &st);
+        /* A synthesized /proc file the host will not stat (Android denies an
+         * app getattr on the files whose open the emulator serves) is stat'able
+         * all the same: the guest can read it, so it can be asked about. */
+        if (procfs_stat_fallback(c, proc_zone_canon(canon, pin.host),
+                                 (gf & G_AT_SYMLINK_NOFOLLOW) != 0, r, &st))
+            r = 0;
+        u64 e = r < 0 ? host_err() : 0;
+        path_unpin(&pin);
+        if (r < 0) return e;
+    }
+out:;
+    GStat g;
+    gstat_from_host(c->m, &g, &st);
+    return copy_to_guest(c, a2, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
+/* access(2) for a guest whose credentials are the fake ones (--fake-id).
+ *
+ * The host cannot answer this. Its identity is the emulator's, and the file's
+ * owner as the guest sees it is the REMAPPED owner that every stat reports --
+ * so a guest that dropped to a non-root fake uid was told it could write files
+ * its own model says belong to fake root, and a guest whose fake groups differ
+ * from the host's was judged by the wrong triad entirely. The decision is made
+ * here against the guest's credentials, the same way exec_perm_check makes it
+ * for execve. Fake root's DAC bypass falls out of mode_access_ok rather than
+ * being a special case bolted on after the host's answer.
+ *
+ * The host is still asked what the guest model cannot know: whether the file is
+ * there at all (the stat), and the refusals that are not about ownership -- a
+ * read-only mount's EROFS, ELOOP, ENAMETOOLONG. A plain EACCES or EPERM from it
+ * is a DAC answer about the wrong identity, and is discarded.
+ *
+ * `eff` picks the identity the kernel picks: access(2) and faccessat(2) ask
+ * about the real ids, faccessat2's AT_EACCESS about the effective ones. */
+static u64 access_faked(struct Machine *m, const PathPin *p, int mode, int eff) {
+    struct stat st;
+    if (fstatat(p->dfd, p->name, &st, p->pinned ? AT_SYMLINK_NOFOLLOW : 0) < 0)
+        return host_err();                          /* keep ENOENT etc. */
+    /* The same mode every other guest-visible stat of this file reports: a
+     * memfd whose mode the host would not hold is the registry's (sys_misc.c). */
+    mfd_stat_fixup(m, proc_own_fd_path(p->host), &st);
+    Cred cr;
+    cred_get(m, &cr);
+    int r = mode_access_ok(eff ? cr.euid : cr.ruid,
+                           eff ? cr.egid : cr.rgid,
+                           cr.groups, cr.ngroups,
+                           remap_uid(m, (u32)st.st_uid),
+                           remap_gid(m, (u32)st.st_gid),
+                           (u32)st.st_mode, mode);
+    if (r < 0) return (u64)(s64)r;
+    if (access_pinned(p, mode) == 0) return 0;
+    return (errno == EACCES || errno == EPERM) ? 0 : host_err();
+}
+
+/* The host's own answer, for a guest running on the emulator's real identity:
+ * access(2) then names the very credentials the guest has, ACLs and all. */
+static u64 access_host(const PathPin *p, int mode) {
+    return access_pinned(p, mode) == 0 ? 0 : host_err();
+}
+
+/* access(2) of a synthesized /proc file the host would not judge (see
+ * procfs_stat_fallback): `hret` is what the host path answered. The file is
+ * the kernel's own shape of one -- root's, 0444 or 0400 -- so the answer is the
+ * mode rule applied to the guest's identity: its fake credentials under
+ * --fake-id, the emulator's own otherwise (the host's access(2) would have
+ * asked about the same ones). Returns `hret` when the host's answer stands. */
+static u64 access_synth(CPU *c, const char *pcanon, int nofollow, int mode,
+                        int eff, u64 hret) {
+    struct stat st;
+    errno = hret ? (int)-(s64)hret : 0;
+    if (!procfs_stat_fallback(c, pcanon, nofollow, hret ? -1 : 0, &st))
+        return hret;
+    struct Machine *m = c->m;
+    Cred cr = { .ngroups = 0 };
+    u32 uid, gid;
+    if (m->fake_id) {
+        cred_get(m, &cr);
+        uid = eff ? cr.euid : cr.ruid;
+        gid = eff ? cr.egid : cr.rgid;
+    } else {
+        uid = eff ? geteuid() : getuid();
+        gid = eff ? getegid() : getgid();
+    }
+    return (u64)(s64)mode_access_ok(uid, gid, cr.groups, cr.ngroups,
+                                    remap_uid(m, (u32)st.st_uid),
+                                    remap_gid(m, (u32)st.st_gid),
+                                    (u32)st.st_mode, mode);
+}
+
+SYSDEF(faccessat) {
+    PathPin pin;
+    char canon[PATH_MAX];
+    int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, canon);
+    if (r < 0) return (u64)(s64)r;
+    u64 ret = c->m->fake_id ? access_faked(c->m, &pin, (int)a2, 0)
+                            : access_host(&pin, (int)a2);
+    const char *pcanon = proc_zone_canon(canon, pin.host);
+    if (pcanon) ret = access_synth(c, pcanon, 0, (int)a2, 0, ret);
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(faccessat2) {
+    /* The flags never reach the host libc. AT_SYMLINK_NOFOLLOW is already
+     * honored by the resolver, and AT_EACCESS means nothing at host level --
+     * the emulator never changes its host ids, so the host's real-id and
+     * effective-id checks are the same check; the guest-visible difference
+     * exists only under --fake-id, where access_faked reads the flag off this
+     * `eff` argument. Passing them through made every faccessat2 fail EINVAL
+     * on Bionic, whose faccessat wrapper rejects ANY flags -- dash's `test -r`
+     * uses AT_EACCESS, so apt-key read the Debian archive keyring as
+     * unreadable, silently verified against /dev/null instead, and every
+     * InRelease signature came back NO_PUBKEY. */
+    unsigned gf = (unsigned)a3;
+    if (gf & ~(unsigned)(G_AT_SYMLINK_NOFOLLOW | G_AT_EACCESS))
+        return (u64)(s64)-EINVAL;
+    PathPin pin;
+    char canon[PATH_MAX];
+    unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
+    if (r < 0) return (u64)(s64)r;
+    /* AT_SYMLINK_NOFOLLOW on a real hardlink is a no-op -- the kernel judges
+     * the file -- so an emulated one must be judged by its backing and not by
+     * the 0777 symlink standing in for it (faccessat itself takes no flags,
+     * so it always follows and there is nothing to undo there). */
+    if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
+    u64 ret = c->m->fake_id
+                  ? access_faked(c->m, &pin, (int)a2, (gf & G_AT_EACCESS) != 0)
+                  : access_host(&pin, (int)a2);
+    const char *pcanon = proc_zone_canon(canon, pin.host);
+    if (pcanon)
+        ret = access_synth(c, pcanon, (gf & G_AT_SYMLINK_NOFOLLOW) != 0, (int)a2,
+                           (gf & G_AT_EACCESS) != 0, ret);
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(readlinkat) {
+    /* bufsiz is an int to the kernel and judged before the path is even
+     * fetched: zero or negative is EINVAL. Read as a u64 count, -5 was a
+     * 16-exabyte buffer, the whole target was copied over a 16-byte one and
+     * the guest died of its own stack protector. */
+    int bufsiz = (int)(s32)a3;
+    if (bufsiz <= 0) return (u64)(s64)-EINVAL;
+    size_t cap = (size_t)bufsiz;
+    char gpath[PATH_MAX];
+    long gn = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+    if (gn < 0) return (u64)(s64)gn;
+    if (gn == 0) {   /* empty path: readlink the O_PATH symlink fd itself (Linux >= 2.6.39) */
+        char lbuf[PATH_MAX];
+        ssize_t ln = readlinkat((int)(s32)a0, "", lbuf, sizeof lbuf - 1);
+        if (ln < 0) return host_err();
+        size_t out = (size_t)ln < cap ? (size_t)ln : cap;
+        if (copy_to_guest(c, a2, lbuf, out) < 0) return (u64)(s64)-EFAULT;
+        return out;
+    }
+    PathPin pin;
+    char canon[PATH_MAX];
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink && l2s_guest_denied(c->m, (int)(s32)a0, gpath))
+        return (u64)(s64)-ENOENT;   /* as resolve_pin */
+#endif
+    int r = path_resolve(c->m, (int)(s32)a0, gpath, PATH_NOFOLLOW_LAST, pin.host, canon);
+    if (r < 0) return (u64)(s64)r;
+    if ((r = path_pin(c->m, canon, pin.host, &pin)) < 0) return (u64)(s64)r;
+    const char *host = pin.host;
+    char buf[PATH_MAX];
+    ssize_t rn;
+    /* Magic /proc self-links (exe/cwd/root): the host targets name emulator
+     * state; report the guest-view target instead. */
+    int gone = 0;
+    int magic = path_proc_magic(c->m, canon, buf, &gone);
+    if (magic == 0 && proc_zone_path(host))
+        magic = path_proc_magic(c->m, host, buf, &gone);
+    if (magic < 0) { path_unpin(&pin); return (u64)(s64)magic; }   /* guest process */
+    if (magic > 0) {
+        path_unpin(&pin);
+        rn = (ssize_t)strlen(buf);
+        /* The cwd link of an unlinked directory is spelled "<path> (deleted)",
+         * and d_path answers ENAMETOOLONG when that does not fit the PATH_MAX
+         * the link is read into -- which a path of PATH_MAX - 1 bytes leaves
+         * no room for. Bounded here; it used to be an unchecked strcat. */
+        if (gone) {
+            static const char sfx[] = " (deleted)";
+            if ((size_t)rn + sizeof sfx > sizeof buf) return (u64)(s64)-ENAMETOOLONG;
+            memcpy(buf + rn, sfx, sizeof sfx);
+            rn += (ssize_t)(sizeof sfx - 1);
+        }
+    } else {
+#ifdef L2S_ENABLED
+        /* A name of a group (ours or proot's) is a regular file to the guest,
+         * not a link. */
+        if (c->m->link2symlink && pin.pinned) {
+            char data[PATH_MAX];
+            if (l2s_resolve(pin.host, data, sizeof data, NULL) == 1) {
+                path_unpin(&pin);
+                return (u64)(s64)-EINVAL;
+            }
+        }
+#endif
+        /* readlinkat never follows the final component, so the pin alone is
+         * the whole guarantee here. */
+        rn = readlinkat(pin.dfd, pin.name, buf, sizeof buf - 1);
+        u64 e = rn < 0 ? host_err() : 0;
+        path_unpin(&pin);
+        if (rn < 0) return e;
+        /* Passthrough /proc (and /dev/fd -> /proc/self/fd) links to a
+         * rootfs-contained file carry the rootfs prefix; strip it. */
+        if (!strncmp(host, "/proc/", 6)) {
+            buf[rn] = 0;
+            if (mfd_link_rewrite(c, host, buf))   /* tier memfd: no host leak */
+                rn = (ssize_t)strlen(buf);
+            /* One of our own descriptors reads back as the path it was opened
+             * under, when that is remembered and still true: a node on the
+             * /dev or /proc zone, or a directory that is both /oldroot and
+             * /newroot, has one host path and the reverse map cannot say
+             * which (path.c, fdname_get). */
+            char opened[PATH_MAX];
+            int own = proc_own_fd_path(host);
+            if (own >= 0 && fdname_get(c->m, own, buf, opened))
+                strcpy(buf, opened);
+            else
+                path_strip_rootfs(c->m, buf);
+            rn = (ssize_t)strlen(buf);
+        }
+#ifdef L2S_ENABLED
+        /* proot's own bookkeeping links (an indirection, in plain sight where
+         * proot kept a group beside its first name) carry the HOST path of
+         * the file they name; the guest is told its own name for that file,
+         * as proot tells it. */
+        if (c->m->link2symlink && buf[0] == '/') {
+            char gv[PATH_MAX];
+            buf[rn] = 0;
+            if (l2s_untranslate_target(buf, gv, sizeof gv)) {
+                strcpy(buf, gv);
+                rn = (ssize_t)strlen(buf);
+            }
+        }
+#endif
+    }
+    /* Report the target in the guest's own view: a link that resolves to a
+     * guest path (a magic self-link, or a /proc/self/fd entry mapped back
+     * through the mount table) is namespace-absolute here, and a guest that
+     * pivot_root'd would not recognize its own paths. */
+    if (buf[0] == '/' && croot_active(c->m)) {
+        buf[rn] = 0;
+        char view[PATH_MAX];
+        path_chroot_view(c->m, buf, view);
+        strcpy(buf, view);
+        rn = (ssize_t)strlen(buf);
+    }
+    size_t out = (size_t)rn < cap ? (size_t)rn : cap;
+    if (copy_to_guest(c, a2, buf, out) < 0) return (u64)(s64)-EFAULT;
+    return out;
+}
+
+/* Keep predicate for the top-level /proc listing (hidden-process view): a
+ * numeric name is a PID and is kept only if it is a guest process; every
+ * non-numeric name (self, cpuinfo, sys, net, …) is always kept. */
+static int proc_keep_name(const char *name) {
+    if (*name < '0' || *name > '9') return 1;
+    long pid = 0;
+    for (const char *p = name; *p; p++) {
+        if (*p < '0' || *p > '9') return 1;      /* mixed name: not a PID */
+        pid = pid * 10 + (*p - '0');
+        if (pid > 0x7fffffff) return 1;
+    }
+    return pid == (long)getpid() || proctab_has((s32)pid);
+}
+
+/* Splice virtual bind mount points into a directory listing. A --bind (or
+ * runtime mount --bind) destination is a pure path-resolution overlay
+ * (path.c bind_match) with no physical dirent in the rootfs, so a plain
+ * getdents64 on the parent never lists it — e.g. `ls /` would not show a
+ * `--bind X:/host`. We append a synthetic linux_dirent64 for every live bind
+ * whose mount point is a direct child of the directory open on `dirfd` (its
+ * canonical guest path is `dir`), so listings match real mount semantics and
+ * the /proc/mounts view (which already reports binds). `buf` holds `used`
+ * bytes of real entries within capacity `cap`; returns the new length. Records
+ * are 8-byte aligned; a mount point already present as a real dirent (a bind
+ * overlaying an existing directory) or one that would overflow `cap` is
+ * skipped, as is a basename already emitted (stacked binds share a point). */
+static size_t bind_inject_dents(struct Machine *m, int dirfd, const char *dir,
+                                u8 *buf, size_t used, size_t cap) {
+    int nb = bind_count();
+    for (int i = 0; i < nb; i++) {
+        char guest[PATH_MAX], host[PATH_MAX];
+        if (!bind_get(i, guest, host, NULL)) continue;
+        /* Split the mount point into parent + basename; inject only when the
+         * parent is exactly the directory being listed. Guest paths are
+         * canonical and absolute with no trailing slash (add_bind/bind_add). */
+        char *slash = strrchr(guest, '/');
+        if (!slash || !slash[1]) continue;
+        const char *base = slash + 1;
+        char parent[PATH_MAX];
+        size_t plen = (size_t)(slash - guest);
+        if (plen == 0) { parent[0] = '/'; parent[1] = 0; }   /* child of "/" */
+        else { memcpy(parent, guest, plen); parent[plen] = 0; }
+        if (strcmp(parent, dir) != 0) continue;
+        /* Physically present already? getdents returned it — skip (no dup). */
+        struct stat st;
+        if (fstatat(dirfd, base, &st, AT_SYMLINK_NOFOLLOW) == 0) continue;
+        /* De-dup stacked binds mounted at the same point (same basename). */
+        int dup = 0;
+        for (size_t o = 0; o + 19 <= used; ) {
+            u16 rl; memcpy(&rl, buf + o + 16, 2);
+            if (rl == 0) break;
+            if (!strcmp((char *)buf + o + 19, base)) { dup = 1; break; }
+            o += rl;
+        }
+        if (dup) continue;
+        /* Real ino + d_type from the bind source (a source may be a file, not a
+         * directory); fall back to a synthetic non-zero ino + DT_DIR. */
+        u64 ino = 0; u8 type = DT_DIR;
+        if (stat(host, &st) == 0) {
+            ino = (u64)st.st_ino;
+            type = (u8)((st.st_mode >> 12) & 0xf);   /* S_IFMT>>12 == DT_* */
+        }
+        if (!ino) ino = 0xffffffffu - (u64)i;
+        size_t namelen = strlen(base);
+        size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
+        if (used + reclen > cap) continue;
+        u8 *rec = buf + used;
+        memset(rec, 0, reclen);
+        memcpy(rec + 0, &ino, 8);
+        s64 off = (s64)0x7fffffff00000000LL + i;      /* opaque high cookie */
+        memcpy(rec + 8, &off, 8);
+        u16 rl = (u16)reclen; memcpy(rec + 16, &rl, 2);
+        rec[18] = type;
+        memcpy(rec + 19, base, namelen + 1);
+        used += reclen;
+    }
+    return used;
+}
+
+/* Splice the passthrough /dev device nodes (path.c's dev_nodes[] whitelist)
+ * into a listing of guest /dev. Like bind mount points, these nodes have no
+ * physical dirent in the rootfs /dev — special_host_path grants access by name
+ * only — so a plain getdents never lists them. For each whitelist entry we
+ * lstat its host target for a real d_ino/d_type, skipping it when the node is
+ * absent on this host or already present as a real dirent (dedup, e.g. a rootfs
+ * that ships a real "null"). Records are 8-byte aligned, same builder as
+ * bind_inject_dents; entry names are unique so no cross-record dedup is needed.
+ * The caller suppresses this under --no-dev and when /dev is served by a -bind
+ * (that directory's own contents are authoritative). Returns the new length. */
+static size_t dev_inject_dents(int dirfd, u8 *buf, size_t used, size_t cap) {
+    int nd = dev_node_count();
+    for (int i = 0; i < nd; i++) {
+        const char *name, *host;
+        if (!dev_node_get(i, &name, &host)) continue;
+        struct stat hst;
+        if (lstat(host, &hst) != 0) continue;   /* not available on this host */
+        struct stat pst;
+        if (fstatat(dirfd, name, &pst, AT_SYMLINK_NOFOLLOW) == 0) continue;   /* already listed */
+        u64 ino = (u64)hst.st_ino;
+        u8 type = (u8)((hst.st_mode >> 12) & 0xf);   /* S_IFMT>>12 == DT_* */
+        size_t namelen = strlen(name);
+        size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
+        if (used + reclen > cap) continue;
+        u8 *rec = buf + used;
+        memset(rec, 0, reclen);
+        memcpy(rec + 0, &ino, 8);
+        s64 off = (s64)0x7ffffffe00000000LL + i;      /* opaque high cookie */
+        memcpy(rec + 8, &off, 8);
+        u16 rl = (u16)reclen; memcpy(rec + 16, &rl, 2);
+        rec[18] = type;
+        memcpy(rec + 19, name, namelen + 1);
+        used += reclen;
+    }
+    return used;
+}
+
+SYSDEF(getdents64) {
+    /* linux_dirent64 layout is a fixed kernel ABI, identical for guest and
+     * host. Two filters may apply: hide ".l2s.*" backing files (-link2symlink),
+     * and hide non-guest PIDs from the top-level /proc (pid-namespace view).
+     * Names sit at record offset +19 (8 d_ino + 8 d_off + 2 d_reclen + 1
+     * d_type). We also append synthetic records for entries with no physical
+     * dirent in the rootfs: the passthrough /dev device nodes (dev_inject_dents)
+     * and virtual bind mount points (bind_inject_dents). Otherwise the raw
+     * buffer passes straight through. */
+    /* The count is an unsigned int in the kernel's own prototype, so the
+     * register's high half is not part of it: getdents64(fd, buf, 2^32 + 5)
+     * is a count of 5, EINVAL for the first record. Read whole, it was a
+     * megabyte's read of the directory on a 64-bit host (and the kernel's
+     * answer on a 32-bit one only because the cast happened to agree). */
+    size_t len = (size_t)(u32)a2;
+    if (len > (1u << 20)) len = 1u << 20;
+    /* Only as far as the guest's buffer is mapped: filldir64 writes one
+     * record at a time and stops at the first that faults, returning what it
+     * wrote (EFAULT if that was nothing), and the directory position stays at
+     * the record that did not fit. Reading `count` bytes from the host and
+     * failing the copy-out afterwards consumed every entry past the mapped
+     * part, and a buffer that was not there at all read as an empty
+     * directory. Bounding the host read by the room does both the kernel's
+     * way -- except that a first record too long for the room comes back
+     * from the host as EINVAL, which is what a kernel answers for a count
+     * too small; when it was the mapping and not the count that was short,
+     * that is the fault the kernel would have taken (below). */
+    size_t room = len ? rw_room(c, a1, len, ACC_WRITE) : 0;
+    if (len && !room) return (u64)(s64)-EFAULT;
+    size_t asked = len;
+    len = room;
+    u8 *buf = malloc(len ? len : 1);
+    if (!buf) return (u64)(s64)-ENOMEM;
+
+    /* Identify the fd's directory once, from a single readlink of its host path
+     * (guest fd == host fd): its guest path `gdir`, whether it resolved through
+     * a -bind (`via_bind`), and whether it is the host /proc passthrough (which
+     * takes the PID-namespace filter, unless --no-proc disabled /proc). */
+    char gdir[PATH_MAX], dhost[PATH_MAX];
+    int have_gdir = 0, via_bind = 0, is_proc = 0;
+    dhost[0] = 0;
+    /* /proc/<pid>/task of a guest process: its entries are that process's guest
+     * threads, except for any host task in its thread group that is not one --
+     * an interposer's own thread, which the guest must not be able to see, name
+     * or ptrace. Each process publishes its own set (proc_foreign_sample). */
+    s32 foreign[PROCTAB_FOREIGN];
+    int nforeign = 0;
+    {
+        char link[64], hpath[PATH_MAX];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", (int)a0);
+        ssize_t ln = readlink(link, hpath, sizeof hpath - 1);
+        if (ln > 0) {
+            hpath[ln] = 0;
+            strcpy(dhost, hpath);
+            is_proc = !c->m->no_proc && !strcmp(hpath, "/proc");
+            have_gdir = host_fd_guest_path(c->m, hpath, gdir, &via_bind) == 0;
+            int tp = 0, adv = 0;
+            if (!c->m->no_proc &&
+                sscanf(hpath, "/proc/%d/task%n", &tp, &adv) == 1 &&
+                adv > 0 && hpath[adv] == 0 && tp > 0) {
+                /* /proc/<tid>/task of a guest thread lists its process's. */
+                s32 g = proctab_task_group((s32)tp);
+                nforeign = proc_foreign_tasks(g > 0 ? g : (s32)tp, foreign,
+                                              PROCTAB_FOREIGN);
+            }
+        }
+    }
+
+    /* Synthetic entries have no physical dirent, so we splice them into the
+     * listing of their directory, but only on its first read (offset 0): a real
+     * directory always yields "."/".." so the cursor then advances and later
+     * reads see a non-zero offset and skip injection — this fires once and rules
+     * out a re-inject loop. /dev nodes go in when this fd is guest /dev served by
+     * the built-in passthrough (not --no-dev, and not a -bind, whose own
+     * contents are authoritative). Bind mount points go into their parent
+     * listing (bind_inject_dents filters to those whose parent is gdir). The
+     * offset must be sampled before any host getdents64 below. */
+    int inject_dev = have_gdir && !via_bind && !c->m->no_dev &&
+                     !strcmp(gdir, "/dev");
+    int inject_binds = have_gdir && bind_count() > 0;
+    int want_inject = inject_dev || inject_binds;
+    off_t pos0 = want_inject ? lseek((int)a0, 0, SEEK_CUR) : -1;
+
+    int l2s = 0;
+#ifdef L2S_ENABLED
+    l2s = c->m->link2symlink;
+    /* The store is the rootfs's "/.l2s": not listed at the namespace root. */
+    int l2s_root = l2s && have_gdir && !via_bind && !strcmp(gdir, "/");
+#endif
+
+    long n;
+    if (is_proc || l2s || nforeign) {
+        /* Re-read if a whole batch is filtered away (0 would look like EOF). */
+        for (;;) {
+            n = syscall(SYS_getdents64, (int)a0, buf, len);
+            if (n <= 0) break;
+            size_t w = 0, o = 0;
+            while (o + 19 <= (size_t)n) {
+                u16 reclen;
+                memcpy(&reclen, buf + o + 16, 2);
+                if (reclen == 0 || o + reclen > (size_t)n) break;
+                const char *nm = (const char *)(buf + o + 19);
+                int keep = 1;
+#ifdef L2S_ENABLED
+                if (l2s && (l2s_hidden(nm) || (l2s_root && !strcmp(nm, ".l2s"))))
+                    keep = 0;
+                /* A name of a link2symlink group is a symlink to the host and
+                 * the one file a hardlink is to the guest: lstat says so, and
+                 * the record must agree -- the data file's type and inode --
+                 * or find -type f, ls -F, ls -i and every tool that trusts
+                 * d_type and d_ino see through it. Asked of a record that can
+                 * be a symlink: DT_LNK, or DT_UNKNOWN from a filesystem that
+                 * does not type its entries. */
+                if (keep && l2s && (buf[o + 18] == 10 /*DT_LNK*/ || buf[o + 18] == 0)) {
+                    u64 dino;
+                    unsigned dtype;
+                    if (l2s_dirent((int)a0, dhost, nm, &dino, &dtype)) {
+                        memcpy(buf + o, &dino, sizeof dino);
+                        buf[o + 18] = (u8)dtype;
+                    }
+                }
+#endif
+                if (keep && is_proc && !proc_keep_name(nm)) keep = 0;
+                if (keep && nforeign) {
+                    s32 t = (s32)atoi(nm);
+                    for (int i = 0; i < nforeign; i++)
+                        if (foreign[i] == t) { keep = 0; break; }
+                }
+                if (keep) {
+                    if (w != o) memmove(buf + w, buf + o, reclen);
+                    w += reclen;
+                }
+                o += reclen;
+            }
+            if (w > 0) { n = (long)w; break; }
+        }
+    } else {
+        n = syscall(SYS_getdents64, (int)a0, buf, len);
+    }
+    if (n < 0) {
+        u64 e = host_err();
+        if (e == (u64)(s64)-EINVAL && len < asked) e = (u64)(s64)-EFAULT;
+        free(buf);
+        return e;
+    }
+    if (want_inject && pos0 == 0 && n > 0) {
+        if (inject_dev)
+            n = (long)dev_inject_dents((int)a0, buf, (size_t)n, len);
+        if (inject_binds)
+            n = (long)bind_inject_dents(c->m, (int)a0, gdir, buf, (size_t)n, len);
+    }
+    if (n > 0 && copy_to_guest(c, a1, buf, (size_t)n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+    free(buf);
+    return (u64)n;
+}
+
+/* ---- extended attributes (xattr) ----
+ * value/list payloads are opaque bytes and names are C strings, so every variant
+ * is a straight bounce to the host.  Path variants resolve through the rootfs;
+ * the *l* variants keep the final symlink (resolve NOFOLLOW + host l*xattr) while
+ * the plain variants follow it.  fd variants use the guest==host fd directly. */
+#define XATTR_BUF_MAX (1u << 20)     /* Linux caps a value/list at 64 KiB; be generous */
+#define XATTR_NAME_BUF 256           /* XATTR_NAME_MAX (255) + NUL */
+
+/* Sized read shared by {get,lget,fget}xattr and {list,llist,flist}xattr.
+ * Exactly one target is live: `host` (path) or `fd`; `name` is NULL for the list
+ * variants.  size == 0 is the "how big?" probe (no buffer written). */
+static u64 xattr_read(CPU *c, const char *host, int fd, int follow,
+                      const char *name, u64 val_va, u64 size) {
+    size_t n = size > XATTR_BUF_MAX ? XATTR_BUF_MAX : (size_t)size;
+    void *buf = NULL;
+    if (n && !(buf = malloc(n))) return (u64)(s64)-ENOMEM;
+    ssize_t r;
+    if (host)
+        r = name ? (follow ? getxattr(host, name, buf, n)
+                           : lgetxattr(host, name, buf, n))
+                 : (follow ? listxattr(host, buf, n)
+                           : llistxattr(host, buf, n));
+    else
+        r = name ? fgetxattr(fd, name, buf, n) : flistxattr(fd, buf, n);
+    if (r < 0) { u64 e = host_err(); free(buf); return e; }
+    if (n && r > 0 && copy_to_guest(c, val_va, buf, (size_t)r) < 0) {
+        free(buf); return (u64)(s64)-EFAULT;
+    }
+    free(buf);
+    return (u64)r;
+}
+
+/* Sized write shared by {set,lset,fset}xattr. The size is a guest size_t,
+ * judged whole: cast to an ILP32 host's size_t first, a value of 2^32 + 5
+ * passed the E2BIG check as 5 and set a five-byte value where the kernel
+ * answers E2BIG (xattr_read above compares before it casts, too). */
+static u64 xattr_write(CPU *c, const char *host, int fd, int follow,
+                       const char *name, u64 val_va, u64 size, int flags) {
+    if (size > XATTR_BUF_MAX) return (u64)(s64)-E2BIG;
+    size_t n = (size_t)size;
+    void *buf = NULL;
+    if (n) {
+        if (!(buf = malloc(n))) return (u64)(s64)-ENOMEM;
+        if (copy_from_guest(c, buf, val_va, n) < 0) { free(buf); return (u64)(s64)-EFAULT; }
+    }
+    int r;
+    if (host)
+        r = follow ? setxattr(host, name, buf, n, flags)
+                   : lsetxattr(host, name, buf, n, flags);
+    else
+        r = fsetxattr(fd, name, buf, n, flags);
+    if (r < 0) { u64 e = host_err(); free(buf); return e; }
+    free(buf);
+    return 0;
+}
+
+/* Copy a guest xattr name; -errno on fault or overflow. */
+static long xattr_name(CPU *c, char *dst, u64 va) {
+    return copy_str_from_guest(c, dst, va, XATTR_NAME_BUF);
+}
+
+SYSDEF(getxattr) {   /* (path, name, value, size) — follow */
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    u64 ret = nn < 0 ? (u64)(s64)nn
+                     : xattr_read(c, spell, -1, !pin.pinned, name, a2, a3);
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(lgetxattr) {  /* (path, name, value, size) — nofollow */
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    u64 ret = nn < 0 ? (u64)(s64)nn : xattr_read(c, spell, -1, 0, name, a2, a3);
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(fgetxattr) {  /* (fd, name, value, size) */
+    char name[XATTR_NAME_BUF];
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    return xattr_read(c, NULL, (int)a0, 1, name, a2, a3);
+}
+SYSDEF(listxattr) {  /* (path, list, size) — follow */
+    char spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    u64 ret = xattr_read(c, spell, -1, !pin.pinned, NULL, a1, a2);
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(llistxattr) { /* (path, list, size) — nofollow */
+    char spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    u64 ret = xattr_read(c, spell, -1, 0, NULL, a1, a2);
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(flistxattr) { /* (fd, list, size) */
+    return xattr_read(c, NULL, (int)a0, 1, NULL, a1, a2);
+}
+SYSDEF(setxattr) {   /* (path, name, value, size, flags) — follow */
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    u64 ret = nn < 0            ? (u64)(s64)nn
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
+            : xattr_write(c, spell, -1, !pin.pinned, name, a2, a3, (int)a4);
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(lsetxattr) {  /* (path, name, value, size, flags) — nofollow */
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    u64 ret = nn < 0            ? (u64)(s64)nn
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
+            : xattr_write(c, spell, -1, 0, name, a2, a3, (int)a4);
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(fsetxattr) {  /* (fd, name, value, size, flags) */
+    char name[XATTR_NAME_BUF];
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    return xattr_write(c, NULL, (int)a0, 1, name, a2, a3, (int)a4);
+}
+SYSDEF(removexattr) {  /* (path, name) — follow */
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell(c, G_AT_FDCWD, a0, 0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    u64 ret = nn < 0                  ? (u64)(s64)nn
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
+            : (pin.pinned ? lremovexattr(spell, name)
+                          : removexattr(spell, name)) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(lremovexattr) { /* (path, name) — nofollow */
+    char name[XATTR_NAME_BUF], spell[PATH_MAX];
+    PathPin pin;
+    int r = resolve_at_spell_nofollow(c, G_AT_FDCWD, a0, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    long nn = xattr_name(c, name, a1);
+    u64 ret = nn < 0                  ? (u64)(s64)nn
+            : pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
+            : lremovexattr(spell, name) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
+}
+SYSDEF(fremovexattr) { /* (fd, name) */
+    char name[XATTR_NAME_BUF];
+    long nn = xattr_name(c, name, a1);
+    if (nn < 0) return (u64)(s64)nn;
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    if (fremovexattr((int)a0, name) < 0) return host_err();
+    return 0;
+}
+
+/* ioctl whitelist: cmd values below are asm-generic and shared by arm64, arm
+ * and x86; the payloads (kernel termios/winsize/int) have identical layout on
+ * all four hosts, so a size-tagged bounce is enough. `kind` says whose command
+ * it is, which is what a refusal by the host's policy is answered by
+ * (ioctl_refused below). */
+typedef struct { u32 cmd; u16 size; u8 dir; u8 kind; } IoctlEnt;   /* dir: 0 none/int-arg, 1 read(out), 2 write(in), 3 rw */
+#define IOK_FILE 0          /* any file's: FIONREAD, FIONBIO */
+#define IOK_TTY  1          /* a terminal's: ENOTTY from anything that is none */
+#define IOK_FD   2          /* the descriptor's own close-on-exec flag */
+#define IOK_OUTQ 3          /* a terminal's, and a socket's (SIOCOUTQ): TIOCOUTQ */
+#define IOC_TERMIOS_SZ 36   /* kernel struct termios: 4 u32 + c_line + c_cc[19] */
+static const IoctlEnt ioctl_tab[] = {
+    { 0x5401 /*TCGETS*/,     IOC_TERMIOS_SZ, 1, IOK_TTY },
+    { 0x5402 /*TCSETS*/,     IOC_TERMIOS_SZ, 2, IOK_TTY },
+    { 0x5403 /*TCSETSW*/,    IOC_TERMIOS_SZ, 2, IOK_TTY },
+    { 0x5404 /*TCSETSF*/,    IOC_TERMIOS_SZ, 2, IOK_TTY },
+    { 0x5409 /*TCSBRK*/,     0, 0, IOK_TTY },     /* tcdrain (arg != 0), tcsendbreak (0) */
+    { 0x5425 /*TCSBRKP*/,    0, 0, IOK_TTY },     /* glibc's tcsendbreak(fd, n > 0): n deciseconds */
+    { 0x540A /*TCXONC*/,     0, 0, IOK_TTY },
+    { 0x540B /*TCFLSH*/,     0, 0, IOK_TTY },
+    { 0x540E /*TIOCSCTTY*/,  0, 0, IOK_TTY },
+    { 0x540F /*TIOCGPGRP*/,  4, 1, IOK_TTY },
+    { 0x5410 /*TIOCSPGRP*/,  4, 2, IOK_TTY },
+    { 0x5411 /*TIOCOUTQ*/,   4, 1, IOK_OUTQ },    /* bytes not yet sent; SIOCOUTQ on a socket */
+    { 0x5413 /*TIOCGWINSZ*/, 8, 1, IOK_TTY },
+    { 0x5414 /*TIOCSWINSZ*/, 8, 2, IOK_TTY },
+    { 0x5415 /*TIOCMGET*/,     4, 1, IOK_TTY },   /* get modem status bits (out) */
+    { 0x5416 /*TIOCMBIS*/,     4, 2, IOK_TTY },   /* set the given modem bits (in) */
+    { 0x5417 /*TIOCMBIC*/,     4, 2, IOK_TTY },   /* clear the given modem bits (in) */
+    { 0x5418 /*TIOCMSET*/,     4, 2, IOK_TTY },   /* set all modem bits (in) */
+    { 0x5419 /*TIOCGSOFTCAR*/, 4, 1, IOK_TTY },   /* get CLOCAL/soft-carrier flag (out) */
+    { 0x541A /*TIOCSSOFTCAR*/, 4, 2, IOK_TTY },   /* set CLOCAL/soft-carrier flag (in) */
+    { 0x5420 /*TIOCPKT*/,      4, 2, IOK_TTY },   /* enable/disable pty packet mode (in: int); screen's OpenPTY needs it */
+    { 0x541B /*FIONREAD*/,   4, 1, IOK_FILE },
+    { 0x5421 /*FIONBIO*/,    4, 2, IOK_FILE },
+    { 0x5422 /*TIOCNOTTY*/,  0, 0, IOK_TTY },
+    { 0x5451 /*FIOCLEX*/,    0, 0, IOK_FD },
+    { 0x5450 /*FIONCLEX*/,   0, 0, IOK_FD },
+    { 0x80045430 /*TIOCGPTN*/, 4, 1, IOK_TTY },
+    { 0x40045431 /*TIOCSPTLCK*/, 4, 2, IOK_TTY },
+    { 0x5603 /*VT_GETSTATE*/, 6, 1, IOK_TTY },   /* struct vt_stat: 3 u16, out */
+    { 0x4b33 /*KDGKBTYPE*/,   1, 1, IOK_TTY },   /* char keyboard type, out; ENOTTY off a real VT */
+};
+
+/* ---- A policy that refuses an ioctl ahead of the file it is for ----
+ *
+ * Android's SELinux policy lists, per class of file, the ioctl commands an app
+ * may issue, and answers EACCES for the rest before the file's own handler is
+ * reached. On anything that is not a terminal it lists next to none of the
+ * terminal commands: on a pipe, a socket or a regular file every one but TCGETS
+ * (and a socket's TIOCGWINSZ and SIOCOUTQ) is EACCES, on a directory, a memfd
+ * or a /proc file TCGETS too, and on a memfd FIOCLEX/FIONCLEX besides. A
+ * kernel answers each of those terminal commands ENOTTY, so a guest asking
+ * tcgetpgrp(3) of a pipe -- bash's job control does, to report why it has
+ * none -- was told "Permission denied" where it should read "Inappropriate
+ * ioctl for device", and isatty(3) of a /proc file failed with EACCES.
+ *
+ * No terminal is a pipe, a socket, a regular file or a directory, so a terminal
+ * command refused on one of those is answered ENOTTY: what the kernel would
+ * have said (TIOCOUTQ on a socket aside, which is SIOCOUTQ there and keeps the
+ * refusal). A character or block device keeps the host's answer -- a driver
+ * decides what it says to a command it does not know (/dev/urandom: EINVAL),
+ * and a terminal is one -- except a pty slave, whose answers are the tty
+ * core's alone (pts_refused below). FIOCLEX and FIONCLEX set or clear
+ * close-on-exec on the descriptor, which is all a kernel does for them, and
+ * F_SETFD does the same thing unrefused. ARM64EMU_TTYIOCTL_FORCE_DENY makes any host
+ * refuse the way the policy does: on a memfd, everything on each of those four
+ * kinds of descriptor; on a pty slave, all but the commands it lists. */
+#define TC_FIOCLEX  0x5451u
+#define TC_FIONCLEX 0x5450u
+#define TC_FIONREAD 0x541bu
+#define TC_OUTQ     0x5411u
+
+static int ttyio_force_deny = -1;     /* as tc2_host_lacks below: -1 = knob unread */
+
+/* What a descriptor is, as far as answering a refused ioctl goes. A pty slave
+ * is any of the UNIX98 slave majors (136..143, the kernel's
+ * UNIX98_PTY_SLAVE_MAJOR + UNIX98_PTY_MAJOR_COUNT): the ptys an app has. */
+#define FDK_OTHER 0
+#define FDK_FILE  1         /* a pipe, a regular file or a directory */
+#define FDK_SOCK  2
+#define FDK_PTS   3
+static int fd_kind(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return FDK_OTHER;
+    if (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) return FDK_FILE;
+    if (S_ISSOCK(st.st_mode)) return FDK_SOCK;
+    if (S_ISCHR(st.st_mode) && major(st.st_rdev) >= 136 && major(st.st_rdev) < 144)
+        return FDK_PTS;
+    return FDK_OTHER;
+}
+
+/* Whether a descriptor of this kind can answer a command of `kind` at all:
+ * 0 means the kernel's answer is ENOTTY whatever the command asks. */
+static int fd_answers(int fdk, int kind) {
+    if (kind == IOK_TTY)  return fdk != FDK_FILE && fdk != FDK_SOCK;
+    if (kind == IOK_OUTQ) return fdk != FDK_FILE;
+    return 1;
+}
+
+/* The commands Android's policy lets an app issue on its pty slave, of those
+ * this table has (its unpriv_tty_ioctls). TIOCOUTQ is among them; it is the
+ * one IOK_OUTQ command, so it is never asked here. */
+static int pts_policy_allows(u32 cmd) {
+    switch (cmd) {
+    case 0x5401: case 0x5402: case 0x5403: case 0x5404:   /* TCGETS, TCSETS{,W,F} */
+    case 0x540B: case 0x540E:                             /* TCFLSH, TIOCSCTTY */
+    case 0x540F: case 0x5410:                             /* TIOC[GS]PGRP */
+    case 0x5413: case 0x5414:                             /* TIOC[GS]WINSZ */
+        return 1;
+    }
+    return 0;
+}
+
+/* The host's ioctl, for a command of `kind` -- or, with ARM64EMU_TTYIOCTL_FORCE_DENY,
+ * the policy's EACCES. Only for a descriptor the command could reach at all:
+ * one that is not open, or open O_PATH, is the host's EBADF either way. */
+static int ioctl_host(int fd, u32 cmd, unsigned long arg, int kind) {
+    if (kind != IOK_FILE &&
+        PROBE_ONCE(ttyio_force_deny, getenv("ARM64EMU_TTYIOCTL_FORCE_DENY") != NULL) > 0) {
+        int fl = fcntl(fd, F_GETFL);
+        int fdk = fl >= 0 && !(fl & O_PATH) ? fd_kind(fd) : FDK_OTHER;
+        if ((fdk == FDK_FILE || fdk == FDK_SOCK) ? (kind == IOK_FD || !fd_answers(fdk, kind))
+            : fdk == FDK_PTS && kind == IOK_TTY && !pts_policy_allows(cmd)) {
+            errno = EACCES;
+            return -1;
+        }
+    }
+    return ioctl(fd, cmd, arg);
+}
+
+static int pts_refused(int fd, u32 cmd, unsigned long arg, u64 *ret);
+
+/* What the host's refusal (errno) of `cmd` with `arg` -- the very argument the
+ * host was handed -- is to the guest: see above. */
+static u64 ioctl_refused(int fd, u32 cmd, int kind, unsigned long arg) {
+    int e = errno;
+    if (e != EACCES || kind == IOK_FILE) return (u64)(s64)-e;
+    if (kind == IOK_FD) {
+        if (fcntl(fd, F_SETFD, cmd == TC_FIOCLEX ? FD_CLOEXEC : 0) < 0) return host_err();
+        return 0;
+    }
+    int fdk = fd_kind(fd);
+    if (!fd_answers(fdk, kind)) return (u64)(s64)-ENOTTY;
+    u64 ret;
+    if (fdk == FDK_PTS && pts_refused(fd, cmd, arg, &ret)) return ret;
+    return (u64)(s64)-EACCES;
+}
+
+/* ---- termios2: TCGETS2 / TCSETS2 / TCSETSW2 / TCSETSF2 ----
+ *
+ * 44 bytes: the 36-byte termios plus c_ispeed and c_ospeed (2 u32), the same
+ * on every host. A glibc since 2.42 implements tcgetattr/tcsetattr -- and so
+ * isatty -- on these, which is how a guest learns whether it has a terminal.
+ *
+ * Android's SELinux policy whitelists the ioctls an app may issue on its pty
+ * and TCGETS2 is not among them: the host answers EACCES, on a terminal and on
+ * a pipe alike. isatty(0) was then false for the guest, so bash (Ubuntu 26.04,
+ * glibc 2.43) ran non-interactively on a terminal and printed no prompt, and
+ * readline's tcsetattr would have been refused the same way. A host kernel
+ * that predates the commands (ENOTTY on a tty) is in the same position.
+ *
+ * Both are served from the classic commands, which every host answers: the
+ * termios is the first 36 bytes either way, and what the classic struct leaves
+ * out are the rates, which c_cflag already holds -- as a Bnnn constant in
+ * CBAUD (output) and CIBAUD (input; 0 = "as the output"), or BOTHER, "the
+ * number is in c_ospeed / c_ispeed". A Bnnn is read back from the constant;
+ * a BOTHER number cannot be held by a termios that has no field for it, so
+ * the emulator keeps the last one set per terminal (tc_shadow below) while
+ * c_cflag keeps the BOTHER marker in the host's own termios, where every
+ * reader sees it. The kernel's own termios2 reads the speeds back from the tty
+ * the same way for a tty that is not a serial port: they are only ever what
+ * was last set.
+ *
+ * Tried on the host first, so a host that does implement termios2 serves them
+ * itself; the first refusal that the classic command then proves to be about
+ * termios2 (it worked on the same descriptor) is remembered, and the
+ * remaining calls go straight to the fallback instead of being denied -- and
+ * logged by the policy -- every time. ARM64EMU_TERMIOS2_FORCE_DENY forces the tier
+ * on any host. */
+#define TC_GETS    0x5401u
+#define TC_SETS    0x5402u
+#define TC_GETS2   0x802c542au
+#define TC_SETS2   0x402c542bu
+#define TC_SETSW2  0x402c542cu
+#define TC_SETSF2  0x402c542du
+#define TC_CBAUD   0x100fu     /* c_cflag's output-rate field */
+#define TC_BOTHER  0x1000u     /* ... holding "the rate is in c_ospeed" */
+#define TC_IBSHIFT 16          /* the input-rate field is CBAUD << this */
+#define IOC_TERMIOS2_SZ 44     /* kernel struct termios2: termios + c_ispeed + c_ospeed */
+
+/* The rate each Bnnn names: B0..B38400 are 0..15, B57600..B4000000 0x1001..0x100f. */
+static const u32 tc_rate_lo[16] = { 0, 50, 75, 110, 134, 150, 200, 300, 600, 1200,
+                                    1800, 2400, 4800, 9600, 19200, 38400 };
+static const u32 tc_rate_hi[15] = { 57600, 115200, 230400, 460800, 500000, 576000,
+                                    921600, 1000000, 1152000, 1500000, 2000000,
+                                    2500000, 3000000, 3500000, 4000000 };
+
+/* A rate field's number; `held` is the one kept for BOTHER. */
+static u32 tc_rate(u32 field, u32 held) {
+    if (field == TC_BOTHER) return held;
+    return (field & TC_BOTHER) ? tc_rate_hi[(field & 0xf) - 1] : tc_rate_lo[field];
+}
+
+/* The BOTHER numbers last set, per terminal: a few slots, replaced round
+ * robin. Lock-free on purpose (a lock held across fork() would be inherited
+ * held by the child): `speeds` is written before `key`, and a reader that
+ * lands between two writers of the same terminal gets one of the two pairs. */
+typedef struct { u64 key, speeds; } TcShadow;
+static TcShadow tc_shadow[8];
+static unsigned tc_shadow_next;
+
+/* /dev/ptmx, whichever devpts mounts it: a pty's master end. */
+static int tc_is_ptmx(dev_t rd) { return major(rd) == 5 && minor(rd) == 2; }
+
+/* Which terminal a descriptor is: the slave's device number, which the master
+ * ptmx's termios is too (it talks to its slave's). Bit 63 keeps it nonzero. */
+static u64 tc_key(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) return 1;
+    dev_t rd = st.st_rdev;
+    int n;
+    if (tc_is_ptmx(rd) && ioctl(fd, 0x80045430 /*TIOCGPTN*/, &n) == 0 && n >= 0)
+        rd = makedev(136 + n / 256, n % 256);       /* UNIX98_PTY_SLAVE_MAJOR */
+    return (u64)rd | (1ull << 63);
+}
+
+static int tc_shadow_get(u64 key, u32 *ispeed, u32 *ospeed) {
+    for (unsigned i = 0; i < sizeof tc_shadow / sizeof tc_shadow[0]; i++) {
+        if (__atomic_load_n(&tc_shadow[i].key, __ATOMIC_ACQUIRE) != key) continue;
+        u64 v = __atomic_load_n(&tc_shadow[i].speeds, __ATOMIC_RELAXED);
+        *ispeed = (u32)(v >> 32);
+        *ospeed = (u32)v;
+        return 1;
+    }
+    return 0;
+}
+
+static void tc_shadow_put(u64 key, u32 ispeed, u32 ospeed) {
+    unsigned n = sizeof tc_shadow / sizeof tc_shadow[0], slot = n;
+    for (unsigned i = 0; i < n; i++)
+        if (__atomic_load_n(&tc_shadow[i].key, __ATOMIC_RELAXED) == key) { slot = i; break; }
+    if (slot == n) slot = __atomic_fetch_add(&tc_shadow_next, 1, __ATOMIC_RELAXED) % n;
+    __atomic_store_n(&tc_shadow[slot].speeds, (u64)ispeed << 32 | ospeed, __ATOMIC_RELAXED);
+    __atomic_store_n(&tc_shadow[slot].key, key, __ATOMIC_RELEASE);
+}
+
+/* Whether to skip the host's termios2 and go straight to the classic commands:
+ * forced by the knob, or set once the host refused a termios2 command that the
+ * classic one answering for it was not refused (so the refusal was about
+ * termios2). -1 = the knob is not read yet, 0 = ask the host. */
+static int tc2_host_lacks = -1;
+
+/* The host's own answer, or a refusal when the tier is forced. */
+static int tc2_host(int fd, u32 cmd, void *buf) {
+    if (PROBE_ONCE(tc2_host_lacks, getenv("ARM64EMU_TERMIOS2_FORCE_DENY") != NULL) > 0) {
+        errno = EACCES;
+        return -1;
+    }
+    return ioctl_host(fd, cmd, (unsigned long)buf, IOK_TTY);
+}
+
+static u64 tty_termios2(CPU *c, int fd, u32 cmd, u64 gp) {
+    u8 buf[IOC_TERMIOS2_SZ];
+    int set = cmd != TC_GETS2;
+    /* Zeroed first, as in the table path below: only what is written is copied out. */
+    memset(buf, 0, sizeof buf);
+    if (set && copy_from_guest(c, buf, gp, sizeof buf) < 0) return (u64)(s64)-EFAULT;
+    if (tc2_host(fd, cmd, buf) < 0) {
+        if (errno != EACCES && errno != ENOTTY) return host_err();
+        /* Not served by the host: the classic command answers for it (and
+         * says ENOTTY itself where the descriptor is no terminal). */
+        u32 cflag, ispeed = 0, ospeed = 0;
+        u64 key = 0;
+        if (!set) {
+            if (ioctl_host(fd, TC_GETS, (unsigned long)buf, IOK_TTY) < 0)
+                return ioctl_refused(fd, TC_GETS, IOK_TTY, (unsigned long)buf);
+            memcpy(&cflag, buf + 8, 4);
+            u32 ib = (cflag >> TC_IBSHIFT) & TC_CBAUD, ob = cflag & TC_CBAUD;
+            u32 hi = 38400, ho = 38400;        /* a BOTHER nobody told us the number of */
+            if ((ob == TC_BOTHER || ib == TC_BOTHER) && (key = tc_key(fd)))
+                tc_shadow_get(key, &hi, &ho);
+            ospeed = tc_rate(ob, ho);
+            ispeed = ib ? tc_rate(ib, hi) : ospeed;
+            memcpy(buf + 36, &ispeed, 4);
+            memcpy(buf + 40, &ospeed, 4);
+        } else {
+            memcpy(&cflag, buf + 8, 4);
+            memcpy(&ispeed, buf + 36, 4);
+            memcpy(&ospeed, buf + 40, 4);
+            u32 hcmd = TC_SETS + (cmd - TC_SETS2);          /* TCSETS, TCSETSW, TCSETSF */
+            if (ioctl_host(fd, hcmd, (unsigned long)buf, IOK_TTY) < 0)
+                return ioctl_refused(fd, hcmd, IOK_TTY, (unsigned long)buf);
+            if (((cflag & TC_CBAUD) == TC_BOTHER ||
+                 ((cflag >> TC_IBSHIFT) & TC_CBAUD) == TC_BOTHER) && (key = tc_key(fd)))
+                tc_shadow_put(key, ispeed, ospeed);
+        }
+        __atomic_store_n(&tc2_host_lacks, 1, __ATOMIC_RELAXED);
+    }
+    if (!set && copy_to_guest(c, gp, buf, sizeof buf) < 0) return (u64)(s64)-EFAULT;
+    return 0;
+}
+
+/* ---- TIOCGSID: the session a terminal belongs to ----
+ *
+ * tcgetsid(3), which login, script and agetty ask. Android's SELinux policy
+ * whitelists a pty's ioctls and TIOCGSID is not on the list: EACCES, where a
+ * kernel answers the session, or ENOTTY for a descriptor that is no terminal
+ * of the caller's (the policy answers a pipe EACCES too). The host is asked
+ * first; on that refusal it is served from the commands that are allowed --
+ * TCGETS to know a terminal from a pipe (ENOTTY, as a kernel says), TIOCGPGRP
+ * for the kernel's own reach check (a slave answers only the process whose
+ * controlling terminal it is, a master always: ENOTTY otherwise) -- and the
+ * session is then worked out the way the kernel holds it:
+ *   - a slave the caller controls belongs to the caller's session: getsid(0).
+ *     A terminal is a session's only while it is that session's controlling
+ *     terminal, and a process controls it only from inside that session;
+ *   - a master answers for its slave, the session of its foreground group (a
+ *     slave nobody controls has no group, and no session: ENOTTY).
+ * The ids are the host's, as getsid(2) and TIOCGPGRP report them. As with
+ * termios2 above, the first refusal that the allowed commands prove to be
+ * about TIOCGSID is remembered, and ARM64EMU_TIOCGSID_FORCE_DENY forces the tier
+ * on any host. */
+#define TC_GPGRP 0x540fu
+#define TC_GSID  0x5429u
+
+static int tsid_host_lacks = -1;      /* as tc2_host_lacks: -1 = knob unread, 1 = skip the host */
+
+static u64 tty_tiocgsid(CPU *c, int fd, u64 gp) {
+    s32 sid = 0;
+    int ok = 0;
+    if (!PROBE_ONCE(tsid_host_lacks, getenv("ARM64EMU_TIOCGSID_FORCE_DENY") != NULL)) {
+        if (ioctl_host(fd, TC_GSID, (unsigned long)&sid, IOK_TTY) == 0) ok = 1;
+        else if (errno != EACCES) return host_err();
+    }
+    if (!ok) {
+        u8 probe[IOC_TERMIOS_SZ];
+        s32 pg = 0;
+        struct stat st;
+        if (ioctl_host(fd, TC_GETS, (unsigned long)probe, IOK_TTY) < 0)     /* no terminal */
+            return ioctl_refused(fd, TC_GETS, IOK_TTY, (unsigned long)probe);
+        if (ioctl_host(fd, TC_GPGRP, (unsigned long)&pg, IOK_TTY) < 0)      /* not the caller's */
+            return ioctl_refused(fd, TC_GPGRP, IOK_TTY, (unsigned long)&pg);
+        if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && tc_is_ptmx(st.st_rdev)) {
+            if (pg <= 0 || (sid = sig_pgrp_session(pg)) < 0) return (u64)(s64)-ENOTTY;
+        } else {
+            sid = (s32)getsid(0);
+        }
+        __atomic_store_n(&tsid_host_lacks, 1, __ATOMIC_RELAXED);
+    }
+    if (copy_to_guest(c, gp, &sid, sizeof sid) < 0) return (u64)(s64)-EFAULT;
+    return 0;
+}
+
+/* ---- The commands a policy refuses on a pty slave ----
+ *
+ * On its pty slave Android's policy lets an app issue TCGETS, TCSETS{,W,F},
+ * TCFLSH, TIOCSCTTY, TIOC[GS]PGRP, TIOC[GS]WINSZ and TIOCOUTQ (FIONREAD,
+ * FIONBIO and FIOCLEX/FIONCLEX it does not ask about) and refuses the rest
+ * with EACCES. A slave has no ioctl operation, no break, no modem lines, no
+ * output queue and no xchar of its own (drivers/tty/pty.c, pty_unix98_ops), so
+ * the kernel's answer to each of those is the tty core's, and is served from
+ * the commands that are allowed:
+ *   - TIOCMGET/TIOCMSET/TIOCMBIS/TIOCMBIC (no modem lines), TIOCPKT, TIOCGPTN,
+ *     TIOCSPTLCK (the master's) and VT_GETSTATE, KDGKBTYPE (a console's):
+ *     ENOTTY, before the argument is looked at;
+ *   - TIOCGSOFTCAR: CLOCAL in the termios, from TCGETS;
+ *   - TIOCSSOFTCAR: CLOCAL set or cleared with TCGETS + TCSETS. The kernel
+ *     changes the bit without the background-job check every TCSETS makes, and
+ *     that check passes for a caller with SIGTTOU blocked (is_ignored), so it
+ *     is blocked across the pair. Unlike the kernel's change in place the pair
+ *     is not atomic: a TCSETS of another process between the two is undone;
+ *   - TCSBRK and TCSBRKP (tcdrain, tcsendbreak): the background-job check, and
+ *     nothing else -- the output queue is always empty (no chars_in_buffer)
+ *     and there is no break to send (no break_ctl). The check comes from
+ *     TCFLSH, which makes exactly that one and then, with no queue named,
+ *     answers EINVAL;
+ *   - TCXONC: the same check, then TCOON restarts output that TCOOFF stopped
+ *     -- which the policy refuses to everyone, so there is none to restart;
+ *     TCIOFF/TCION send the STOP/START character to the master, written here
+ *     through the line discipline, which passes a control character through
+ *     as it is (refused instead where it would not: OPOST, and one of \n \r
+ *     \t \b or a printable character). The kernel's xchar goes out even while
+ *     output is stopped with ^S; this one is dropped then, as the kernel drops
+ *     one the master has no room for. Any other argument: the check, then
+ *     EINVAL. TCOOFF itself stays refused, since nothing an app may issue
+ *     stops a terminal's output;
+ *   - TIOCNOTTY: ENOTTY unless the slave is the caller's controlling terminal,
+ *     which TIOCGPGRP tells (the kernel's own test). Nothing else can take a
+ *     controlling terminal away, so on the caller's own it stays refused.
+ * TIOCGSID and the termios2 commands have fallbacks of their own, above. */
+#define TC_FLSH      0x540bu
+#define TC_FLSH_NONE 0x7fffffffUL   /* no queue: TCIFLUSH 0, TCOFLUSH 1, TCIOFLUSH 2 */
+#define TC_CLOCAL    0x800u         /* c_cflag (asm-generic 0004000, as everywhere) */
+#define TC_OPOST     0x1u           /* c_oflag */
+#define TC_CC        17             /* c_cc's offset in the 36-byte termios */
+#define TC_VSTART    8
+#define TC_VSTOP     9
+
+/* tty_check_change, as TCSBRK and TCXONC make it: 0 when it passes, else its
+ * answer -- EIO for an orphaned group, or the SIGTTOU it sent the caller's. */
+static int pts_check_change(int fd) {
+    if (ioctl(fd, TC_FLSH, TC_FLSH_NONE) == 0 || errno == EINVAL) return 0;
+    return -errno;
+}
+
+static int pts_softcar(int fd, int on) {
+    sigset_t ttou, was;
+    u8 t[IOC_TERMIOS_SZ];
+    u32 cflag;
+    int r = 0;
+    sigemptyset(&ttou);
+    sigaddset(&ttou, SIGTTOU);
+    pthread_sigmask(SIG_BLOCK, &ttou, &was);
+    if (ioctl(fd, TC_GETS, t) < 0) {
+        r = -errno;
+    } else {
+        memcpy(&cflag, t + 8, 4);
+        cflag = on ? cflag | TC_CLOCAL : cflag & ~TC_CLOCAL;
+        memcpy(t + 8, &cflag, 4);
+        if (ioctl(fd, TC_SETS, t) < 0 || ioctl(fd, TC_GETS, t) < 0) {
+            r = -errno;
+        } else {
+            memcpy(&cflag, t + 8, 4);
+            if (!(cflag & TC_CLOCAL) != !on) r = -EINVAL;   /* tty_change_softcar's */
+        }
+    }
+    /* Only SIGTTOU back: a capture handler may have changed the rest of the
+     * mask meanwhile (the queue's back-pressure gate does). */
+    if (!sigismember(&was, SIGTTOU)) pthread_sigmask(SIG_UNBLOCK, &ttou, NULL);
+    return r;
+}
+
+static int pts_xchar(int fd, int start) {
+    u8 t[IOC_TERMIOS_SZ];
+    u32 oflag;
+    if (ioctl(fd, TC_GETS, t) < 0) return -errno;
+    memcpy(&oflag, t + 4, 4);
+    u8 ch = t[TC_CC + (start ? TC_VSTART : TC_VSTOP)];
+    if (!ch) return 0;                                    /* __DISABLED_CHAR */
+    int ctl = ch < 0x20 || (ch >= 0x7f && ch < 0xa0);     /* the kernel's iscntrl */
+    if ((oflag & TC_OPOST) && (!ctl || ch == '\n' || ch == '\r' || ch == '\t' || ch == '\b'))
+        return -EACCES;
+    struct pollfd pf = { fd, POLLOUT, 0 };
+    if (poll(&pf, 1, 0) == 1 && (pf.revents & POLLOUT)) {
+        ssize_t w = write(fd, &ch, 1);
+        (void)w;                      /* tty_send_xchar ignores the write's count */
+    }
+    return 0;
+}
+
+/* `arg` is what the host was handed: the value for an int-argument command,
+ * the emulator's buffer for the others (0 for an input the guest could not
+ * supply). 1 and *ret when the refusal is answered, 0 to keep it. */
+static int pts_refused(int fd, u32 cmd, unsigned long arg, u64 *ret) {
+    int r;
+    switch (cmd) {
+    case 0x5415: case 0x5416: case 0x5417: case 0x5418:   /* TIOCM{GET,BIS,BIC,SET} */
+    case 0x5420: case 0x80045430: case 0x40045431:        /* TIOCPKT, TIOCGPTN, TIOCSPTLCK */
+    case 0x5603: case 0x4b33:                             /* VT_GETSTATE, KDGKBTYPE */
+        r = -ENOTTY;
+        break;
+    case 0x5419: {                                        /* TIOCGSOFTCAR */
+        u8 t[IOC_TERMIOS_SZ];
+        u32 cflag;
+        if (ioctl(fd, TC_GETS, t) < 0) { r = -errno; break; }
+        memcpy(&cflag, t + 8, 4);
+        s32 v = (cflag & TC_CLOCAL) ? 1 : 0;
+        memcpy((void *)arg, &v, sizeof v);
+        r = 0;
+        break;
+    }
+    case 0x541A: {                                        /* TIOCSSOFTCAR */
+        s32 v;
+        if (!arg) { r = -EFAULT; break; }
+        memcpy(&v, (const void *)arg, sizeof v);
+        r = pts_softcar(fd, v != 0);
+        break;
+    }
+    case 0x5409: case 0x5425:                             /* TCSBRK, TCSBRKP */
+        r = pts_check_change(fd);
+        break;
+    case 0x540A:                                          /* TCXONC */
+        if (arg == 0) return 0;                           /* TCOOFF */
+        r = pts_check_change(fd);
+        if (!r && (arg == 2 || arg == 3)) r = pts_xchar(fd, arg == 3);   /* TCIOFF, TCION */
+        else if (!r && arg != 1) r = -EINVAL;                            /* not TCOON */
+        break;
+    case 0x5422: {                                        /* TIOCNOTTY */
+        s32 pg;
+        if (ioctl(fd, TC_GPGRP, &pg) == 0 || errno != ENOTTY) return 0;
+        r = -ENOTTY;
+        break;
+    }
+    default:
+        return 0;
+    }
+    if (r == -EACCES) return 0;       /* what it is served from was refused too */
+    *ret = (u64)(s64)r;
+    return 1;
+}
+
+/* The fs reflink ioctls -- FICLONE, FICLONERANGE -- clone the SOURCE fd's
+ * blocks into the DESTINATION (the ioctl's own fd). The emulator's objects
+ * that stand in for a kernel's are the synthesized /proc views and the memfd
+ * tier's files, and both are backed by an ordinary unlinked file on whatever
+ * filesystem the writable-dir chain landed on (path.c tmpfs_base). On one
+ * that reflinks -- btrfs, xfs -- the host clones straight into the backing,
+ * and none of the write-family gates ever see it: a guest could plant a
+ * file's blocks under F_SEAL_WRITE, rewrite its own maps through an O_RDONLY
+ * descriptor, or clone a memfd's content OUT into a file, where a kernel
+ * answers EXDEV/EOPNOTSUPP (neither procfs nor shmem has remap_file_range).
+ *
+ * Decided here, in do_clone_file_range's order and only when one of the two
+ * is such an object -- a pair of the host's own files is the host's call:
+ *   1. the two on different superblocks: EXDEV, before anything is asked
+ *      about either file. Every /proc file is one superblock, the passthrough
+ *      ones (the host's procfs) included; every memfd is another;
+ *   2. generic_file_rw_checks: source readable, destination writable and not
+ *      O_APPEND, else EBADF -- a view's mode is the one the guest opened it
+ *      in (PfFd.acc), a tier memfd's is its own descriptor's;
+ *   3. no remap_file_range on the filesystem: EOPNOTSUPP.
+ * A source that is not open is EBADF (fdget) ahead of all three, and that is
+ * what the host answers for it whatever the destination is. */
+static int reflink_denied(CPU *c, int dst, int src, u64 *ret) {
+    int dacc = 0, sacc = 0;
+    int dsyn = procfs_fd_synth(c->m, dst, &dacc);
+    int ssyn = procfs_fd_synth(c->m, src, &sacc);
+    int dm = !dsyn && mfd_resolve(c, dst, NULL, NULL, NULL) >= 0;
+    int sm = !ssyn && mfd_resolve(c, src, NULL, NULL, NULL) >= 0;
+    if (!dsyn && !ssyn && !dm && !sm) return 0;
+    if (fcntl(src, F_GETFD) < 0) return 0;              /* EBADF, from the host */
+    /* One side a view, the other a host file: on the host's procfs it shares
+     * the view's superblock (a passthrough /proc file), anywhere else not. */
+    int dp = dsyn, sp = ssyn;
+    struct statfs fs;
+    if (dp && !sp && !sm && fstatfs(src, &fs) == 0 && fs.f_type == 0x9fa0 /*PROC_SUPER_MAGIC*/)
+        sp = 1;
+    if (sp && !dp && !dm && fstatfs(dst, &fs) == 0 && fs.f_type == 0x9fa0)
+        dp = 1;
+    if (dp != sp || dm != sm) { *ret = (u64)(s64)-EXDEV; return 1; }
+    int dfl = dsyn ? dacc : fcntl(dst, F_GETFL);
+    int sfl = ssyn ? sacc : fcntl(src, F_GETFL);
+    if (dfl < 0 || sfl < 0) return 0;
+    if ((sfl & O_ACCMODE) == O_WRONLY || (dfl & O_ACCMODE) == O_RDONLY ||
+        (dfl & O_APPEND))
+        *ret = (u64)(s64)-EBADF;
+    else
+        *ret = (u64)(s64)-EOPNOTSUPP;
+    return 1;
+}
+
+SYSDEF(ioctl) {
+    u32 cmd = (u32)a1;
+    if (cmd == 0xc020660b /*FS_IOC_FIEMAP*/) {
+        /* struct fiemap = 32-byte header + fm_extent_count * 56-byte extents.
+         * All fields are __u64/__u32 (no pointers), so the layout is identical
+         * across arm64/arm/x86 and the host can be handed it as it stands; the
+         * payload is variable-length, so it can't ride the fixed-size
+         * ioctl_tab path.
+         *
+         * ioctl_fiemap's order: a file with no extent map is EOPNOTSUPP before
+         * the header is read at all -- a probe with no buffer has the host
+         * give that answer itself -- then the header (EFAULT), then
+         * fm_extent_count against FIEMAP_MAX_EXTENTS (EINVAL). The kernel
+         * reads nothing but the header, writes the extents it maps one by one
+         * into the array (EFAULT at the first that lands on memory that is not
+         * there), and writes the header back whatever the mapping answered --
+         * EBADR included, whose fm_flags name the flags the file refused. */
+        if (ioctl((int)a0, cmd, NULL) < 0 && errno != EFAULT) return host_err();
+        u8 hdr[32];
+        if (copy_from_guest(c, hdr, a2, sizeof hdr) < 0) return (u64)(s64)-EFAULT;
+        u32 count;                                 /* fm_extent_count @ offset 24 */
+        memcpy(&count, hdr + 24, sizeof count);
+        if (count > 0xffffffffu / 56) return (u64)(s64)-EINVAL;
+        u64 total = 32 + (u64)count * 56;
+        size_t want = total > SIZE_MAX ? SIZE_MAX : (size_t)total;
+        size_t room = rw_room(c, a2, want, ACC_WRITE);
+        if (room < sizeof hdr) return (u64)(s64)-EFAULT;
+        /* The whole array in the guest's own pages, one run of host memory:
+         * lent (sys.h, GuestXfer), so the kernel writes into it directly and
+         * the slots it does not fill are never touched -- as on a kernel. */
+        if (room == total) {
+            GIovec g = { a2, room };
+            GuestXfer x;
+            int xr = xfer_begin(c, (int)a0, &g, 1, 1, XFER_LEND, NULL, NULL, &x);
+            if (xr < 0) return (u64)(s64)xr;
+            if (x.n == 1 && !x.stage && x.total == room) {
+                int r = ioctl((int)a0, cmd, x.iov[0].iov_base);
+                u64 e = r < 0 ? host_err() : (u64)r;
+                xfer_end(c, &x, 0);
+                return e;
+            }
+            xfer_end(c, &x, 0);
+        }
+        /* Otherwise staged: the header and as many slots as the guest has
+         * memory for, up to XFER_STAGE_MAX, in front of a guard for the rest
+         * (sys.h, guardbuf_map). This used to allocate the whole array --
+         * up to 56 MB -- and copy all of it in and out again, and refused any
+         * array the guest had not mapped in full with an EFAULT the kernel
+         * gives only when an extent actually lands there. A file with more
+         * extents than the staged slots hold faults on the guard; with more
+         * of the guest's array left to stage, it is staged whole and asked
+         * again (a query: nothing to undo), and past the guest's own memory
+         * the fault is the kernel's own answer. What comes back is what the
+         * kernel wrote: the header, and the extents it mapped. */
+        size_t head = room < XFER_STAGE_MAX ? room : XFER_STAGE_MAX;
+        for (;;) {
+            GuardBuf gb;
+            u8 *p = guardbuf_map(&gb, head, want);
+            if (!p) return (u64)(s64)-ENOMEM;
+            memcpy(p, hdr, sizeof hdr);
+            int r = ioctl((int)a0, cmd, p);
+            int err = r < 0 ? errno : 0;
+            if (err == EFAULT && head < room) { guardbuf_free(&gb); head = room; continue; }
+            u32 mapped;                            /* fm_mapped_extents @ offset 20 */
+            memcpy(&mapped, p + 20, sizeof mapped);
+            u64 out = 32 + (u64)(mapped < count ? mapped : count) * 56;
+            if (out > head) out = head;
+            if (copy_to_guest(c, a2, p, (size_t)out) < 0) err = EFAULT;
+            guardbuf_free(&gb);
+            return err ? (u64)(s64)-err : (u64)r;
+        }
+    }
+    /* fs reflink (copy-on-write clone) ioctls, arch-independent cmd values.
+     * cp --reflink=auto (coreutils default) issues these on every copy. Guest
+     * fd == host fd, so they forward verbatim once reflink_denied has spoken
+     * for the emulator's own objects; host_err() hands back the real errno
+     * (EOPNOTSUPP/EXDEV) so the guest falls back to a plain copy. FICLONE's
+     * "int" payload is the source fd by value, not a pointer; FICLONERANGE's
+     * is a struct file_clone_range (4 u64, the first an __s64 src_fd), whose
+     * layout is the same on every host. The kernel looks the source up by
+     * its low 32 bits (fdget takes an unsigned int), after the destination
+     * (the ioctl's fdget) and, for the range form, after the struct copy. */
+    if (cmd == 0x40049409 /*FICLONE*/ || cmd == 0x4020940D /*FICLONERANGE*/) {
+        if (fcntl((int)a0, F_GETFD) < 0) return host_err();          /* EBADF */
+        u64 fr[4] = { a2, 0, 0, 0 };
+        if (cmd == 0x4020940D && copy_from_guest(c, fr, a2, sizeof fr) < 0)
+            return (u64)(s64)-EFAULT;
+        u64 ret;
+        if (reflink_denied(c, (int)a0, (int)(u32)fr[0], &ret)) return ret;
+        int r = cmd == 0x40049409 ? ioctl((int)a0, cmd, (unsigned long)a2)
+                                  : ioctl((int)a0, cmd, fr);
+        if (r < 0) return host_err();
+        /* A whole-file clone makes the destination the source's size, which
+         * can shrink it under a mapping of it, exactly as ftruncate can: the
+         * pages past the new end must stop resolving (mem.c as_file_resized).
+         * The range form only ever grows it; the fstat is the same either
+         * way and this is cp's cold path. */
+        struct stat st;
+        if (fstat((int)a0, &st) == 0)
+            as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)st.st_size);
+        return (u64)r;
+    }
+    /* FS_IOC_GETFLAGS/SETFLAGS carry sizeof(long) in the size field, so the 64-bit
+     * guest word differs from a 32-bit host build's; the handler only touches an int.
+     * Translate to the host-native command and marshal 4 bytes. lsattr/chattr and
+     * systemd-tmpfiles read these to preserve inode attribute flags. */
+    if (cmd == 0x80086601 /*guest FS_IOC_GETFLAGS*/ ||
+        cmd == 0x40086602 /*guest FS_IOC_SETFLAGS*/) {
+        int is_set = (cmd == 0x40086602);
+        /* The same family as fchmod/fchown: the kernel takes a write reference
+         * on the MOUNT for this (mnt_want_write_file -> EROFS on a read-only
+         * one) and none on the file, so `chattr` does its work through a plain
+         * O_RDONLY descriptor -- and a :ro bind has to answer for it here. */
+        if (is_set && fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+        unsigned long hcmd = is_set ? _IOW('f', 2, long) : _IOR('f', 1, long);
+        /* Give the call a buffer of the width the command declares, not of the
+         * width the handler happens to touch. A bare int left the four bytes
+         * the command promises undefined -- valgrind flags the ioctl -- and a
+         * handler that ever did honour the declared size would write those four
+         * bytes past it, into the emulator's stack frame. The int member starts
+         * at the same address, so it is exactly the word every filesystem's
+         * handler get_user/put_user's there. */
+        union { long declared; int val; } arg = { .declared = 0 };
+        if (is_set && copy_from_guest(c, &arg.val, a2, sizeof arg.val) < 0)
+            return (u64)(s64)-EFAULT;
+        int r = ioctl((int)a0, hcmd, &arg);
+        if (r < 0) return host_err();
+        if (!is_set && copy_to_guest(c, a2, &arg.val, sizeof arg.val) < 0)
+            return (u64)(s64)-EFAULT;
+        return (u64)r;
+    }
+    /* Interface-query ioctls (ifconfig/net-tools, if_nametoindex, ...). Answered
+     * from the host's own interface table so they work on Android, where the
+     * socket ioctls are denied (EACCES), and on rootfs setups without a
+     * /proc/net/dev to enumerate from. Ungated (like proot) so they work whether
+     * or not the host blocks netlink; non-network cmds fall through to ioctl_tab.
+     * Only on a socket, though: these reach dev_ioctl through sock_do_ioctl,
+     * and a file's ioctl op answers them ENOTTY -- they used to be answered on
+     * any descriptor, /dev/null included. */
+    if (nl_ifreq_cmd(cmd)) {
+        struct stat st;
+        if (fstat((int)a0, &st) != 0) return host_err();          /* EBADF */
+        if (!S_ISSOCK(st.st_mode)) return (u64)(s64)-ENOTTY;
+        u64 ret;
+        if (cmd == 0x8912 /*SIOCGIFCONF*/) {
+            if (nl_maybe_siocgifconf(c, a2, &ret)) return ret;
+        } else if (nl_maybe_ifreq_ioctl(c, cmd, a2, &ret)) {
+            return ret;
+        }
+    }
+    /* A netlink socket the emulator stands in for with an AF_UNIX one (the
+     * host refused netlink, sys_netlink.c): netlink answers no ioctl of its
+     * own, so FIONREAD and SIOCOUTQ are ENOTTY there, where the stand-in
+     * would count the bytes queued on it. */
+    if ((cmd == TC_FIONREAD || cmd == TC_OUTQ) && nl_is_fd(c->m, (int)a0))
+        return (u64)(s64)-ENOTTY;
+    if (cmd == TC_GETS2 || cmd == TC_SETS2 || cmd == TC_SETSW2 || cmd == TC_SETSF2)
+        return tty_termios2(c, (int)a0, cmd, a2);
+    if (cmd == TC_GSID) return tty_tiocgsid(c, (int)a0, a2);
+    const IoctlEnt *e = NULL;
+    for (size_t i = 0; i < sizeof ioctl_tab / sizeof ioctl_tab[0]; i++)
+        if (ioctl_tab[i].cmd == cmd) { e = &ioctl_tab[i]; break; }
+    if (!e) {
+        static u32 warned[32];
+        static int nwarned;
+        for (int i = 0; i < nwarned; i++)
+            if (warned[i] == cmd) return (u64)(s64)-ENOTTY;
+        if (nwarned < 32) warned[nwarned++] = cmd;
+        fprintf(stderr, "arm64emu: unhandled ioctl 0x%x\n", cmd);
+        return (u64)(s64)-ENOTTY;
+    }
+    if (e->size == 0) {
+        /* The argument is the guest's 64-bit word, and a 32-bit host takes 32.
+         * A word that does not fit is one none of these commands takes for a
+         * valid argument, so it goes over as the largest word rather than
+         * wrapped: TCSBRK's "non-zero" stays non-zero, and TCXONC's and
+         * TCFLSH's selectors stay invalid instead of landing on one that is
+         * not (TCFLSH 0x100000000 would flush the input). TIOCSCTTY is the
+         * exception, since its kernel handler reads an int and wraps it too. */
+        unsigned long harg = (unsigned long)a2;
+        if ((u64)harg != a2 && cmd != 0x540E /*TIOCSCTTY*/) harg = ~0UL;
+        int r = ioctl_host((int)a0, cmd, harg, e->kind);
+        return r < 0 ? ioctl_refused((int)a0, cmd, e->kind, harg) : (u64)r;
+    }
+    u8 buf[256];
+    if (e->size > sizeof buf) return (u64)(s64)-EINVAL;   /* table entry too big */
+    /* Zero it first. The table's size is what the command *declares*, and a
+     * driver is under no obligation to fill all of it -- a legacy number (the
+     * 0x54xx tty block) encodes no size at all, so nothing even checks. Copying
+     * an unfilled tail back would hand the guest whatever was on the emulator's
+     * stack, the same disclosure shape as the SIMD-pair bug. Cold path; the
+     * largest entry is a 44-byte termios2. */
+    memset(buf, 0, e->size);
+    /* An argument the guest cannot supply goes to the host as an address no
+     * process has (0) rather than as an EFAULT of the emulator's own: the
+     * kernel reads it only after its own refusals -- ENOTTY from anything that
+     * is no terminal, EBADF for a descriptor that is not open, ENOTTY from a
+     * pty slave for its modem lines -- and says EFAULT itself where it does. */
+    unsigned long harg = (unsigned long)buf;
+    if ((e->dir & 2) && copy_from_guest(c, buf, a2, e->size) < 0) harg = 0;
+    int r = ioctl_host((int)a0, cmd, harg, e->kind);
+    if (r < 0) {
+        /* A refusal answered in the host's place may have filled `buf`
+         * (TIOCGSOFTCAR): it is copied out like the host's own answer. */
+        u64 rr = ioctl_refused((int)a0, cmd, e->kind, harg);
+        if ((s64)rr < 0) return rr;
+        r = (int)rr;
+    }
+    if (e->dir & 1)
+        if (copy_to_guest(c, a2, buf, e->size) < 0) return (u64)(s64)-EFAULT;
+    return (u64)r;
+}
+
+/* fcntl's owner (F_SETOWN, F_SETOWN_EX): the task or process group the kernel
+ * will send SIGIO/SIGURG to for this fd. That is an id the guest supplies, so
+ * it takes the same containment kill(2) does -- otherwise naming a host process
+ * here is a way to signal it (machine.h, proctab_has_task). 0 clears the owner.
+ * `pgrp` selects the process-group reading of a positive id, which F_SETOWN
+ * spells as a negative one. */
+/* The owner an fd REPORTS (F_GETOWN, F_GETOWN_EX), as the guest may see it:
+ * the setters above admit only ids the guest can see, but a descriptor can
+ * arrive with an owner already on it -- inherited from whatever started the
+ * emulator, or received over SCM_RIGHTS from a host process -- and its host
+ * pid came back raw. The kernel answers pid_vnr for a caller in another pid
+ * namespace: the number when it was allocated there, 0 otherwise. The fd
+ * keeps a reference on its owner's pid (held), and a group is visible when a
+ * guest process leads or belongs to it (proctab_pgrp_visible). */
+static s32 owner_view(s32 id, int pgrp) {
+    if (!pgrp) return proctab_pid_view(id, 1);
+    return proctab_pgrp_visible(id) ? id : 0;
+}
+
+static int owner_allowed(s32 id, int pgrp) {
+    if (!id) return 1;                       /* clear */
+    if (id < 0) {
+        if (id == INT32_MIN) return 0;
+        return owner_allowed(-id, 1);        /* F_SETOWN: -pgid */
+    }
+    if (!pgrp) return proctab_has_task(id);
+    /* A process group is a SET, and the kernel signals every member of it.
+     * Admitting one because some guest process happened to be in it admitted
+     * the emulator's own host process group -- the shell pipeline that started
+     * it, whose other members are host processes -- and the "our own group,
+     * registry or not" fallback admitted it even when the registry could have
+     * said so. SIGIO/SIGURG then went to processes the guest cannot see and has
+     * no other way to signal (kill(2) walks the registry; these do not).
+     *
+     * The group is admitted here only when a guest process LEADS it, which is
+     * what makes its membership knowable: a group's members are its leader and
+     * the tasks setpgid into it, and only a descendant in the same session can
+     * do that -- so a group led by a guest process holds guest processes. Our
+     * own pid covers the registry being unavailable, and covers the ordinary
+     * case besides: an interactive shell puts each job in its own group, so
+     * the top-level guest process usually leads the group it is in. The IPC
+     * broker daemon setsid()s, so it is never a member of one of these. */
+    return id == (s32)getpid() || proctab_has(id);
+}
+
+SYSDEF(fcntl) {
+    int fd = (int)a0, cmd = (int)a1;
+    switch (cmd) {
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC: {
+            /* The argument is a FLOOR the guest names, and the kernel refuses
+             * one at or above the soft limit with EINVAL before it looks for a
+             * free descriptor; the descriptor it then finds is subject to the
+             * limit like any other (dup(2) above). */
+            if ((s32)a2 < 0 || (s32)a2 >= fd_nofile_cap(c->m))
+                return (u64)(s64)-EINVAL;
+            int r = fcntl(fd, cmd, (int)a2);
+            if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
+            if (r < 0) return host_err();
+            int t = fd_track_dup(c->m, fd, r);          /* as dup(2) above */
+            if (t < 0) { close(r); return (u64)(s64)t; }
+            return (u64)r;
+        }
+        case 1033: case 1034: {   /* F_ADD_SEALS / F_GET_SEALS: a tier memfd's
+                                   * seals live in the broker registry, not on
+                                   * the host inode; anything else forwards
+                                   * (native memfd, or the old host's EINVAL) */
+            u64 ret;
+            if (mfd_fcntl(c, fd, cmd, a2, &ret)) return ret;
+            int r = fcntl(fd, cmd, (int)a2);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case F_GETFD:
+        case F_SETFD: {
+            int r = fcntl(fd, cmd, (int)a2);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case F_GETFL: {
+            int r = fcntl(fd, F_GETFL);
+            return r < 0 ? host_err() : (u64)oflags_h2g(r);
+        }
+        case F_SETFL: {
+            int r = fcntl(fd, F_SETFL, oflags_g2h((int)a2));
+            return r < 0 ? host_err() : (u64)r;
+        }
+        /* Record-lock commands. Match the GUEST's asm-generic values literally
+         * (F_GETLK=5, F_SETLK=6, F_SETLKW=7; OFD 36/37/38): with
+         * -D_FILE_OFFSET_BITS=64 the host F_SETLK *macro* becomes F_SETLK64 (13)
+         * on ILP32 hosts, so using it in the case label would miss the guest's
+         * 6 and fall through, passing a guest pointer to the host (EFAULT). */
+        case 5: case 6: case 7:
+        case 36: case 37: case 38: {
+            /* guest struct flock (arm64 LP64, 32 bytes): l_type i16 @0,
+             * l_whence i16 @2, l_start i64 @8, l_len i64 @16, l_pid i32 @24.
+             * Read at explicit offsets (host struct alignment differs on ILP32). */
+            u8 gfl[32];
+            if (copy_from_guest(c, gfl, a2, sizeof gfl) < 0) return (u64)(s64)-EFAULT;
+            s16 l_type, l_whence; s64 l_start, l_len; s32 l_pid;
+            memcpy(&l_type, gfl + 0, 2);  memcpy(&l_whence, gfl + 2, 2);
+            memcpy(&l_start, gfl + 8, 8); memcpy(&l_len, gfl + 16, 8);
+            memcpy(&l_pid, gfl + 24, 4);
+            struct flock fl = { .l_type = l_type, .l_whence = l_whence,
+                                .l_start = (off_t)l_start, .l_len = (off_t)l_len,
+                                .l_pid = l_pid };
+            int hcmd;
+            switch (cmd) {
+                case 5: hcmd = F_GETLK;  break;
+                case 6: hcmd = F_SETLK;  break;
+                case 7: hcmd = F_SETLKW; break;
+#ifdef F_OFD_GETLK
+                case 36: hcmd = F_OFD_GETLK;  break;
+                case 37: hcmd = F_OFD_SETLK;  break;
+                case 38: hcmd = F_OFD_SETLKW; break;
+#endif
+                default: return (u64)(s64)-EINVAL;
+            }
+            int r = fcntl(fd, hcmd, &fl);
+            if (r < 0) return host_err();
+            if (cmd == 5 || cmd == 36) {   /* GETLK: copy the result back */
+                l_type = fl.l_type; l_whence = fl.l_whence;
+                l_start = fl.l_start; l_len = fl.l_len;
+                /* The conflicting lock's owner as the guest may see it: a
+                 * kernel reports 0 for a holder outside the caller's pid
+                 * namespace (locks_translate_pid), and a host process holding
+                 * a lock on a shared file is exactly that to the guest -- its
+                 * raw pid used to come back here. -1 (an OFD lock's) passes. */
+                l_pid = proctab_pid_view((s32)fl.l_pid, 0);
+                memcpy(gfl + 0, &l_type, 2);  memcpy(gfl + 2, &l_whence, 2);
+                memcpy(gfl + 8, &l_start, 8); memcpy(gfl + 16, &l_len, 8);
+                memcpy(gfl + 24, &l_pid, 4);
+                if (copy_to_guest(c, a2, gfl, sizeof gfl) < 0) return (u64)(s64)-EFAULT;
+            }
+            return (u64)r;
+        }
+#ifdef F_SETOWN_EX
+        /* These take a pointer too, so the default branch below would hand the
+         * host the guest VA itself -- EFAULT, or a write into whatever the
+         * emulator happens to have at that address. struct f_owner_ex is
+         * {s32 type; s32 pid} on guest and host alike. Literal guest command
+         * values, for the reason given above the lock commands. */
+        case 15: case 16: {
+            struct f_owner_ex ex;
+            u8 gex[8];
+            s32 type = 0, pid = 0;
+            if (cmd == 15) {
+                if (copy_from_guest(c, gex, a2, sizeof gex) < 0) return (u64)(s64)-EFAULT;
+                memcpy(&type, gex + 0, 4); memcpy(&pid, gex + 4, 4);
+                /* F_OWNER_PGRP is 2; TID and PID name a task. */
+                if (!owner_allowed(pid, type == 2)) return (u64)(s64)-ESRCH;
+                ex.type = type; ex.pid = pid;
+            }
+            int r = fcntl(fd, cmd == 15 ? F_SETOWN_EX : F_GETOWN_EX, &ex);
+            if (r < 0) return host_err();
+            if (cmd == 16) {
+                type = (s32)ex.type;
+                pid = owner_view((s32)ex.pid, type == 2);
+                memcpy(gex + 0, &type, 4); memcpy(gex + 4, &pid, 4);
+                if (copy_to_guest(c, a2, gex, sizeof gex) < 0) return (u64)(s64)-EFAULT;
+            }
+            return (u64)r;
+        }
+        case 9: {   /* F_GETOWN: pid, or -pgid for a process group -- f_getown's
+                     * own composition, from the typed answer (a libc's F_GETOWN
+                     * wrapper answers -pgid too, and forwarding that through the
+                     * "negative is an error" return here reported a stale errno
+                     * for every group-owned descriptor). */
+            struct f_owner_ex ex;
+            int r = fcntl(fd, F_GETOWN_EX, &ex);
+            if (r < 0) return host_err();
+            s32 pid = owner_view((s32)ex.pid, ex.type == 2 /* F_OWNER_PGRP */);
+            return (u64)(s64)(ex.type == 2 ? -pid : pid);
+        }
+#else
+        case 9: {   /* F_GETOWN on a host too old for the typed form (< 2.6.32):
+                     * the raw answer, pid or -pgid, held to the same view. */
+            errno = 0;
+            int r = fcntl(fd, F_GETOWN);
+            if (r < 0 && errno) return host_err();
+            return (u64)(s64)(r < 0 ? -owner_view(-r, 1) : owner_view(r, 0));
+        }
+#endif
+        /* Async-I/O ownership: an id the guest supplies, contained as above. */
+        case 8: {   /* F_SETOWN */
+            if (!owner_allowed((s32)a2, 0)) return (u64)(s64)-ESRCH;
+            int r = fcntl(fd, F_SETOWN, (int)a2);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case 10: {  /* F_SETSIG: a GUEST signal number, so it crosses to the
+                     * host the way every other one does. Raised raw, guest 32
+                     * and 33 would be the host libc's own SIGCANCEL/SIGSETXID
+                     * and would kill the emulator instead of reaching the
+                     * guest (signal.c, sig_send_host_nr). 0 restores SIGIO. */
+            int gs = (int)(s32)a2;
+            if (gs < 0 || gs > 64) return (u64)(s64)-EINVAL;
+            int r = fcntl(fd, F_SETSIG, gs ? sig_send_host_nr(gs) : 0);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        case 11: {  /* F_GETSIG: back to the guest's number */
+            int r = fcntl(fd, F_GETSIG);
+            return r < 0 ? host_err() : (u64)(r ? sig_guest_nr(r) : 0);
+        }
+        /* Write life-time hints: a __u64 through a POINTER, which is exactly
+         * what must never be forwarded as a guest VA. */
+        case 1035: case 1037: {   /* F_GET_RW_HINT / F_GET_FILE_RW_HINT */
+            u64 hint = 0;
+            int r = fcntl(fd, cmd, &hint);
+            if (r < 0) return host_err();
+            if (copy_to_guest(c, a2, &hint, sizeof hint) < 0) return (u64)(s64)-EFAULT;
+            return (u64)r;
+        }
+        case 1036: case 1038: {   /* F_SET_RW_HINT / F_SET_FILE_RW_HINT */
+            u64 hint;
+            if (copy_from_guest(c, &hint, a2, sizeof hint) < 0) return (u64)(s64)-EFAULT;
+            int r = fcntl(fd, cmd, &hint);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        /* The rest of the scalar-argument commands, forwarded as they are:
+         * F_SETLEASE/F_GETLEASE, F_NOTIFY, F_DUPFD_QUERY and F_CREATED_QUERY
+         * (whose argument is an fd, and guest fd == host fd),
+         * F_SETPIPE_SZ/F_GETPIPE_SZ. (F_GETOWN is above, with F_GETOWN_EX.) */
+        case 1024: case 1025: case 1026: case 1027: case 1028:
+        case 1031: case 1032: {
+            int r = fcntl(fd, cmd, (int)a2);
+            return r < 0 ? host_err() : (u64)r;
+        }
+        default:
+            /* An unknown command's ARGUMENT TYPE is unknown too, so it cannot
+             * be forwarded: a2 would go to the host as a bare word, and the
+             * next pointer-taking command the kernel grows (the four above were
+             * once such a case) would read or write through it -- a guest VA
+             * interpreted as a host address, which on an ILP32 host is
+             * plausibly a valid one. EINVAL is what a kernel that does not know
+             * the command answers, and what this build not knowing it means. */
+            return (u64)(s64)-EINVAL;
+    }
+}
+
+SYSDEF(dup) {
+    int r = dup((int)a0);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
+    if (r < 0) return host_err();
+    int t = fd_track_dup(c->m, (int)a0, r);   /* a second name for what a0 is */
+    if (t < 0) { close(r); return (u64)(s64)t; }
+    return (u64)r;
+}
+
+SYSDEF(dup3) {
+    int oldfd = (int)a0, newfd = (int)a1, flags = (int)a2;
+    /* Everything the kernel refuses is refused here BEFORE any bookkeeping is
+     * touched, in ksys_dup3's own order: a flag other than O_CLOEXEC and
+     * oldfd == newfd are EINVAL, a newfd at or above the soft limit is EBADF
+     * (the guest NAMES the descriptor, so the limit is asked of the name), and
+     * an oldfd that is not open is EBADF. The unmarking below used to run
+     * before the host had judged any of this, so a call that replaced nothing
+     * -- dup3(-1, sfd, 0), dup3(fd, fd, 0), a bad flag -- left newfd open and
+     * exactly what it was, but no longer tracked: a signalfd read reached the
+     * bare eventfd, a uid_map write landed in the backing memfd, a fake netlink
+     * request went to the AF_UNIX stand-in. */
+    if (flags & ~O_CLOEXEC) return (u64)(s64)-EINVAL;
+    if ((u32)a0 == (u32)a1) return (u64)(s64)-EINVAL;
+    if ((u32)a1 >= (u32)fd_nofile_cap(c->m)) return (u64)(s64)-EBADF;
+    if (fcntl(oldfd, F_GETFD) < 0) return (u64)(s64)-EBADF;
+    int r = dup3(oldfd, newfd, flags);
+    if (r < 0) return host_err();   /* nothing replaced, nothing to unmark */
+    /* dup2/dup3 *replace* newfd, so whatever it named is gone -- dropped only
+     * now, once the host has really replaced it, so that no failure can leave
+     * a live descriptor untracked. Another thread using newfd in the instant
+     * between the two steps is served as if it had got in before the
+     * replacement, which is one of the two answers the kernel itself gives
+     * that race; the signalfd, /proc and memfd classes re-check the
+     * descriptor's identity on use besides. Then the new name is tracked as a
+     * second name for whatever oldfd is, as dup(2) does. */
+    fd_track_close(c->m, newfd);
+    int t = fd_track_dup(c->m, oldfd, newfd);
+    if (t < 0) { close(newfd); return (u64)(s64)t; }
+    return (u64)r;
+}
+
+SYSDEF(pipe2) {
+    int fds[2];
+    if (pipe2(fds, oflags_g2h((int)a1)) < 0) return host_err();
+    if (!fd_pair_within_limit(c, fds[0], fds[1])) return (u64)(s64)-EMFILE;
+    s32 gfds[2] = { fds[0], fds[1] };
+    if (copy_to_guest(c, a0, gfds, sizeof gfds) < 0) {
+        /* The kernel releases both descriptors before returning EFAULT. Leaving
+         * them open leaks a pair per failed call -- and since guest fd == host
+         * fd they are guest-visible -- so a guest looping on a bad pointer would
+         * exhaust its own descriptor table. */
+        close(fds[0]); close(fds[1]);
+        return (u64)(s64)-EFAULT;
+    }
+    return 0;
+}
+
+/* The cwd is the host process's own (path.c, "the working directory is the
+ * host's"): getcwd asks the kernel, and chdir/fchdir move the host. */
+SYSDEF(getcwd) {
+    struct Machine *m = c->m;
+    char cur[PATH_MAX], view[PATH_MAX];
+    int gone = 0;
+    cwd_current(m, cur, &gone);
+    if (gone) return (u64)(s64)-ENOENT;   /* unlinked: what sys_getcwd answers */
+    /* Report the cwd as the guest sees it: inside a chroot, subtract the chroot
+     * base (the canonical path is namespace-absolute). If cwd lies outside the
+     * chroot -- only possible right after chroot(2), before the guest
+     * chdir("/")s -- report "/". */
+    path_chroot_view(m, cur, view);
+    size_t l = strlen(view) + 1;
+    if (a1 < l) return (u64)(s64)-ERANGE;
+    if (copy_to_guest(c, a0, view, l) < 0) return (u64)(s64)-EFAULT;
+    return l;
+}
+
+SYSDEF(chdir) {
+    PathPin pin;
+    char canon[PATH_MAX];
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, canon);
+    if (r < 0) return (u64)(s64)r;
+    /* The pinned target is opened and the host moved there: the inode the
+     * walk found, whatever the name means by now. The open carries the
+     * kernel's own refusals -- ENOTDIR, and EACCES for a directory this
+     * process may not search, which the old string tracking never noticed.
+     * The descriptor is ours for the moment (machine.h). The host's move and
+     * the published copy are one step under the task lock (a kernel's
+     * set_fs_pwd under fs->lock): a sibling refreshing the copy from the
+     * kernel's answer meanwhile would otherwise publish the old directory
+     * over the new one. The fd window sits inside the lock, never the other
+     * way round (machine.h, the fork barrier). */
+    task_lock();
+    fdwin_enter();
+    int dfd = openat(pin.dfd, pin.name,
+                     O_PATH | O_DIRECTORY | O_CLOEXEC | (pin.pinned ? O_NOFOLLOW : 0));
+    int e = errno;
+    if (dfd >= 0 && fchdir(dfd) < 0) { e = errno; close(dfd); dfd = -1; }
+    else if (dfd >= 0) close(dfd);
+    fdwin_leave();
+    if (dfd >= 0) cwd_publish_locked(c->m, canon);   /* keep /proc/<pid>/cwd live */
+    task_unlock();
+    path_unpin(&pin);
+    return dfd < 0 ? (u64)(s64)-e : 0;
+}
+
+SYSDEF(fchdir) {
+    /* Guest fd == host fd: the host's own fchdir, with its own refusals. The
+     * guest view of where that leaves us goes through the bind table
+     * (dirfd_guest_path), not a bare rootfs-prefix strip: a directory reached
+     * through a mount -- an emulated tmpfs, or the root a pivot_root moved --
+     * has a host path outside the rootfs entirely, and used to land the guest
+     * on "/". bubblewrap fchdir()s a root fd it kept across its pivot_root, so
+     * it noticed immediately. That fd must name the mount NOW covering the
+     * directory (the old root, stacked on the new one), not the path it was
+     * opened under, so this is the one reader that skips the remembered name
+     * (dirfd_mount_path). */
+    task_lock();   /* the move and the published copy, one step (chdir) */
+    if (fchdir((int)(s32)a0) < 0) {
+        u64 e = host_err();
+        task_unlock();
+        return e;
+    }
+    char guest[PATH_MAX];
+    if (dirfd_mount_path(c->m, (int)(s32)a0, guest) == 0)
+        cwd_publish_locked(c->m, guest);   /* keep /proc/<pid>/cwd live */
+    cwd_current_locked(c->m, guest, NULL);   /* ...and the kernel's word on it */
+    task_unlock();
+    return 0;
+}
+
+/* An operand of the mount family (chroot, mount, umount2, pivot_root): the
+ * resolver's answer for it and, when that is a /proc fd link, the object the
+ * descriptor holds -- the kernel's walk ends there too, so the call acts on the
+ * directory the fd is open on and not on the link's own spelling
+ * (path_fd_link_target says why the resolver cannot do it). `canon` becomes
+ * that object's guest path; `real` (optional, PATH_MAX) receives the host path
+ * a bind has to record -- the link's target, never "/proc/self/fd/N", which
+ * means a different object the moment the descriptor is closed or reused.
+ * `follow` is 0 where the call forbids following a final link
+ * (UMOUNT_NOFOLLOW). On failure the pin is already released. */
+static int mnt_operand_follow(struct Machine *m, PathPin *pin, int follow,
+                              char *canon, char *real) {
+    if (real) strcpy(real, pin->host);
+    if (!follow) return 0;
+    int f = path_fd_link_target(m, pin->host, canon, real);
+    if (f < 0) { path_unpin(pin); return f; }
+    return 0;
+}
+
+static int mnt_operand(CPU *c, u64 va, unsigned rflags, PathPin *pin,
+                       char *canon, char *real) {
+    int r = resolve_pin(c, G_AT_FDCWD, va, rflags, pin, canon);
+    if (r < 0) return r;
+    return mnt_operand_follow(c->m, pin, !(rflags & PATH_NOFOLLOW_LAST), canon, real);
+}
+
+/* chroot(path=a0): re-root the guest at `path`. path_resolve resolves it in the
+ * current namespace (honoring any existing chroot, so nesting composes) to a
+ * canonical namespace-absolute path stored in m->chroot_base; subsequent
+ * absolute paths, "..", and absolute symlinks re-root there (path.c). Gated on
+ * fake-root, matching the kernel's CAP_SYS_CHROOT. Per POSIX, cwd is NOT changed
+ * (the classic footgun: programs do chroot(x); chdir("/")). */
+SYSDEF(chroot) {
+    struct Machine *m = c->m;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    PathPin pin;
+    char canon[PATH_MAX];
+    int r = mnt_operand(c, a0, 0, &pin, canon, NULL);
+    if (r < 0) return (u64)(s64)r;
+    struct stat st;
+    int sr = fstatat(pin.dfd, pin.name, &st, pin.pinned ? AT_SYMLINK_NOFOLLOW : 0);
+    u64 e = sr < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    if (sr < 0) return e;
+    if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+    croot_set(m, canon);
+    return 0;
+}
+
+/* Does the pinned target exist (and, when `want_dir`, is it a directory)? The
+ * mount family only ever asks that much of the host -- everything else it does
+ * is bookkeeping in the bind table -- but it must ask it about the file the
+ * walk resolved, not about whatever the name means by the time the host looks.
+ * 0, or -errno. */
+static int pin_isdir(PathPin *p, int want_dir) {
+    /* An O_PATH open is the lookup and nothing more, which is all a mount
+     * operand gets from a kernel: no getattr. A stat is more than that, and an
+     * Android app is refused it on nodes it can still name -- /dev/full answers
+     * stat EACCES, access and O_PATH fine -- which is what bubblewrap --dev
+     * binds. O_DIRECTORY makes the same open the directory test (ENOTDIR for
+     * anything else, a final symlink the pin did not follow included). The
+     * descriptor is ours for an instant, hence the window (machine.h). */
+    fdwin_enter();
+    int fd = openat(p->dfd, p->name,
+                    O_PATH | O_CLOEXEC | (p->pinned ? O_NOFOLLOW : 0) |
+                    (want_dir ? O_DIRECTORY : 0));
+    int e = errno;
+    if (fd >= 0) close(fd);
+    fdwin_leave();
+    return fd < 0 ? -e : 0;
+}
+
+/* mount(2)'s user-memory arguments, imported the way sys_mount imports them
+ * and in its order, before anything about the call is decided: the type
+ * string, then the source, then the options page, then (in do_mount) the
+ * target path -- and only then, in path_mount, the caller's privilege. A
+ * string is EFAULT when unreadable and EINVAL at PATH_MAX or longer
+ * (strndup_user); the options are a page copied as far as it is readable
+ * (copy_mount_options tolerates a short copy), and EFAULT only when not a
+ * single byte is -- so a null pointer means "no options" and a bad one is an
+ * error whatever the mount was going to be. The tmpfs branch used to be the
+ * only reader of the options, and it fell back to the defaults for a pointer
+ * it could not read; nothing read them at all for any other flavor. */
+static int mount_str(CPU *c, u64 va, char *out) {   /* out >= PATH_MAX */
+    out[0] = 0;
+    if (!va) return 0;
+    long n = copy_str_from_guest(c, out, va, PATH_MAX);
+    if (n == -ENAMETOOLONG) return -EINVAL;
+    return n < 0 ? (int)n : 0;
+}
+static int mount_options(CPU *c, u64 va, char *out) {   /* out is 4096 */
+    out[0] = 0;
+    if (!va) return 0;
+    size_t room = rw_room(c, va, 4096, ACC_READ);
+    if (!room) return -EFAULT;
+    if (copy_from_guest(c, out, va, room) < 0) return -EFAULT;
+    if (room < 4096) memset(out + room, 0, 4096 - room);
+    out[4095] = 0;   /* path_mount: the page's last byte is always a NUL */
+    return 0;
+}
+
+/* mount(source=a0, target=a1, fstype=a2, flags=a3, data=a4): bind-mount
+ * emulation over the process-shared bind table (path.c). Real-filesystem mounts need
+ * privilege we do not have, so only bind mounts, per-mount remount (ro/rw), and
+ * mount-propagation changes are honored; anything else fails as it would for an
+ * unprivileged caller. Gated on fake-root, matching the kernel's CAP_SYS_ADMIN
+ * requirement (the --bind CLI stays the unprivileged startup path). Forward path
+ * resolution of a bound subtree is exact; reverse mapping (getcwd/fd readback)
+ * of a source that shares a host inode with another path prefers the bind view,
+ * an inherent limit of prefix-based reverse mapping also present for CLI binds. */
+SYSDEF(mount) {
+    struct Machine *m = c->m;
+    char fstype[PATH_MAX], source[PATH_MAX], data[4096];
+    int r = mount_str(c, a2, fstype);
+    if (r == 0) r = mount_str(c, a0, source);
+    if (r == 0) r = mount_options(c, a4, data);
+    if (r < 0) return (u64)(s64)r;
+    /* The target (do_mount's user_path_at): it has to exist, whatever the
+     * call is going to do at it -- a propagation change on a name that is
+     * not there is ENOENT, not a success. Pinned for the moment, so the
+     * question "is it a directory" the new-filesystem flavors ask is asked of
+     * the thing the walk found. */
+    char tcanon[PATH_MAX];
+    PathPin tp;
+    r = mnt_operand(c, a1, 0, &tp, tcanon, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = pin_isdir(&tp, 1);
+    path_unpin(&tp);
+    if (r < 0 && r != -ENOTDIR) return (u64)(s64)r;
+    int tisdir = r == 0;
+
+    unsigned long flags = (unsigned long)a3;
+    if ((flags & G_MS_MGC_MSK) == G_MS_MGC_VAL)      /* strip legacy mount magic */
+        flags &= ~(unsigned long)G_MS_MGC_MSK;
+    if (flags & (1UL << 31)) return (u64)(s64)-EINVAL;   /* MS_NOUSER: never from user space */
+    if (!fake_root(m)) return (u64)(s64)-EPERM;         /* may_mount */
+
+    /* path_mount's dispatch, in its order: remount, bind, propagation change,
+     * move, new mount. */
+    if (flags & G_MS_REMOUNT)                          /* change ro/rw on a bind */
+        return (u64)(s64)bind_remount(m, tcanon, (flags & G_MS_RDONLY) ? 1 : 0);
+
+    if (flags & G_MS_BIND) {                           /* new bind mount */
+        char shost[PATH_MAX], scanon[PATH_MAX];
+        PathPin sp;
+        if (!source[0]) return (u64)(s64)-EINVAL;      /* do_loopback: no source */
+        r = path_resolve_pin(m, G_AT_FDCWD, source, 0, &sp, scanon);   /* source */
+        if (r < 0) return (u64)(s64)r;
+        r = mnt_operand_follow(m, &sp, 1, scanon, shost);   /* an fd's link: its object */
+        if (r < 0) return (u64)(s64)r;
+        r = pin_isdir(&sp, 0);                                   /* must exist */
+        path_unpin(&sp);
+        if (r < 0) return (u64)(s64)r;
+        /* The source is a GUEST path, so only its host-owned prefix may ever be
+         * opened by name -- the guest can rename every component below it.
+         * The new mount is a clone of the one the source lies on (clone_mnt
+         * copies its flags): a subtree of a read-only mount comes out
+         * read-only, and one whose read-only flag is locked -- a :ro --bind
+         * -- stays that way at the new point too, or the guest could bind the
+         * invoker's read-only tree somewhere writable and be done with it.
+         * The unmount lock is not copied (do_loopback clears MNT_LOCKED): the
+         * guest made this one, so it may take it away again. */
+        int sslot = bind_slot_of_canon(scanon);
+        int sro = sslot >= 0 && bind_ro(sslot);
+        int slock = sslot >= 0 ? (bind_locked(sslot) & BIND_LOCK_RO) : 0;
+        r = bind_add(m, tcanon, shost, path_host_root(m, scanon),
+                     (sro || (flags & G_MS_RDONLY)) ? 1 : 0, slock);
+        return r < 0 ? (u64)(s64)r : 0;
+    }
+
+    /* Propagation-only change (e.g. bwrap's MS_REC|MS_PRIVATE on "/"): a no-op
+     * here, but it must succeed. It carries no real source and makes no new
+     * mount. */
+    if (flags & (G_MS_PRIVATE | G_MS_SLAVE | G_MS_SHARED | G_MS_UNBINDABLE))
+        return 0;
+
+    if (flags & G_MS_MOVE) return (u64)(s64)-EINVAL;   /* not supported */
+
+    /* A new mount: do_new_mount wants a type. */
+    if (!a2) return (u64)(s64)-EINVAL;
+
+    /* tmpfs: no real filesystem is created (that needs privilege we do not
+     * have), but what a caller wants from one -- an empty writable tree that
+     * hides the mountpoint's contents until umount -- is exactly a bind of a
+     * fresh host directory. bubblewrap builds its whole sandbox in a tmpfs, so
+     * without this no sandbox helper gets off the ground. ramfs is the same
+     * deal. Anything else really is a filesystem we cannot fabricate. */
+    if (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "ramfs")) {
+        char backing[PATH_MAX];
+        if (!tisdir) return (u64)(s64)-ENOTDIR;
+        r = tmpfs_dir_new(m, backing);
+        if (r < 0) return (u64)(s64)r;
+        /* mode= from the option string, like the kernel's tmpfs parser; the
+         * default matches the kernel's (0755, not the /tmp 01777 an fstab sets). */
+        const char *mp = strstr(data, "mode=");
+        if (mp && (mp == data || mp[-1] == ',')) {
+            unsigned mode = 0;
+            const char *p = mp + 5;
+            for (; *p >= '0' && *p <= '7'; p++) mode = mode * 8 + (unsigned)(*p - '0');
+            if (p != mp + 5) chmod(backing, (mode_t)(mode & 07777));
+        }
+        /* The backing directory is ours, in a host-owned dir: trusted whole. */
+        r = bind_add(m, tcanon, backing, (unsigned)strlen(backing),
+                     (flags & G_MS_RDONLY) ? 1 : 0, 0);
+        return r < 0 ? (u64)(s64)r : 0;
+    }
+
+    /* proc: the guest already has a /proc -- synthesized where it matters,
+     * host passthrough elsewhere -- so mounting one is a bind of the zone at
+     * the requested point. proc_zone_path then keeps the synthesized files and
+     * magic links working under the new name (bubblewrap --proc mounts one
+     * inside the sandbox it is about to pivot into).
+     *
+     * devpts is the same story: the guest's /dev/pts is the host's, so a mount
+     * of one is a bind of that zone (bubblewrap --dev builds a private /dev in
+     * a tmpfs and mounts devpts into it, and a sandbox without a pty device is
+     * not much of a shell host). */
+    const char *zone = !strcmp(fstype, "proc")   && !m->no_proc ? "/proc"    :
+                       !strcmp(fstype, "devpts") && !m->no_dev  ? "/dev/pts" : NULL;
+    if (zone) {
+        if (!tisdir) return (u64)(s64)-ENOTDIR;
+        r = bind_add(m, tcanon, zone, path_host_root(m, zone), 0, 0);
+        return r < 0 ? (u64)(s64)r : 0;
+    }
+
+    return (u64)(s64)-EPERM;   /* a real filesystem type: unprivileged, can't */
+}
+
+/* pivot_root(new_root=a0, put_old=a1): re-root the guest at new_root and make
+ * the old root reachable at put_old. Emulated over the same two mechanisms
+ * chroot(2) and mount(2) already use -- m->chroot_base for the root, a bind for
+ * the old tree -- because that is all "the root moved" means to a guest whose
+ * every path we resolve. Gated on fake-root, like the kernel's CAP_SYS_ADMIN.
+ *
+ * bubblewrap's second call is the idiom `chdir(newroot); pivot_root(".", ".")`:
+ * the old root is stacked *on* the new one and detached right after with
+ * umount2(".", MNT_DETACH). That works here because a bind added later wins
+ * ties in the resolver, so removing it uncovers the mount underneath. */
+SYSDEF(pivot_root) {
+    struct Machine *m = c->m;
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    char ncanon[PATH_MAX], ocanon[PATH_MAX];
+    PathPin np, op;
+    int r = mnt_operand(c, a0, 0, &np, ncanon, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = pin_isdir(&np, 1);
+    path_unpin(&np);
+    if (r < 0) return (u64)(s64)r;
+    r = mnt_operand(c, a1, 0, &op, ocanon, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = pin_isdir(&op, 1);
+    path_unpin(&op);
+    if (r < 0) return (u64)(s64)r;
+    /* put_old must be at or underneath new_root, as the kernel requires. */
+    size_t nl = strlen(ncanon);
+    if (strncmp(ocanon, ncanon, nl) ||
+        (ocanon[nl] != 0 && ocanon[nl] != '/' && nl != 1))
+        return (u64)(s64)-EINVAL;
+    /* Where the current root lives on the host, resolved before it stops being
+     * the root, so put_old can be bound to it. */
+    char roothost[PATH_MAX];
+    r = path_resolve(m, G_AT_FDCWD, "/", 0, roothost, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = bind_add(m, ocanon, roothost, path_host_root(m, "/"), 0, 0);
+    if (r < 0) return (u64)(s64)r;
+    croot_set(m, ncanon);
+    return 0;
+}
+
+/* umount2(target=a0, flags=a1): remove the bind mounted at exactly target.
+ * FORCE/DETACH/EXPIRE are accepted and ignored (EXPIRE's two-call expiry
+ * mark is not kept: the first call unmounts); UMOUNT_NOFOLLOW leaves a final
+ * symlink unresolved. Gated on fake-root like mount. */
+SYSDEF(umount2) {
+    struct Machine *m = c->m;
+    unsigned gf = (unsigned)a1;
+    /* ksys_umount's order: the flags are judged first, the name is looked up
+     * second, and only then is the caller's privilege asked about -- so a
+     * stray bit is EINVAL whoever calls, and an unprivileged caller naming a
+     * path that does not exist hears ENOENT, not EPERM. */
+    if (gf & ~(G_MNT_FORCE | G_MNT_DETACH | G_MNT_EXPIRE | G_UMOUNT_NOFOLLOW))
+        return (u64)(s64)-EINVAL;
+    unsigned rf = (gf & G_UMOUNT_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    char canon[PATH_MAX];
+    PathPin pin;
+    int r = mnt_operand(c, a0, rf, &pin, canon, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = pin_isdir(&pin, 0);   /* the target must exist (the resolver is lexical) */
+    path_unpin(&pin);
+    if (r < 0) return (u64)(s64)r;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
+    /* MNT_EXPIRE is exclusive with the two that unmount at once (do_umount). */
+    if ((gf & G_MNT_EXPIRE) && (gf & (G_MNT_FORCE | G_MNT_DETACH)))
+        return (u64)(s64)-EINVAL;
+    return (u64)(s64)bind_remove(m, canon);
+}
+
+/* What a create (mkdir, mknod, symlink, link) is told on a read-only mount.
+ * The kernel's filename_create looks the name up BEFORE it gives up on the
+ * mount -- "don't fail immediately if it's r/o, at least try to report other
+ * errors" -- so a name that is already there is EEXIST and only a free one is
+ * EROFS. Callers lean on the difference: bubblewrap mkdir()s every mount point
+ * and tolerates EEXIST, so --ro-bind / / --tmpfs /tmp died of the EROFS on a
+ * /tmp that was there. Takes the pin of the new name; returns -errno. */
+static u64 ro_create_err(const PathPin *pin) {
+    struct stat st;
+    return fstatat(pin->dfd, pin->name, &st, AT_SYMLINK_NOFOLLOW) == 0
+               ? (u64)(s64)-EEXIST : (u64)(s64)-EROFS;
+}
+
+SYSDEF(mknodat) {
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, pin.host)) { u64 e = ro_create_err(&pin); path_unpin(&pin); return e; }
+    /* Pass the guest-supplied dev straight to the raw host syscall: it is
+     * already in the kernel's major:minor encoding, and glibc's mknod()
+     * wrapper would re-encode it. Unprivileged callers (this emulator) can
+     * make S_IFIFO/S_IFSOCK/S_IFREG nodes -- so mkfifo(3) works; device
+     * nodes fail with EPERM, exactly as on a real unprivileged host. */
+    /* mknod never follows a final symlink, so the pinned parent is the whole
+     * guarantee. */
+    u64 ret = syscall(SYS_mknodat, pin.dfd, pin.name, (unsigned)a2, (unsigned)a3) < 0
+                  ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(mkdirat) {
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+    u64 ret = host_ro(c->m, pin.host) ? ro_create_err(&pin)
+            : mkdirat(pin.dfd, pin.name, (mode_t)a2) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(unlinkat) {
+    /* The one flag, judged before the name is even read (sys_unlinkat). A
+     * stray bit used to be ignored and the file removed all the same. */
+    if ((unsigned)a2 & ~(unsigned)G_AT_REMOVEDIR) return (u64)(s64)-EINVAL;
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+    if (host_ro(c->m, pin.host)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    int flags = ((unsigned)a2 & G_AT_REMOVEDIR) ? AT_REMOVEDIR : 0;
+#ifdef L2S_ENABLED
+    /* A name of a group (ours or proot's) takes one off the count when it
+     * goes -- after it is gone, never before -- and the last takes the data
+     * along. Where the probe cannot tell, the name goes and the count is left:
+     * high, never low. */
+    char data[PATH_MAX]; unsigned long count = 0; int isl = 0;
+    if (c->m->link2symlink && !flags && pin.pinned)
+        isl = l2s_resolve(pin.host, data, sizeof data, &count) == 1;
+#endif
+    int ur = unlinkat(pin.dfd, pin.name, flags);   /* never follows a symlink */
+    u64 e = ur < 0 ? host_err() : 0;
+    path_unpin(&pin);
+#ifdef L2S_ENABLED
+    /* A group whose data is on a :ro bind loses a writable name and keeps its
+     * count: the marker is on the :ro mount, and nothing is written there. */
+    if (ur == 0 && isl && !host_ro(c->m, data)) l2s_decref(data, count);
+#endif
+    return ur < 0 ? e : 0;
+}
+
+#ifdef L2S_ENABLED
+/* --link2symlink and rename(2). What a rename of names of groups owes, beyond
+ * the host's rename of two symlinks:
+ *
+ *  - Two names of one group are two names of one file, and the kernel's
+ *    vfs_rename does nothing for those and answers 0 -- after the flags, the
+ *    lookups and the mount's EROFS, before any permission of the directories.
+ *    The host saw two symlinks and moved one over the other: the source name
+ *    was gone and the group a name short (`mv a b` of `ln a b`). So such a
+ *    pair is answered here, for no flags and for EXCHANGE.
+ *  - A destination that was a name of a group takes one off its count, once
+ *    the rename has replaced it (not under EXCHANGE, where it moves instead).
+ *  - A group's LAST name moving away takes the data with it (l2s_rename_last):
+ *    a real hardlink's last name carries its inode along.
+ *  - A name of the older layout -- a bare same-directory target -- dangles
+ *    once it leaves its data's directory, so it is repointed at the data's
+ *    path afterwards (l2s_rename_prep/fixup); under EXCHANGE the destination's
+ *    name moves the other way and is repointed the same way.
+ *
+ * l2s_rename_pre returns 1 with *ret when it answered the call, 0 to go on to
+ * the host's rename and then l2s_rename_post. */
+struct l2s_rn {
+    int dec, fix, fix_back;
+    unsigned long cnt;
+    char data[PATH_MAX], absdata[PATH_MAX], sdata[PATH_MAX];
+};
+
+static int l2s_rename_pre(struct Machine *m, const PathPin *p1, const PathPin *p2,
+                          unsigned rfl, struct l2s_rn *rn, u64 *ret) {
+    rn->dec = rn->fix = rn->fix_back = 0;
+    if (!m->link2symlink || !p1->pinned || !p2->pinned || !strcmp(p1->host, p2->host))
+        return 0;
+    const char *srch = p1->host, *dsth = p2->host;
+    int exch = (rfl & 2 /*RENAME_EXCHANGE*/) != 0;
+    int dst_l2s = l2s_resolve(dsth, rn->data, sizeof rn->data, &rn->cnt) == 1;
+    if (dst_l2s && !(rfl & ~2u) &&
+        l2s_resolve(srch, rn->sdata, sizeof rn->sdata, NULL) == 1 &&
+        !strcmp(rn->sdata, rn->data)) {
+        *ret = 0;
+        return 1;
+    }
+    rn->dec = dst_l2s && !exch;
+    long lr;
+    if (!exch && !(rfl & ~1u /*RENAME_NOREPLACE*/) &&
+        l2s_rename_last(srch, dsth, rfl, &lr)) {
+        if (lr == 0 && rn->dec && !host_ro(m, rn->data)) l2s_decref(rn->data, rn->cnt);
+        *ret = (u64)(s64)lr;
+        return 1;
+    }
+    rn->fix = l2s_rename_prep(srch, rn->absdata, sizeof rn->absdata);
+    if (exch) rn->fix_back = l2s_rename_prep(dsth, rn->sdata, sizeof rn->sdata);
+    return 0;
+}
+
+/* After the host's rename succeeded. A group whose data is on a :ro bind
+ * keeps its count (see unlinkat). */
+static void l2s_rename_post(struct Machine *m, const char *srch, const char *dsth,
+                            const struct l2s_rn *rn) {
+    if (rn->dec && !host_ro(m, rn->data)) l2s_decref(rn->data, rn->cnt);
+    if (rn->fix) l2s_rename_fixup(dsth, rn->absdata);
+    if (rn->fix_back) l2s_rename_fixup(srch, rn->sdata);
+}
+#endif
+
+SYSDEF(renameat) {
+    PathPin p1, p2;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &p1, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
+    const char *h1 = p1.host, *h2 = p2.host;
+    if (host_ro(c->m, h1) || host_ro(c->m, h2)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return (u64)(s64)-EROFS;
+    }
+#ifdef L2S_ENABLED
+    struct l2s_rn rn;
+    u64 lret;
+    if (l2s_rename_pre(c->m, &p1, &p2, 0, &rn, &lret)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return lret;
+    }
+#endif
+    int rr = renameat(p1.dfd, p1.name, p2.dfd, p2.name);   /* follows neither end */
+    u64 e = rr < 0 ? host_err() : 0;
+    path_unpin(&p1); path_unpin(&p2);
+#ifdef L2S_ENABLED
+    if (rr == 0) l2s_rename_post(c->m, h1, h2, &rn);
+#endif
+    return rr < 0 ? e : 0;
+}
+
+SYSDEF(renameat2) {
+    if (a4 == 0) return sys_renameat(c, a0, a1, a2, a3, 0, 0);
+    PathPin p1, p2;
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &p1, NULL);
+    if (r < 0) return (u64)(s64)r;
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
+    const char *h1 = p1.host, *h2 = p2.host;
+    if (host_ro(c->m, h1) || host_ro(c->m, h2)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return (u64)(s64)-EROFS;
+    }
+#ifdef L2S_ENABLED
+    struct l2s_rn rn;
+    u64 lret;
+    if (l2s_rename_pre(c->m, &p1, &p2, (unsigned)a4, &rn, &lret)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return lret;
+    }
+#endif
+    long rr = syscall(SYS_renameat2, p1.dfd, p1.name, p2.dfd, p2.name, (unsigned)a4);
+    u64 ret = rr < 0 ? host_err() : 0;
+    path_unpin(&p1); path_unpin(&p2);
+#ifdef L2S_ENABLED
+    if (rr == 0) l2s_rename_post(c->m, h1, h2, &rn);
+#endif
+    return ret;
+}
+
+SYSDEF(symlinkat) {
+    char target[PATH_MAX];
+    PathPin pin;
+    long n = copy_str_from_guest(c, target, a0, sizeof target);
+    if (n < 0) return (u64)(s64)n;
+#ifdef L2S_ENABLED
+    /* --link2symlink: the emulation recognizes its links by their target, so
+     * a guest link whose target's last component is in the ".l2s." grammar
+     * would be taken for one of them -- counted into a group it was never
+     * counted into, and its unlink the decref that deletes the data under the
+     * group's other names. Such a target names the machinery, which does not
+     * exist for the guest; the link is refused as the names themselves are. */
+    if (c->m->link2symlink) {
+        const char *tb = strrchr(target, '/');
+        if (l2s_hidden(tb ? tb + 1 : target)) return (u64)(s64)-ENOENT;
+    }
+#endif
+    int r = resolve_pin(c, (int)(s32)a1, a2, PATH_NOFOLLOW_LAST, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+    /* The link *content* is stored as the guest wrote it. */
+    u64 ret = host_ro(c->m, pin.host) ? ro_create_err(&pin)
+            : symlinkat(target, pin.dfd, pin.name) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(linkat) {
+    PathPin p1, p2;
+    unsigned gf = (unsigned)a4;
+    /* do_linkat judges the flags before either name is looked up. A stray bit
+     * used to be ignored and the link made all the same. (AT_EMPTY_PATH on an
+     * empty old name is the fd-linking form the advertised 6.1 ABI refuses an
+     * unprivileged caller with ENOENT, which is what the resolver answers for
+     * the empty name; on a non-empty one it changes nothing there either.) */
+    if (gf & ~(G_AT_SYMLINK_FOLLOW | G_AT_EMPTY_PATH)) return (u64)(s64)-EINVAL;
+    unsigned rf = (gf & G_AT_SYMLINK_FOLLOW) ? 0 : PATH_NOFOLLOW_LAST;
+    char canon1[PATH_MAX], canon2[PATH_MAX];
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &p1, canon1);
+    if (r < 0) return (u64)(s64)r;
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, canon2);
+    if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
+    const char *h2 = p2.host;
+    if (host_ro(c->m, h2)) {                          /* new name on a :ro bind */
+        u64 e = ro_create_err(&p2);
+        path_unpin(&p1); path_unpin(&p2);
+        return e;
+    }
+    /* A hard link is a second name for the INODE, and do_linkat refuses one
+     * that would cross mounts (old_path.mnt != new_path.mnt is EXDEV, after
+     * the new name's EROFS). That rule is what keeps a read-only mount
+     * read-only: the new name would be a writable alias of a file the mount
+     * protects -- and the host, seeing one filesystem, made the link. Binds
+     * are mounts here, so the same rule applies, judged by the mount each name
+     * resolved through: the bind covering its canonical path, or the rootfs.
+     * An old name that is a /proc fd link (an O_TMPFILE being published, a
+     * descriptor being named) has no canonical mount, only a host location,
+     * and a --bind whose source lies inside the rootfs gives its files a
+     * second guest route the canonical path does not show. Both are answered
+     * by the same test an open for writing gets: a host location under a
+     * read-only bind is EXDEV to link from, whichever way it was named. */
+    int mnt1 = proc_zone_path(p1.host) ? -2 : bind_slot_of_canon(canon1);
+    if ((mnt1 != -2 && mnt1 != bind_slot_of_canon(canon2)) || host_ro(c->m, p1.host)) {
+        path_unpin(&p1); path_unpin(&p2);
+        return (u64)(s64)-EXDEV;
+    }
+    /* Pinned, the old name has already been followed as far as the guest asked,
+     * so AT_SYMLINK_FOLLOW must not be passed on -- a symlink standing there now
+     * is the race. Unpinned it still carries the guest's flag, which is what
+     * lets "/proc/self/fd/N" (an O_TMPFILE the guest is naming) materialize. */
+    int hflags = (!p1.pinned && (gf & G_AT_SYMLINK_FOLLOW)) ? AT_SYMLINK_FOLLOW : 0;
+#ifdef L2S_ENABLED
+    /* A name of a group (ours or proot's) is a symlink to the host, and the
+     * data file a following walk reached is the group's file: a host link(2)
+     * of either makes a name the count never had -- one the last counted
+     * unlink deletes the data from under -- or, where the host refuses links,
+     * a copy. So the engine links it, asked first, whatever the host would
+     * say. A group whose data is on a :ro bind is on another mount than any
+     * new name outside it: EXDEV, after the new name's own verdict (a name in
+     * a zone holds no link; one that exists is EEXIST), as for the data file
+     * named directly (above). */
+    if (c->m->link2symlink && p1.pinned) {
+        char data[PATH_MAX];
+        if (l2s_target(p1.host, data, sizeof data, NULL) == 1) {
+            struct stat dst;
+            u64 ret = !p2.pinned ? (u64)(s64)-EXDEV
+                    : fstatat(p2.dfd, p2.name, &dst, AT_SYMLINK_NOFOLLOW) == 0 ? (u64)(s64)-EEXIST
+                    : host_ro(c->m, data) ? (u64)(s64)-EXDEV
+                    : (u64)(s64)l2s_link(p1.host, p2.host);
+            path_unpin(&p1); path_unpin(&p2);
+            return ret;
+        }
+    }
+#endif
+#if defined(L2S_ENABLED) && defined(A64_L2S_FORCE)
+    /* Test hook: exercise the l2s path even where the host allows hardlinks. */
+    if (c->m->link2symlink) {
+        u64 lret = (u64)(s64)l2s_link(p1.host, p2.host);
+        path_unpin(&p1); path_unpin(&p2);
+        return lret;
+    }
+#endif
+    int lr = linkat(p1.dfd, p1.name, p2.dfd, p2.name, hflags);
+    if (lr == 0) { path_unpin(&p1); path_unpin(&p2); return 0; }
+#ifdef L2S_ENABLED
+    /* Android refuses hardlinks with EXDEV/EPERM/EACCES depending on the path
+     * (an O_TMPFILE publish via linkat(AT_SYMLINK_FOLLOW) yields EACCES), and a
+     * filesystem that lacks links reports EOPNOTSUPP; fall back for all. A
+     * genuine permission error still surfaces, since the copy/symlink then
+     * fails the same way. */
+    if (c->m->link2symlink && (errno == EXDEV || errno == EPERM
+                               || errno == EACCES || errno == EOPNOTSUPP)) {
+        u64 lret = (u64)(s64)l2s_link(p1.host, p2.host);
+        path_unpin(&p1); path_unpin(&p2);
+        return lret;
+    }
+#endif
+    { u64 e = host_err(); path_unpin(&p1); path_unpin(&p2); return e; }
+}
+
+/* A file the guest has mapped just changed size. Shrinking pulls the ground
+ * out from under any mapping that reached past the new end: those pages must
+ * stop resolving, or the emulator would read a host page the kernel now
+ * refuses and take the SIGBUS itself (mem.c as_file_resized). */
+static void note_resize(CPU *c, int fd, s64 newsize) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return;
+    as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)newsize);
+}
+
+SYSDEF(ftruncate) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    if (mfd_ftruncate_denied(c, (int)a0, a1)) return (u64)(s64)-EPERM;
+    if (ftruncate((int)a0, (off_t)(s64)a1) < 0) return host_err();
+    note_resize(c, (int)a0, (s64)a1);
+    return 0;
+}
+
+SYSDEF(truncate) {
+    PathPin pin;
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+    if (pin_ro(c->m, &pin)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    /* truncate(2) follows the final component and has no way to be told not
+     * to, so the component itself is pinned and named by its descriptor: that
+     * magic link resolves to the inode the walk found, whatever the tree looks
+     * like by now (machine.h, path_pin_final). */
+    int ffd = path_pin_final(&pin);
+    path_unpin(&pin);
+    if (ffd < 0) return (u64)(s64)ffd;
+    char spell[PATH_MAX];
+    path_fd_spell(ffd, spell);
+    int tr = truncate(spell, (off_t)(s64)a1);
+    u64 e = tr < 0 ? host_err() : 0;
+    if (tr == 0) {
+        struct stat st;
+        if (fstat(ffd, &st) == 0)
+            as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)(s64)a1);
+    }
+    path_unpin_final(ffd);
+    return e;
+}
+
+/* Fake-root (fake_id && euid==0) turns an EPERM/EINVAL failure on an ownership/
+ * mode change into success — the host can't perform it unprivileged, but the
+ * guest believes it is root. Real errors (ENOENT, etc.) still propagate. */
+static u64 chattr_result(struct Machine *m, int rr) {
+    if (rr == 0) return 0;
+    if (fake_root(m) && (errno == EPERM || errno == EINVAL || errno == EACCES)) return 0;
+    return host_err();
+}
+
+SYSDEF(fchmod) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    /* A memfd on a host that will not hold its mode: the registry holds it
+     * instead and the guest is told what Linux would have told it. Asked
+     * before the host call rather than after it, because on such a host the
+     * call cannot succeed -- and because the forced tier stands in for that
+     * host on one where it would. Anything that is not one of our memfds
+     * (a tier memfd is a plain file, and its chmod works) says so and the
+     * host answers as it always did. */
+    if (mfd_chmod_blocked() && mfd_chmod_hold(c->m, (int)a0, (u32)a1)) return 0;
+    return chattr_result(c->m, fchmod((int)a0, (mode_t)a1));
+}
+
+SYSDEF(fchmodat) {
+    PathPin pin;
+    int r = resolve_pin(c, (int)(s32)a0, a1, 0, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+    if (pin_ro(c->m, &pin)) { path_unpin(&pin); return (u64)(s64)-EROFS; }
+    /* The path spelling of one of our own fds: same object, same answer as
+     * fchmod above, and on the host this exists for the path form is refused
+     * as flatly as the fd one. */
+    if (mfd_chmod_blocked()) {
+        int ofd = proc_own_fd_path(pin.host);
+        if (ofd >= 0 && mfd_chmod_hold(c->m, ofd, (u32)a2)) {
+            path_unpin(&pin);
+            return 0;
+        }
+    }
+    /* As truncate: fchmodat's AT_SYMLINK_NOFOLLOW is ENOTSUP on Linux, so the
+     * final component is pinned and reached through its own descriptor. */
+    int ffd = path_pin_final(&pin);
+    path_unpin(&pin);
+    if (ffd < 0) return (u64)(s64)ffd;
+    char spell[PATH_MAX];
+    path_fd_spell(ffd, spell);
+    u64 ret = chattr_result(c->m, chmod(spell, (mode_t)a2));
+    path_unpin_final(ffd);
+    return ret;
+}
+
+SYSDEF(fchownat) {
+    unsigned gf = (unsigned)a4;
+    /* do_fchownat judges the flags before it reads the name: a bit other than
+     * these two is EINVAL, ahead of any EFAULT or ENOENT the path would earn. */
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_EMPTY_PATH)) return (u64)(s64)-EINVAL;
+    if (gf & G_AT_EMPTY_PATH) {   /* fchownat(fd, "", ..., AT_EMPTY_PATH): operate on the fd */
+        char gpath[PATH_MAX];
+        long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+        if (n < 0) return (u64)(s64)n;
+        if (n == 0) {
+            /* Named by descriptor, so the bind has to be asked about the fd --
+             * there is no path here for host_ro to judge. Missing that check
+             * was a hole with nothing to warn about it: fchown(fd) on the very
+             * same descriptor was refused, and under --fake-id chattr_result
+             * turned the host's own EPERM into a reported success, so the
+             * guest was told an ownership change on a :ro bind had happened. */
+            if (fd_ro(c->m, (int)(s32)a0)) return (u64)(s64)-EROFS;
+            return chattr_result(c->m,
+                fchownat((int)(s32)a0, "", (uid_t)a2, (gid_t)a3, AT_EMPTY_PATH));
+        }
+    }
+    PathPin pin;
+    unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    int r = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+    /* lchown of an emulated hardlink is a chown of the file: the flag has no
+     * link to spare here, and ownership belongs to the data every name of the
+     * group shares (l2s_deref_pin). */
+    if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
+    int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+    u64 ret = pin_ro(c->m, &pin)
+                  ? (u64)(s64)-EROFS
+                  : chattr_result(c->m, fchownat(pin.dfd, pin.name, (uid_t)a2,
+                                                 (gid_t)a3, hf));
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(fchown) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    return chattr_result(c->m, fchown((int)a0, (uid_t)a1, (gid_t)a2));
+}
+
+/* The two tv_nsec values that are not a nanosecond count (<linux/stat.h>). */
+#define G_UTIME_NOW  ((1LL << 30) - 1)
+#define G_UTIME_OMIT ((1LL << 30) - 2)
+static int utime_nsec_valid(s64 n) {
+    return n == G_UTIME_NOW || n == G_UTIME_OMIT || (n >= 0 && n <= 999999999);
+}
+
+/* utimensat(dfd, path, times, flags), in the kernel's own order (fs/utimes.c):
+ * the times are read first (EFAULT), a pair of UTIME_OMITs is a success that
+ * looks at nothing else, then the flags are judged (EINVAL), and only then is
+ * the file found -- by descriptor for a NULL path (do_utimes_fd, which takes
+ * no flags at all; AT_FDCWD there is a name lookup of NULL, EFAULT), by
+ * descriptor again for an empty path under AT_EMPTY_PATH (the working
+ * directory when that descriptor is AT_FDCWD), by name otherwise. A bad
+ * nanosecond field is EINVAL only after the lookup (vfs_utimes), so it is
+ * judged on the guest's 64-bit value -- a 32-bit host's long could make a
+ * valid one of it -- and then handed to the host as a value no kernel
+ * accepts, which keeps the host's own ordering: ENOENT or EBADF first.
+ *
+ * It used to stamp a file named beside a stray flag bit, answer EBADF where
+ * the kernel answers EFAULT or EINVAL, and refuse the AT_EMPTY_PATH form with
+ * ENOENT, so a guest's futimens(2) of an O_PATH descriptor never landed. */
+SYSDEF(utimensat) {
+    struct timespec ts[2], *tsp = NULL;
+    if (a2) {
+        GTimespec g[2];
+        if (copy_from_guest(c, g, a2, sizeof g) < 0) return (u64)(s64)-EFAULT;
+        if (g[0].tv_nsec == G_UTIME_OMIT && g[1].tv_nsec == G_UTIME_OMIT) return 0;
+        ts[0].tv_sec = (time_t)g[0].tv_sec; ts[0].tv_nsec = (long)g[0].tv_nsec;
+        ts[1].tv_sec = (time_t)g[1].tv_sec; ts[1].tv_nsec = (long)g[1].tv_nsec;
+        if (!utime_nsec_valid(g[0].tv_nsec) || !utime_nsec_valid(g[1].tv_nsec))
+            ts[0].tv_nsec = ts[1].tv_nsec = -1;
+        tsp = ts;
+    }
+    unsigned gf = (unsigned)a3;
+    int dfd = (int)(s32)a0;
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_EMPTY_PATH)) return (u64)(s64)-EINVAL;
+    if (a1 == 0) {   /* NULL path: the descriptor itself */
+        if (dfd == G_AT_FDCWD) return (u64)(s64)-EFAULT;
+        if (gf) return (u64)(s64)-EINVAL;
+        if (fd_ro(c->m, dfd)) return (u64)(s64)-EROFS;
+        return futimens(dfd, tsp) < 0 ? host_err() : 0;
+    }
+    char gpath[PATH_MAX];
+    long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+    if (n < 0) return (u64)(s64)n;
+    if (n == 0 && (gf & G_AT_EMPTY_PATH) && dfd != G_AT_FDCWD) {
+        /* Named by descriptor, so the bind is asked about the fd (fchownat's
+         * AT_EMPTY_PATH form does the same; there is no path for host_ro). */
+        if (fd_ro(c->m, dfd)) return (u64)(s64)-EROFS;
+        return utimensat(dfd, "", tsp, AT_EMPTY_PATH) < 0 ? host_err() : 0;
+    }
+    PathPin pin;
+    unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+    /* An empty name under AT_EMPTY_PATH at AT_FDCWD is the working directory. */
+    const char *gp = n == 0 && (gf & G_AT_EMPTY_PATH) ? "." : gpath;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink && l2s_guest_denied(c->m, dfd, gp))
+        return (u64)(s64)-ENOENT;   /* as resolve_pin */
+#endif
+    int r = path_resolve_pin(c->m, dfd, gp, rf, &pin, NULL);
+    if (r < 0) return (u64)(s64)r;
+#ifdef L2S_ENABLED
+    if (c->m->link2symlink) l2s_pin_ro(c->m, dfd, gp, rf, &pin);
+#endif
+    /* As fchownat: timestamps belong to the shared data, so a no-follow stamp
+     * on an emulated hardlink has to land on the backing. Left alone, the call
+     * returned 0 and moved a timestamp nothing could ever read back. */
+    if (gf & G_AT_SYMLINK_NOFOLLOW) l2s_deref_pin(c->m, &pin);
+    int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+    u64 ret = pin_ro(c->m, &pin) ? (u64)(s64)-EROFS
+            : utimensat(pin.dfd, pin.name, tsp, hf) < 0 ? host_err() : 0;
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(fsync) { return fsync((int)a0) < 0 ? host_err() : 0; }
+SYSDEF(fdatasync) { return fdatasync((int)a0) < 0 ? host_err() : 0; }
+
+SYSDEF(sync) { (void)c;(void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5; sync(); return 0; }
+
+/* syncfs/readahead/sync_file_range: Bionic only declares these wrappers on
+ * newer API levels, so issue the raw syscalls there -- all three numbers are on
+ * the Android 8 seccomp allow-list.  Termux also builds for 32-bit ARM, and
+ * there an argument the guest passed in one register needs two of the host's,
+ * so the halves have to be handed over one at a time: syscall(3) is variadic,
+ * and giving it an s64 would let the ABI's own 8-byte varargs alignment insert
+ * padding between the words that the kernel is not expecting. glibc's and
+ * musl's wrappers do all of this themselves. */
+#if __SIZEOF_LONG__ == 4
+/* A 64-bit syscall argument as the two words an ILP32 register pair holds,
+ * lower-numbered register first. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define SC_ARG64(x) (long)(u32)((u64)(x) >> 32), (long)(u32)(u64)(x)
+#else
+#define SC_ARG64(x) (long)(u32)(u64)(x), (long)(u32)((u64)(x) >> 32)
+#endif
+#endif
+
+SYSDEF(syncfs) {
+#ifdef __BIONIC__
+    return syscall(SYS_syncfs, (int)a0) < 0 ? host_err() : 0;
+#else
+    return syncfs((int)a0) < 0 ? host_err() : 0;
+#endif
+}
+
+SYSDEF(readahead) {
+    ssize_t n;
+#if !defined(__BIONIC__)
+    n = readahead((int)a0, (off_t)a1, (size_t)a2);
+#elif __SIZEOF_LONG__ == 8
+    n = syscall(SYS_readahead, (int)a0, (off_t)a1, (size_t)a2);
+#elif defined(__ARM_EABI__)
+    /* What decides the register layout is the kernel's own prototype --
+     * (int fd, loff_t offset, size_t count) -- compiled for this ABI, which
+     * starts a 64-bit argument on an even-numbered register. So the offset
+     * skips one and the count lands a register further out than its position
+     * suggests. The dummy word is the padding the compiler would emit. */
+    n = syscall(SYS_readahead, (int)a0, 0L, SC_ARG64(a1), (long)(size_t)a2);
+#else
+    n = syscall(SYS_readahead, (int)a0, SC_ARG64(a1), (long)(size_t)a2);
+#endif
+    return n < 0 ? host_err() : (u64)n;
+}
+
+SYSDEF(sync_file_range) {
+    /* (fd, offset, nbytes, flags); the SYNC_FILE_RANGE_* flags are arch-generic,
+     * but the syscall carrying them is not. 32-bit ARM has no
+     * __NR_sync_file_range at all: it carries sync_file_range2, which takes the
+     * flags second precisely so that the two 64-bit arguments each start on an
+     * even-numbered register and need no padding of their own. Reaching for the
+     * undeclared wrapper there was the whole bug -- a Termux arm build did not
+     * compile. */
+    (void)a4; (void)a5;
+    long r;
+#if !defined(__BIONIC__)
+    r = sync_file_range((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (unsigned)a3);
+#elif __SIZEOF_LONG__ == 8
+    r = syscall(SYS_sync_file_range, (int)a0, (s64)a1, (s64)a2, (unsigned)a3);
+#elif defined(SYS_sync_file_range2)
+    r = syscall(SYS_sync_file_range2, (int)a0, (unsigned)a3,
+                SC_ARG64(a1), SC_ARG64(a2));
+#else
+    r = syscall(SYS_sync_file_range, (int)a0, SC_ARG64(a1), SC_ARG64(a2),
+                (unsigned)a3);
+#endif
+    return r < 0 ? host_err() : 0;
+}
+
+/* A synthesized /proc file as the destination of a splice-family call. The
+ * kernel's proc files have no splice_write: do_splice_from answers EINVAL --
+ * after the FMODE_WRITE check every one of these makes first, so a read-only
+ * descriptor is EBADF. copy_file_range is EXDEV instead (a different
+ * superblock with no copy_file_range of its own). The memfd behind the view
+ * would have taken the bytes: a guest could rewrite its own /proc/self/maps
+ * with sendfile, or land an id map in the memfd where the write hook never
+ * sees it. */
+static int procfs_out_denied(CPU *c, int fd, int nofs_err, u64 *ret) {
+    int acc;
+    if (!procfs_fd_synth(c->m, fd, &acc)) return 0;
+    *ret = (u64)(s64)(acc == O_RDONLY ? -EBADF : -nofs_err);
+    return 1;
+}
+
+SYSDEF(sendfile) {
+    u64 pd;
+    if (procfs_out_denied(c, (int)a0, EINVAL, &pd)) return pd;   /* out_fd */
+    if (mfd_write_denied(c, (int)a0)) return (u64)(s64)-EPERM;   /* out_fd */
+    off_t off, *offp = NULL;
+    if (a2) {
+        s64 g;
+        if (copy_from_guest(c, &g, a2, 8) < 0) return (u64)(s64)-EFAULT;
+        off = (off_t)g;
+        offp = &off;
+    }
+    /* The count is a guest 64-bit size_t, and the host's is 32 bits wide on an
+     * ILP32 build: clamp before the cast (rw_count), exactly as do_sendfile
+     * clamps it to MAX_RW_COUNT. Cast first and a count at or above 4 GB wraps
+     * into an unrelated small one -- zero for an exact multiple -- and moves
+     * the wrong number of bytes while reporting success. The clamp costs
+     * nothing observable: a short transfer is what sendfile(2) returns for a
+     * count the kernel clamped, and callers loop on it. */
+    ssize_t n = sendfile((int)a0, (int)a1, offp, rw_count(a3));
+    if (n < 0) return host_err();
+    if (offp) {
+        s64 g = off;
+        if (copy_to_guest(c, a2, &g, 8) < 0) return (u64)(s64)-EFAULT;
+    }
+    return (u64)n;
+}
+
+SYSDEF(fallocate) {
+    if (fd_ro(c->m, (int)a0)) return (u64)(s64)-EROFS;
+    /* The kernel's own argument check (vfs_fallocate), which runs before any
+     * question about the file: a negative offset or a non-positive length is
+     * EINVAL. Made here rather than left to the host so every backing tier
+     * answers the same -- the memfd fallback tier decides a sealed file's
+     * fallocate itself and would otherwise report the seal (EPERM) for an
+     * argument pair the kernel never gets far enough to consider. */
+    if ((s64)a2 < 0 || (s64)a3 <= 0) return (u64)(s64)-EINVAL;
+    if (mfd_fallocate_denied(c, (int)a0, (int)a1, a2, a3)) return (u64)(s64)-EPERM;
+    if (fallocate((int)a0, (int)a1, (off_t)(s64)a2, (off_t)(s64)a3) < 0)
+        return host_err();
+    /* FALLOC_FL_PUNCH_HOLE / COLLAPSE_RANGE can shrink a file, and the plain
+     * form can grow it; re-read the size rather than infer it. */
+    struct stat st;
+    if (fstat((int)a0, &st) == 0)
+        as_file_resized(&c->m->as, (u64)st.st_dev, (u64)st.st_ino, (u64)st.st_size);
+    return 0;
+}
+
+/* guest struct statfs (LP64 asm-generic): all fields u64 except fsid. */
+typedef struct {
+    s64 f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree;
+    s32 f_fsid[2];
+    s64 f_namelen, f_frsize, f_flags, f_spare[4];
+} GStatfs;
+
+static u64 statfs_out(CPU *c, u64 va, const struct statfs *h) {
+    GStatfs g;
+    memset(&g, 0, sizeof g);
+    g.f_type = (s64)h->f_type; g.f_bsize = (s64)h->f_bsize;
+    g.f_blocks = (s64)h->f_blocks; g.f_bfree = (s64)h->f_bfree;
+    g.f_bavail = (s64)h->f_bavail; g.f_files = (s64)h->f_files;
+    g.f_ffree = (s64)h->f_ffree;
+    memcpy(g.f_fsid, &h->f_fsid, 8);
+    g.f_namelen = (s64)h->f_namelen; g.f_frsize = (s64)h->f_frsize;
+    g.f_flags = (s64)h->f_flags;
+    return copy_to_guest(c, va, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
+SYSDEF(statfs) {
+    /* statfs follows the final component with no way to be told not to, so ask
+     * the filesystem through a descriptor on the pinned inode instead of by
+     * name. fstatfs on an O_PATH fd wants Linux >= 3.12; where it is refused,
+     * the descriptor's own /proc spelling still names that exact inode. */
+    PathPin pin;
+    char canon[PATH_MAX];
+    int r = resolve_pin(c, G_AT_FDCWD, a0, 0, &pin, canon);
+    if (r < 0) return (u64)(s64)r;
+    int ffd = path_pin_final(&pin);
+    const char *pcanon = proc_zone_canon(canon, pin.host);
+    path_unpin(&pin);
+    struct statfs h;
+    int sr;
+    if (ffd < 0) {
+        if (!pcanon) return (u64)(s64)ffd;
+        errno = -ffd;
+        sr = -1;
+    } else {
+        sr = fstatfs(ffd, &h);
+        if (sr < 0 && (errno == EBADF || errno == EINVAL)) {
+            char spell[PATH_MAX];
+            path_fd_spell(ffd, spell);
+            sr = statfs(spell, &h);
+        }
+    }
+    /* A synthesized /proc file the host refuses to describe: it lives on the
+     * proc filesystem like every other file under /proc, so that is the
+     * answer (procfs_stat_fallback; the attributes it fills are not needed). */
+    struct stat ps;
+    if (procfs_stat_fallback(c, pcanon, 0, sr, &ps) && statfs("/proc", &h) == 0)
+        sr = 0;
+    u64 e = sr < 0 ? host_err() : 0;
+    if (ffd >= 0) path_unpin_final(ffd);
+    return sr < 0 ? e : statfs_out(c, a1, &h);
+}
+
+SYSDEF(fstatfs) {
+    struct statfs h;
+    if (fstatfs((int)a0, &h) < 0) return host_err();
+    return statfs_out(c, a1, &h);
+}
+
+/* Host statx entry. Old host kernels lack it (ENOSYS), and Android 8.x blocks
+ * it in the app seccomp filter (the SIGSYS net turns that into ENOSYS too);
+ * callers then synthesize the result from the classic stat family. */
+static long host_statx(int dirfd, const char *path, int flags, unsigned mask,
+                       u8 *buf) {
+#if !defined(SYS_statx) || defined(A64_STATX_FORCE_FALLBACK)
+    (void)dirfd; (void)path; (void)flags; (void)mask; (void)buf;
+    errno = ENOSYS;
+    return -1;
+#else
+    return syscall(SYS_statx, dirfd, path, flags, mask, buf);
+#endif
+}
+
+/* Fill a struct statx (fixed 256-byte kernel ABI; explicit byte offsets, same
+ * ILP32 rule as the guest structs) from a classic struct stat. stx_mask
+ * reports STATX_BASIC_STATS (0x7ff) only: no btime, and none is advertised. */
+static void statx_from_stat(u8 *buf, const struct stat *st) {
+    memset(buf, 0, 256);
+    u32 v32; u16 v16; u64 v64;
+    v32 = 0x7ff;                         memcpy(buf + 0, &v32, 4);   /* stx_mask */
+    v32 = (u32)st->st_blksize;           memcpy(buf + 4, &v32, 4);
+    v32 = (u32)st->st_nlink;             memcpy(buf + 16, &v32, 4);
+    v32 = (u32)st->st_uid;               memcpy(buf + 20, &v32, 4);
+    v32 = (u32)st->st_gid;               memcpy(buf + 24, &v32, 4);
+    v16 = (u16)st->st_mode;              memcpy(buf + 28, &v16, 2);
+    v64 = (u64)st->st_ino;               memcpy(buf + 32, &v64, 8);
+    v64 = (u64)st->st_size;              memcpy(buf + 40, &v64, 8);
+    v64 = (u64)st->st_blocks;            memcpy(buf + 48, &v64, 8);
+    /* statx_timestamp {s64 sec; u32 nsec} at atime 64, ctime 96, mtime 112
+     * (btime at 80 stays zero) */
+    v64 = (u64)(s64)st->st_atim.tv_sec;  memcpy(buf + 64, &v64, 8);
+    v32 = (u32)st->st_atim.tv_nsec;      memcpy(buf + 72, &v32, 4);
+    v64 = (u64)(s64)st->st_ctim.tv_sec;  memcpy(buf + 96, &v64, 8);
+    v32 = (u32)st->st_ctim.tv_nsec;      memcpy(buf + 104, &v32, 4);
+    v64 = (u64)(s64)st->st_mtim.tv_sec;  memcpy(buf + 112, &v64, 8);
+    v32 = (u32)st->st_mtim.tv_nsec;      memcpy(buf + 120, &v32, 4);
+    v32 = (u32)major(st->st_rdev);       memcpy(buf + 128, &v32, 4);
+    v32 = (u32)minor(st->st_rdev);       memcpy(buf + 132, &v32, 4);
+    v32 = (u32)major(st->st_dev);        memcpy(buf + 136, &v32, 4);
+    v32 = (u32)minor(st->st_dev);        memcpy(buf + 140, &v32, 4);
+}
+
+/* mfd_stat_fixup for the statx buffer: stx_mode is a u16 at offset 28. */
+static void mfd_statx_fixup(struct Machine *m, int fd, u8 *buf) {
+    if (fd < 0 || !mfd_chmod_blocked()) return;
+    struct stat st;
+    memset(&st, 0, sizeof st);
+    u16 v16;
+    memcpy(&v16, buf + 28, 2);
+    st.st_mode = v16;
+    mfd_stat_fixup(m, fd, &st);
+    v16 = (u16)st.st_mode;
+    memcpy(buf + 28, &v16, 2);
+}
+
+SYSDEF(statx) {
+    /* struct statx is a fixed-layout kernel ABI (same on all arches). */
+    char gpath[PATH_MAX];
+    long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+    if (n < 0) return (u64)(s64)n;
+    unsigned gf = (unsigned)a2;
+    /* do_statx's own refusals, after the name is read (getname comes first
+     * in the syscall) and before anything is looked up: both sync bits at
+     * once, a reserved mask bit, a flag statx does not take. None of them
+     * used to be judged, so statx(..., 0x8000, ...) answered the stat. */
+    if ((gf & G_AT_STATX_SYNC_TYPE) == G_AT_STATX_SYNC_TYPE) return (u64)(s64)-EINVAL;
+    if ((unsigned)a3 & G_STATX__RESERVED) return (u64)(s64)-EINVAL;
+    if (gf & ~(G_AT_SYMLINK_NOFOLLOW | G_AT_NO_AUTOMOUNT | G_AT_EMPTY_PATH |
+               G_AT_STATX_SYNC_TYPE))
+        return (u64)(s64)-EINVAL;
+    char host[PATH_MAX];
+    u8 buf[256];
+    long r;
+    if ((gf & G_AT_EMPTY_PATH) && gpath[0] == 0) {
+        r = host_statx((int)(s32)a0, "", AT_EMPTY_PATH, (unsigned)a3, buf);
+        if (r < 0 && errno == ENOSYS) {
+            struct stat st;
+            r = fstat((int)(s32)a0, &st);
+            if (r == 0) statx_from_stat(buf, &st);
+        }
+        if (r == 0) mfd_statx_fixup(c->m, (int)(s32)a0, buf);
+    } else {
+        unsigned rf = (gf & G_AT_SYMLINK_NOFOLLOW) ? PATH_NOFOLLOW_LAST : 0;
+        char canon[PATH_MAX];
+#ifdef L2S_ENABLED
+        if (c->m->link2symlink && l2s_guest_denied(c->m, (int)(s32)a0, gpath))
+            return (u64)(s64)-ENOENT;   /* as resolve_pin */
+#endif
+        int rr = path_resolve(c->m, (int)(s32)a0, gpath, rf, host, canon);
+        if (rr < 0) return (u64)(s64)rr;
+        PathPin pin;
+        if ((rr = path_pin(c->m, canon, host, &pin)) < 0) return (u64)(s64)rr;
+        int hf = (pin.pinned || (gf & G_AT_SYMLINK_NOFOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+#ifdef L2S_ENABLED
+        /* As newfstatat: a name of a group (ours or proot's) is the data file
+         * to a statx with or without AT_SYMLINK_NOFOLLOW, and the data file a
+         * following walk reached carries the group's count. */
+        char l2sd[PATH_MAX];
+        unsigned long l2sc = 0;
+        int l2s_done = 0;
+        if (c->m->link2symlink && pin.pinned &&
+            l2s_target(pin.host, l2sd, sizeof l2sd, &l2sc) == 1) {
+            PathPin dp;
+            if (l2s_host_pin(l2sd, &dp) == 0) {
+                r = host_statx(dp.dfd, dp.name, AT_SYMLINK_NOFOLLOW, (unsigned)a3, buf);
+                if (r < 0 && errno == ENOSYS) {
+                    struct stat st;
+                    r = fstatat(dp.dfd, dp.name, &st, AT_SYMLINK_NOFOLLOW);
+                    if (r == 0) statx_from_stat(buf, &st);
+                }
+                if (r == 0) {
+                    u32 nl = l2sc ? (u32)l2sc : 1;
+                    memcpy(buf + 16, &nl, 4);               /* stx_nlink */
+                    l2s_done = 1;
+                }
+            }
+            path_unpin(&dp);
+        }
+        /* One whose data file is not there is the dangling symlink it is. */
+        if (!l2s_done)
+#endif
+        {
+            r = host_statx(pin.dfd, pin.name, hf, (unsigned)a3, buf);
+            if (r < 0 && errno == ENOSYS) {
+                struct stat st;
+                r = fstatat(pin.dfd, pin.name, &st, hf);
+                if (r == 0) statx_from_stat(buf, &st);
+            }
+            if (r == 0) mfd_statx_fixup(c->m, proc_own_fd_path(host), buf);
+        }
+        /* As newfstatat: a synthesized /proc file the host refuses is still
+         * one the guest may ask about. */
+        struct stat ps;
+        if (procfs_stat_fallback(c, proc_zone_canon(canon, host),
+                                 (gf & G_AT_SYMLINK_NOFOLLOW) != 0,
+                                 r < 0 ? -1 : 0, &ps)) {
+            statx_from_stat(buf, &ps);
+            r = 0;
+        }
+        path_unpin(&pin);
+    }
+    if (r < 0) return host_err();
+    if (c->m->fake_id) {   /* remap stx_uid (off 20), stx_gid (off 24) */
+        u32 u, g;
+        memcpy(&u, buf + 20, 4); memcpy(&g, buf + 24, 4);
+        u = remap_uid(c->m, u); g = remap_gid(c->m, g);
+        memcpy(buf + 20, &u, 4); memcpy(buf + 24, &g, 4);
+    }
+    return copy_to_guest(c, a4, buf, 256) < 0 ? (u64)(s64)-EFAULT : 0;
+}
+
+/* ---- the temporary signal mask of ppoll / pselect6 / epoll_pwait ----
+ *
+ * These install a signal mask for the duration of the wait and restore it on
+ * return. That is the whole point of the p-variants: a guest blocks SIGCHLD,
+ * checks its state, and then sleeps with SIGCHLD unblocked *only* while
+ * sleeping, so the handler cannot run in the window between the check and the
+ * sleep.
+ *
+ * Handing the mask to the host call alone does not implement that here. The
+ * host mask is not the guest's -- everything except the job-control trio stays
+ * unblocked host-side so host_catcher can queue into the capture ring, and
+ * g_tls.sigmask is what actually gates delivery to the guest. So the wait was
+ * interrupted, the syscall returned EINTR, and the run loop then declined to
+ * run the handler because the guest mask still had the signal blocked: the
+ * guest saw a bare EINTR and no signal, forever.
+ *
+ * Swap the guest mask too, and hold it across delivery the way rt_sigsuspend
+ * does -- the handler must run under the temporary mask, and sigreturn puts
+ * the original back from the frame (have_saved_sigmask). If the wait ends
+ * without a signal to deliver, restore it here instead. */
+static int pwait_mask_enter(CPU *c, u64 gmask) {
+    g_tls.saved_sigmask = g_tls.sigmask;
+    g_tls.have_saved_sigmask = 1;
+    g_tls.sigmask = gmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    sig_sync_host_mask(c->m);
+    /* The kernel tests for a pending signal before it sleeps. Without this, one
+     * that arrived while the caller had it blocked -- already sitting in the
+     * ring, which is the case the idiom exists to handle -- would not be seen
+     * until some later signal happened to wake the wait. */
+    return sig_pending_deliverable(c->m);
+}
+
+/* The guest's blocked set as the host sigset these calls install for the
+ * duration of the wait: the same translation the mirror uses for the
+ * thread's own mask (sig_host_wait_mask -- guest 32/33 as their carriers, the
+ * gate's bits kept, the numbers the emulator's nets own held out), so the
+ * kernel holds and routes under the temporary mask exactly as under the
+ * standing one.
+ *
+ * One of the held-out numbers matters here in particular. The emulator
+ * reserves a high RT signal for its own control channel (PTRACE_KICKSIG: a
+ * tracer's attach kick, and execve's de_thread call-out), and the guest must
+ * not be able to switch that off. It otherwise could, because blocking
+ * everything is the usual way to reach one of these calls and sigfillset
+ * covers that number too -- and then a thread parked here cannot be reached
+ * at all, so de_thread times out and execve is refused on a program that
+ * should have worked. The cost is confined to a guest-directed signal of that
+ * exact number arriving while the guest has it blocked and is inside one of
+ * these three calls: it is still queued in the capture ring (not lost, and
+ * delivered once the guest unblocks it), but the wait returns EINTR where a
+ * kernel would have kept waiting. Nothing sends the top of the RT range in
+ * practice; being unable to reach our own threads is the worse failure. */
+static void pwait_host_mask(sigset_t *ss, u64 gmask) {
+    u64 hm = sig_host_wait_mask(gmask);
+    sigemptyset(ss);
+    for (int i = 1; i <= 64; i++)
+        if (hm & (1ULL << (i - 1))) sigaddset(ss, i);
+}
+
+static void pwait_mask_leave(CPU *c) {
+    if (sig_pending_deliverable(c->m)) return;   /* a handler is about to run */
+    int e = errno;                               /* callers still owe host_err() */
+    g_tls.sigmask = g_tls.saved_sigmask;
+    g_tls.have_saved_sigmask = 0;
+    sig_sync_host_mask(c->m);
+    errno = e;
+}
+
+/* The temporary mask's SIZE, which the three waits below take beside the
+ * mask: set_user_sigmask refuses any but the kernel's own (8 bytes) with
+ * EINVAL, exactly as rt_sigprocmask and its family do (sys_sig.c), and only
+ * when a mask was given at all. It is what lets a libc built against another
+ * sigset layout fail loudly instead of installing a mask read from the wrong
+ * bytes; the size used to be ignored here, and every such refusal came back
+ * as a successful wait. Judged before the mask is read -- a bad size beats an
+ * unreadable mask -- and after the timespec, which ppoll and pselect6 read
+ * first (tests/c/pwait_sigsetsize.c). */
+static int pwait_mask_read(CPU *c, u64 mask_va, u64 sigsetsize, u64 *gmask) {
+    if (sigsetsize != 8) return -EINVAL;
+    if (copy_from_guest(c, gmask, mask_va, 8) < 0) return -EFAULT;
+    return 0;
+}
+
+/* The time a ppoll/pselect6 timeout has left goes back to the caller's
+ * timespec (poll_select_finish) -- and it goes back whatever the call
+ * returned: descriptors ready, the timeout itself, EINTR, even do_sys_poll's
+ * own EINVAL for too many descriptors. Only a zero timeout is left alone, and
+ * only a timespec that cannot be written stays as it was. The host libc's
+ * wrappers hide the kernel's own update (glibc hands the kernel a private
+ * copy of the timespec on purpose), so it is reconstructed here from the
+ * deadline the wait was given: what a caller does with the value is loop on
+ * EINTR with the time it has left, and given the whole timeout each time it
+ * never finished.
+ *
+ * It is also how a restarted call keeps its deadline. The emulator's own
+ * control signal rewinds an interrupted SVC (syscall_restart_internal), and
+ * the re-run reads the guest's timespec again -- which now holds the time
+ * left, exactly as a kernel's restart re-reads it. So a wait whose remainder
+ * was written back charges nothing to sc_waited_ns (the timespec carries the
+ * accounting); one whose write-back failed keeps the stopwatch running and
+ * the accounting subtracts what was spent from the unchanged timespec. */
+typedef struct { u64 va; u64 deadline; } PwaitTmo;
+
+/* Arm after syscall_wait_begin has shrunk `ts`: the deadline is what THIS
+ * attempt was given, and the remainder written back is measured from it. */
+static void pwait_tmo_arm(PwaitTmo *t, u64 va, const struct timespec *ts) {
+    t->va = 0;
+    if (!va || !ts || (ts->tv_sec == 0 && ts->tv_nsec == 0)) return;
+    t->va = va;
+    t->deadline = deadline_sat(mono_ns(),
+                               span_ns_sat((u64)ts->tv_sec, (u64)ts->tv_nsec));
+}
+
+static u64 pwait_tmo_finish(CPU *c, const PwaitTmo *t, u64 ret) {
+    if (!t->va) return ret;
+    /* personality(STICKY_TIMEOUTS): the caller's timeout is left as it was
+     * given -- poll_select_finish's first test, ahead of the zero-timeout one.
+     * The stopwatch keeps running, as for a write-back that failed. (The other
+     * half of the flag, no restart across a stop, is the host kernel's to
+     * apply: the bit rides on the host thread's personality, sys_proc.c.) */
+    if (g_tls.personality & G_STICKY_TIMEOUTS) return ret;
+    int e = errno;
+    u64 now = mono_ns();
+    u64 rem = t->deadline > now ? t->deadline - now : 0;
+    GTimespec g = { (s64)(rem / 1000000000ULL), (s64)(rem % 1000000000ULL) };
+    if (copy_to_guest(c, t->va, &g, sizeof g) == 0) g_tls.sc_wait_t0 = 0;
+    errno = e;
+    return ret;
+}
+
+/* The guest's timespec as the host's: EFAULT if unreadable, EINVAL if not a
+ * valid duration (poll_select_set_timeout) -- both judged before the sigmask
+ * is looked at, which is the kernel's order. */
+static int pwait_tmo_read(CPU *c, u64 va, struct timespec *ts) {
+    GTimespec g;
+    if (copy_from_guest(c, &g, va, sizeof g) < 0) return -EFAULT;
+    if (g.tv_sec < 0 || g.tv_nsec < 0 || g.tv_nsec >= 1000000000) return -EINVAL;
+    ts->tv_sec = (time_t)g.tv_sec; ts->tv_nsec = (long)g.tv_nsec;
+    return 0;
+}
+
+SYSDEF(ppoll) {
+    /* (fds, nfds, timespec, sigmask, sigsetsize), judged in the kernel's
+     * order: the timespec, then the mask and its size (set_user_sigmask),
+     * then nfds against the soft RLIMIT_NOFILE (do_sys_poll). */
+    unsigned nfds = (unsigned)a1;
+    struct timespec ts, *tsp = NULL;
+    if (a2) {
+        int e = pwait_tmo_read(c, a2, &ts);
+        if (e < 0) return (u64)(s64)e;
+        tsp = &ts;
+    }
+    u64 gmask = 0;
+    if (a3) {
+        int e = pwait_mask_read(c, a3, a4, &gmask);
+        if (e < 0) return (u64)(s64)e;
+    }
+    /* From here on the timeout is written back whatever happens: the
+     * refusals below are do_sys_poll's own, inside poll_select_finish's
+     * bracket. Nothing has waited yet, so the remainder is the whole. */
+    PwaitTmo tmo;
+    syscall_wait_begin(tsp);   /* see syscall.c: a restart keeps the deadline */
+    pwait_tmo_arm(&tmo, a2, tsp);
+    /* do_sys_poll's bound is the guest's own descriptor limit, not a size of
+     * ours: a server polling five thousand descriptors is within its rights
+     * wherever RLIMIT_NOFILE allows it. The array is on the stack for the
+     * common count and on the heap past it. */
+    if (nfds > (unsigned)fd_nofile_cap(c->m))
+        return pwait_tmo_finish(c, &tmo, (u64)(s64)-EINVAL);
+    struct pollfd pfs[256], *pf = pfs;
+    if (nfds > sizeof pfs / sizeof pfs[0]) {
+        pf = malloc(sizeof *pf * nfds);
+        if (!pf) return pwait_tmo_finish(c, &tmo, (u64)(s64)-ENOMEM);
+    }
+    /* guest struct pollfd == host (int, short, short) on all targets */
+    if (nfds && copy_from_guest(c, pf, a0, sizeof(struct pollfd) * nfds) < 0) {
+        if (pf != pfs) free(pf);
+        return pwait_tmo_finish(c, &tmo, (u64)(s64)-EFAULT);
+    }
+    sigset_t ss, *ssp = NULL;
+    if (a3) {
+        pwait_host_mask(&ss, gmask);
+        ssp = &ss;
+        if (pwait_mask_enter(c, gmask)) {
+            if (pf != pfs) free(pf);
+            return pwait_tmo_finish(c, &tmo, (u64)(s64)-EINTR);
+        }
+    }
+    int r = ppoll(pf, nfds, tsp, ssp);
+    if (ssp) pwait_mask_leave(c);
+    u64 ret;
+    if (r < 0) ret = host_err();
+    else if (nfds && copy_to_guest(c, a0, pf, sizeof(struct pollfd) * nfds) < 0)
+        ret = (u64)(s64)-EFAULT;
+    else ret = (u64)r;
+    if (pf != pfs) free(pf);
+    return pwait_tmo_finish(c, &tmo, ret);
+}
+
+/* How many descriptors the kernel's fd table has room for right now: what
+ * core_sys_select clamps a select's nfds to. The guest's table IS the host's
+ * (guest fd == host fd), and its size is the FDSize line of the host process's
+ * own status -- the one place the kernel publishes it. Consulted only for an
+ * nfds past what a libc fd_set can hold, where the clamp decides how much of
+ * the caller's memory is read at all; below that the sets are copied whole,
+ * as they were. Falls back to the hard RLIMIT_NOFILE, which the table cannot
+ * have outgrown, if the host's /proc is not there to ask. */
+static int host_fdtable_size(void) {
+    int size = -1;
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    FILE *f = fopen("/proc/self/status", "re");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "FDSize:", 7)) { size = atoi(line + 7); break; }
+        fclose(f);
+    }
+    fdwin_leave();
+    if (size <= 0) {
+        struct rlimit rl;
+        size = getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max <= (rlim_t)INT_MAX
+                   ? (int)rl.rlim_max : INT_MAX;
+    }
+    return size;
+}
+
+SYSDEF(pselect6) {
+    /* (nfds, in, out, ex, timespec, {sigmask, sigsetsize}*), in the kernel's
+     * order: the mask pair is fetched first, then the timespec, then the mask
+     * itself (set_user_sigmask), and only then does core_sys_select judge
+     * nfds and read the sets -- inside poll_select_finish's bracket, so the
+     * timeout is written back even when it refuses. */
+    u64 pair[2] = { 0, 0 };
+    if (a5 && copy_from_guest(c, pair, a5, 16) < 0) return (u64)(s64)-EFAULT;
+    struct timespec ts, *tsp = NULL;
+    if (a4) {
+        int e = pwait_tmo_read(c, a4, &ts);
+        if (e < 0) return (u64)(s64)e;
+        tsp = &ts;
+    }
+    u64 gmask = 0;
+    if (pair[0]) {
+        int e = pwait_mask_read(c, pair[0], pair[1], &gmask);
+        if (e < 0) return (u64)(s64)e;
+    }
+    PwaitTmo tmo;
+    syscall_wait_begin(tsp);
+    pwait_tmo_arm(&tmo, a4, tsp);
+    int nfds = (int)a0;
+    if (nfds < 0) return pwait_tmo_finish(c, &tmo, (u64)(s64)-EINVAL);
+    /* A count past the fd table's size is clamped to it, not refused: the
+     * kernel reads and writes only as much of each set as the table can name.
+     * A libc fd_set holds 1024, and that is what every set in practice is;
+     * past it the clamp is what bounds the copies, and the buffers move to
+     * the heap. The sets are copied in whole longs (FDS_BYTES). */
+    if (nfds > FD_SETSIZE) {
+        int cap = host_fdtable_size();
+        if (nfds > cap) nfds = cap;
+    }
+    size_t setb = ((size_t)nfds + 63) / 64 * 8;
+    unsigned long sets[3][FD_SETSIZE / (8 * sizeof(unsigned long))];
+    unsigned long *r = sets[0], *w = sets[1], *e = sets[2], *heap = NULL;
+    if (setb > sizeof sets[0]) {
+        heap = calloc(3, setb);
+        if (!heap) return pwait_tmo_finish(c, &tmo, (u64)(s64)-ENOMEM);
+        r = heap; w = heap + setb / sizeof *heap; e = w + setb / sizeof *heap;
+    } else {
+        memset(sets, 0, sizeof sets);
+    }
+    u64 ret;
+    fd_set *rp = a1 ? (fd_set *)r : NULL, *wp = a2 ? (fd_set *)w : NULL,
+           *ep = a3 ? (fd_set *)e : NULL;
+    if ((a1 && copy_from_guest(c, r, a1, setb) < 0) ||
+        (a2 && copy_from_guest(c, w, a2, setb) < 0) ||
+        (a3 && copy_from_guest(c, e, a3, setb) < 0)) {
+        ret = (u64)(s64)-EFAULT;
+        goto out;
+    }
+    sigset_t ss, *ssp = NULL;
+    if (pair[0]) {
+        pwait_host_mask(&ss, gmask);
+        ssp = &ss;
+        if (pwait_mask_enter(c, gmask)) { ret = (u64)(s64)-EINTR; goto out; }
+    }
+    int rr = pselect(nfds, rp, wp, ep, tsp, ssp);
+    if (ssp) pwait_mask_leave(c);
+    if (rr < 0) { ret = host_err(); goto out; }
+    /* A set that cannot be written back is EFAULT, whatever the call found:
+     * core_sys_select overwrites its own return with it (the input sets were
+     * readable at entry, but nothing says the memory is still writable when
+     * the sleep ends). Reporting the ready count instead tells the guest to
+     * read descriptor bits that were never stored. */
+    if ((a1 && copy_to_guest(c, a1, r, setb) < 0) ||
+        (a2 && copy_to_guest(c, a2, w, setb) < 0) ||
+        (a3 && copy_to_guest(c, a3, e, setb) < 0))
+        ret = (u64)(s64)-EFAULT;
+    else
+        ret = (u64)rr;
+out:
+    free(heap);
+    return pwait_tmo_finish(c, &tmo, ret);
+}
+
+SYSDEF(splice) {
+    /* splice(fd_in, off_in*, fd_out, off_out*, len, flags). Guest fd == host fd,
+     * so the fds pass straight through; the optional loff_t* offsets are
+     * marshalled like sendfile's, and the SPLICE_F_* flags are arch-generic.
+     * GNU grep (>=3.5) relies on splice for its input->output fast path and,
+     * because splice always exists on a real kernel, treats -ENOSYS as a fatal
+     * I/O error ("(standard input): Function not implemented") -- so we forward
+     * to the host rather than stub. */
+    loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    u64 pd;
+    if (procfs_out_denied(c, (int)a2, EINVAL, &pd)) return pd;   /* fd_out */
+    if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
+    if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
+    if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
+    /* len is a guest 64-bit size_t: clamp it before it becomes a host one, or
+     * an ILP32 build turns a >= 4 GB request into an unrelated small one (see
+     * sendfile). splice(2) is always free to move less than asked -- a pipe
+     * bounds it anyway -- so the clamp is invisible to a looping caller. */
+    size_t len = rw_count(a4);
+    ssize_t n;
+#ifdef __BIONIC__
+    n = syscall(SYS_splice, (int)a0, inp, (int)a2, outp, len, (unsigned)a5);
+#else
+    n = splice((int)a0, inp, (int)a2, outp, len, (unsigned)a5);
+#endif
+    if (n < 0) return host_err();
+    if (inp)  { s64 g = in_off;  if (copy_to_guest(c, a1, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    if (outp) { s64 g = out_off; if (copy_to_guest(c, a3, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    return (u64)n;
+}
+
+SYSDEF(copy_file_range) {
+    /* copy_file_range(fd_in, off_in*, fd_out, off_out*, len, flags). Same offset
+     * marshalling as splice; forwarded so callers that don't fall back on ENOSYS
+     * (like splice's grep case) keep working. */
+    loff_t in_off, out_off, *inp = NULL, *outp = NULL;
+    u64 pd;
+    if (procfs_out_denied(c, (int)a2, EXDEV, &pd)) return pd;    /* fd_out */
+    if (mfd_write_denied(c, (int)a2)) return (u64)(s64)-EPERM;   /* fd_out */
+    if (a1) { s64 g; if (copy_from_guest(c, &g, a1, 8) < 0) return (u64)(s64)-EFAULT; in_off  = (loff_t)g; inp  = &in_off; }
+    if (a3) { s64 g; if (copy_from_guest(c, &g, a3, 8) < 0) return (u64)(s64)-EFAULT; out_off = (loff_t)g; outp = &out_off; }
+    /* Clamped before the cast like splice's, and here the kernel does exactly
+     * the same thing itself: generic_copy_file_checks caps the count at
+     * MAX_RW_COUNT and reports the short copy. */
+    size_t len = rw_count(a4);
+    ssize_t n;
+#ifdef __BIONIC__
+    n = syscall(SYS_copy_file_range, (int)a0, inp, (int)a2, outp, len, (unsigned)a5);
+#else
+    n = copy_file_range((int)a0, inp, (int)a2, outp, len, (unsigned)a5);
+#endif
+    if (n < 0) return host_err();
+    if (inp)  { s64 g = in_off;  if (copy_to_guest(c, a1, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    if (outp) { s64 g = out_off; if (copy_to_guest(c, a3, &g, 8) < 0) return (u64)(s64)-EFAULT; }
+    return (u64)n;
+}
+
+SYSDEF(flock) {
+    return flock((int)a0, (int)a1) < 0 ? host_err() : 0;
+}
+
+SYSDEF(fadvise64) {
+    /* Advisory: posix_fadvise returns the errno directly (not via errno). */
+    (void)a4; (void)a5;
+    int e = posix_fadvise((int)a0, (off_t)(s64)a1, (off_t)(s64)a2, (int)a3);
+    return e ? (u64)(s64)-e : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Event fds: eventfd2, epoll. Guest fd == host fd, so the objects themselves
+ * pass through; only epoll_event needs marshalling (guest 16B vs packed-x86
+ * host 12B, see GEpollEvent). The EFD_ and EPOLL_ flags equal the shared
+ * O_CLOEXEC / O_NONBLOCK values, so they need no translation.
+ * ------------------------------------------------------------------------- */
+
+SYSDEF(eventfd2) {
+    int r = eventfd((unsigned)a0, (int)a1);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
+    return r < 0 ? host_err() : (u64)r;
+}
+
+/* inotify: IN_NONBLOCK/IN_CLOEXEC equal O_NONBLOCK/O_CLOEXEC (identical on
+ * asm-generic and x86, the eventfd2 reasoning), the IN_* mask bits are
+ * arch-uniform, and struct inotify_event has no arch-dependent fields, so
+ * the fd and its event stream pass through 1:1. */
+SYSDEF(inotify_init1) {
+    int r = inotify_init1((int)(s32)a0);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(inotify_add_watch) {
+    PathPin pin;
+    char spell[PATH_MAX];
+    unsigned rf = ((u32)a2 & 0x02000000u /*IN_DONT_FOLLOW*/) ? PATH_NOFOLLOW_LAST : 0;
+    int r = rf ? resolve_at_spell_nofollow(c, G_AT_FDCWD, a1, &pin, spell)
+               : resolve_at_spell(c, G_AT_FDCWD, a1, rf, &pin, spell);
+    if (r < 0) return (u64)(s64)r;
+    /* No *at form at all, so the pinned parent is named by its descriptor and
+     * IN_DONT_FOLLOW keeps the host off the final component -- which the walk
+     * has already resolved as far as the guest asked. */
+    u32 mask = (u32)a2 | (pin.pinned ? 0x02000000u /*IN_DONT_FOLLOW*/ : 0);
+    r = inotify_add_watch((int)a0, spell, mask);
+    u64 ret = r < 0 ? host_err() : (u64)r;
+    path_unpin(&pin);
+    return ret;
+}
+
+SYSDEF(inotify_rm_watch) {
+    return inotify_rm_watch((int)a0, (int)(s32)a1) < 0 ? host_err() : 0;
+}
+
+SYSDEF(epoll_create1) {
+    int r = epoll_create1((int)a0);
+    if (r >= 0 && !fd_within_limit(c, r)) return (u64)(s64)-EMFILE;
+    return r < 0 ? host_err() : (u64)r;
+}
+
+SYSDEF(epoll_ctl) {
+    /* (epfd, op, fd, event); event may be NULL for EPOLL_CTL_DEL. */
+    struct epoll_event ev, *evp = NULL;
+    if (a3) {
+        GEpollEvent g;
+        if (copy_from_guest(c, &g, a3, sizeof g) < 0) return (u64)(s64)-EFAULT;
+        ev.events = g.events;
+        ev.data.u64 = g.data;
+        evp = &ev;
+    }
+    return epoll_ctl((int)a0, (int)a1, (int)a2, evp) < 0 ? host_err() : 0;
+}
+
+SYSDEF(epoll_pwait) {
+    /* (epfd, events, maxevents, timeout, sigmask, sigsetsize). The mask and
+     * its size are judged first (set_user_sigmask runs before do_epoll_wait
+     * looks at anything else), then maxevents. */
+    u64 gmask = 0;
+    if (a4) {
+        int e = pwait_mask_read(c, a4, a5, &gmask);
+        if (e < 0) return (u64)(s64)e;
+    }
+    /* ep_check_params's bound is EP_MAX_EVENTS, INT_MAX over the size of an
+     * event -- not a size of ours. The bounce buffer IS bounded: the kernel
+     * hands back what is ready up to maxevents, and a call answered with
+     * fewer events than that is indistinguishable from one on a quieter
+     * queue (whatever was not delivered stays on the ready list for the next
+     * call), so the cap goes on the buffer, never on the argument. */
+    int maxevents = (int)a2;
+    if (maxevents <= 0 || maxevents > INT_MAX / (int)sizeof(GEpollEvent))
+        return (u64)(s64)-EINVAL;
+    if (maxevents > 4096) maxevents = 4096;
+    sigset_t ss, *ssp = NULL;
+    if (a4) {
+        pwait_host_mask(&ss, gmask);
+        ssp = &ss;
+        if (pwait_mask_enter(c, gmask)) return (u64)(s64)-EINTR;
+    }
+    struct epoll_event *evs = malloc(sizeof *evs * (size_t)maxevents);
+    if (!evs) { if (ssp) pwait_mask_leave(c); return (u64)(s64)-ENOMEM; }
+    int tmo = (int)a3;
+    syscall_wait_begin_ms(&tmo);
+    int r = epoll_pwait((int)a0, evs, maxevents, tmo, ssp);
+    if (ssp) pwait_mask_leave(c);
+    if (r < 0) { u64 e = host_err(); free(evs); return e; }
+    for (int i = 0; i < r; i++) {
+        GEpollEvent g = { .events = evs[i].events, .__pad = 0, .data = evs[i].data.u64 };
+        if (copy_to_guest(c, a1 + (u64)i * sizeof g, &g, sizeof g) < 0) {
+            free(evs);
+            return (u64)(s64)-EFAULT;
+        }
+    }
+    free(evs);
+    return (u64)r;
+}

@@ -1,0 +1,614 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2026 Sylirre */
+/* Guest (user-space) memory access: a software page table mapping guest
+ * 4 KB pages to host pointers, behind the shared core's guest memory
+ * interface (lib/arm64/mem.h), whose slow paths and cache maintenance mem.c
+ * defines. Guest VAs are decoupled from host VAs, so a 39-bit guest address
+ * space works on 32-bit hosts. Beyond mem.h: the address space itself, and
+ * the bulk copies, loans and bus-fault recovery of the syscall layer. */
+#ifndef A64_MMU_H
+#define A64_MMU_H
+
+#include <setjmp.h>
+
+#include "cpu.h"
+#include "mem.h"
+
+/* PROBE_ONCE, the work-it-out-once flag, is lib/arm64's (types.h). */
+
+/* The calling thread runs c from here on: point c at this thread's own
+ * translation caches (cpu.h's CpuEngine, c->eng), which every guest access
+ * reaches through the CPU, and set its mode (user mode, guest threads
+ * running concurrently). Called by every thread that takes up a CPU -- the
+ * main thread at startup, a new guest thread on its copy of its creator's,
+ * and a thread adopting another CPU's state wholesale (an exec's) -- before
+ * its first guest memory access.
+ *
+ * Those caches and the D-TLB they point at live in the thread's own storage.
+ * The D-TLB is filled for the TBI-stripped page, and its entries are checked
+ * against the address-space generation on every access (CpuEngine.gen_src):
+ * every PTE mutation, by any thread, bumps it, so one thread's munmap or
+ * mprotect invalidates every thread's cached translations at their next
+ * access. tlb_flush_all forces the calling thread's caches to re-sync. */
+void as_cpu_attach(CPU *c);
+/* Ask for the attention of the CPU the calling thread runs, if it has one
+ * yet (cpu.h, cpu_attn); and that CPU itself, or NULL. Async-signal-safe. */
+void as_cpu_attn(void);
+CPU *as_cpu_current(void);
+
+/* ---- host bus-error recovery (mem.c) ----
+ * A file truncated from outside this address space leaves PTEs pointing at
+ * host pages the kernel now refuses; the resulting SIGBUS lands on the
+ * emulator rather than the guest. as_bus_init installs the handler, and the
+ * run loop brackets the execution engines with bus_setjmp(&g_bus_jb) +
+ * as_bus_arm/as_bus_disarm so a recoverable fault can unwind to a point where
+ * the CPU struct is the whole guest state. The engine bracket is armed ONLY
+ * around the engines: it unwinds all the way to the run loop, and a syscall
+ * handler on that path may hold locks the unwind would strand.
+ *
+ * The syscall layer reaches guest memory too -- every bulk copy helper below
+ * memcpys through a translated host pointer -- and it gets the second bracket,
+ * BUS_ARM_COPY (BUS_GUARD_BEGIN/END). That one unwinds no further than the
+ * helper it is written in, so nothing an outer frame holds is stranded, and
+ * the helper reports the fault as EFAULT: what a kernel's own copy_to_user
+ * does with a page past end-of-file.
+ *
+ * On 32-bit ARM Bionic the bracket must not use libc sigsetjmp: that
+ * implementation cookie-mangles the LIVE sp register in place (eor sp, sp,
+ * cookie ... stores ... eor back), so for a dozen instructions per call the
+ * thread's stack pointer names unmapped memory. The bracket runs once per
+ * run-loop iteration, and the ptrace kick net makes async signals constant
+ * traffic, so a delivery inside that window was a per-minute event on an
+ * armv7 Android 7 device -- and its kernel answered by killing the process
+ * with a forced SIGSEGV (SI_KERNEL, fault addr 0: the signal-frame write
+ * has nowhere to go). bus_setjmp/bus_longjmp are a plain callee-saved
+ * save/restore that keeps a real stack pointer in sp at every instruction;
+ * everywhere else they are libc sigsetjmp/siglongjmp with savemask 0. */
+struct CPU;
+#if defined(__arm__) && defined(__BIONIC__)
+typedef struct { u64 raw[14]; } BusJmpBuf;  /* r4-r11, sp, lr, fpscr, d8-d15 */
+int bus_setjmp(BusJmpBuf *jb);
+void bus_longjmp(BusJmpBuf *jb, int val) __attribute__((noreturn));
+#else
+typedef sigjmp_buf BusJmpBuf;
+#define bus_setjmp(jb)       sigsetjmp(*(jb), 0)
+#define bus_longjmp(jb, val) siglongjmp(*(jb), val)
+#endif
+extern __thread BusJmpBuf g_bus_jb;        /* engine bracket (loop.c) */
+extern __thread BusJmpBuf g_bus_copy_jb;   /* syscall-copy bracket (below) */
+extern __thread int g_bus_armed;
+#define BUS_ARM_ENGINE 1   /* record the guest abort, then unwind to loop.c */
+#define BUS_ARM_COPY   2   /* unwind only: the bracketed copy reports EFAULT */
+void as_bus_init(void);
+void as_bus_arm(struct CPU *c, int mode);
+void as_bus_disarm(void);
+
+/* Bracket a guest-memory touch made outside the engines (the copy helpers in
+ * mem.c, and the few syscall-layer sites that write through a translated
+ * pointer of their own) so a host bus error returns `failval` instead of
+ * killing the emulator. Place BEGIN before the first touch and END on every
+ * path out; a `return` from the fault path runs END itself. A void function
+ * passes an empty failval -- a comment is one, being replaced by a space
+ * before the macro is expanded.
+ *
+ * The saved arming state, rather than a plain disarm at END, is what makes
+ * the bracket nest: inside the engine bracket it hands control back to it,
+ * and inside another copy bracket it restores the frame that one would unwind
+ * to. Nothing nests today -- no copy helper calls another -- but a bracket
+ * that breaks silently when one does is not worth having. */
+#define BUS_GUARD_BEGIN(cpu, failval)                                        \
+    BusJmpBuf bus_outer_jb_;                                                 \
+    volatile int bus_prev_ = g_bus_armed;                                    \
+    if (bus_prev_ == BUS_ARM_COPY)                                           \
+        __builtin_memcpy(&bus_outer_jb_, &g_bus_copy_jb,                     \
+                         sizeof bus_outer_jb_);                              \
+    if (bus_setjmp(&g_bus_copy_jb) != 0) { BUS_GUARD_END(); return failval; } \
+    as_bus_arm((cpu), BUS_ARM_COPY)
+#define BUS_GUARD_END()                                                      \
+    do {                                                                     \
+        if (bus_prev_ == BUS_ARM_COPY)                                       \
+            __builtin_memcpy(&g_bus_copy_jb, &bus_outer_jb_,                 \
+                             sizeof bus_outer_jb_);                          \
+        g_bus_armed = bus_prev_;                                             \
+    } while (0)
+
+/* ---- Guest address space (linux-user), defined in mem.c ---- */
+
+#define GUEST_VA_BITS   47
+#define GUEST_TASK_SIZE (1ULL << GUEST_VA_BITS)
+
+/* AArch64 TBI0: on Linux, EL0 data accesses run with TCR_EL1.TBI0=1, so the top
+ * byte (VA bits [63:56]) is ignored during translation. Bionic's scudo allocator
+ * stores a tag there and dereferences the tagged pointer; the mask strips it. */
+#define A64_TBI_MASK    0x00ffffffffffffffULL
+
+/* The kernel's untagged_addr: the top byte gone, bit 55 carried up -- what an
+ * address-space syscall (munmap, mprotect, madvise, ...) takes a tagged
+ * address for, whatever the tagged-address ABI says; one with bit 55 set is
+ * no user address then, and fails the call's range check as it should. */
+static inline u64 a64_untag(u64 va) { return (u64)((s64)(va << 8) >> 8); }
+
+/* Guest page protection (software-enforced; PTE low bits). */
+#define PTE_R 1u
+#define PTE_W 2u
+#define PTE_X 4u
+#define PTE_FLAGS 7u
+
+/* One host mmap allocation. Several Regions can reference it after munmap/
+ * mremap trims or splits a mapping; the allocation is released only when the
+ * last one goes away. Slice-wise release is impossible in general: on hosts
+ * with pages larger than the guest's 4 KB an interior slice can't be munmapped
+ * independently, and a trimmed fragment's host pointer (4 KB-aligned only)
+ * need not even be a valid munmap address there. */
+typedef struct HostMap {
+    u8    *base;              /* mmap base (host-page aligned) */
+    size_t len;               /* mmap length */
+    int    refs;              /* Regions referencing this allocation */
+    int    pins;              /* runs of it lent to host syscalls in flight
+                               * (guest_lend): while any are, the allocation
+                               * is neither retired nor given new backing */
+    struct HostMap *orphan_next;  /* on AddrSpace.orphans: no Region left, a
+                                   * loan still out (see hmap_unref) */
+    u8    *rw_lo;             /* lowest byte the host lets us touch: `base`,
+                               * except under a stack (guest_map_stack), whose
+                               * allocation starts with room reserved for it
+                               * to grow into -- inaccessible and uncommitted
+                               * below here, handed over as the growth
+                               * reaches it (mem.c, as_stack_grow) */
+    u8    *fresh_hi;          /* ...and [rw_lo, fresh_hi) has never been any
+                               * region's: still the zeroes the host handed
+                               * out, where the rest may hold what a slice
+                               * unmapped off a stack's bottom left behind */
+    u8     hostlocked;        /* some of it has been mlock'ed on the host
+                               * (host_lock_sync): unlocked whole at its
+                               * retirement, not when the deferred munmap
+                               * finally comes */
+} HostMap;
+
+typedef struct Region {
+    u64  start, end;          /* guest range [start, end), page aligned */
+    u32  prot;                /* PTE_R/W/X */
+    u32  shared;              /* MAP_SHARED file mapping (host prot mirrors) */
+    u32  file;                /* file-backed: `path` is only a /proc/maps name,
+                               * and is set for the ELF image alone, so it can't
+                               * be used to tell a file mapping from anonymous */
+    u32  wr_ok;               /* the host backing may be made writable: always so
+                               * except for a MAP_SHARED mapping of a fd that was
+                               * not opened for writing (mprotect -> EACCES) */
+    u8  *host;                /* host address backing `start`: hmap->base plus a
+                               * pad for a MAP_SHARED mapping whose 4 KB-aligned
+                               * file offset isn't host-page aligned (host page
+                               * > 4 KB), plus whatever head trims consumed */
+    HostMap *hmap;            /* refcounted host allocation backing this region */
+    char *path;               /* strdup'd guest path for /proc/self/maps, or NULL */
+    u64  file_off;            /* file offset at `start` (file-backed only) */
+    u64  dev, ino;            /* the mapped file's identity, so a later truncate
+                               * can find the mappings it invalidates */
+    u32  hostmap;             /* backed by a real host mapping OF THE FILE, so a
+                               * page past end-of-file faults. True of every
+                               * file-backed region -- an anonymous one is the
+                               * only kind without it */
+    u32  anon_shm;            /* MAP_SHARED|MAP_ANONYMOUS: the backing is a memfd
+                               * this emulator made, standing in for the shmem
+                               * object the kernel's shmem_zero_setup makes */
+    u64  shm_size;            /* ...and that object's size, which is the
+                               * mapping's length at mmap time and never
+                               * changes: a page at or past it is past
+                               * end-of-file (a grow reaches there). The
+                               * memfd's own size is rounded up to a host page
+                               * and is no guide on a host with bigger ones */
+    u32  mfdcnt;              /* counted in the memfd tier's writable-shared
+                               * mapping census (F_SEAL_WRITE's EBUSY check):
+                               * region_insert/-delete keep the broker's count
+                               * in step as splits copy and unmaps retire it */
+    u32  forkflags;           /* RF_*: what a fork child gets of this region
+                               * (madvise MADV_DONTFORK / MADV_WIPEONFORK).
+                               * Travels with the region through splits, trims
+                               * and moves, the way vm_flags travel with a vma */
+    u32  growsdown;           /* VM_GROWSDOWN: the main stack, or anonymous
+                               * private memory mapped MAP_GROWSDOWN. A fault
+                               * in the hole below grows it down to meet the
+                               * fault (as_stack_grow); it is the stack in
+                               * every size a guest reads about itself, and
+                               * what mprotect(PROT_GROWSDOWN) reaches down
+                               * through to the region's start. Travels like
+                               * forkflags */
+    u32  stack_id;            /* ...and which stack: every growsdown mapping
+                               * gets an id of its own, which its splits and
+                               * the pieces it grows keep (0: none). A stack
+                               * that grew past the host room under its
+                               * backing goes on in a region of its own below
+                               * -- another allocation, nothing moved -- and
+                               * the two are still ONE mapping to the guest
+                               * wherever they agree (as_same_vma) */
+    u32  lock;                /* RL_*: what mlock(2) and its kin made of it,
+                               * the kernel's VM_LOCKED and VM_LOCKONFAULT.
+                               * Travels like forkflags; a fork child's are
+                               * cleared (dup_mmap), an exec's are gone */
+    u32  special;             /* never locked, nor counted: the sigreturn
+                               * trampoline, which stands for the vDSO a
+                               * kernel maps VM_DONTEXPAND (mlock_fixup skips
+                               * every VM_SPECIAL vma) */
+    u32  shm_lock;            /* a System V segment this process attached
+                               * and saw SHM_LOCKed (at its shmat, or its own
+                               * shmctl): the host keeps its pages as they are
+                               * faulted in, best effort -- the kernel's lock
+                               * is on the segment's pages, wherever mapped */
+} Region;
+
+/* Region.lock (and AddrSpace.def_lock, which mlockall(MCL_FUTURE) sets for
+ * every mapping made after it). */
+#define RL_LOCKED  1u         /* VM_LOCKED: its pages kept resident */
+#define RL_ONFAULT 2u         /* VM_LOCKONFAULT: ...as they are faulted in,
+                               * not populated up front */
+
+/* Region.forkflags. RF_DONTFORK leaves the range out of a fork child's address
+ * space altogether (the kernel's VM_DONTCOPY); RF_WIPEONFORK hands the child
+ * zeroes there and stays set in the child (VM_WIPEONFORK, private anonymous
+ * memory only). Neither means anything to vfork, whose child shares the
+ * space. Applied on the child side of fork by as_fork_child. */
+#define RF_DONTFORK   1u
+#define RF_WIPEONFORK 2u
+
+/* Host backing whose guest mapping is gone but whose munmap is deferred:
+ * another guest thread may still hold a translated host pointer or a stale
+ * (lazily invalidated) D-TLB entry into it. Drained at as_destroy. */
+typedef struct RetiredMap {
+    void  *addr;
+    size_t len;
+    unsigned long gen;        /* address-space generation at retirement: this
+                               * backing is unreachable to any thread that has
+                               * emptied its D-TLB at or after it (mem.c) */
+} RetiredMap;
+
+/* A second-level table: 1 << 14 PTEs covering 64 MiB of guest VA, plus the
+ * count of live ones. The count is what lets an unmap hand the 128 KiB block
+ * back as soon as its last page goes (mem.c); without it a guest that churns
+ * fresh mappings kept one alive for every 64 MiB of address space it ever
+ * touched. Defined in mem.c -- nothing outside it walks the table. */
+struct L2Table;
+
+typedef struct AddrSpace {
+    struct L2Table **l1;      /* [1 << (47-26)] L1 entries -> L2[1 << 14] */
+    struct L2Table *l2spare;  /* one emptied table, kept for the next mapping:
+                               * a guest that unmaps and maps again inside the
+                               * same 64 MiB would otherwise free and re-zero a
+                               * 128 KiB block every time round (mem.c) */
+    Region *regions;          /* sorted by start */
+    int nregions, cap_regions;
+    RetiredMap *retired;      /* quarantined host backing (see hmap_unref, mem.c) */
+    int nretired, cap_retired;
+    HostMap *orphans;         /* allocations whose last Region went while a run
+                               * of them was lent out: retired by the last
+                               * guest_unlend instead (mem.c) */
+    int nthreads;             /* guest threads sharing this space (atomic).
+                               * 1 means the whole quarantine can go at once: no
+                               * other D-TLB exists to hold a stale pointer. */
+    u64 brk_start, brk;       /* program break */
+    u64 mmap_next;            /* bump allocator for mmap(NULL, ...) */
+    u64 stack_top;            /* initial stack top (guest VA) */
+    /* What the ELF loader knows about the image it laid out, and the guest can
+     * read back about itself (/proc/<pid>/{status,statm,stat}). Named after the
+     * mm_struct fields they answer, and derived the way binfmt_elf derives
+     * them: the code span is the PF_X PT_LOADs, the data span every PT_LOAD's
+     * (last vaddr, highest file end), and start_stack with the arg and env
+     * bounds describe the argv+envp string block at the top of the stack. */
+    u64 start_code, end_code;
+    u64 start_data, end_data;
+    u64 start_stack;
+    u64 arg_start, arg_end, env_start, env_end;
+    u64 peak;                 /* high-water mapped bytes (VmPeak): raised by
+                               * every mapping that grows the space, since only
+                               * an unmap can lower the total */
+    u64 peak_rss;             /* highest resident set yet SAMPLED (VmHWM) --
+                               * see as_meminfo, which is where sampling
+                               * happens */
+    u32 npgtables;            /* live second-level tables (VmPTE) */
+    u32 stack_ids;            /* the last Region.stack_id handed out */
+    u64 locked_vm;            /* pages, the kernel's mm->locked_vm (VmLck):
+                               * a counter, moved where the kernel moves it,
+                               * and so not always the sum of the locked
+                               * regions -- a MREMAP_DONTUNMAP of a locked
+                               * mapping counts the new one and never takes
+                               * the old one back, as the kernel does */
+    u32 def_lock;             /* RL_* every new mapping gets: mm->def_flags,
+                               * from mlockall(MCL_FUTURE [| MCL_ONFAULT]) */
+} AddrSpace;
+
+/* The guest's memory footprint as its own /proc reports it. Bytes throughout;
+ * a kernel prints kB in status and pages in statm/stat, and the callers there
+ * divide. `rss_ok` is 0 on a host whose mincore(2) would not answer (and under
+ * ARM64EMU_MINCORE_FORCE_FAIL, which is how that tier is tested elsewhere): the
+ * resident set is unknowable there, the rss_* fields are left zero, and the
+ * caller falls back to the host's own figures -- bounded, since the host
+ * process is the emulator and its resident set is not the guest's. */
+typedef struct {
+    u64 size, peak;              /* total_vm, hiwater_vm */
+    u64 data, stack, exec;       /* data_vm, stack_vm, exec_vm */
+    u64 rss_anon, rss_file, rss_shmem, rss_peak;
+    u64 pgtables;
+    int rss_ok;
+} AsMem;
+
+void as_init(AddrSpace *as);
+/* as_init for execve's in-place reload: resets everything EXCEPT nthreads,
+ * which lock-free readers in other threads may sample at any instant (a
+ * transient 0 there ends the process; see the definition). */
+void as_reinit_live(AddrSpace *as);
+/* Tear down all guest mappings and host backing (execve, exit). */
+void as_destroy(AddrSpace *as);
+
+/* Address-space mutation lock (held across find-free + map in the syscall
+ * layer so concurrent guest threads can't claim the same VA range). Recursive:
+ * the guest_* helpers below also take it. */
+void as_lock(void);
+void as_unlock(void);
+
+/* Map/unmap/protect guest pages (addr/len page aligned). Returns 0 or -errno.
+ * guest_map_anon allocates zeroed host backing; guest_map_file maps host_fd. */
+int  guest_map_anon(AddrSpace *as, u64 addr, u64 len, u32 prot);
+int  guest_map_file(AddrSpace *as, u64 addr, u64 len, u32 prot, int host_fd,
+                    u64 off, int shared, const char *path);
+/* A VM_GROWSDOWN mapping -- the main stack, an mmap(MAP_GROWSDOWN) -- whose
+ * host backing has room below it to grow into: toward `limit` bytes in all,
+ * the guest's RLIMIT_STACK (G_RLIM_INFINITY for none), which an ILP32 host
+ * goes by and an LP64 one reserves past (mem.c, GROW_ROOM_MAX). */
+int  guest_map_stack(AddrSpace *as, u64 addr, u64 len, u32 prot, u64 limit);
+int  guest_unmap(AddrSpace *as, u64 addr, u64 len);
+/* mremap(2) primitives. guest_remap_move re-points the guest VA of an existing
+ * mapping without touching its backing (so MAP_SHARED, the file behind a file
+ * mapping and the protection all survive the move); guest_remap_grow extends
+ * the mapping ending at addr + old_len, or fails rather than substitute
+ * backing that maps something else. `in_place` says the mapping has not just
+ * been moved there: such a grow is refused (-ENOMEM) where it would copy a
+ * private mapping lent to a host syscall onto new backing (guest_lend). */
+int  guest_remap_move(AddrSpace *as, u64 addr, u64 len, u64 dst);
+int  guest_remap_grow(AddrSpace *as, u64 addr, u64 old_len, u64 new_len,
+                      int in_place);
+/* mremap(addr, 0, len, MREMAP_MAYMOVE): a second mapping, at `dst` (free
+ * ground), of the shareable object mapped at addr -- len bytes of it from
+ * the offset addr names. -EFAULT with nothing under addr, -EINVAL for a
+ * private mapping (the kernel refuses to "duplicate" one of those). */
+int  guest_remap_dup(AddrSpace *as, u64 addr, u64 len, u64 dst);
+/* mremap(MREMAP_DONTUNMAP): [addr, addr+len) moves to dst and stays mapped
+ * afresh behind (mem.c has the per-kind story). 0 or -errno. */
+int  guest_remap_dontunmap(AddrSpace *as, u64 addr, u64 len, u64 dst);
+/* madvise's fork-inheritance advice over [addr, addr+len): every region inside
+ * gets `set` added to and `clear` taken from its forkflags, in address order,
+ * the regions at the edges being split first so nothing outside the range is
+ * touched. `anon_only` refuses a file-backed or shared region with -EINVAL
+ * and stops there, leaving the regions before it changed -- which is what
+ * the kernel's walk does. -ENOMEM when the range has a hole in it, after the
+ * mapped parts have been advised (madvise_walk_vmas). Caller holds as_lock. */
+int  guest_fork_advise(AddrSpace *as, u64 addr, u64 len, u32 set, u32 clear,
+                       int anon_only);
+/* The child side of fork (not vfork): drop every RF_DONTFORK region and zero
+ * every RF_WIPEONFORK one. The forking thread is the only one here. */
+void as_fork_child(AddrSpace *as);
+/* vfork write tracking (mem.c, "the child's writes, tracked for the parent"):
+ * a vfork child calls _begin before its first instruction, _flush at its exec
+ * / exit / death -- `grow` is handed each stack the child grew (an address
+ * that was its start, and its start now), then `emit` each run of changed
+ * bytes, either stopping the walk by returning nonzero -- and a fork child of
+ * a tracked process calls _fork_child to start clean. _tracking says whether
+ * this process is one. The parent grows its own stack to what the child's
+ * reached with as_stack_grow_shared: the vma the two share grew by the
+ * child's rules, so it takes none of the parent's limits, only free ground
+ * to grow over. 0, or -1. */
+void as_vfork_track_begin(AddrSpace *as);
+int  as_vfork_flush(AddrSpace *as, int (*emit)(void *ctx, u64 va, const u8 *data, u32 len),
+                    int (*grow)(void *ctx, u64 was, u64 start), void *ctx);
+int  as_stack_grow_shared(CPU *c, u64 was, u64 start);
+void as_vfork_fork_child(void);
+int  as_vfork_tracking(void);
+void as_vfork_note_write(AddrSpace *as, u64 va, size_t len);   /* before a host-side write */
+/* Empty and publish this thread's D-TLB epoch, releasing its hold on the
+ * retired-backing quarantine. Called at the run-loop safepoint. */
+void as_tlb_quiesce_self(void);
+/* Bracket a stretch where this thread cannot run guest code (the syscall
+ * dispatch): while blocked it stops holding retired backing back. */
+void as_tlb_block_begin(void);
+void as_tlb_block_end(void);
+/* Drop every other thread's published epoch after a fork: they describe
+ * threads that do not exist in the child. */
+void as_tlb_fork_child(void);
+void as_thread_enter(AddrSpace *as);    /* a guest thread joins this space */
+void as_thread_exit(AddrSpace *as);    /* ...and leaves it, dropping its epoch */
+/* Undo an enter for a thread that never started. The creator calls it, so it
+ * touches only the count -- never the caller's own epoch (mem.c). */
+void as_thread_enter_undo(AddrSpace *as);
+/* A file changed size: drop the guest PTEs of any mapping of it that now
+ * reaches past end-of-file, so an access faults instead of reaching a host page
+ * the kernel would refuse (mem.c). */
+void as_file_resized(AddrSpace *as, u64 dev, u64 ino, u64 newsize);
+int  guest_protect(AddrSpace *as, u64 addr, u64 len, u32 prot);
+/* Bytes of guest address space currently mapped (what RLIMIT_AS bounds), and
+ * the subset of it that is a data mapping -- private, writable, not the main
+ * stack -- which is what RLIMIT_DATA bounds. */
+u64  as_mapped_bytes(AddrSpace *as);
+u64  as_data_bytes(AddrSpace *as);
+/* Everything the guest can read about its own footprint, in one walk. Samples
+ * the resident set (mincore over the host backing), so it also moves the
+ * VmHWM high-water mark. Takes as_lock itself. */
+void as_meminfo(AddrSpace *as, AsMem *out);
+/* The address-space figures a guest process publishes for the others to read:
+ * what its own /proc/<pid>/{statm,stat} report, in bytes. Published by the
+ * owner on every change (as_publish), because another process's sizes live in
+ * its own emulator's region list and nothing else can see them -- without
+ * this, ps and top inside the guest read the emulator's VSZ for every process
+ * but the one doing the reading. The resident set is deliberately NOT here:
+ * sampling it costs a mincore walk over every region, far too much to run on
+ * each mmap, so another process's RSS stays the host's approximation. */
+typedef struct ProcMem {
+    u64 size, data, stack, exec, peak, pgtables, locked;
+    u64 start_code, end_code, start_data, end_data;
+    u64 start_stack, start_brk;
+    u64 arg_start, arg_end, env_start, env_end;
+} ProcMem;
+
+/* This address space's figures in that form. */
+void as_procmem(AddrSpace *as, ProcMem *out);
+/* Republish this address space's figures into the shared registry. Done for
+ * free by every mapping call; needed explicitly only where something OTHER
+ * than a mapping changed them -- the ELF loader recording the image spans, and
+ * the fork path seeding its child's slot. */
+void as_publish(AddrSpace *as);
+/* Pick an unused guest VA range of `len` bytes (for mmap(NULL, ...)). */
+u64  as_find_free(AddrSpace *as, u64 len);
+/* Where `r` begins for placing a mapping below it: its start, less
+ * STACK_GUARD_GAP for a VM_GROWSDOWN region (vm_start_gap). */
+u64  as_gap_start(const Region *r);
+/* Page protection as mapped, PTE truth (caller holds as_lock); 0 = unmapped.
+ * For /proc/self/maps synthesis. */
+u32  as_page_prot(AddrSpace *as, u64 va);
+/* Name pathless regions in [start, end) (ELF images, for /proc/self/maps). */
+void as_set_region_path(AddrSpace *as, u64 start, u64 end, const char *path);
+/* Duplicate a region's path label, the one piece of region metadata a caller
+ * outside mem.c also sets (sys_mm.c names a memfd mapping). NULL in, NULL out;
+ * an allocation failure ends the process, as it does for every other piece of
+ * this bookkeeping. See mem.c for why a label must not be dropped quietly. */
+char *as_path_dup(const char *path);
+/* Caller must hold as_lock: the region array is realloc'd/memmove'd by
+ * concurrent mappers, and the returned pointer is only valid while held. */
+const Region *as_find_region(AddrSpace *as, u64 va);
+/* The lowest-addressed mapping that ends above `va` (it may contain `va`), or
+ * NULL if nothing does. Lets a walker cross an unmapped gap in one step
+ * instead of a page at a time -- a range the guest names can span the whole
+ * address space, and the kernel walks it vma by vma. Same locking as above. */
+const Region *as_next_region(AddrSpace *as, u64 va);
+/* Are `a` and `b` -- `a` immediately below `b` in the list -- parts of ONE
+ * mapping as the guest knows it: two pieces of a stack that grew past the
+ * host room under its backing (Region.stack_id), agreeing in everything else
+ * a vma carries. /proc/<pid>/maps prints them as one line, and a stack's
+ * size, its growth limit and mprotect(PROT_GROWSDOWN) take them together. */
+int  as_same_vma(const Region *a, const Region *b);
+/* The bounds of the mapping region `i` of as->regions is a part of
+ * (as_same_vma). Caller holds as_lock. */
+u64  as_vma_start(AddrSpace *as, int i);
+u64  as_vma_end(AddrSpace *as, int i);
+/* stack_guard_gap: how far below a VM_GROWSDOWN region the kernel keeps the
+ * next accessible mapping, when it grows the region and when it places a
+ * mapping (vm_start_gap) -- 256 pages, the default of its boot parameter. */
+#define STACK_GUARD_GAP (256ULL << 12)
+
+/* mem_host_ptr (mem.h) is the substrate for the futex, atomics and DC ZVA
+ * fast paths too. Its slow path here resolves a missed page, and may grow a
+ * stack down to `va` to do it, but never moves one: the caller may still
+ * hold a pointer an earlier call handed out (mem.c). */
+/* Could an access of `acc` reach [va, va+size) (within one guest page)? A
+ * page mapped with the permission, or one under a stack that the access would
+ * grow the stack over -- without growing it: the copy that touches the page
+ * does that, as a kernel's does, and only if bytes move at all. */
+bool mem_reachable(CPU *c, u64 va, unsigned size, AccType acc);
+
+/* ---- lending guest memory to a host syscall (mem.c) ----
+ * A large transfer is not staged through a bounce buffer: the host syscall is
+ * handed the guest's own backing instead, as the runs of host memory that back
+ * the guest's buffer -- so the emulator never has to find room for what the
+ * guest merely named, and the host kernel moves the bytes exactly as the
+ * guest's kernel would, datagram, atomicity and all (sys_file.c, xfer_begin).
+ *
+ * What makes that safe is the pin. A thread parked in a host syscall does not
+ * hold the retired-backing quarantine open (as_tlb_block_begin), so without
+ * one an allocation another thread unmapped meanwhile could be released and
+ * its host range reused -- and the host kernel would then write the guest's
+ * bytes into whatever the emulator put there. A pinned allocation is never
+ * retired while its loan is out (its last unmap parks it on the orphan list,
+ * and the last guest_unlend retires it), and the one resize that copies a
+ * mapping to new backing under a guest VA that stays put declines instead, so
+ * a transfer in flight always lands in the pages the guest will look at.
+ *
+ * guest_lend appends the runs backing [va, va+len) -- each page permitted for
+ * `acc`, as rw_room judges it, with a vfork child's write tracking healed on
+ * the way -- to iov[*n..cap), the allocation under each in pin[]. A run is one
+ * allocation's contiguous host memory, extended only by this call, so every
+ * guest segment keeps a run boundary of its own. Returns the bytes covered,
+ * and *why says what stopped it short -- a stack's hole among the rest, which
+ * is never lent: the walk grows no stack (mem_stack_hole below). guest_unlend
+ * releases the first `n` entries of pin[] (NULL entries are skipped). */
+#define LEND_ALL  0   /* covered the whole range */
+#define LEND_CUT  1   /* a page not mapped for `acc`: where rw_room stops */
+#define LEND_FULL 2   /* `cap` runs are in use */
+struct iovec;
+size_t guest_lend(CPU *c, u64 va, size_t len, AccType acc, struct iovec *iov,
+                  HostMap **pin, int *n, int cap, int *why);
+void guest_unlend(CPU *c, HostMap **pin, int n);
+/* A transfer's bytes in a stack's hole. A kernel grows the stack over the
+ * hole when its copy touches it, which is when the copy moves a byte there
+ * or from there -- not before the call, and not for one that moves none (a
+ * read at end-of-file, a write to a pipe with no reader, to /dev/null) --
+ * and never for its GUP, which an O_DIRECT transfer pins its pages by. So
+ * the transfer is set up without growing anything (rw_room looks,
+ * guest_lend stops), and grows the stack after the host call as far as the
+ * host got (sys_file.c, xfer_end).
+ *   mem_stack_hole        the run of a stack's hole at `va`, up to `len`:
+ *                         unmapped pages a touch would grow the stack over,
+ *                         with `acc` permitted once it has; 0 when `va` is
+ *                         not in one. A look.
+ *   mem_stack_touch       grow the stack over `va` as an access with `acc`
+ *                         would: 1 when it is mapped now.
+ *   copy_from_guest_look  copy_from_guest_partial, growing nothing: the bytes
+ *                         before the first page it cannot read as it is. */
+/* Locked memory (mem.c, "locked memory"). Caller holds as_lock but for
+ * as_mlock_populate, which takes it.
+ *   as_lock_range       apply_vma_lock_flags: [start, start+len) given RL_*
+ *                       `flags` (0 unlocks) region by region; -ENOMEM at a
+ *                       hole, what came before it done; -EINVAL for a range
+ *                       that wraps.
+ *   as_locked_pages     pages of [start, start+len) already locked
+ *                       (count_mm_mlocked_page_nr).
+ *   as_lock_all         mlockall: `def` for later mappings, and every region
+ *                       given `flags` when `current`.
+ *   as_lock_new         a mapping just made, given the lock it is born with
+ *                       (MAP_LOCKED, mlockall(MCL_FUTURE)).
+ *   as_mlock_populate   mlock's populate: -ENOMEM where GUP cannot fault a
+ *                       locked page in (PROT_NONE, a file's end).
+ *   as_mlock_future_ok  mlock_future_ok: may `bytes` more of a mapping locked
+ *                       as `lock` be locked under RLIMIT_MEMLOCK?
+ *   as_cap_ipc_lock     CAP_IPC_LOCK, which lifts that limit: a fake root's.
+ *   as_set_special      the region at `va` is never locked (the trampoline). */
+int  as_lock_range(AddrSpace *as, u64 start, u64 len, u32 flags);
+u64  as_locked_pages(AddrSpace *as, u64 start, u64 len);
+void as_lock_all(AddrSpace *as, u32 def, int current, u32 flags);
+void as_lock_new(AddrSpace *as, u64 start, u64 len, u32 flags);
+int  as_mlock_populate(CPU *c, u64 start, u64 len);
+struct Machine;
+int  as_mlock_future_ok(struct Machine *m, u32 lock, u64 bytes);
+int  as_cap_ipc_lock(struct Machine *m);
+void as_set_special(AddrSpace *as, u64 va);
+/* A SHM_LOCKed segment attached at [va, va+len), or no longer locked: the
+ * host's locks on its pages follow (Region.shm_lock). */
+void as_shm_lock_hint(AddrSpace *as, u64 va, u64 len, int on);
+size_t mem_stack_hole(CPU *c, u64 va, size_t len, AccType acc);
+int    mem_stack_touch(CPU *c, u64 va, AccType acc);
+size_t copy_from_guest_look(CPU *c, void *dst, u64 va, size_t len);
+/* fork(2) child: the loans of the threads that did not come across are gone. */
+void as_lend_fork_child(AddrSpace *as);
+
+/* ---- JIT data-TLB seam ----
+ * The JIT probes the thread's D-TLB (mem.h's entry layout, c->eng) inline,
+ * and on any miss, permission failure or page crossing calls the mem_* slow
+ * path, which refills it. Its inline probe skips the per-access generation
+ * check: jit_dtlb_reset empties this thread's D-TLB and resyncs it to the
+ * current address-space generation -- what translate() does lazily -- at the
+ * JIT's safepoint, eagerly. */
+void  jit_dtlb_reset(void);
+
+/* Bulk copies for the syscall layer. Never raise guest exceptions.
+ * Return 0, or -EFAULT on an unmapped/forbidden page. */
+long copy_from_guest(CPU *c, void *dst, u64 va, size_t len);
+long copy_to_guest(CPU *c, u64 va, const void *src, size_t len);
+/* Partial variants for process_vm_readv/writev: return the byte count copied
+ * before the first unmapped/forbidden page (0..len), never negative. */
+size_t copy_from_guest_partial(CPU *c, void *dst, u64 va, size_t len);
+size_t copy_to_guest_partial(CPU *c, u64 va, const void *src, size_t len);
+/* Like copy_to_guest but bypasses the software write-permission check to patch
+ * a read-only code page (ptrace POKETEXT of a breakpoint), invalidating any JIT
+ * translations over the range. -EIO on unwritable (MAP_SHARED read-only) host
+ * backing. See mem.c. */
+long copy_to_guest_code(CPU *c, u64 va, const void *src, size_t len);
+/* NUL-terminated string copy; returns length (excluding NUL), or -EFAULT /
+ * -ENAMETOOLONG if no NUL within max. */
+long copy_str_from_guest(CPU *c, char *dst, u64 va, size_t max);
+
+#endif /* A64_MMU_H */

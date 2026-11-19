@@ -913,7 +913,7 @@ static void ld_rdx_disp(Emit *e, const IROp *p, int reg, s32 d) {
 
 /* k same-base constant-offset accesses behind ONE span-checked probe
  * (LDP/STP shapes, DC ZVA's eight stores, prologue spill runs). The bail
- * path (miss / span page-cross / TBI / perm — or ARM64CHROOT_JIT_SLOWMEM) re-runs
+ * path (miss / span page-cross / TBI / perm — or ARM64EMU_JIT_SLOWMEM) re-runs
  * every access through its helper in program order, each with its own
  * baked pc and fault exit, so a fault at access j leaves accesses < j
  * committed and j's destination unwritten, exactly like the interpreter.
@@ -4252,7 +4252,7 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             emit_call1(be, o);
             break;
 
-        case IRO_CPULD: {                        /* dst = *(CPU+imm); arm64emu's
+        case IRO_CPULD: {                        /* dst = *(CPU+imm); the
                                                   * w=0 form: u32 zero-extended */
             int hd = ra_def(be, o->dst);
             if (o->w) ld64(e, hd, R14, (s32)o->imm);   /* movs: flag-safe */

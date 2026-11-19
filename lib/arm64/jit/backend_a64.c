@@ -2413,7 +2413,7 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             emit_call1(be, o);
             break;
 
-        case IRO_CPULD: {                        /* dst = *(CPU+imm); arm64emu's
+        case IRO_CPULD: {                        /* dst = *(CPU+imm); the
                                                   * w=0 form: u32 zero-extended */
             int hd = ra_def(be, o->dst);
             ei(e, enc_ldr(o->w ? 3 : 2, (unsigned)hd, 28, (unsigned)o->imm));

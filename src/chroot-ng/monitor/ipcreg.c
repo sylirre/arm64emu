@@ -2,7 +2,7 @@
 /* Copyright 2026 Sylirre */
 /* Daemon-side System V semaphores and message queues (see src/chroot-ng/include/cng/ipcreg.h).
  *
- * Ported from the sem/msg half of arm64chroot's proctab.c. Runs only inside the
+ * Ported from the sem/msg half of arm64emu's proctab.c. Runs only inside the
  * broker daemon, single-threaded from the poll loop in broker.c, so nothing here
  * needs locking. Freestanding like the rest of the monitor: raw syscalls through
  * the gate, no libc — which is the one structural difference from the original,

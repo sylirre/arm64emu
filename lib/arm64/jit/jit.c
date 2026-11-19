@@ -913,7 +913,7 @@ void jit_run(CPU *c, u64 deadline) {
      * left a window: a signal caught between the look and the clear lost its
      * flag and kept its attention unseen, and a block chained to itself then
      * spun on, deaf to the same signals arriving again, which are queued
-     * once (tests/arm64chroot/fixtures/sigtramp.c). The interrupt lines are
+     * once (tests/arm64emu/chroot/fixtures/sigtramp.c). The interrupt lines are
      * asked directly as well: generated code unmasks inline (MSR DAIF,
      * DAIFClr: frontend.c), without the poll the interpreter's unmask
      * makes. */

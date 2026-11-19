@@ -5,7 +5,7 @@
  * queues — and the emulated rtnetlink sockets (netlink.c), whose requests it
  * answers the moment they arrive.
  *
- * Ported from arm64chroot's proctab.c, whose daemon multiplexes both over a
+ * Ported from arm64emu's proctab.c, whose daemon multiplexes both over a
  * single abstract-socket rendezvous. chroot-ng grew the daemon first for
  * --shared-proc (see procreg.h); this file is that daemon, generalized from a
  * one-byte handshake to a tagged request protocol so the shm side (shm.c) can

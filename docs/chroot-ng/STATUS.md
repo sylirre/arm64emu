@@ -156,7 +156,7 @@ kernel 3.18 (Galaxy S7).
   learned to ask the object where its code is).
 
 - [x] **M9 — robust link2symlink (backing-file scheme, `-l`/`--link2symlink`)**
-  Ported from `/home/sol/arm64chroot`. Where the host refuses `link(2)`
+  Ported from arm64emu's chroot mode. Where the host refuses `link(2)`
   (Android/SELinux → EACCES/EXDEV, some EPERM), a guest hardlink group is
   represented in the directory of the first-linked name by a hidden backing file
   `.l2s.<ino>` holding the real contents, with every "hardlink" name a
@@ -197,7 +197,7 @@ kernel 3.18 (Galaxy S7).
   l2s droppings. The first-link `rename` into the store keeps the original
   inode (stable `st_ino`, pinned against reuse); on `EXDEV` (bind mount from
   another filesystem) or an unusable store it falls back to the M9
-  per-directory scheme. The legacy format (what arm64chroot writes) stays
+  per-directory scheme. The legacy format (what arm64emu writes) stays
   fully recognized: stat/decref/bump work on old groups, cross-dir links join
   them via absolute targets, and a legacy name mv'ed to another directory is
   repointed afterwards (`cng_l2s_rename_prep`/`_fixup`).
@@ -223,23 +223,23 @@ kernel 3.18 (Galaxy S7).
     active from startup (the on-disk state survives sessions) and installs the
     monitor by itself; `fstat` + `getdents64` are trapped only under `-l`
     (`l2s_syscalls[]` in seccomp.c). `CHROOTNG_L2S_FORCE=1` routes every `linkat`
-    through the emulation (test aid mirroring arm64chroot's `A64_L2S_FORCE`).
+    through the emulation (test aid mirroring arm64emu's `A64_L2S_FORCE`).
   - Acceptance: `tests/chroot-ng/m10_l2s_shell.sh` runs 13 shell scenarios in an Alpine
     rootfs under `chroot-ng -R -l` + `CHROOTNG_L2S_FORCE=1` and compares stdout +
-    exit status **byte-for-byte** against stock arm64chroot creating REAL
+    exit status **byte-for-byte** against stock arm64emu creating REAL
     hardlinks from the same scripts: ln basics (nlink/inode equality),
     cross-dir ln, `ls -a` hiding, readlink refusal, write-through, cross-dir
     `mv`, rm-one/rm-all + `rmdir`, `rm -rf` over groups, dup-`ln` EEXIST,
     busybox tar round-trip, `cmp` on a linked binary, and two-session
-    persistence. It also runs arm64chroot's own `--link2symlink` C tests
-    (`tests/arm64chroot/c/l2s_{access,nofollow,rename}.c`, `rename` with and
+    persistence. It also runs arm64emu's own `--link2symlink` C tests
+    (`tests/arm64emu/chroot/c/l2s_{access,nofollow,rename}.c`, `rename` with and
     without `exchange`) against the same oracle, in a rootfs copy whose
     writable `/.l2s` puts them on the central store. Running them against
     chroot-ng first (2026-10-31, before the engine became shared) found that
     a rename of a group's LAST name left the data file and marker behind
     (with `/` as the rootfs, the legacy layout, inside the source directory,
     which could then never be removed); `cng_l2s_rename_last` now moves the
-    data file onto the destination instead, as arm64chroot does. A Debian/GNU leg (`find -samefile`, GNU stat) is gated on a
+    data file onto the destination instead, as arm64emu does. A Debian/GNU leg (`find -samefile`, GNU stat) is gated on a
     translation smoke test — it skips under qemu (ld.so-loaded libc.so has no
     rewritten svc sites; the seccomp tier covers it on devices).
   - Accepted divergences (deliberate, documented):
@@ -449,7 +449,7 @@ kernel 3.18 (Galaxy S7).
   Still unsupported: a file we do **not** own and cannot read — there is no bit
   to borrow and no descriptor to copy.
 
-- [x] **M11 — /proc emulation (ported from `/home/sol/arm64chroot`)**
+- [x] **M11 — /proc emulation (ported from arm64emu's chroot mode)**
   The host `/proc` now passes through to the guest automatically (a rootfs
   directory tree has none, and mounting one needs privileges we do not have),
   with two layers on top: a **hidden-process view** and **synthesized files**.
@@ -470,7 +470,7 @@ kernel 3.18 (Galaxy S7).
     `MAP_SHARED` table in which each guest process publishes its argv, environ,
     auxv, exe and cwd. By default the backing is one anonymous region inherited
     across fork (one invocation's view); with **`--shared-proc`** it is served
-    per-rootfs by arm64chroot's broker design — a detached daemon owning an
+    per-rootfs by arm64emu's broker design — a detached daemon owning an
     anonymous memfd (the table) and an abstract-namespace socket (the
     rendezvous), handing the memfd to every joining invocation over
     `SCM_RIGHTS`, so `ps`/`top` in one session see the guest processes of
@@ -489,7 +489,7 @@ kernel 3.18 (Galaxy S7).
     the recorded `/proc/<pid>/stat` starttime **on every membership check**:
     exit is not a trapped syscall (and a SIGKILL never could be), so without
     that a foreign process reusing a dead guest's pid would inherit its
-    visibility — this covers even the signal-killed case that arm64chroot's
+    visibility — this covers even the signal-killed case that arm64emu's
     exit-hook unregister cannot. The starttime itself is read dir-then-
     `openat("stat")`: the same file on a real kernel, and under qemu-user (the
     dev workflow) the only spelling that dodges qemu's realpath'd
@@ -514,7 +514,7 @@ kernel 3.18 (Galaxy S7).
     +rereads it every cycle, so a snapshot would freeze `top`. The refreshable
     files are moved to a reserved high fd range (the top 16 below `RLIMIT_NOFILE`)
     and the filter traps the whole read family — `read`, `readv`, `pread64`,
-    `preadv`, `preadv2`, the same set arm64chroot hooks — **only for fds in
+    `preadv`, `preadv2`, the same set arm64emu hooks — **only for fds in
     that range**, where the dispatcher regenerates content read from offset 0.
     Ordinary reads stay untrapped; a guest fd that lands in the range is just
     re-issued.
@@ -558,26 +558,26 @@ kernel 3.18 (Galaxy S7).
   process that is gone reads as a generic /proc regular file, where the kernel
   would still have the pinned inode); `mmap` of such an fd works read-only
   where the real file answers `ENODEV`, and `fsync` returns 0 where it is
-  `EINVAL`; `/proc/version` passes through (arm64chroot must keep it in
+  `EINVAL`; `/proc/version` passes through (arm64emu must keep it in
   step with the kernel identity its `uname` fakes; chroot-ng fakes neither);
   an explicit `-b DIR:/proc` outranks the synthesis (the user overriding the
-  view — arm64chroot keys its synthesis on the guest path, so there it outlives
+  view — arm64emu keys its synthesis on the guest path, so there it outlives
   a bind); and without `--shared-proc` two separate chroot-ng invocations over
   one rootfs do not share a registry, so each hides the other's processes
-  (matching arm64chroot's default). One place chroot-ng is
-  deliberately *stricter* than arm64chroot: there, a `-b /proc:/proc` bind wins
+  (matching arm64emu's default). One place chroot-ng is
+  deliberately *stricter* than arm64emu: there, a `-b /proc:/proc` bind wins
   over the `/proc` zone in the path layer, so a host process stays reachable by
   explicit path (only the listing is filtered); here the hidden view is keyed on
   the resolved host path, so both routes are closed.
 
-- [x] **M12 — System V shared memory (ported from `/home/sol/arm64chroot`)**
+- [x] **M12 — System V shared memory (ported from arm64emu's chroot mode)**
   Android denies `shmget`/`shmat`/`shmdt`/`shmctl` outright — they are off the
   app seccomp allow-list and SELinux forbids the class — so any guest that uses
   them (PostgreSQL, X clients, dpkg's plumbing, anything linked against a stock
   libc's shm functions) died on the first call. All four are now trapped and
   served in-process from `src/chroot-ng/monitor/shm.c`, with **no host SysV IPC syscall
   and no `/dev/shm` anywhere in the path**. Trapped unconditionally, as in
-  arm64chroot: the guest gets one shm namespace whatever the host's own IPC
+  arm64emu: the guest gets one shm namespace whatever the host's own IPC
   would have allowed.
   - **The broker owns the segments** (`src/chroot-ng/monitor/broker.c`). Somebody has to
     hold each segment's backing fd for its lifetime, and it cannot be a guest
@@ -588,7 +588,7 @@ kernel 3.18 (Galaxy S7).
     and closes it at once, so a process holds a segment only as a mapping. This
     is the same daemon M11's `--shared-proc` registry already used: its
     one-byte handshake became a tagged request protocol so one rendezvous
-    serves the PID table and the segment registry, exactly as arm64chroot's
+    serves the PID table and the segment registry, exactly as arm64emu's
     `proctab.c` multiplexes them. It is spawned lazily on the first shm call —
     safe from inside the SIGSYS handler because everything it runs is our own
     gate-issued syscalls, which our filter allows by instruction pointer.
@@ -596,14 +596,14 @@ kernel 3.18 (Galaxy S7).
     (keyed by a pid+clock nonce seeded in the root process and fork-inherited,
     so one launch's process tree shares a namespace and separate launches do
     not), widened to per-rootfs by **`--shared-proc`**.
-  - **Attach addresses become mmap flags.** arm64chroot mapped into a synthetic
+  - **Attach addresses become mmap flags.** arm64emu mapped into a synthetic
     guest address space; here the guest's address space is ours, so `shmaddr` is
     an `mmap` hint: `SHM_RND` rounds down to the page size (SHMLBA on arm64),
     `SHM_REMAP` is `MAP_FIXED`, and an occupied range is `MAP_FIXED_NOREPLACE`
     → `EINVAL`. Pre-4.17 kernels ignore that flag and treat the address as a
     hint, so a returned address that is not the requested one is unmapped and
     answered `EINVAL` — what `shmat` would have said.
-  - **`nattch` without an exit hook.** arm64chroot detaches from its
+  - **`nattch` without an exit hook.** arm64emu detaches from its
     `exit`/`exit_group` handlers; chroot-ng traps neither (same reason the PID
     registry has no exit hook — a `SIGKILL` could never be trapped either), so
     process death is the *normal* way an attach goes away here. The broker
@@ -627,7 +627,7 @@ kernel 3.18 (Galaxy S7).
     emulation, until the first native run. The address rules now come first,
     in the kernel's order, ahead of the broker's lookup and permission check.
   - **Tested differentially.** `tests/chroot-ng/guests/shm_sysv.c` and `shm_stat.c`
-    (arm64chroot's own, written for exactly this comparison) plus `shm_exec.c`
+    (arm64emu's own, written for exactly this comparison) plus `shm_exec.c`
     run once under the emulation and once straight under qemu-aarch64, where
     the same code gets the genuine article — the host kernel's
     `shmget`/`shmctl` and qemu's own `shmat`; stdout must match byte for byte,
@@ -639,7 +639,7 @@ kernel 3.18 (Galaxy S7).
     is the one part with no counterpart to diff against.
 
 - [x] **M13 — `-b SRC:DST[:ro]`: oracle-compatible bind syntax + read-only binds**
-  `-b` took `GUEST:HOST`; arm64chroot takes `SRC:DST` — host first. Same flag,
+  `-b` took `GUEST:HOST`; arm64emu takes `SRC:DST` — host first. Same flag,
   same syntax, opposite meaning, and nothing diagnosed a swap. The order is now
   the oracle's, and `:ro` (which used to be parsed as part of the host path, so
   `-b /etc:/etc:ro` produced the host path `/etc:ro`) is a real read-only mount.
@@ -714,8 +714,8 @@ kernel 3.18 (Galaxy S7).
   and a guest linked against liburing (recent Node, Tokio, fio) addresses the
   **host** filesystem directly. Unlike every other gap this is not a missing
   translation — there is no interception point to add — so the ring must not be
-  created at all. arm64chroot reaches the same conclusion by `-ENOSYS`.
-  - New **designed-ENOSYS set** (`enosys_syscalls[]`, arm64chroot's
+  created at all. arm64emu reaches the same conclusion by `-ENOSYS`.
+  - New **designed-ENOSYS set** (`enosys_syscalls[]`, arm64emu's
     `quiet_enosys`): the one piece of policy chroot-ng needs that is not
     translation. Answered with `SECCOMP_RET_ERRNO`, so the kernel refuses them
     itself — no signal, no handler, and it holds where nested SIGSYS delivery
@@ -896,7 +896,7 @@ kernel 3.18 (Galaxy S7).
     SELinux denial is on `bind(2)`, not on the query, so `RTM_GETLINK`,
     `RTM_GETADDR` *and* `RTM_GETROUTE` can all be relayed through a host netlink
     socket we open, send on and read from without ever binding it — verified
-    directly before committing to the design. arm64chroot relays only GETROUTE
+    directly before committing to the design. arm64emu relays only GETROUTE
     that way and rebuilds the other two from `getifaddrs`; relaying all three is
     both far less code (about 300 lines against its 1246) and **more faithful**,
     since every reply is the kernel's own rather than an approximation. It is
@@ -1004,7 +1004,7 @@ kernel 3.18 (Galaxy S7).
 
 - [x] **`ip addr` on-device fix: iproute2's dump contract, and no more relay buffer**
   Reported from a device: `ip addr` printed `DONE truncated / Dump terminated` and
-  nothing else, where arm64chroot listed every interface. Two defects, and the
+  nothing else, where arm64emu listed every interface. Two defects, and the
   first explains the message exactly.
   - **`NLMSG_DONE` must carry a 4-byte error int.** iproute2's
     `rtnl_dump_done()` rejects a terminator shorter than
@@ -1053,7 +1053,7 @@ kernel 3.18 (Galaxy S7).
     that, while accepting the bare `rtgenmsg` (family byte only) form that
     Bionic's `getifaddrs(3)` sends. Two pieces of evidence agree: the split
     between the two request types above, and the blank `link/ether` fields in
-    arm64chroot's own output on the same device — the signature of Android's MAC
+    arm64emu's own output on the same device — the signature of Android's MAC
     scrubbing, which proves `RTM_GETLINK` data *is* obtainable there via
     getifaddrs. That is also why the oracle works: it never issues the rich form,
     because it builds link replies out of getifaddrs.
@@ -1094,7 +1094,7 @@ kernel 3.18 (Galaxy S7).
   fine. That is Android's real policy: link dumps expose MAC addresses, so app
   domains are refused them under `nlmsg_readpriv` in **every** request form,
   while address and route dumps are plain `nlmsg_read`. Relaying GETLINK can
-  never work there — and the oracle never tries: arm64chroot synthesizes its
+  never work there — and the oracle never tries: arm64emu synthesizes its
   link replies out of getifaddrs (whose Bionic implementation has its own
   fallback for exactly this restriction).
   - **Synthesis (netlink.c):** a refused GETLINK is rebuilt the oracle's way,
@@ -1104,7 +1104,7 @@ kernel 3.18 (Galaxy S7).
     fleshed out with SIOCGIFNAME/FLAGS/MTU/HWADDR ioctls, and rendered with
     the oracle's exact recipe: hardcoded txqlen 1000, operstate from IFF_UP,
     IFF_LOWER_UP from IFF_RUNNING, IFLA_ADDRESS absent when the host refuses
-    the MAC (the blank `link/ether ` arm64chroot shows). Zero interfaces —
+    the MAC (the blank `link/ether ` arm64emu shows). Zero interfaces —
     including the no-relay degradation — presents loopback alone, as the
     oracle does; a non-dump GETLINK filters by ifindex/IFLA_IFNAME and answers
     ENODEV for a miss. A refused GETADDR falls back to loopback addresses.
@@ -1171,7 +1171,7 @@ kernel 3.18 (Galaxy S7).
   from a clean environment: `-E/--env VAR=VAL` entries (repeatable, up to
   `CNG_MAX_ENV` = 128) plus `TERM`/`COLORTERM`, the two that describe the
   terminal both sides share. Oracle parity — `busybox env` under `-E FOO=bar`
-  prints the same three lines arm64chroot does.
+  prints the same three lines arm64emu does.
   - The host/guest split is explicit in the code now: `cng_g_envp` — read by every
     `CNG_*` knob and by `cng_broker_env` — is `cng_g_host_envp`, and the guest's
     vector is assembled by `build_guest_env` (`src/chroot-ng/run.c`) and handed to
@@ -1209,7 +1209,7 @@ kernel 3.18 (Galaxy S7).
     symlinked `<program>` reported the link rather than the file it named — and
     `comm`, which is taken from the same recorded program.
   - Oracle parity in all four combinations (absolute/relative x file/symlink):
-    arm64chroot answers `exe=/bin/exeprobe comm=exeprobe` for each, and so do we
+    arm64emu answers `exe=/bin/exeprobe comm=exeprobe` for each, and so do we
     now; two of the four used to abort and one was wrong.
   - **Tests:** M7 gained five legs on a new `tests/chroot-ng/guests/exeprobe.c` (reads its
     own exe link and comm), including the reported form — identity rootfs plus a
@@ -1243,7 +1243,7 @@ kernel 3.18 (Galaxy S7).
     right is no working directory at all). Identity-rootfs legs run on every host;
     the rootfs legs need a live translation tier (`guest_xlate_ready`) because
     `getcwd` must come from the virtual cwd. Four of them are byte-for-byte
-    differentials against arm64chroot's own `-w`. Suite: 387 passed, 0 failed.
+    differentials against arm64emu's own `-w`. Suite: 387 passed, 0 failed.
 
 - [x] **M17-7 — a bad guest pointer answers `EFAULT` instead of killing the guest**
   The syscalls the monitor *emulates* rather than re-issues read and write the
@@ -1542,7 +1542,7 @@ kernel 3.18 (Galaxy S7).
     exists for `NETLINK_ROUTE` (`cng_nl_audit_refusal`, `netlink.c`). A host
     that grants the socket is untouched, and no other family or protocol is
     looked at.
-  - **Divergence from the oracle, deliberate:** arm64chroot gates the same shim
+  - **Divergence from the oracle, deliberate:** arm64emu gates the same shim
     on `fake_id && euid == 0`, framing it as part of the pretend-to-be-root
     story (`src/chroot-ng/sys_net.c`). Here it is gated on the host's refusal alone. The
     refusal is the policy's and does not depend on the guest's credentials —
@@ -1579,7 +1579,7 @@ kernel 3.18 (Galaxy S7).
   post-`execve` `SIGTRAP` at all, because our execve never enters the kernel's
   exec path. It is now emulated end to end, in-process, needing no host ptrace
   permission (Android denies it), no `/proc/pid/mem` and no `process_vm_readv`.
-  Model ported from arm64chroot's `ptracetab.c`, with the register file coming
+  Model ported from arm64emu's `ptracetab.c`, with the register file coming
   from the frame the kernel hands us at a stop rather than from an emulated CPU:
   - **The registry** (`src/chroot-ng/monitor/ptrace.c`): one `MAP_SHARED` anonymous
     mapping created before the guest's first fork, so every guest process has it
@@ -1756,7 +1756,7 @@ kernel 3.18 (Galaxy S7).
     without the option of splicing a tag in (the guest would still share the
     host's queue limits and show up in its `/dev/mqueue`).
   - **Refused** with `SECCOMP_RET_ERRNO(ENOSYS)`, which is the oracle's answer
-    (arm64chroot has no handler at all) and what the guest already sees on
+    (arm64emu has no handler at all) and what the guest already sees on
     Android, where all six are off the app allow-list. The four
     descriptor-taking calls are refused with the two name-taking ones: with no
     queue there is nothing to send on, and a bare `mq_getsetattr` on some other
@@ -1815,7 +1815,7 @@ kernel 3.18 (Galaxy S7).
   The richer answer M12's follow-up note asked for, replacing the ENOSYS refusal:
   `semget`/`semop`/`semtimedop`/`semctl` and `msgget`/`msgsnd`/`msgrcv`/`msgctl`
   are emulated from the same per-namespace daemon shm uses. Ported from
-  arm64chroot's `sys_ipc.c` and the sem/msg half of its `proctab.c`. This is also
+  arm64emu's `sys_ipc.c` and the sem/msg half of its `proctab.c`. This is also
   the only way the guest has them at all on Android, where the whole SysV family
   is off the app seccomp allow-list.
   - **All state lives in the daemon** (`src/chroot-ng/monitor/ipcreg.c`), unlike shm, whose
@@ -3501,7 +3501,7 @@ kernel 3.18 (Galaxy S7).
   Android's SELinux policy refuses an app all of `/proc/sys`, and a guest
   that cannot read `overflowuid` and `overflowgid` is not hypothetical:
   bubblewrap reads them before it does anything else and dies with "Can't
-  read /proc/sys/kernel/overflowuid". Ported from arm64chroot's
+  read /proc/sys/kernel/overflowuid". Ported from arm64emu's
   `sys_procfs.c`, which already served them.
   - Same try-host-first rule as `/proc/stat`: the host file is probed once
     per name, and only where it cannot be opened is the open served from a
@@ -3599,7 +3599,7 @@ kernel 3.18 (Galaxy S7).
   was false, bash ran non-interactively, and readline's `tcsetattr` would have
   been refused the same way. Measured on the device (Android, 5.15 GKI) with a
   probe: on a pty slave and on a pipe `TCGETS` is answered and `TCGETS2` is
-  `EACCES`; the ptmx master is let through. Found by reading arm64chroot's
+  `EACCES`; the ptmx master is let through. Found by reading arm64emu's
   `sys_file.c`, which had the same defect and the same fix.
   - The four requests (`TCGETS2`, `TCSETS2`, `TCSETSW2`, `TCSETSF2`) are now
     trapped by the filter, always — a short list of `JEQ`s behind the SIOCxIF
@@ -3629,7 +3629,7 @@ kernel 3.18 (Galaxy S7).
   - `CHROOTNG_TERMIOS2_DENY=1` refuses the four before the host is asked, as the
     policy does (listed in `--help`), so a host that serves them takes the
     same path.
-  - Not ported: arm64chroot's first commit, which only added the four to its
+  - Not ported: arm64emu's first commit, which only added the four to its
     ioctl whitelist. chroot-ng has no whitelist to be missing from; the guest's
     ioctl reaches the kernel untouched unless the filter traps it.
   - Tests: `-t bpftest` has the four requests (trap, with and without a `:ro`
@@ -3679,7 +3679,7 @@ kernel 3.18 (Galaxy S7).
   asks which session a terminal belongs to. The policy of M78 refuses it too:
   measured on the device, `EACCES` on a pty slave and on a pipe, where a
   kernel answers the session or `ENOTTY`; the ptmx master is let through.
-  Found next to M78, with the same probe, and ported from arm64chroot.
+  Found next to M78, with the same probe, and ported from arm64emu.
   - The request is trapped (one more `JEQ` in the terminal list) and
     answered by `tty_tiocgsid`. The host is asked first, with the guest's
     pointer; on `EACCES` the answer is worked out from commands the policy
@@ -3751,7 +3751,7 @@ kernel 3.18 (Galaxy S7).
   without it, beside the first name), which names the data file beside it,
   `<indirection>.<CCCC>`, CCCC the live count. The guest-level walk re-rooted
   those host paths, so every name dangled into `<rootfs><rootfs>/.l2s`: cat,
-  exec and stat failed and `rm` left the count where it was. arm64chroot gained
+  exec and stat failed and `rm` left the count where it was. arm64emu gained
   the same support in its `8f03716`, and the owner chose full bookkeeping over
   a read-only presentation.
   - Read: `cng_l2s_resolve` recognizes a member when the whole chain checks

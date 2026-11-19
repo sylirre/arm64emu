@@ -8,7 +8,7 @@
  * it — glibc/musl `getifaddrs(3)`, iproute2 (`ip link/addr/route`), bubblewrap's
  * `loopback_setup()`, and glibc's netlink-based source-address selection — so
  * without a shim they all fail inside the guest. This is the largest pure
- * functionality gap against arm64chroot, and it is on chroot-ng's own target
+ * functionality gap against arm64emu, and it is on chroot-ng's own target
  * platform.
  *
  * The trick that makes it small: **an unbound socket can still dump.** Android
@@ -18,7 +18,7 @@
  * plain `nlmsg_read` and relay fine, while RTM_GETLINK needs `nlmsg_readpriv`
  * (link dumps expose MAC addresses) and app domains are refused it in *every*
  * request form — the sendto itself fails with EACCES. A dump the host refuses
- * to answer is therefore synthesized instead, the way arm64chroot builds its
+ * to answer is therefore synthesized instead, the way arm64emu builds its
  * link replies (sys_netlink.c build_host_links): interfaces enumerated from
  * the one dump Android leaves open (RTM_GETADDR — the same enumeration
  * Bionic's getifaddrs falls back to under this policy), fleshed out with
@@ -414,7 +414,7 @@ static long open_hostfd(int no_relay) {
  * refuses nothing. That is exactly the split observed on-device, where
  * RTM_GETLINK came back refused and RTM_GETADDR (which iproute2 sends without
  * the extra attribute) went through, leaving `ip addr` with an empty link list
- * and so nothing at all to print. It is also why arm64chroot works there: it
+ * and so nothing at all to print. It is also why arm64emu works there: it
  * builds its link replies from getifaddrs, i.e. from this same minimal form.
  *
  * Dropping the request's filter attributes means the kernel may return more than
@@ -505,7 +505,7 @@ struct ifinfo {
 /* Append an RTM_NEWLINK describing one interface. Attribute set and the values
  * an app cannot query (txqlen 1000, operstate from IFF_UP, IFF_LOWER_UP from
  * IFF_RUNNING) mirror the oracle's nl_build_link, which is what the on-device
- * `ip addr` output has always shown under arm64chroot. */
+ * `ip addr` output has always shown under arm64emu. */
 static long put_link(unsigned char *buf, long off, long max, unsigned seq,
                      unsigned pid, unsigned short nlflags,
                      const struct ifinfo *fi) {
@@ -639,7 +639,7 @@ static int is_error(const unsigned char *buf, long len) {
 /* Enumerate interface indices from our own RTM_GETADDR dump on a throwaway
  * unbound socket — the one enumeration Android's policy leaves open, and the
  * same one Bionic's getifaddrs falls back to when RTM_GETLINK is refused. So
- * the guest sees the interface set arm64chroot shows there: everything that
+ * the guest sees the interface set arm64emu shows there: everything that
  * carries at least one address; an interface with none stays invisible,
  * because an app has no way to learn of it. `scratch` is borrowed for the
  * receive buffer (the caller's reply buffer, not yet written). */
@@ -759,7 +759,7 @@ static int gather_ifinfo(long ioctlfd, int index, struct ifinfo *fi) {
     if (CNG_SYS(__NR_ioctl, ioctlfd, SIOCGIFHWADDR_, (long)&ifr, 0, 0, 0) == 0) {
         /* A sockaddr whose sa_family is the ARPHRD_* type. Android refuses
          * this to apps; then the attribute is simply absent, which is the
-         * blank `link/ether ` arm64chroot prints on-device. */
+         * blank `link/ether ` arm64emu prints on-device. */
         fi->hwtype = *(unsigned short *)ifr.u;
         memcpy(fi->hwaddr, ifr.u + 2, 6);
         fi->hwlen = 6;
@@ -1311,7 +1311,7 @@ long cng_nl_socket(long domain, long type, long protocol) {
  * returns exactly that for a protocol nobody registered — so that is what the
  * guest is told, and every one of those tools proceeds.
  *
- * Deviation from the oracle, deliberate: arm64chroot gates this on
+ * Deviation from the oracle, deliberate: arm64emu gates this on
  * `fake_id && euid == 0`, framing it as part of the pretend-to-be-root story.
  * Here it is gated on the host's refusal alone, for two reasons. The refusal is
  * the SELinux policy's and does not depend on the guest's credentials — real or

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Sylirre
+# Cross-engine differential fuzzing: random instruction blocks over the JIT's
+# inlined surface (tests/arm64emu/boot/scripts/fuzz_gen.c), each image run under the plain
+# interpreter, the predecoded tier, --jit, and --jit with the memory/fusing/V-cache machinery
+# individually disabled. The blocks are fault-free and device-free, so every
+# configuration must produce byte-identical output (serial + cpu_dump +
+# HLT line). A run that never reaches HLT (maxinsn hit) is a generator bug.
+#
+# Env: ARM64EMU_SEEDS (default 200), ARM64EMU_NINSNS (0 = seed-derived size sweep),
+#      ARM64EMU_EMU / ARM64EMU_RUNNER as in run_tests.sh, CC for the generator build,
+#      ARM64EMU_FUZZ_KEEP=dir to keep failing images (default build/tests/arm64emu/boot/fuzz_failures),
+#      ARM64EMU_TIMEOUT the per-run wall-clock ceiling (seconds).
+set -u
+# The runtime default is the host wall clock (ARM64EMU_RTCLOCK=1); pin the deterministic
+# instruction-count clock so every engine config is byte-identical even when a
+# fuzzed block reads CNTPCT/CNTVCT. Overridable for debugging.
+export ARM64EMU_RTCLOCK="${ARM64EMU_RTCLOCK:-0}"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+EMU="${ARM64EMU_EMU:-$ROOT/build/arm64emu}"
+SEEDS=${ARM64EMU_SEEDS:-200}
+NINSNS=${ARM64EMU_NINSNS:-0}
+KEEP="${ARM64EMU_FUZZ_KEEP:-$ROOT/build/tests/arm64emu/boot/fuzz_failures}"
+# Ceiling per run: a fuzzed block is 200k instructions at most, so this only
+# fires on one that has stopped retiring. Without it such a seed wedges the
+# whole sweep with no output rather than reporting a mismatch.
+ARM64EMU_TIMEOUT="${ARM64EMU_TIMEOUT:-60}"
+[ -x "$EMU" ] || { echo "build arm64emu first"; exit 1; }
+
+OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
+${CC:-cc} -std=c11 -O2 -Wall -Wextra -o "$OUT/fuzz_gen" \
+    "$ROOT/tests/arm64emu/boot/scripts/fuzz_gen.c" || exit 1
+
+CFGS="pd jit jit_slowmem jit_nofuse jit_novra"
+run_cfg() { # $1=cfg $2=bin $3=outprefix
+    local flags="" envs=""
+    case "$1" in
+        interp)      flags=--no-predecode ;;   # plain interpreter (opt out of the default tier)
+        pd)          ;;                  # predecoded tier is the default engine
+        jit)         flags=--jit ;;
+        jit_slowmem) flags=--jit; envs="ARM64EMU_JIT_SLOWMEM=1" ;;
+        jit_nofuse)  flags=--jit; envs="ARM64EMU_JIT_NOFUSE=1" ;;
+        jit_novra)   flags=--jit; envs="ARM64EMU_JIT_NOVRA=1" ;;
+    esac
+    timeout -k 5 "$ARM64EMU_TIMEOUT" env $envs ${ARM64EMU_RUNNER:-} "$EMU" boot $flags --bin "$2@0x40000000" \
+        --max-insn "${MAXI_OVERRIDE:-200000}" \
+        </dev/null >"$3.out" 2>"$3.err"
+}
+
+pass=0; fail=0; genbug=0
+for seed in $(seq 1 "$SEEDS"); do
+    BIN="$OUT/f$seed.bin"
+    "$OUT/fuzz_gen" "$seed" "$NINSNS" >"$BIN" || { echo "GENBUG seed=$seed (generator failed)"; genbug=$((genbug+1)); continue; }
+    run_cfg interp "$BIN" "$OUT/i"
+    if grep -q 'maxinsn reached' "$OUT/i.err"; then
+        echo "GENBUG seed=$seed (no HLT under interpreter — bad encoding?)"
+        mkdir -p "$KEEP"; cp "$BIN" "$KEEP/"; genbug=$((genbug+1)); continue
+    fi
+    bad=""
+    for cfg in $CFGS; do
+        run_cfg "$cfg" "$BIN" "$OUT/j"
+        cmp -s "$OUT/i.out" "$OUT/j.out" && cmp -s "$OUT/i.err" "$OUT/j.err" \
+            || bad="$bad $cfg"
+    done
+    # Phase 2: --bin HLT stops print no cpu_dump, so the HLT line above only
+    # compares x0/icount. Stop every config at the exact pre-HLT icount via
+    # --max-insn (instruction-exact in all engines) and compare the full
+    # register dump. The accelerated engines' interpret-tail covers the last
+    # ~256 insns, so this phase checks all GPRs/pc/nzcv while phase 1 keeps
+    # the tail natively executed.
+    I=$(grep -oE 'icount=[0-9]+' "$OUT/i.err" | head -1 | cut -d= -f2)
+    if [ -n "$I" ] && [ "$I" -gt 0 ]; then
+        MAXI_OVERRIDE=$I run_cfg interp "$BIN" "$OUT/mi"
+        for cfg in $CFGS; do
+            MAXI_OVERRIDE=$I run_cfg "$cfg" "$BIN" "$OUT/mj"
+            cmp -s "$OUT/mi.out" "$OUT/mj.out" && cmp -s "$OUT/mi.err" "$OUT/mj.err" \
+                || case " $bad " in *" $cfg "*) ;; *) bad="$bad $cfg(dump)";; esac
+        done
+    fi
+    if [ -n "$bad" ]; then
+        echo "FAIL seed=$seed diverging:$bad"
+        mkdir -p "$KEEP"; cp "$BIN" "$KEEP/"
+        for cfg in $bad; do
+            base=${cfg%(dump)}
+            if [ "$base" = "$cfg" ]; then
+                run_cfg "$base" "$BIN" "$OUT/j"
+                echo "--- interpreter vs $cfg (HLT-line diff, head) ---"
+                diff "$OUT/i.err" "$OUT/j.err" | head -8
+            else
+                MAXI_OVERRIDE=$I run_cfg "$base" "$BIN" "$OUT/mj"
+                echo "--- interpreter vs $cfg (full-dump diff, head) ---"
+                diff "$OUT/mi.err" "$OUT/mj.err" | head -8
+            fi
+        done
+        fail=$((fail+1))
+    else
+        pass=$((pass+1))
+    fi
+done
+echo "----"
+echo "passed=$pass failed=$fail genbugs=$genbug (seeds=$SEEDS)"
+[ "$fail" -eq 0 ] && [ "$genbug" -eq 0 ]

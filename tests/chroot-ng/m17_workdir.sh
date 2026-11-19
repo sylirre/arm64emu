@@ -186,14 +186,14 @@ elif [ "$m17w_probe" = 1 ]; then
     check_contains "and runs there" "rel=INSIDE_AB" "$out"
 fi
 
-# --- differential against arm64chroot ---------------------------------------
+# --- differential against arm64emu ------------------------------------------
 # The oracle has the same option; its resolution is the reference for ours.
 if [ "$m17w_probe" = 0 ]; then
     :   # guest_cc_report already said why there is nothing to run
 elif ! guest_xlate_ready "-w oracle differential"; then
     :   # our side of the diff would fail for want of translation, not for -w
 elif [ -z "$M17W_ORACLE" ] || [ ! -x "$M17W_ORACLE" ]; then
-    skip "-w oracle differential: no arm64chroot oracle for this host"
+    skip "-w oracle differential: no arm64emu oracle for this host"
 else
     # The tree moves out from under any bind first (Termux's $TMPDIR is inside
     # the bound $PREFIX), where the oracle would spell the cwd as the bind.
@@ -207,7 +207,7 @@ else
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
         _got=$(run -R $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
         # shellcheck disable=SC2086
-        _want=$("$M17W_ORACLE" $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
+        _want=$("$M17W_ORACLE" chroot $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
         if [ -n "$_want" ] && [ "$_got" = "$_want" ]; then
             pass=$((pass + 1)); printf '  ok   oracle parity: %s\n' "$_d"
         else

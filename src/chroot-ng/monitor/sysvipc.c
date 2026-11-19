@@ -2,7 +2,7 @@
 /* Copyright 2026 Sylirre */
 /* System V semaphores and message queues, guest side (see cng/sysvipc.h).
  *
- * Ported from arm64chroot's src/arm64chroot/sys_ipc.c. The emulator there copied every
+ * Ported from arm64emu's src/arm64emu/chroot/sys_ipc.c. The emulator there copied every
  * argument in and out of a synthetic guest address space; here the guest's
  * memory is simply ours — but that does not make it ours to dereference. This
  * runs inside the SIGSYS handler with SIGSEGV masked, where a fault is the

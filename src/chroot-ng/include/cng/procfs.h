@@ -33,7 +33,7 @@
  * else under /proc stays host passthrough, including stat() of these paths
  * (readers open and read them).
  *
- * Ported from arm64chroot's sys_procfs.c. What differs is what does NOT need
+ * Ported from arm64emu's sys_procfs.c. What differs is what does NOT need
  * synthesizing here: the guest is a real host process, so its status, stat,
  * statm and the /proc/<pid>/maps *addresses* are already true, and /proc/version
  * is correct because chroot-ng does not fake uname.

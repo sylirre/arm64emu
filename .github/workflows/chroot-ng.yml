@@ -13,10 +13,10 @@
 # at the top of the log. It provisions the guest userland too: the Alpine and
 # Debian images are fetched into build/cache/chroot-ng/rootfs on first use
 # (pinned by hash in tests/chroot-ng/lib.sh), and only their tarballs are cached
-# between runs here. `make test-chroot-ng` builds arm64chroot first, the oracle
-# the differential legs (M10 and friends) compare against — which is why
-# arm64chroot's sources are in the trigger paths below. lib/link2symlink is the
-# -l engine itself, compiled into both.
+# between runs here. `make test-chroot-ng` builds arm64emu first, whose chroot
+# mode is the oracle the differential legs (M10 and friends) compare against —
+# which is why arm64emu's sources are in the trigger paths below.
+# lib/link2symlink is the -l engine itself, compiled into both.
 
 name: chroot-ng
 
@@ -25,7 +25,7 @@ on:
     paths:
       - 'src/chroot-ng/**'
       - 'tests/chroot-ng/**'
-      - 'src/arm64chroot/**'
+      - 'src/arm64emu/**'
       - 'lib/arm64/**'
       - 'lib/link2symlink/**'
       - 'Makefile'
@@ -34,7 +34,7 @@ on:
     paths:
       - 'src/chroot-ng/**'
       - 'tests/chroot-ng/**'
-      - 'src/arm64chroot/**'
+      - 'src/arm64emu/**'
       - 'lib/arm64/**'
       - 'lib/link2symlink/**'
       - 'Makefile'

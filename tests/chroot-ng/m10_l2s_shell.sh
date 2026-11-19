@@ -1,6 +1,6 @@
 # M10: link2symlink guest-shell fidelity (sourced by tests/chroot-ng/run.sh).
 #
-# Differential against arm64chroot running REAL hardlinks: the oracle binary
+# Differential against arm64emu running REAL hardlinks: the oracle binary
 # has l2s compiled out and this host's filesystem allows link(2), so the same
 # shell script runs once with genuine hardlinks (oracle) and once with the
 # emulation forced on (CHROOTNG_L2S_FORCE routes every linkat through l2s). Stdout
@@ -15,7 +15,7 @@
 # milestone only runs where a matching build of it exists (tests/chroot-ng/lib.sh checks
 # its machine against the host's and drops it otherwise). Locations come from
 # tests/chroot-ng/lib.sh; M10_ORACLE/M10_ALPINE/M10_DEBIAN still override per-milestone.
-echo "== M10: l2s shell (differential vs arm64chroot real hardlinks) =="
+echo "== M10: l2s shell (differential vs arm64emu real hardlinks) =="
 
 M10_ORACLE="${M10_ORACLE:-$CHROOTNG_ORACLE}"
 M10_ALPINE="${M10_ALPINE:-$CHROOTNG_ALPINE}"
@@ -30,7 +30,7 @@ if [ -n "$M10_ORACLE" ] && [ -x "$M10_ORACLE" ] &&
     # Sanity: the oracle must produce real hardlinks (l2s compiled out).
     SAN=$(mktemp -d)
     cp -a "$M10_ALPINE/." "$SAN"
-    san=$("$M10_ORACLE" "$SAN" /bin/sh -c \
+    san=$("$M10_ORACLE" chroot "$SAN" /bin/sh -c \
         'cd /tmp; echo x>a; ln a b; stat -c %h a' 2>/dev/null)
     rm -rf "$SAN"
     if [ "$san" = "2" ]; then
@@ -46,7 +46,7 @@ fi
 l2s_diff() {
     RO=$(mktemp -d); REM=$(mktemp -d)
     cp -a "$M10_ALPINE/." "$RO"; cp -a "$M10_ALPINE/." "$REM"
-    out_o=$("$M10_ORACLE" "$RO" /bin/sh -c "$2" 2>/dev/null); rc_o=$?
+    out_o=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$2" 2>/dev/null); rc_o=$?
     out_e=$(run -R -l "$REM" /bin/sh -c "$2" 2>/dev/null); rc_e=$?
     if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
         pass=$((pass + 1)); echo "  ok   m10 $1"
@@ -157,8 +157,8 @@ if [ "$m10_ready" -eq 1 ]; then
     s2='cd /tmp; stat -c %h a b;
         [ "$(stat -c %i a)" = "$(stat -c %i b)" ] && echo same-ino; cat b;
         readlink b; echo rc=$?; ls -a'
-    o1=$("$M10_ORACLE" "$RO" /bin/sh -c "$s1" 2>/dev/null)
-    o2=$("$M10_ORACLE" "$RO" /bin/sh -c "$s2" 2>/dev/null); rc_o=$?
+    o1=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s1" 2>/dev/null)
+    o2=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s2" 2>/dev/null); rc_o=$?
     e1=$(run -R -l "$REM" /bin/sh -c "$s1" 2>/dev/null)
     e2=$(run -R -l "$REM" /bin/sh -c "$s2" 2>/dev/null); rc_e=$?
     if [ "$o1" = "$e1" ] && [ "$o2" = "$e2" ] && [ "$rc_o" = "$rc_e" ]; then
@@ -188,12 +188,12 @@ if [ "$m10_ready" -eq 1 ]; then
     s2='cd /tmp; echo copy >> a; busybox cat b; busybox stat -c %h a b;
         busybox rm a b; busybox ls -a'
     s3='cd /tmp; busybox cat a; busybox stat -c %h a b'
-    o1=$("$M10_ORACLE" "$RO/r" /bin/sh -c "$s1" 2>/dev/null)
+    o1=$("$M10_ORACLE" chroot "$RO/r" /bin/sh -c "$s1" 2>/dev/null)
     e1=$(run -R -l "$REM/r" /bin/sh -c "$s1" 2>/dev/null)
     cp -a "$RO/r" "$RO/c"; cp -a "$REM/r" "$REM/c"
-    o2=$("$M10_ORACLE" "$RO/c" /bin/sh -c "$s2" 2>/dev/null)
+    o2=$("$M10_ORACLE" chroot "$RO/c" /bin/sh -c "$s2" 2>/dev/null)
     e2=$(run -R -l "$REM/c" /bin/sh -c "$s2" 2>/dev/null)
-    o3=$("$M10_ORACLE" "$RO/r" /bin/sh -c "$s3" 2>/dev/null); rc_o=$?
+    o3=$("$M10_ORACLE" chroot "$RO/r" /bin/sh -c "$s3" 2>/dev/null); rc_o=$?
     e3=$(run -R -l "$REM/r" /bin/sh -c "$s3" 2>/dev/null); rc_e=$?
     if [ "$o1|$o2|$o3" = "$e1|$e2|$e3" ] && [ "$rc_o" = "$rc_e" ] &&
         [ -n "$o3" ]; then
@@ -248,7 +248,7 @@ if [ "$m10_ready" -eq 1 ]; then
        ./echo via-member; stat -c %h echo true;
        stat -c %h m1 m2; cat m2; ln m1 m3; rm m1; stat -c %h m2 m3;
        stat -c %h q /h/p; cat q; rm /h/p q; ls -a /h; rm b s/c; ls -a . s'
-    out_o=$("$M10_ORACLE" "$RO" /bin/sh -c "$s" 2>/dev/null); rc_o=$?
+    out_o=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s" 2>/dev/null); rc_o=$?
     out_e=$(run -R -l "$REM" /bin/sh -c "$s" 2>/dev/null); rc_e=$?
     if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
         pass=$((pass + 1)); echo "  ok   m10 proot-distro's groups read as hardlinks"
@@ -285,11 +285,11 @@ if [ "$m10_ready" -eq 1 ] && guest_xlate_ready "l2s raw-dirent leg" &&
     s1='cd /tmp; mkdir d d/sub; cd d; echo hi>a; ln a b; ln -s a s; ln a sub/c;
         /bin/dents . | sort; /bin/dents sub | sort'
     s2='cd /tmp/d; /bin/dents . | sort; /bin/dents sub | sort; stat -c %h a b sub/c'
-    o1=$("$M10_ORACLE" "$RO" /bin/sh -c "$s1" 2>/dev/null)
+    o1=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s1" 2>/dev/null)
     e1=$(run -R -l "$REM" /bin/sh -c "$s1" 2>/dev/null)
     mv "$RO" "$RO.moved"; mv "$REM" "$REM.moved"
     RO="$RO.moved"; REM="$REM.moved"
-    o2=$("$M10_ORACLE" "$RO" /bin/sh -c "$s2" 2>/dev/null); rc_o=$?
+    o2=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s2" 2>/dev/null); rc_o=$?
     e2=$(run -R -l "$REM" /bin/sh -c "$s2" 2>/dev/null); rc_e=$?
     if [ "$o1" = "$e1" ] && [ "$o2" = "$e2" ] && [ "$rc_o" = "$rc_e" ] &&
         [ -n "$o1" ]; then
@@ -381,7 +381,7 @@ if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]
         ds='cd /tmp; mkdir d; cd d; echo hi>a; ln a b; stat -c %h a b;
             [ "$(stat -c %i a)" = "$(stat -c %i b)" ] && echo same-ino;
             find . -samefile a | sort; cat b'
-        out_o=$("$M10_ORACLE" "$RDO" /bin/sh -c "$ds" 2>/dev/null); rc_o=$?
+        out_o=$("$M10_ORACLE" chroot "$RDO" /bin/sh -c "$ds" 2>/dev/null); rc_o=$?
         out_e=$(run -R -l "$RD" /bin/sh -c "$ds" 2>/dev/null); rc_e=$?
         if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
             pass=$((pass + 1)); echo "  ok   m10 debian: GNU stat + find -samefile"
@@ -401,17 +401,17 @@ elif [ "$m10_ready" -eq 1 ]; then
     skip "debian leg: no debian rootfs${m10_deb_why:+ ($m10_deb_why)}"
 fi
 
-# arm64chroot's own --link2symlink C tests (tests/arm64chroot/c/l2s_*.c, the
+# arm64emu's own --link2symlink C tests (tests/arm64emu/chroot/c/l2s_*.c, the
 # ones its android-sim build runs): each runs under the real-hardlink oracle
 # and under the forced emulation, in its own copy of the rootfs, and stdout and
 # status must match. Here the rootfs's writable /.l2s puts the emulation on the
-# central store; arm64chroot's suite runs them with "/" as the rootfs, on the
+# central store; arm64emu's suite runs them with "/" as the rootfs, on the
 # legacy layout. They are the contract the shared l2s engine keeps for both
 # programs.
 if [ "$m10_ready" -eq 1 ] && [ "${GUEST_STATIC:-0}" = 1 ]; then
     M10C=$(mktemp -d)
     for m10t in l2s_access l2s_nofollow l2s_rename; do
-        if ! guest_cc "$M10C/$m10t" "tests/arm64chroot/c/$m10t.c"; then
+        if ! guest_cc "$M10C/$m10t" "tests/arm64emu/chroot/c/$m10t.c"; then
             skip "m10 c/$m10t: guest build failed"
             continue
         fi
@@ -422,7 +422,7 @@ if [ "$m10_ready" -eq 1 ] && [ "${GUEST_STATIC:-0}" = 1 ]; then
             mkdir -p "$RO/t" "$REM/t"
             cp "$M10C/$m10t" "$RO/t/"; cp "$M10C/$m10t" "$REM/t/"
             # shellcheck disable=SC2086  # $m10a is one word or empty
-            out_o=$("$M10_ORACLE" -E TMPDIR=/tmp "$RO" /t/$m10t $m10a 2>/dev/null); rc_o=$?
+            out_o=$("$M10_ORACLE" chroot -E TMPDIR=/tmp "$RO" /t/$m10t $m10a 2>/dev/null); rc_o=$?
             # shellcheck disable=SC2086
             out_e=$(run -R -l "$REM" /usr/bin/env TMPDIR=/tmp /t/$m10t $m10a 2>/dev/null); rc_e=$?
             if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then

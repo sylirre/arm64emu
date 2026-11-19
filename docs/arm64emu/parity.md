@@ -99,7 +99,7 @@ lazily by `fpsr_sync` (`lib/arm64/exec_fpsimd.c`) only when the guest reads FPSR
   the fast tiers at block/slice boundaries. Deep in a boot the guest can read
   timer values at slightly different icounts — shifted printk timestamps and
   clock-derived values (e.g. the kernel audit stamp). Console content stays
-  identical; `tests/arm64emu/run_bootlog_gate.sh` normalizes exactly these.
+  identical; `tests/arm64emu/boot/run_bootlog_gate.sh` normalizes exactly these.
 - **Same-page self-modification** (`--jit`): a store into the running block's
   page lets the stale tail run to the block end (≤128 insns) —
   architecturally permitted without IC IVAU+ISB.
@@ -113,19 +113,19 @@ lazily by `fpsr_sync` (`lib/arm64/exec_fpsimd.c`) only when the guest reads FPSR
   the two bits are mirrored into the host's own FPCR and `--jit` keeps
   inlining floating point; on any other host `--jit` leaves floating point to
   the interpreter while FZ or FZ16 is set.
-- **Debug facilities force the interpreter** (`--trace`, `--reg-trace`, watchpoints,
+- **Debug facilities force the interpreter** (`--debug`, `--reg-trace`, watchpoints,
   ARM64EMU_* per-instruction hooks).
 
 ## Verification matrix
 
 | Gate | Command | What it proves |
 |------|---------|----------------|
-| asm suite ×3 | `make test-arm64emu` / `make test-arm64emu-pd` / `make test-arm64emu-jit` | m1–m34 pass (`x0=0`) under every engine; values oracle-validated once via qemu-aarch64 (`-DUSERMODE` dual-mode files: m13, m19–m22, m34) |
-| consistency checkpoints | inside `test-arm64emu-pd` / `test-arm64emu-jit` | deterministic firmware+Linux boot (harness pins `ARM64EMU_RTCLOCK=0`; runtime default is the host clock), byte-identical serial + final CPU state at 1M/4M/16M/64M/300M |
-| full-boot log gate | `make test-arm64emu-jit-full` / `make test-arm64emu-pd-full` (`tests/arm64emu/run_bootlog_gate.sh`) | 1.6B-insn boot log identical after timestamp normalization — covers the whole boot, not just the UEFI phase the checkpoints sit in; **mandatory for frontend changes** |
-| cross-engine fuzzing | `make fuzz-arm64emu` (`tests/arm64emu/run_fuzz_engines.sh` + `tests/arm64emu/scripts/fuzz_gen.c`) | random blocks over the inlined surface, interpreter (`--no-pd`) vs the predecoded tier vs `--jit` vs `--jit`+SLOWMEM/NOFUSE/NOVRA; phase 1 compares the HLT line natively-executed, phase 2 stops at the exact pre-HLT icount and compares the full register dump |
-| a64 backend | `make test-arm64emu-jit-a64` (and `ARM64EMU_RUNNER=qemu-aarch64 ARM64EMU_EMU=./arm64emu-a64 tests/arm64emu/run_fuzz_engines.sh`) | the second backend stays executable and byte-identical under qemu-user |
-| regression pins | `tests/arm64emu/asm/m23_jitpar.S` | the fuzzer-found bugs below stay fixed, engine-agnostic |
+| asm suite ×3 | `make test-arm64emu-boot` / `make test-arm64emu-boot-pd` / `make test-arm64emu-boot-jit` | m1–m34 pass (`x0=0`) under every engine; values oracle-validated once via qemu-aarch64 (`-DUSERMODE` dual-mode files: m13, m19–m22, m34) |
+| consistency checkpoints | inside `test-arm64emu-boot-pd` / `test-arm64emu-boot-jit` | deterministic firmware+Linux boot (harness pins `ARM64EMU_RTCLOCK=0`; runtime default is the host clock), byte-identical serial + final CPU state at 1M/4M/16M/64M/300M |
+| full-boot log gate | `make test-arm64emu-boot-jit-full` / `make test-arm64emu-boot-pd-full` (`tests/arm64emu/boot/run_bootlog_gate.sh`) | 1.6B-insn boot log identical after timestamp normalization — covers the whole boot, not just the UEFI phase the checkpoints sit in; **mandatory for frontend changes** |
+| cross-engine fuzzing | `make fuzz-arm64emu` (`tests/arm64emu/boot/run_fuzz_engines.sh` + `tests/arm64emu/boot/scripts/fuzz_gen.c`) | random blocks over the inlined surface, interpreter (`--no-predecode`) vs the predecoded tier vs `--jit` vs `--jit`+SLOWMEM/NOFUSE/NOVRA; phase 1 compares the HLT line natively-executed, phase 2 stops at the exact pre-HLT icount and compares the full register dump |
+| a64 backend | `make test-arm64emu-boot-jit-a64` (and `ARM64EMU_RUNNER=qemu-aarch64 ARM64EMU_EMU=./arm64emu-a64 tests/arm64emu/boot/run_fuzz_engines.sh`) | the second backend stays executable and byte-identical under qemu-user |
+| regression pins | `tests/arm64emu/boot/asm/m23_jitpar.S` | the fuzzer-found bugs below stay fixed, engine-agnostic |
 
 Bisection knobs: `ARM64EMU_JIT_PDMAX` / `ARM64EMU_JIT_SLOWMEM` / `ARM64EMU_JIT_NOFUSE` /
 `ARM64EMU_JIT_NOVRA` / `ARM64EMU_JIT_DUMP` (docs/arm64emu/jit.md) and `ARM64EMU_PD_MAX=N` for the predecoded tier

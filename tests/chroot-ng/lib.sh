@@ -278,7 +278,7 @@ cng_guest_binds() {
 }
 
 # cng_outside_binds DIR — where a scratch tree may be put in front of the
-# arm64chroot oracle. The oracle spells a guest path with the longest HOST prefix
+# arm64emu oracle. The oracle spells a guest path with the longest HOST prefix
 # it finds, and a rootfs that sits inside a directory $CHROOTNG_GUEST_BINDS exposes is then
 # spelled as the bind: Termux's $TMPDIR is inside $PREFIX, which is bound for the
 # linker, so the oracle's getcwd answered "/data/data/.../tmp.X/a/b" for a guest
@@ -399,7 +399,7 @@ cng_probe_caps() {
 
 # ---- guest rootfs images + the differential oracle ------------------------
 # Several milestones need a real AArch64 userland (Alpine busybox, Debian glibc)
-# and M10 needs the arm64chroot oracle. The userlands are pinned images the
+# and M10 needs the arm64emu oracle. The userlands are pinned images the
 # suite provisions itself under $CHROOTNG_ROOTFS_DIR (default build/cache/chroot-ng/rootfs):
 # Alpine at startup, since seven milestones use it, and Debian only when M10
 # reaches its one leg, which needs the oracle as well. The oracle is another
@@ -594,11 +594,12 @@ cng_detect_images() {
     fi
 
     # The oracle is a host-native emulator, not an AArch64 program: usable only
-    # where its own machine matches this host. It is the arm64chroot this
-    # repository builds (`make arm64chroot`; `make test-chroot-ng` builds it).
+    # where its own machine matches this host. It is the arm64emu this
+    # repository builds (`make arm64emu`; `make test-chroot-ng` builds it), run
+    # in its chroot mode: `$CHROOTNG_ORACLE chroot [options] <rootfs> ...`.
     CHROOTNG_ORACLE="${CHROOTNG_ORACLE:-}"
-    if [ -z "$CHROOTNG_ORACLE" ] && [ -x "$PWD/build/arm64chroot" ]; then
-        CHROOTNG_ORACLE=$PWD/build/arm64chroot
+    if [ -z "$CHROOTNG_ORACLE" ] && [ -x "$PWD/build/arm64emu" ]; then
+        CHROOTNG_ORACLE=$PWD/build/arm64emu
     fi
     if [ -n "$CHROOTNG_ORACLE" ]; then
         _m=$(elf_machine "$CHROOTNG_ORACLE")

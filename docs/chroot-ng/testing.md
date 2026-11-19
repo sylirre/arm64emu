@@ -1,7 +1,7 @@
 # chroot-ng test harness
 
 ```sh
-make test-chroot-ng          # or: sh tests/chroot-ng/run.sh (after make chroot-ng arm64chroot)
+make test-chroot-ng          # or: sh tests/chroot-ng/run.sh (after make chroot-ng arm64emu)
 ```
 
 The suite runs on three hosts. `tests/chroot-ng/lib.sh` resolves every difference between
@@ -29,7 +29,7 @@ separately in the summary, so a partial run never reads like full coverage:
 
 Common reasons: no AArch64 guest toolchain; an Alpine/Debian rootfs image that
 could not be provisioned (no network, `CHROOTNG_ROOTFS_FETCH=0`); no
-host-native `arm64chroot` oracle (M10 is differential against it); the host has
+host-native `arm64emu chroot` oracle (M10 is differential against it); the host has
 no working SysV shm to diff against (Android drops it); the guest links
 dynamically *and* the seccomp tier is inert, so neither tier reaches libc's own
 `svc` sites.
@@ -81,7 +81,7 @@ expected failure:
   `/proc/self/timers`, and `PTRACE_O_SUSPEND_SECCOMP` is `EINVAL`.
 * **`$TMPDIR` is inside `$PREFIX`, which the harness binds** for a guest's
   linker. A scratch directory the guest must *not* be able to name therefore has
-  to be moved out of the binds (`cng_outside_binds`), and the arm64chroot oracle
+  to be moved out of the binds (`cng_outside_binds`), and the arm64emu oracle
   needs its rootfs there too, because it spells a guest path with the longest
   host prefix it finds.
 * **`LD_PRELOAD` carries `libtermux-exec`**, which answers some `execve`
@@ -119,7 +119,7 @@ expected failure:
 | `CHROOTNG_ROOTFS_DIR` | where the `alpine/` and `debian/` rootfs images are provisioned (default `build/cache/chroot-ng/rootfs`) |
 | `CHROOTNG_ROOTFS_FETCH` | `0` = never download a rootfs tarball; one already in `$CHROOTNG_ROOTFS_DIR/downloads/` is still unpacked |
 | `CHROOTNG_ALPINE`, `CHROOTNG_DEBIAN` | individual rootfs paths, used as they are instead of provisioning one |
-| `CHROOTNG_ORACLE` | `arm64chroot` binary for M10's real-hardlink differential. Unset = `build/arm64chroot`, which `make test-chroot-ng` builds first (a bare `sh tests/chroot-ng/run.sh` uses it only if present). Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
+| `CHROOTNG_ORACLE` | `arm64emu` binary for M10's real-hardlink differential, run in its chroot mode. Unset = `build/arm64emu`, which `make test-chroot-ng` builds first (a bare `sh tests/chroot-ng/run.sh` uses it only if present). Dropped automatically if its machine does not match the host — it is a host-native emulator, not an AArch64 program |
 | `CHROOTNG_SYSROOT` | sysroot holding the AArch64 ELF interpreter for M4 (cross host default `/usr/aarch64-linux-gnu`; empty on an AArch64 host, where it is on the system paths) |
 
 `cng_dyn_binds` sets `GUEST_DYN_BINDS`, the same list for a guest that is
@@ -136,7 +136,7 @@ name:
   startup. The suite only ever calls `bin/busybox` inside it.
 * **`debian/`** is the arm64 layer of the official `debian:trixie-…-slim` image,
   fetched from Docker Hub (~30 MB). It is provisioned only when M10 reaches its
-  Debian leg, which needs the arm64chroot oracle as well.
+  Debian leg, which needs the arm64emu oracle as well.
 
 A tree is stamped with the hash it came from (`.alpine.sha256` beside it), so
 bumping a pin replaces it on the next run. A tree that carries no stamp was
