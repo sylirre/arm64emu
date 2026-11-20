@@ -300,9 +300,9 @@ static inline void cpu_refresh_el_state(CPU *c) {
 
 /* Whether this CPU may ever have to check SP alignment (SCTLR_EL1.SA/SA0):
  * in a full system the guest kernel can turn either on at any time; in user
- * mode SA0 is what sysreg_init gave it, for good. The engines that decide
- * ahead of execution (the decode cache, the JIT) ask this whether an SP-based
- * access needs the check at all. */
+ * mode SA0 is what sysreg_init gave it, for good -- set, as Linux sets it.
+ * The JIT, which decides ahead of execution, asks this whether an SP-based
+ * access needs the check emitted at all. */
 static inline bool cpu_sp_chk_possible(const CPU *c) {
     return c->eng.sys || ((c->sctlr[1] >> 4) & 1);
 }

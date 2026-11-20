@@ -1002,6 +1002,12 @@ static int fe_ldst_extra(IRBlock *ir, u32 insn, u64 pc) {
 
     if ((insn >> 21) & 1) {                        /* register offset */
         if (((insn >> 10) & 3) != 2) return 0;     /* LSE atomics: fe_atomic */
+        /* The address is summed into a temp, and a base that is not VREG_SP
+         * hides an SP base from the backends' SP-alignment check (base_stage):
+         * an SP base indexed by a register is rare in real code (0-2 in a
+         * whole libc or libcrypto), so where the check can fire it is the
+         * helper's. */
+        if (rn == 31 && ir->spchk) return 0;
         if (V) {
             if ((opc & 2) && size != 0) return 0;
         } else {
@@ -1606,6 +1612,10 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
         /* register offset (imm = option<<3 | shift): va = base + extend(rm) */
         case PD_LDR64RO: case PD_LDR32RO: case PD_LDRBRO: case PD_LDRHRO:
         case PD_STR64RO: case PD_STR32RO: case PD_STRBRO: case PD_STRHRO: {
+            if (e->rn == 31 && ir->spchk) {   /* SP base: see fe_ldst_extra */
+                put_call1(ir, pc, insn);      /* jit_exec1 counts this insn */
+                return FE_CONT;
+            }
             u8 idx = fe_extended(ir, e->rm, (unsigned)(e->imm >> 3) & 7,
                                  (unsigned)e->imm & 7);
             ir_put(ir, IRO_ADD, 1, VREG_TMP1, rsp(e->rn), idx, 0, 0, 0);

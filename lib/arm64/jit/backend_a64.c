@@ -1795,6 +1795,9 @@ static void emit_atomic_smp(BE *be, const IRBlock *ir, int i) {
     int hb = uses_b ? ra_use(be, o->b) : -1;
     int hs = (kind == AT_CAS) ? ra_use(be, o->cc) : -1;
     int ha = ra_use(be, o->a);
+    /* Ahead of the probe and the alignment gate: an SP base takes the
+     * SP-alignment check first, as in the interpreter. */
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
     ei(e, enc_mov(1, 1, (unsigned)ha));           /* x1 = va */
 
     u8 *slow0 = NULL, *slow1 = NULL, *slow2 = NULL, *slow3 = NULL;

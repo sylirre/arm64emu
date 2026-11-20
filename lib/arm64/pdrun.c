@@ -29,29 +29,25 @@ static int pd_max_op(void) {
 }
 
 /* The tier's fill: pd_fill plus what belongs to executing straight out of a
- * PDEnt.
- *
- * SP-alignment faults (SCTLR_EL1.SA/SA0) are raised only on the exec_a64 path
- * (decode.c sp_align_ok), and this tier's native handlers do not check, so
- * where the check can apply at all (cpu_sp_chk_possible) an SP-based memory
- * op has to run through L_GENERIC to fault like the interpreter when a
- * misaligned SP is used as a base. Literal loads are PC-relative, never SP,
- * so they keep their handlers.
- *
- * The JIT deliberately does NOT take this demotion: both backends emit an
- * inline alignment check (emit_spchk) ahead of every memory op whose base is
- * VREG_SP, so they can translate these natively and still fault identically.
- * It matters more than it looks -- SP-based load/store is every function
- * prologue and epilogue, and demoting it was the single largest source of
- * helper calls in a guest boot. */
-static void pd_fill_tier(CPU *c, PDEnt *e, u32 insn) {
+ * PDEnt. */
+static void pd_fill_tier(PDEnt *e, u32 insn) {
     pd_fill(e, insn);
-    if (e->rn == 31 && e->op >= PD_LDR64U && e->op <= PD_STPDPOST &&
-        e->op != PD_LDRLIT64 && e->op != PD_LDRLIT32 && e->op != PD_LDRLITV &&
-        cpu_sp_chk_possible(c))
-        e->op = PD_GENERIC;
     int max = pd_max_op();
     if (UNLIKELY(max >= 0) && e->op > max) e->op = PD_GENERIC;
+}
+
+/* The SP-alignment check (SCTLR_EL1.SA/SA0, decode.c sp_align_ok) of a memory
+ * op whose base is Xn|SP, on the base its handler has just read: nonzero when
+ * that base is SP, the check is on at this EL, and SP is not 16-byte aligned.
+ * Branch-free -- (rn + 1) >> 5 is 1 for rn == 31 alone -- so every handler
+ * pays one rarely taken branch, whatever its base. The handler then hands the
+ * instruction to exec_a64, which raises the fault: SP-based load/store is
+ * every function prologue and epilogue, so running those natively is worth a
+ * few instructions on each access (sending them to exec_a64 whenever the check
+ * could fire cost call-heavy guest code 16% in user mode, where it always
+ * can). The JIT does the same with an inline test (emit_spchk). */
+static inline u64 pd_sp_misaligned(const CPU *c, const PDEnt *e, u64 base) {
+    return base & (u64)((((e->rn + 1u) >> 5) & c->sp_chk) * 15u);
 }
 
 /* The CPU's decode cache, allocated on its first run; NULL if that failed. */
@@ -376,7 +372,7 @@ void pd_run(CPU *c, u64 deadline) {
         if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return; \
         c->pc += 4; \
         e = &pd[(c->cur_insn_pc >> 2) & PD_MASK]; \
-        if (UNLIKELY(e->insn != insn)) pd_fill_tier(c, e, insn); \
+        if (UNLIKELY(e->insn != insn)) pd_fill_tier(e, insn); \
         goto *pd_tab[e->op]; \
     } while (0)
 
@@ -385,7 +381,7 @@ void pd_run(CPU *c, u64 deadline) {
     if (UNLIKELY(!mem_ifetch(c, c->pc, &insn))) return;
     c->pc += 4;
     e = &pd[(c->cur_insn_pc >> 2) & PD_MASK];
-    if (UNLIKELY(e->insn != insn)) pd_fill_tier(c, e, insn);
+    if (UNLIKELY(e->insn != insn)) pd_fill_tier(e, insn);
     goto *pd_tab[e->op];
 
 L_GENERIC:
@@ -815,74 +811,106 @@ L_RORV64:
 L_RORV32:
     set_x(c, e->rd, (u32)pd_shift_reg(reg_x(c, e->rn), 3, (unsigned)reg_x(c, e->rm), false)); NEXT;
 
+    /* Ahead of the access and of any writeback, as the architecture checks
+     * (pd_sp_misaligned): exec_a64 raises the fault. */
+#define SP_CHECK(base) do { \
+        if (UNLIKELY(pd_sp_misaligned(c, e, (base)))) goto L_GENERIC; \
+    } while (0)
+
     /* ---- integer load/store, va = base + imm ---- */
 L_LDR64U:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 8, &v)) set_x(c, e->rd, v);
         NEXT;
     }
 L_LDR32U:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 4, &v)) set_x(c, e->rd, (u32)v);
         NEXT;
     }
 L_LDRB:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 1, &v)) set_x(c, e->rd, v);
         NEXT;
     }
 L_LDRH:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 2, &v)) set_x(c, e->rd, v);
         NEXT;
     }
 L_LDRSB64:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 1, &v)) set_x(c, e->rd, sign_extend(v, 8));
         NEXT;
     }
 L_LDRSB32:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 1, &v)) set_x(c, e->rd, (u32)sign_extend(v, 8));
         NEXT;
     }
 L_LDRSH64:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 2, &v)) set_x(c, e->rd, sign_extend(v, 16));
         NEXT;
     }
 L_LDRSH32:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 2, &v)) set_x(c, e->rd, (u32)sign_extend(v, 16));
         NEXT;
     }
 L_LDRSW:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (mem_read(c, va, 4, &v)) set_x(c, e->rd, sign_extend(v, 32));
         NEXT;
     }
 L_STR64U:
-    mem_write(c, reg_xsp(c, e->rn) + e->imm, 8, reg_x(c, e->rd)); NEXT;
+    {
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
+        mem_write(c, base + e->imm, 8, reg_x(c, e->rd)); NEXT;
+    }
 L_STR32U:
-    mem_write(c, reg_xsp(c, e->rn) + e->imm, 4, reg_x(c, e->rd)); NEXT;
+    {
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
+        mem_write(c, base + e->imm, 4, reg_x(c, e->rd)); NEXT;
+    }
 L_STRB:
-    mem_write(c, reg_xsp(c, e->rn) + e->imm, 1, reg_x(c, e->rd)); NEXT;
+    {
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
+        mem_write(c, base + e->imm, 1, reg_x(c, e->rd)); NEXT;
+    }
 L_STRH:
-    mem_write(c, reg_xsp(c, e->rn) + e->imm, 2, reg_x(c, e->rd)); NEXT;
+    {
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
+        mem_write(c, base + e->imm, 2, reg_x(c, e->rd)); NEXT;
+    }
 
     /* ---- pre/post-indexed (writeback commits only after success) ---- */
 L_LDR64PRE:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (!mem_read(c, va, 8, &v)) NEXT;
         set_x(c, e->rd, v); set_xsp(c, e->rn, va);
         NEXT;
@@ -890,13 +918,15 @@ L_LDR64PRE:
 L_LDR64POST:
     {
         u64 base = reg_xsp(c, e->rn), v;
+        SP_CHECK(base);
         if (!mem_read(c, base, 8, &v)) NEXT;
         set_x(c, e->rd, v); set_xsp(c, e->rn, base + e->imm);
         NEXT;
     }
 L_LDR32PRE:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm, v;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm, v;
+        SP_CHECK(base);
         if (!mem_read(c, va, 4, &v)) NEXT;
         set_x(c, e->rd, (u32)v); set_xsp(c, e->rn, va);
         NEXT;
@@ -904,13 +934,15 @@ L_LDR32PRE:
 L_LDR32POST:
     {
         u64 base = reg_xsp(c, e->rn), v;
+        SP_CHECK(base);
         if (!mem_read(c, base, 4, &v)) NEXT;
         set_x(c, e->rd, (u32)v); set_xsp(c, e->rn, base + e->imm);
         NEXT;
     }
 L_STR64PRE:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm;
+        SP_CHECK(base);
         if (!mem_write(c, va, 8, reg_x(c, e->rd))) NEXT;
         set_xsp(c, e->rn, va);
         NEXT;
@@ -918,13 +950,15 @@ L_STR64PRE:
 L_STR64POST:
     {
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         if (!mem_write(c, base, 8, reg_x(c, e->rd))) NEXT;
         set_xsp(c, e->rn, base + e->imm);
         NEXT;
     }
 L_STR32PRE:
     {
-        u64 va = reg_xsp(c, e->rn) + e->imm;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm;
+        SP_CHECK(base);
         if (!mem_write(c, va, 4, reg_x(c, e->rd))) NEXT;
         set_xsp(c, e->rn, va);
         NEXT;
@@ -932,6 +966,7 @@ L_STR32PRE:
 L_STR32POST:
     {
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         if (!mem_write(c, base, 4, reg_x(c, e->rd))) NEXT;
         set_xsp(c, e->rn, base + e->imm);
         NEXT;
@@ -939,6 +974,7 @@ L_STR32POST:
 L_LDRBPOST:
     {
         u64 base = reg_xsp(c, e->rn), v;
+        SP_CHECK(base);
         if (!mem_read(c, base, 1, &v)) NEXT;
         set_x(c, e->rd, v); set_xsp(c, e->rn, base + e->imm);
         NEXT;
@@ -946,6 +982,7 @@ L_LDRBPOST:
 L_STRBPOST:
     {
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         if (!mem_write(c, base, 1, reg_x(c, e->rd))) NEXT;
         set_xsp(c, e->rn, base + e->imm);
         NEXT;
@@ -954,7 +991,9 @@ L_STRBPOST:
     /* ---- register offset (imm = option<<3|shift) ---- */
 L_LDR64RO:
     {
-        u64 va = reg_xsp(c, e->rn) +
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
+        u64 va = base +
                  pd_extend_reg(reg_x(c, e->rm), (unsigned)(e->imm >> 3) & 7,
                                (unsigned)e->imm & 7);
         u64 v;
@@ -1009,6 +1048,7 @@ L_LDP64:
         bool wb = post || e->op == PD_LDP64PRE || e->op == PD_LDP32PRE;
         unsigned esz = is64 ? 8 : 4;
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         u64 addr = post ? base : base + e->imm;
         u64 a, b;
         if (!mem_read(c, addr, esz, &a)) NEXT;
@@ -1025,6 +1065,7 @@ L_STP64:
         bool wb = post || e->op == PD_STP64PRE || e->op == PD_STP32PRE;
         unsigned esz = is64 ? 8 : 4;
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         u64 addr = post ? base : base + e->imm;
         if (!mem_write(c, addr, esz, reg_x(c, e->rd))) NEXT;
         if (!mem_write(c, addr + esz, esz, reg_x(c, e->rm))) NEXT;
@@ -1038,30 +1079,42 @@ L_STP64:
 L_LDRQ:
     {
         FP_GUARD();
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         V128 v;
-        if (mem_read128(c, reg_xsp(c, e->rn) + e->imm, &v)) c->v[e->rd] = v;
+        if (mem_read128(c, base + e->imm, &v)) c->v[e->rd] = v;
         NEXT;
     }
 L_STRQ:
-    FP_GUARD();
-    mem_write128(c, reg_xsp(c, e->rn) + e->imm, &c->v[e->rd]); NEXT;
+    {
+        FP_GUARD();
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
+        mem_write128(c, base + e->imm, &c->v[e->rd]); NEXT;
+    }
 L_LDRV:
     {   /* rm = byte count 1/2/4/8; high half cleared */
         FP_GUARD();
-        u64 t;
-        if (mem_read(c, reg_xsp(c, e->rn) + e->imm, e->rm, &t)) {
+        u64 base = reg_xsp(c, e->rn), t;
+        SP_CHECK(base);
+        if (mem_read(c, base + e->imm, e->rm, &t)) {
             c->v[e->rd].d[0] = t;
             c->v[e->rd].d[1] = 0;
         }
         NEXT;
     }
 L_STRV:
-    FP_GUARD();
-    mem_write(c, reg_xsp(c, e->rn) + e->imm, e->rm, c->v[e->rd].d[0]); NEXT;
+    {
+        FP_GUARD();
+        u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
+        mem_write(c, base + e->imm, e->rm, c->v[e->rd].d[0]); NEXT;
+    }
 L_LDRQPRE:
     {
         FP_GUARD();
-        u64 va = reg_xsp(c, e->rn) + e->imm;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm;
+        SP_CHECK(base);
         V128 v;
         if (!mem_read128(c, va, &v)) NEXT;
         c->v[e->rd] = v; set_xsp(c, e->rn, va);
@@ -1071,6 +1124,7 @@ L_LDRQPOST:
     {
         FP_GUARD();
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         V128 v;
         if (!mem_read128(c, base, &v)) NEXT;
         c->v[e->rd] = v; set_xsp(c, e->rn, base + e->imm);
@@ -1079,7 +1133,8 @@ L_LDRQPOST:
 L_STRQPRE:
     {
         FP_GUARD();
-        u64 va = reg_xsp(c, e->rn) + e->imm;
+        u64 base = reg_xsp(c, e->rn), va = base + e->imm;
+        SP_CHECK(base);
         if (!mem_write128(c, va, &c->v[e->rd])) NEXT;
         set_xsp(c, e->rn, va);
         NEXT;
@@ -1088,6 +1143,7 @@ L_STRQPOST:
     {
         FP_GUARD();
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         if (!mem_write128(c, base, &c->v[e->rd])) NEXT;
         set_xsp(c, e->rn, base + e->imm);
         NEXT;
@@ -1101,6 +1157,7 @@ L_LDPQ:
         bool post = (e->op == PD_LDPQPOST);
         bool wb = post || e->op == PD_LDPQPRE;
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         u64 addr = post ? base : base + e->imm;
         V128 v;
         if (!mem_read128(c, addr, &v)) NEXT;
@@ -1116,6 +1173,7 @@ L_STPQ:
         bool post = (e->op == PD_STPQPOST);
         bool wb = post || e->op == PD_STPQPRE;
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         u64 addr = post ? base : base + e->imm;
         if (!mem_write128(c, addr, &c->v[e->rd])) NEXT;
         if (!mem_write128(c, addr + 16, &c->v[e->rm])) NEXT;
@@ -1128,6 +1186,7 @@ L_LDPD:
         bool post = (e->op == PD_LDPDPOST);
         bool wb = post || e->op == PD_LDPDPRE;
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         u64 addr = post ? base : base + e->imm;
         u64 t;
         if (!mem_read(c, addr, 8, &t)) NEXT;
@@ -1143,6 +1202,7 @@ L_STPD:
         bool post = (e->op == PD_STPDPOST);
         bool wb = post || e->op == PD_STPDPRE;
         u64 base = reg_xsp(c, e->rn);
+        SP_CHECK(base);
         u64 addr = post ? base : base + e->imm;
         if (!mem_write(c, addr, 8, c->v[e->rd].d[0])) NEXT;
         if (!mem_write(c, addr + 8, 8, c->v[e->rm].d[0])) NEXT;
@@ -1151,5 +1211,6 @@ L_STPD:
     }
 
 #undef FP_GUARD
+#undef SP_CHECK
 #undef NEXT
 }

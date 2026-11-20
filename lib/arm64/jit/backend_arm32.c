@@ -118,6 +118,7 @@ typedef struct BE {
     u8  locked[HREG_N];         /* in use by the op being emitted */
     u32 lru[HREG_N];
     u32 stamp;
+    u8  spchk;                  /* IRBlock.spchk: check SP-based accesses */
 } BE;
 
 /* ---- raw emission ---- */
@@ -731,9 +732,32 @@ static void shift_imm_pair(BE *be, int op, Pair p, unsigned amt) {
 
 /* ---- memory (helper-only in this backend) ---- */
 
+/* SP-alignment check (SCTLR_EL1.SA/SA0) ahead of an access whose base is SP,
+ * the 64-bit backends' emit_spchk: if SP's low 4 bits are set, call
+ * jit_sp_check, which faults (the block exits) where the check is on, or
+ * returns 0 to let the access proceed. The low word alone decides alignment.
+ * Emitted after sync_all, so the homes are current for that exit; the call
+ * clobbers only r0-r3, r12 and lr, none of them allocated. */
+static void emit_spchk(BE *be, u64 pc, u32 icnt) {
+    Emit *e = be->e;
+    int lo = src_hv(be, HV(VREG_SP, 0), R0);
+    dp_i(e, CC_AL, OP_TST, 1, 0, lo, 15);         /* tst lo, #15 */
+    u8 *aligned = b_fwd(e, CC_EQ);
+    mov_ri(e, R2, (u32)pc);                       /* jit_sp_check(c, pc) */
+    mov_ri(e, R3, (u32)(pc >> 32));
+    mov_rr(e, R0, RCPU);
+    call_env(be, offsetof(JitEnv, helper_spchk));
+    dp_i(e, CC_AL, OP_CMP, 1, 0, R0, 0);          /* cmp r0, #0 */
+    u8 *proceed = b_fwd(e, CC_EQ);
+    exit_plain(be, icnt);                         /* faulted: leave the block */
+    fwd_here(e, proceed);
+    fwd_here(e, aligned);
+}
+
 static void emit_mem(BE *be, const IROp *o) {
     Emit *e = be->e;
     sync_all(be);
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, o->imm2pc, o->icnt);
     /* va = base + offset, into the AAPCS pair r2/r3 */
     int blo = src_hv(be, HV(o->a, 0), R2);
     mov_rr(e, R2, blo);
@@ -791,6 +815,7 @@ int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
     be.e = e;
     be.env = env;
     be.b = b;
+    be.spchk = ir->spchk;
     for (int hv = 0; hv < NHV; hv++) be.h[hv] = -1;
     for (int h = 0; h < HREG_N; h++) be.r2v[h] = NHV;
     b->exit_pc[0] = b->exit_pc[1] = ~0ULL;

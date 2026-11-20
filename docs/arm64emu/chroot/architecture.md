@@ -187,7 +187,8 @@ emu_loop:
       switch on ESR.EC:
         EC_SVC64            -> syscall_dispatch(c)          // x8=nr, x0..x5 args, x0=ret
         EC_DABORT/EC_IABORT -> sig_deliver_fault(SIGSEGV)   // MAPERR vs ACCERR from mem.c
-        EC_PC_ALIGN/SP      -> sig_deliver_fault(SIGBUS)
+        EC_PC_ALIGN         -> sig_deliver_fault(SIGBUS)    // BUS_ADRALN, si_addr = PC
+        EC_SP_ALIGN         -> sig_deliver_fault(SIGBUS)    // BUS_ADRALN, si_addr = SP
         EC_BRK64            -> sig_deliver_fault(SIGTRAP)
         EC_UNKNOWN/default   -> sig_deliver_fault(SIGILL)
   if g_sig_npend:  sig_deliver_pending(c)   // host-caught guest signals, at a safe point

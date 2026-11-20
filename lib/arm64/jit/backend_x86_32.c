@@ -115,6 +115,7 @@ typedef struct BE {
     u8  locked[HREG_N];         /* in use by the op being emitted */
     u32 lru[HREG_N];
     u32 stamp;
+    u8  spchk;                  /* IRBlock.spchk: check SP-based accesses */
 } BE;
 
 /* ---- raw emission ---- */
@@ -869,6 +870,29 @@ static u32 cache_off(BE *be) {
 /* [eax] / [eax + disp] */
 static Mem M_at(s32 d) { return M_reg(EAX, d); }
 
+/* SP-alignment check (SCTLR_EL1.SA/SA0) ahead of an access whose base is SP,
+ * the 64-bit backends' emit_spchk: if SP's low 4 bits are set, call
+ * jit_sp_check, which faults (the block exits) where the check is on, or
+ * returns 0 to let the access proceed. The low word alone decides alignment.
+ * Emitted after sync_all, so the homes are current for that exit, and before
+ * the access takes its probe register and locates its operands: the call
+ * clobbers ecx, which reload_clobbered restores on the way back. */
+static void emit_spchk(BE *be, u64 pc, u32 icnt) {
+    Emit *e = be->e;
+    mov_rs(e, EAX, src_hv(be, HV(VREG_SP, 0)));
+    e8(e, 0xA8); e8(e, 15);                      /* test al, 15 */
+    u8 *aligned = jcc_fwd(e, CC_E);
+    arg_cpu(be, 0);                              /* jit_sp_check(c, pc) */
+    arg_imm64(be, 1, pc);
+    call_c(e, (const void *)jit_sp_check);
+    op_rr(e, 0x85, EAX, EAX);                    /* test eax, eax */
+    u8 *proceed = jcc_fwd(e, CC_E);
+    exit_plain(be, icnt);                        /* faulted: leave the block */
+    fwd_here(e, proceed);
+    reload_clobbered(be);
+    fwd_here(e, aligned);
+}
+
 static void emit_mem(BE *be, const IROp *o) {
     Emit *e = be->e;
     int is_st = (o->op == IRO_ST || o->op == IRO_STV);
@@ -881,6 +905,7 @@ static void emit_mem(BE *be, const IROp *o) {
     /* The homes must be current before the paths split: the helper commits its
      * result there, and a fault exits the block from the slow arm. */
     sync_all(be);
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, o->imm2pc, o->icnt);
 
     /* Take the probe's pool register BEFORE locating the operands: eviction can
      * spill the base's own register, and a Src captured earlier would then name
@@ -1090,6 +1115,9 @@ static void emit_mem_run(BE *be, const IRBlock *ir, int i, int k) {
     }
 
     sync_all(be);
+    /* One check for the run: every access in it shares the base, the first
+     * would fault before any other ran, and none writes the base. */
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, o->imm2pc, o->icnt);
     int t_reg = ra_alloc(be);
     ra_evict(be, t_reg);
     ra_lock(be, t_reg);
@@ -1233,6 +1261,7 @@ int be_emit_block(Emit *e, JitEnv *env, JBlock *b, const struct IRBlock *ir) {
     be.e = e;
     be.env = env;
     be.b = b;
+    be.spchk = ir->spchk;
     for (int hv = 0; hv < NHV; hv++) be.h[hv] = -1;
     for (int h = 0; h < HREG_N; h++) be.r2v[h] = NHV;
     b->exit_pc[0] = b->exit_pc[1] = ~0ULL;

@@ -332,9 +332,14 @@ int emu_loop(CPU *c) {
                                           far);
                     break;
                 }
-                case EC_PC_ALIGN:
+                case EC_PC_ALIGN:                /* si_addr: the PC (FAR) */
+                    sig_deliver_fault(c, SIGBUS, 1 /*BUS_ADRALN*/, far);
+                    break;
                 case EC_SP_ALIGN:
-                    sig_deliver_fault(c, SIGBUS, 1, far);
+                    /* FAR means nothing for this one: the kernel's el0_sp
+                     * reports the SP itself (do_sp_pc_abort(regs->sp)), as
+                     * every engine left it, checked before any writeback. */
+                    sig_deliver_fault(c, SIGBUS, 1 /*BUS_ADRALN*/, reg_xsp(c, 31));
                     break;
                 case EC_BRK64:
                     sig_deliver_fault(c, SIGTRAP, 1, c->pc);

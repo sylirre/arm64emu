@@ -925,9 +925,10 @@ static void ldst_casp(CPU *c, u32 insn) {
  * Returns true if the access may proceed; false after raising the fault.
  * Called before the access and any base writeback, matching the
  * architecture's per-instruction check. Inline, since every load and store
- * asks; the fault is out of line. User mode has never checked: its
- * sysreg_init leaves SA0 clear (a Linux kernel does set it, and answers the
- * fault with SIGBUS; adopting that would be a behaviour change of its own). */
+ * asks; the fault is out of line. Both modes check: user mode's sysreg_init
+ * sets SA0 as a Linux kernel does, and the program answers the fault with
+ * SIGBUS as the kernel would. A prefetch never checks (CheckSPAlignment is
+ * skipped for MemOp_PREFETCH): PRFM is no access at all. */
 __attribute__((cold)) static bool sp_align_fault(CPU *c) {
     cpu_raise_sync(c, esr_make(EC_SP_ALIGN, 0), 0);
     return false;
@@ -1217,7 +1218,12 @@ static void ldst_register(CPU *c, u32 insn) {
 
     /* compute effective address and optional writeback */
     u64 va, base = reg_xsp(c, Rn);
-    if (!sp_align_ok(c, Rn)) return;
+    /* PRFM (immediate, register) and PRFUM take no SP-alignment check; the
+     * other size 3/opc 2 slots (writeback, unprivileged) are no prefetch, and
+     * an LSE atomic's opc is its A/R bits. */
+    bool prfm = !V && size == 3 && opc == 2 &&
+                (BIT(24) || (BIT(21) ? BITS(11, 10) == 2 : BITS(11, 10) == 0));
+    if (!prfm && !sp_align_ok(c, Rn)) return;
     int wb = 0;          /* 0 none, 1 post, 2 pre */
     bool unpriv = false; /* LDTR/STTR: access checked with EL0 permissions */
     if (BIT(24)) {                              /* unsigned immediate offset */

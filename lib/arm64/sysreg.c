@@ -373,9 +373,11 @@ void sysreg_init(CPU *c) {
          * MSCEn (EL0 MOPS, as it advertises HWCAP2_MOPS), DZE, UCT and UCI
          * (DC ZVA, CTR_EL0 and cache maintenance by VA at EL0), never UMA;
          * of the counters only the virtual one opened to EL0; and FP/SIMD
-         * untrapped (FPEN=0b11). Not Linux's SA0: user mode has never
-         * checked SP alignment (decode.c sp_align_ok). */
-        c->sctlr[1] = (0x00C50838ULL & ~SCTLR_SA0) | SCTLR_DZE | SCTLR_UCT |
+         * untrapped (FPEN=0b11). SA0 too, which the reset word carries
+         * already: a load or store through a misaligned SP takes the
+         * SP-alignment fault (decode.c sp_align_ok), which the program
+         * answers as the kernel does, with SIGBUS. */
+        c->sctlr[1] = 0x00C50838ULL | SCTLR_SA0 | SCTLR_DZE | SCTLR_UCT |
                       SCTLR_UCI | (1ULL << 33);
         c->cntkctl_el1 = CNTK_EL0VCTEN;
         c->cpacr_el1 = 0x300000;

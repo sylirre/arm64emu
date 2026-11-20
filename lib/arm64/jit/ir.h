@@ -449,7 +449,7 @@ typedef struct IRBlock {
     u8   spchk;             /* the SP-alignment check can fire here, so the
                              * backends emit it on every SP-based access: in a
                              * full system always (the helper reads SCTLR_EL1),
-                             * in user mode only if its SA0 were set */
+                             * in user mode as its SA0 is set (sysreg_init) */
     CPU *c;                 /* the CPU translated for: its EL1 configuration
                              * decides what EL0 may execute (frontend.c) */
     /* Per-op vreg liveness (bit v set = vreg v live after this op). Computed

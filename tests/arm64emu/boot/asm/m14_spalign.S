@@ -9,10 +9,12 @@
  *
  * The battery walks the whole SP-based memory surface, not just one store,
  * because the three engines reach it three different ways: the interpreter
- * checks in sp_align_ok, the predecoded tier demotes these to GENERIC so it
- * inherits that check (pd_fill_tier), and the JIT translates them natively
- * with an inline check its backends emit (emit_spchk). The writeback forms
- * carry the extra rule that a faulted access must not write the base back. */
+ * checks in sp_align_ok, the predecoded tier's handlers test the base they
+ * read and hand a misaligned SP to the interpreter (pd_sp_misaligned), and
+ * the JIT translates them natively with an inline check its backends emit
+ * (emit_spchk), except a register-offset SP base, which it leaves to the
+ * interpreter. The writeback forms carry the extra rule that a faulted access
+ * must not write the base back. A prefetch is no access and never checks. */
 
 .arch armv8.1-a
 
@@ -96,6 +98,21 @@ _start:
     cmp     x9, x19
     b.ne    fail2
 
+    /* Register offset: the JIT sums the base and the index into a temp,
+     * which would hide an SP base from its check. */
+    mov     x1, #8
+    SPFAULT 85, ldr  x9, [sp, x1]
+    SPFAULT 86, str  w8, [sp, x1, lsl #2]
+    /* A prefetch takes no SP-alignment check (MemOp_PREFETCH), in any of
+     * its forms. */
+    movz    x21, #0xffff
+    prfm    pldl1keep, [sp]
+    prfm    pldl1keep, [sp, x1]
+    prfum   pldl1keep, [sp, #3]
+    movz    x11, #87
+    movz    x9, #0xffff
+    cmp     x21, x9
+    b.ne    fail2
     /* The atomics reach memory through their own translators, which stage
      * the base in a temp for the Rt-aliases-Rn hazard; an SP base must keep
      * its identity through that or the check is skipped. */
@@ -123,6 +140,9 @@ _start:
     ldr     x9, [sp], #-16
     stp     x8, x9, [sp, #16]!
     ldp     x8, x9, [sp], #-16
+    mov     x1, #8                      /* register offset: clean */
+    ldr     x9, [sp, x1]
+    str     w8, [sp, x1, lsl #2]
     mov     x1, #1                      /* atomics on an aligned SP: clean */
     ldadd   x1, x2, [sp]
     swp     x1, x2, [sp]

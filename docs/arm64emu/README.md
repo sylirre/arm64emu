@@ -619,6 +619,13 @@ Both modes run one AArch64 CPU (`lib/arm64`):
 - **Where guest threads run concurrently** (chroot mode) the atomics and
   exclusives are host compare-and-swap and the barriers host fences; a full
   system's single CPU needs neither.
+- **SP alignment** is checked in every engine: a load or store whose base is
+  a stack pointer not 16-byte aligned takes the SP-alignment fault — in boot
+  mode as the guest kernel sets `SCTLR_EL1.SA`/`SA0`, in chroot mode always,
+  since Linux sets `SA0`, and as the kernel does, the process gets `SIGBUS`
+  (`BUS_ADRALN`, `si_addr` the SP). A prefetch never checks. qemu-aarch64
+  checks SP alignment in neither mode, so a program that misaligns SP runs
+  under it but not on hardware or here.
 
 What remains unimplemented is deliberately unadvertised (PAuth/BTI/MTE/SVE —
 see [todo/TODO_OPCODES.md](todo/TODO_OPCODES.md)).

@@ -32,7 +32,9 @@ Divergence can therefore only hide in two places:
 The predecoded tier has almost no inlined-semantics surface: its native handlers are the
 integer/branch/load-store classes plus FP *load/stores* (with their own
 `FP_GUARD`); all FP data-processing, system and exception ops stay GENERIC.
-SP-based memory ops are deliberately GENERIC so SP-alignment faults match.
+SP-based memory ops stay native: each memory handler tests the base it read
+for a misaligned SP (`pd_sp_misaligned`) and hands that case to `exec_a64`,
+so SP-alignment faults match.
 
 ## Deliberate punts (interpreter stays authoritative)
 

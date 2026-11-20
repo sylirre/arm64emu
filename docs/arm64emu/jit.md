@@ -62,10 +62,15 @@ anywhere, and nothing raising its cross-thread `interrupt` flag.
 
 The translator itself (`lib/arm64/jit`) is one for both programs. What a
 full system's blocks need beyond a user-mode one's — the block ctx in the
-jump-cache key, the banked SP, the SP-alignment check, the icount deadline,
-atomics lowered to ordinary probed accesses on the one CPU — is chosen per
-block from the mode of the CPU it is translated for (`IRBlock.sys`/`smp`,
-from `c->eng`), so generated code carries no test for it.
+jump-cache key, the banked SP, the icount deadline, atomics lowered to
+ordinary probed accesses on the one CPU — is chosen per block from the mode
+of the CPU it is translated for (`IRBlock.sys`/`smp`, from `c->eng`), so
+generated code carries no test for it. The SP-alignment check is in both
+modes' blocks (`IRBlock.spchk`): a full system's as the guest kernel may set
+`SCTLR_EL1.SA`/`SA0` at any time, a user-mode one's as Linux sets `SA0`.
+Every backend tests the base of an SP-based access inline (`emit_spchk`);
+an SP base indexed by a register is left to the interpreter, since the
+frontend sums it into a temporary that would hide it.
 
 **Block identity.** A translation is keyed by
 `(pc << 3) | ctx` where ctx = EL0 flag, `SCTLR_EL1.M`, the active SP

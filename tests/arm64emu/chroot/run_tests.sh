@@ -1649,6 +1649,37 @@ child 0" ] && [ "$heads" = 3 ] && [ "$tops" = 3 ] && [ "$pids" = 2 ] ||
     fi
 fi
 
+# ---- the SP-alignment check (lib/arm64/sysreg.c sets SCTLR_EL1.SA0 as Linux
+# does; decode.c sp_align_ok, pdrun.c pd_sp_misaligned, the JIT backends'
+# emit_spchk; src/arm64emu/chroot/loop.c, the signal): a load or store
+# through a misaligned SP is SIGBUS, BUS_ADRALN, si_addr = SP, in every
+# engine, with the frame a kernel builds; a prefetch, another base register,
+# and an aligned SP at an unaligned address are not. Self-checking: qemu-user
+# never checks SP alignment, so the block below is what the kernel's el0_sp
+# gives. Each case faults twice, from code already run aligned 200 times. ----
+if [ -n "$AGCC" ]; then
+    SPA=build/tests/arm64emu/chroot/fixtures/spalign.bin
+    if "$AGCC" -static -O2 -o "$SPA" tests/arm64emu/chroot/fixtures/spalign.c 2>/dev/null; then
+        spa_want=$(printf '%s: SIGBUS BUS_ADRALN\n' ldr ldrw ldrb ldrsw ldur str strpre \
+                       ldrpost ldrreg ldp stppre ldppost run ldrq strd ldrqpre ldpq stpd \
+                       ld1 st1lane ldxr ldar stlr ldadd cas ldapur
+                   printf '%s: none\n' prfm prfmreg prfum xbase unalva)
+        for eng in "" "--no-predecode" "--jit"; do
+            lbl="spalign: ${eng:-predecoded}"
+            got=$(timeout -k 5 60 "$EMU" chroot $eng / "$SPA" 2>/dev/null); rc=$?
+            if [ "$got" = "$spa_want" ] && [ "$rc" = 0 ]; then
+                pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl (rc=$rc)"
+                diff <(printf '%s\n' "$spa_want") <(printf '%s\n' "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm "$SPA"
+    else
+        skip_build "fixtures/spalign"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom
