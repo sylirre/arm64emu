@@ -1680,6 +1680,62 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- what a fault leaves in the signal frame (src/arm64emu/chroot/loop.c
+# fault_note_abort / fault_note, signal.c deliver_to_handler): the thread's
+# fault record, sigcontext.fault_address and an esr_context, set by the
+# exceptions that set it in a kernel and read by every frame after -- kept
+# through a BRK and a kill, inherited by a thread and a fork child, kept by
+# an execve; si_addr untagged unless SA_EXPOSE_TAGBITS. Self-checking:
+# qemu-user writes no esr_context, so the block below is what a 6.8 kernel
+# gave this program (qemu-system, neoverse-n2). ----
+if [ -n "$AGCC" ]; then
+    FCX=build/tests/arm64emu/chroot/fixtures/faultctx.bin
+    if "$AGCC" -static -O2 -o "$FCX" tests/arm64emu/chroot/fixtures/faultctx.c -lpthread 2>/dev/null; then
+        fcx_want=$(cat <<'FCXEOF'
+undef    SIGILL code 1 addr udf | fault_address 0 | esr none
+usr1     SIGUSR1 | fault_address 0 | esr none
+rdhole   SIGSEGV code 1 addr hole | fault_address hole | esr 0x92000007 (record 1)
+usr1     SIGUSR1 | fault_address hole | esr 0x92000007 (record 1)
+brk      SIGTRAP code 1 addr brk | fault_address hole | esr 0x92000007 (record 1)
+wrhole   SIGSEGV code 1 addr hole | fault_address hole | esr 0x92000047 (record 1)
+wrro     SIGSEGV code 2 addr ro | fault_address ro | esr 0x9200004f (record 1)
+zvaro    SIGSEGV code 2 addr ro | fault_address ro | esr 0x9200004f (record 1)
+tagged   SIGSEGV code 1 addr hole | fault_address hole | esr 0x92000007 (record 1)
+exposed  SIGSEGV code 1 addr hole, tag 0x5a | fault_address hole | esr 0x92000007 (record 1)
+khalf    SIGSEGV code 1 addr 0xffff000000001000 | fault_address 0xffff000000001000 | esr 0x92000004 (record 1)
+toohigh  SIGSEGV code 1 addr 0x70000000001000 | fault_address 0x70000000001000 | esr 0x92000004 (record 1)
+xro      SIGSEGV code 2 addr ro | fault_address ro | esr 0x8200000f (record 1)
+xhole    SIGSEGV code 1 addr hole | fault_address hole | esr 0x82000007 (record 1)
+ldadd    SIGBUS code 1 addr un | fault_address un | esr 0x92000061 (record 1)
+pcalign  SIGBUS code 1 addr mis | fault_address 0 | esr 0x8a000000 (record 1)
+usr1     SIGUSR1 | fault_address 0 | esr 0x8a000000 (record 1)
+eof      SIGBUS code 2 addr eof | fault_address eof | esr 0x92000007 (record 1)
+child    SIGUSR1 | fault_address eof | esr 0x92000007 (record 1)
+thr-new  SIGUSR1 | fault_address eof | esr 0x92000007 (record 1)
+thr-wr   SIGSEGV code 1 addr hole | fault_address hole | esr 0x92000047 (record 1)
+thr-usr1 SIGUSR1 | fault_address hole | esr 0x92000047 (record 1)
+usr1     SIGUSR1 | fault_address eof | esr 0x92000007 (record 1)
+exec     SIGUSR1 | fault_address eof | esr 0x92000007 (record 1)
+undef    SIGILL code 1 addr udf | fault_address 0 | esr none
+usr1     SIGUSR1 | fault_address 0 | esr none
+FCXEOF
+)
+        for eng in "" "--no-predecode" "--jit"; do
+            lbl="faultctx: ${eng:-predecoded}"
+            got=$(timeout -k 5 60 "$EMU" chroot $eng / "$FCX" 2>/dev/null); rc=$?
+            if [ "$got" = "$fcx_want" ] && [ "$rc" = 0 ]; then
+                pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl (rc=$rc)"
+                diff <(printf '%s\n' "$fcx_want") <(printf '%s\n' "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm "$FCX"
+    else
+        skip_build "fixtures/faultctx"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom

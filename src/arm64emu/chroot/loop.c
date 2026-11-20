@@ -86,6 +86,34 @@ static bool emulate_id_mrs(CPU *c) {
     return true;
 }
 
+/* The fault record the frames to come read (thread.h), set where a kernel
+ * sets it. fault_note_abort is arch/arm64/mm/fault.c set_thread_esr, for a
+ * data or instruction abort, an alignment fault among them: the address
+ * untagged, the ESR as the CPU gave it -- except for an address no user page
+ * can have (is_ttbr0_addr: past TASK_SIZE, or in the kernel's half), which
+ * is reported as a level-0 translation fault keeping only EC, IL, CM and
+ * WnR, as user space is never to learn about kernel mappings. */
+static void fault_note_abort(u64 far, u64 esr) {
+    u64 addr = a64_untag(far);
+    g_tls.fault_address = addr;
+    if (addr >= GUEST_TASK_SIZE) {
+        const u64 ec_il = 0x3fULL << 26 | 1u << 25;
+        if ((esr >> 26) == EC_DABORT_LOWER)
+            esr = (esr & (ec_il | 1u << 8 /*CM*/ | 1u << 6 /*WnR*/)) | FSC_TRANS_L0;
+        else
+            esr = (esr & ec_il) | FSC_TRANS_L0;
+    }
+    g_tls.fault_code = esr;
+}
+
+/* ...and fault_note arch/arm64/kernel/traps.c arm64_notify_die, for an SP or
+ * PC alignment fault and everything the kernel answers as an undefined
+ * instruction (`esr` 0 then, which takes the record away): no address. */
+static void fault_note(u64 esr) {
+    g_tls.fault_address = 0;
+    g_tls.fault_code = esr;
+}
+
 /* Fatal guest fault with no guest handler (M1..M4): report, restore the host
  * default disposition and re-raise so the parent sees the real termination
  * status (guest handler delivery arrives in M5). */
@@ -304,44 +332,51 @@ int emu_loop(CPU *c) {
                     g_sig_in_syscall = 0;
                     break;
                 case EC_DABORT_LOWER:
-                case EC_DABORT_SAME: {
-                    unsigned fsc = esr & 0x3f;
-                    /* A synchronous external abort is how a file mapping
-                     * reports a page past end-of-file: SIGBUS/BUS_ADRERR, not
-                     * SIGSEGV (mem.c raise_dabort). */
-                    if (fsc == FSC_EXTERNAL)
-                        sig_deliver_fault(c, SIGBUS, 2 /*BUS_ADRERR*/, far);
-                    else
-                        sig_deliver_fault(c, SIGSEGV,
-                                          (fsc >= FSC_PERM_L0 && fsc <= FSC_PERM_L3) ? 2 : 1,
-                                          far);
-                    break;
-                }
+                case EC_DABORT_SAME:
                 case EC_IABORT_LOWER:
                 case EC_IABORT_SAME: {
-                    /* As a data abort: a permission fault -- the page is
-                     * mapped, just not executable -- is SEGV_ACCERR, and only
-                     * a page with no mapping at all SEGV_MAPERR (the kernel's
-                     * do_page_fault answers VM_FAULT_BADACCESS for the first). */
                     unsigned fsc = esr & 0x3f;
-                    if (fsc == FSC_EXTERNAL)
+                    if (fsc == FSC_EXTERNAL) {
+                        /* A page past end-of-file of a file mapping (mem.c
+                         * raise_dabort), data or instruction: the kernel's
+                         * translation fault, which the fault handler answers
+                         * VM_FAULT_SIGBUS -- SIGBUS/BUS_ADRERR, with that
+                         * fault's ESR in the frame. */
+                        fault_note_abort(far, (esr & ~0x3fULL) | FSC_TRANS_L3);
                         sig_deliver_fault(c, SIGBUS, 2 /*BUS_ADRERR*/, far);
-                    else
+                    } else if (fsc == FSC_ALIGN) {
+                        /* An unaligned atomic (decode.c atomic_align_fault):
+                         * do_alignment_fault's SIGBUS/BUS_ADRALN. It was
+                         * delivered as SIGSEGV/SEGV_MAPERR. */
+                        fault_note_abort(far, esr);
+                        sig_deliver_fault(c, SIGBUS, 1 /*BUS_ADRALN*/, far);
+                    } else {
+                        /* A permission fault -- the page is mapped, just not
+                         * readable, writable or executable as asked -- is
+                         * SEGV_ACCERR, and only a page with no mapping at all
+                         * SEGV_MAPERR (the kernel's do_page_fault answers
+                         * VM_FAULT_BADACCESS for the first). */
+                        fault_note_abort(far, esr);
                         sig_deliver_fault(c, SIGSEGV,
                                           (fsc >= FSC_PERM_L0 && fsc <= FSC_PERM_L3) ? 2 : 1,
                                           far);
+                    }
                     break;
                 }
                 case EC_PC_ALIGN:                /* si_addr: the PC (FAR) */
+                    fault_note(esr);
                     sig_deliver_fault(c, SIGBUS, 1 /*BUS_ADRALN*/, far);
                     break;
                 case EC_SP_ALIGN:
                     /* FAR means nothing for this one: the kernel's el0_sp
                      * reports the SP itself (do_sp_pc_abort(regs->sp)), as
                      * every engine left it, checked before any writeback. */
+                    fault_note(esr);
                     sig_deliver_fault(c, SIGBUS, 1 /*BUS_ADRALN*/, reg_xsp(c, 31));
                     break;
                 case EC_BRK64:
+                    /* send_user_sigtrap: the fault record stays the last
+                     * fault's (fault_note). */
                     sig_deliver_fault(c, SIGTRAP, 1, c->pc);
                     break;
                 case EC_MOP: {
@@ -377,10 +412,16 @@ int emu_loop(CPU *c) {
                     break;
                 }
                 case EC_UNKNOWN:
-                    if (emulate_id_mrs(c)) break;
+                case EC_MSR_MRS:
+                    /* do_el0_undef (and do_el0_sys, which no hook of ours
+                     * claims): force_signal_inject with no ESR, which takes
+                     * the record away. */
+                    if (esr >> 26 == EC_UNKNOWN && emulate_id_mrs(c)) break;
+                    fault_note(0);
                     sig_deliver_fault(c, SIGILL, 1, c->pc);
                     break;
                 default:
+                    fault_note(esr);         /* bad_el0_sync */
                     sig_deliver_fault(c, SIGILL, 1, c->pc);
                     break;
             }

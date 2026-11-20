@@ -11,9 +11,11 @@
  * Guest side: an arm64 kernel rt_sigframe is built on the guest stack (or the
  * guest sigaltstack): 128-byte siginfo + ucontext with sigcontext (x0-x30, sp,
  * pc, pstate, fault_address) + fpsimd_context (magic 0x46508001) in
- * __reserved, terminator record, x30 pointed at a trampoline page containing
- * `mov x8, #139; svc #0` (arm64 has no sa_restorer; the kernel uses the vDSO
- * for this). rt_sigreturn restores everything from the frame at SP. */
+ * __reserved, then esr_context (magic 0x45535201) while the thread's fault
+ * record holds one (thread.h), terminator record, x30 pointed at a trampoline
+ * page containing `mov x8, #139; svc #0` (arm64 has no sa_restorer; the kernel
+ * uses the vDSO for this). rt_sigreturn restores everything from the frame at
+ * SP. */
 #include <dirent.h>
 #include <limits.h>
 #include <errno.h>
@@ -52,6 +54,7 @@
 #define G_SA_RESTART   0x10000000
 #define G_SA_NODEFER   0x40000000
 #define G_SA_RESETHAND 0x80000000
+#define G_SA_EXPOSE_TAGBITS 0x00000800
 
 /* ---- host-side capture queue (async-signal-safe: handlers are installed
  * with everything masked, so they never nest) ----
@@ -3816,11 +3819,18 @@ int sig_altstack_set(u64 sp, u32 flags, u64 size, int on, u64 min_size) {
 #define MC_SP         (MCTX_OFF + 256)
 #define MC_PC         (MCTX_OFF + 264)
 #define MC_PSTATE     (MCTX_OFF + 272)
-#define MC_RESERVED   (MCTX_OFF + 288)   /* fpsimd_context + terminator */
+#define MC_RESERVED   (MCTX_OFF + 288)   /* fpsimd_context [, esr_context] +
+                                          * terminator */
 #ifndef FPSIMD_MAGIC  /* Bionic <asm/sigcontext.h> already defines it (same value) */
 #define FPSIMD_MAGIC  0x46508001u
 #endif
-#define FRAME_SIZE    ((MC_RESERVED + 544 + 15) & ~15)
+#ifndef ESR_MAGIC
+#define ESR_MAGIC     0x45535201u
+#endif
+#define MC_ESR        (MC_RESERVED + 528)  /* after the fpsimd_context */
+/* Room for the esr_context whether or not this delivery has one, so where the
+ * frame lands never depends on the thread's fault record. */
+#define FRAME_SIZE    ((MC_ESR + 16 + 16 + 15) & ~15)
 
 /* Frame fields are laid into a host-side image of the frame, not written to
  * the guest one at a time -- see deliver_to_handler. */
@@ -4092,6 +4102,13 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
 
     /* siginfo (LP64 layout: signo, errno, code, pad, fields at +16) */
     siginfo_to_guest(fr + SI_OFF, sig, info);
+    /* hide_si_addr_tag_bits: a fault's si_addr reaches a handler untagged
+     * (arch_untagged_si_addr) unless the handler asked for the tag with
+     * SA_EXPOSE_TAGBITS, a BRK's always as it is. After the tracer's look,
+     * as get_signal does it: a tracer is shown the address the CPU gave. */
+    if (info->code > 0 && is_sync_sig(sig) && !(act->flags & G_SA_EXPOSE_TAGBITS) &&
+        !(sig == SIGTRAP && info->code == 1 /*TRAP_BRKPT*/))
+        wr64(fr, SI_OFF + 16, a64_untag(info->addr));
 
     /* ucontext */
     u64 mask_to_save = g_tls.have_saved_sigmask ? g_tls.saved_sigmask
@@ -4103,8 +4120,12 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     wr64(fr, UC_STACK + 16, g_tls.sig_altstack_size);
     wr64(fr, UC_SIGMASK, mask_to_save);
 
-    /* sigcontext */
-    wr64(fr, MC_FAULTADDR, is_sync_sig(sig) ? info->addr : 0);
+    /* sigcontext. fault_address is the thread's record (thread.h), not this
+     * signal's: what the last fault left, for every signal until the next
+     * one -- 0 after an SP/PC alignment fault or an undefined instruction,
+     * the untagged address after an abort. It used to be the siginfo's
+     * address for a fault and 0 for everything else. */
+    wr64(fr, MC_FAULTADDR, g_tls.fault_address);
     for (int i = 0; i < 31; i++) wr64(fr, MC_REGS + 8u * (unsigned)i,
                                       (i == 0) ? saved_x0 : c->x[i]);
     wr64(fr, MC_SP, *cpu_cur_sp(c));
@@ -4122,6 +4143,15 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     wr32(fr, MC_RESERVED + 12, c->fpcr);
     for (int i = 0; i < 32; i++)
         memcpy(fr + MC_RESERVED + 16 + 16u * (unsigned)i, &c->v[i], 16);
+    /* esr_context, setup_sigframe's "fault information, if valid": the ESR
+     * of the thread's last fault, present while that is not 0 -- whatever
+     * the signal, as nothing clears the record (thread.h). A handler reads
+     * it to tell a read from a write (WnR) and what kind of fault it was. */
+    if (g_tls.fault_code) {
+        wr32(fr, MC_ESR + 0, ESR_MAGIC);
+        wr32(fr, MC_ESR + 4, 16);
+        wr64(fr, MC_ESR + 8, g_tls.fault_code);
+    }
     /* terminator record is already zero */
 
     if (copy_to_guest(c, frame, fr, sizeof fr) < 0) {

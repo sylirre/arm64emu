@@ -172,7 +172,37 @@ qemu-user). The frame:
   `sp`, `pc`, `pstate`, `fault_address`,
 - an `fpsimd_context` record (magic `0x46508001`, 528 bytes: `fpsr`, `fpcr`,
   32×`V128`),
+- an `esr_context` record (magic `0x45535201`, 16 bytes: the ESR), while the
+  thread's fault record holds one,
 - a terminator record.
+
+`sigcontext.fault_address` and the `esr_context` are not the signal's: they
+are the kernel's `thread.fault_address` and `thread.fault_code`, a record
+per thread (`g_tls.fault_address`/`fault_code`) that every frame reads and
+no delivery clears. The run loop sets it where the kernel does (`loop.c`,
+`fault_note_abort` and `fault_note`):
+
+| exception | `fault_address` | ESR in the record |
+|---|---|---|
+| data/instruction abort, an unaligned atomic's alignment fault (`set_thread_esr`) | the address, untagged | the CPU's; for an address no user page can have (past `TASK_SIZE`, the kernel's half) a level-0 translation fault keeping only EC, IL, CM, WnR |
+| a page past end-of-file (`SIGBUS`/`BUS_ADRERR`) | the address | the translation fault the kernel took (DFSC level 3) |
+| SP or PC alignment (`arm64_notify_die`) | 0 | the CPU's (EC 0x26/0x22, IL) |
+| undefined instruction (`force_signal_inject`, no ESR) | 0 | none: the record goes |
+| BRK, a kill, a seccomp trap, a syscall's own `EFAULT` | unchanged | unchanged |
+
+So a `SIGUSR1` after a `SIGSEGV` still carries the `SIGSEGV`'s ESR. A new
+thread starts with its creator's record and a fork child with its parent's
+(`arch_dup_task_struct` copies the task), and an `execve` keeps the exec'ing
+thread's, whichever thread then runs the new image (`dethread_fault_*`).
+The data-abort syndrome is `mem.c`'s: DFSC level 3 always, where a kernel
+reports the level of the first missing table, and a permission fault where
+a page the kernel never faulted in would give it a translation fault. A
+fault's `si_addr` reaches a handler with its tag stripped unless the handler
+was installed with `SA_EXPOSE_TAGBITS` (`hide_si_addr_tag_bits`; a tracer is
+shown the address as the CPU gave it). qemu-user writes no `esr_context` at
+all, so `tests/arm64emu/chroot/fixtures/faultctx.c` checks itself against
+what a 6.8 kernel gave it (and `fixtures/spalign.c` the SP-alignment
+record).
 
 The CPU is redirected: `x0`=signo, `x1`=&siginfo, `x2`=&ucontext, `pc`=handler,
 and — because arm64 has no `sa_restorer` — `x30` points at a hidden one-page

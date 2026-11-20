@@ -186,11 +186,15 @@ emu_loop:
   if g_tls.pend_exc.valid:
       switch on ESR.EC:
         EC_SVC64            -> syscall_dispatch(c)          // x8=nr, x0..x5 args, x0=ret
-        EC_DABORT/EC_IABORT -> sig_deliver_fault(SIGSEGV)   // MAPERR vs ACCERR from mem.c
+        EC_DABORT/EC_IABORT -> sig_deliver_fault(SIGSEGV)   // MAPERR vs ACCERR from mem.c;
+                                                            // SIGBUS: BUS_ADRERR past EOF,
+                                                            // BUS_ADRALN unaligned atomic
         EC_PC_ALIGN         -> sig_deliver_fault(SIGBUS)    // BUS_ADRALN, si_addr = PC
         EC_SP_ALIGN         -> sig_deliver_fault(SIGBUS)    // BUS_ADRALN, si_addr = SP
         EC_BRK64            -> sig_deliver_fault(SIGTRAP)
         EC_UNKNOWN/default   -> sig_deliver_fault(SIGILL)
+      (each but EC_SVC64 and EC_BRK64 first sets the thread's fault record:
+       fault_note_abort / fault_note, which every later frame reads)
   if g_sig_npend:  sig_deliver_pending(c)   // host-caught guest signals, at a safe point
 ```
 

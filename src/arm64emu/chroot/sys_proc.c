@@ -790,6 +790,8 @@ typedef struct {
                                * joins it (task_join_group_stop) */
     u32 tagged_addr_ctrl;     /* ...and its tagged-address ABI (inherited) */
     u32 pers;                 /* creator's personality, inherited likewise */
+    u64 fault_address, fault_code;   /* ...and its last fault's record (thread.h):
+                               * arch_dup_task_struct copies the creator's */
     /* The creator's call-out counters, not the Machine's current ones: if the
      * creator was already out of date -- an execve called it out while it sat
      * in clone() -- then so is this thread, and it must stop at its first
@@ -855,6 +857,8 @@ static void *thread_entry(void *arg) {
     g_tls.sigmask = t->sigmask;
     g_tls.jc_seen = t->jc_seen;
     g_tls.tagged_addr_ctrl = t->tagged_addr_ctrl;
+    g_tls.fault_address = t->fault_address;
+    g_tls.fault_code = t->fault_code;
     g_tls.personality = t->pers;
     g_tls.pers_pub = 0;
     thr_reg_add(tid, t->pers);
@@ -1981,6 +1985,8 @@ SYSDEF(clone) {
         t->sigmask = g_tls.sigmask;
         t->jc_seen = g_tls.jc_seen;
         t->tagged_addr_ctrl = g_tls.tagged_addr_ctrl;
+        t->fault_address = g_tls.fault_address;
+        t->fault_code = g_tls.fault_code;
         t->pers = g_tls.personality;
         t->stop_gen = g_tls.stop_gen;
         t->image_gen = g_tls.image_gen;
@@ -3010,6 +3016,10 @@ static void dethread_join(CPU *c) {
     g_tls.have_saved_sigmask = 0;
     g_tls.sc_ret_eintr = 0;
     g_tls.sigmask = m->dethread_sigmask;
+    /* ...and so is its last fault's record (thread.h), which no execve
+     * clears: */
+    g_tls.fault_address = m->dethread_fault_address;
+    g_tls.fault_code = m->dethread_fault_code;
     /* ...and so are its pending signals: the ones the old leader was sent by
      * tid died with it, and what the exec'ing thread and the victims handed
      * over is this thread's now (signal.c). */
@@ -3116,6 +3126,8 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
     __atomic_store_n(&m->dethread_parked, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&m->dethread_done, 0, __ATOMIC_RELAXED);
     m->dethread_sigmask = g_tls.sigmask;
+    m->dethread_fault_address = g_tls.fault_address;
+    m->dethread_fault_code = g_tls.fault_code;
     m->dethread_ptlink = NULL;
     __atomic_store_n(&m->dethread_state, DT_PENDING, __ATOMIC_RELEASE);
     /* Publish the call-out last: this counter is what the run loop reads. */

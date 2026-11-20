@@ -13,7 +13,9 @@
  * that has already faulted once. The handler checks the frame against what
  * the kernel gives: the PC of the access, SP as it was before it (no
  * writeback), si_addr = that SP, the marker set before the access committed,
- * and its own stack 16-byte aligned. */
+ * its own stack 16-byte aligned, and arm64_notify_die's fault record:
+ * sigcontext.fault_address 0, an esr_context with the SP-alignment ESR (EC
+ * 0x26, IL). */
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -102,13 +104,24 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
         snprintf(res, sizeof res, "signal %d code %d", sig, si->si_code);
         siglongjmp(jb, 1);
     }
-    uint64_t sp = uc->uc_mcontext.sp, x9 = uc->uc_mcontext.regs[9];
-    snprintf(res, sizeof res, "SIGBUS BUS_ADRALN%s%s%s%s%s",
+    uint64_t sp = uc->uc_mcontext.sp, x9 = uc->uc_mcontext.regs[9], esr = 0;
+    const unsigned char *r = (const unsigned char *)uc->uc_mcontext.__reserved;
+    for (unsigned off = 0; off + 16 <= 4096;) {      /* the {magic, size} records */
+        uint32_t magic, size;
+        memcpy(&magic, r + off, 4);
+        memcpy(&size, r + off + 4, 4);
+        if (!magic || size < 8) break;
+        if (magic == 0x45535201u) memcpy(&esr, r + off + 8, 8);   /* ESR_MAGIC */
+        off += size;
+    }
+    snprintf(res, sizeof res, "SIGBUS BUS_ADRALN%s%s%s%s%s%s%s",
              uc->uc_mcontext.pc == (uint64_t)(uintptr_t)cur->pc ? "" : " BAD-pc",
              sp == x9 - 64 - 8 ? "" : " BAD-sp",
              (uint64_t)(uintptr_t)si->si_addr == sp ? "" : " BAD-si_addr",
              uc->uc_mcontext.regs[6] == 0x1234 ? "" : " BAD-x6",
-             (hsp & 15) == 0 ? "" : " BAD-handler-sp");
+             (hsp & 15) == 0 ? "" : " BAD-handler-sp",
+             uc->uc_mcontext.fault_address == 0 ? "" : " BAD-fault_address",
+             esr == 0x9a000000 ? "" : " BAD-esr");
     siglongjmp(jb, 1);
 }
 

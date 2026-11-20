@@ -156,6 +156,9 @@ struct Machine {
     u64 dethread_sigmask;     /* the exec'ing thread's blocked set, which the
                                * new image inherits (execve preserves it) */
     u32 dethread_personality; /* ...and its personality, as the exec left it */
+    u64 dethread_fault_address, dethread_fault_code;
+                              /* ...and its last fault's record (thread.h),
+                               * which execve keeps */
     void *dethread_ptlink;    /* ...and its ptrace link (ptracetab.c), or NULL:
                                * the kernel's exec'ing thread keeps its tracer
                                * under the leader's pid */

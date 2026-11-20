@@ -17,6 +17,16 @@ typedef struct {
 
 typedef struct {
     PendExc pend_exc;         /* recorded by exception.c, dispatched by loop.c */
+    /* The kernel's thread.fault_address and thread.fault_code: what every
+     * signal frame this thread is given reads -- sigcontext.fault_address, and
+     * an esr_context record while fault_code is not 0 (signal.c,
+     * deliver_to_handler). Set only by the exceptions that set them in a
+     * kernel (loop.c, fault_note), never cleared by a delivery: a BRK, a kill,
+     * a seccomp trap still show the last fault's. Inherited by a new thread
+     * (GThread, thread_entry) and by a fork child, kept by an execve -- the
+     * exec'ing thread's, whichever thread then runs the image (Machine,
+     * dethread_fault_address/_code). */
+    u64 fault_address, fault_code;
     u64 clear_child_tid;      /* CLONE_CHILD_CLEARTID address (futex on exit) */
     u64 robust_head;          /* set_robust_list head, echoed by get_robust_list */
     /* Guest blocked-signal set: a per-thread attribute (POSIX), inherited
