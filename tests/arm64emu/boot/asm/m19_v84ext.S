@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* M19 self-test: ARMv8.3/8.4 GPR-side extensions — FEAT_LRCPC2 LDAPUR/STLUR
- * (full opc x size grid, sign/zero extension, negative and unaligned imm9,
+ * (full opc x size grid, sign/zero extension, negative and unscaled imm9,
  * SP base), FEAT_JSCVT FJCVTZS (result + NZCV corner battery) and
  * FEAT_FLAGM/FLAGM2 CFINV/RMIF/SETF8/SETF16/AXFLAG/XAFLAG. x0=0 on success,
  * else failing-check id. Expected values are hand-computed; the same file
@@ -52,8 +52,12 @@ _start:
     ldapur  x2, [x12, #-8]               /* negative imm9 */
     CKX     x2, 0x8899AABBCCDDEEFF, 11
 #endif
-    ldapur  w2, [x10, #5]                /* unaligned: bytes 5..8 */
-    CKX     x2, 0x778899AA, 12
+    /* An imm9 the access size does not divide, at an aligned address: an
+     * ordered access must be aligned (no FEAT_LSE2 here, where qemu -cpu
+     * max has it; m37_align checks the fault a misaligned one takes). */
+    add     x13, x10, #3
+    ldapur  w2, [x13, #1]                /* unscaled imm9: bytes 4..7 */
+    CKX     x2, 0x8899AABB, 12
 
     /* ================= FEAT_LRCPC2: STLUR (store grid) ================= */
     ldr     x12, =d64b

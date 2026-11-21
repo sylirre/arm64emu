@@ -188,7 +188,8 @@ emu_loop:
         EC_SVC64            -> syscall_dispatch(c)          // x8=nr, x0..x5 args, x0=ret
         EC_DABORT/EC_IABORT -> sig_deliver_fault(SIGSEGV)   // MAPERR vs ACCERR from mem.c;
                                                             // SIGBUS: BUS_ADRERR past EOF,
-                                                            // BUS_ADRALN unaligned atomic
+                                                            // BUS_ADRALN misaligned exclusive,
+                                                            // ordered or atomic access
         EC_PC_ALIGN         -> sig_deliver_fault(SIGBUS)    // BUS_ADRALN, si_addr = PC
         EC_SP_ALIGN         -> sig_deliver_fault(SIGBUS)    // BUS_ADRALN, si_addr = SP
         EC_BRK64            -> sig_deliver_fault(SIGTRAP)

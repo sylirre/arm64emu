@@ -1718,6 +1718,29 @@ static void emit_atomic_up(BE *be, const IRBlock *ir, int i) {
     be->fl = FL_MEM;
 }
 
+/* IRO_ALIGN (one CPU; mirrors backend_x86_64.c emit_align): tst against the
+ * mask, and misaligned, jit_exec1 raises the alignment fault and the block
+ * ends. The mask is 1, 3, 7 or 15, a logical immediate of 1 to 4 ones. */
+static void emit_align(BE *be, const IROp *o) {
+    Emit *e = be->e;
+    materialize_flags(be);                        /* the tst sets NZCV */
+    int ha = ra_use(be, o->a);
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
+    unsigned ones = (unsigned)__builtin_popcount(o->aux);
+    ei(e, 0xF240001Fu | ((ones - 1) << 10) |      /* tst x[ha], #mask */
+          ((unsigned)ha << 5));
+    u8 *aligned = bcond_fwd(e, 0);                /* b.eq aligned (Z=1) */
+    slow_store_dirty(be);
+    ei(e, enc_mov(1, 0, 28));                     /* jit_exec1(c, pc, insn) */
+    emit_imm64(e, 1, o->imm2pc);
+    ei(e, enc_movz(0, 2, (u32)o->imm & 0xffff, 0));
+    ei(e, enc_movk(0, 2, ((u32)o->imm >> 16) & 0xffff, 1));
+    ei(e, enc_ldr(3, 16, 27, (unsigned)offsetof(JitEnv, helper_exec1)));
+    ei(e, enc_blr(16));
+    exit_plain(be, o->icnt);
+    fwd_here(e, aligned);
+}
+
 static void emit_atomic_end(BE *be, const IROp *o) {
     Emit *e = be->e;
     sync_all(be);
@@ -2408,6 +2431,9 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             break;
         case IRO_ATOMIC_END:
             emit_atomic_end(be, o);
+            break;
+        case IRO_ALIGN:
+            emit_align(be, o);
             break;
         case IRO_VOP:
             emit_vop(be, o);

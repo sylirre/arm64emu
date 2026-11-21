@@ -184,7 +184,7 @@ no delivery clears. The run loop sets it where the kernel does (`loop.c`,
 
 | exception | `fault_address` | ESR in the record |
 |---|---|---|
-| data/instruction abort, an unaligned atomic's alignment fault (`set_thread_esr`) | the address, untagged | the CPU's; for an address no user page can have (past `TASK_SIZE`, the kernel's half) a level-0 translation fault keeping only EC, IL, CM, WnR |
+| data/instruction abort, the alignment fault of a misaligned exclusive, ordered or atomic access (`set_thread_esr`) | the address, untagged | the CPU's; for an address no user page can have (past `TASK_SIZE`, the kernel's half) a level-0 translation fault keeping only EC, IL, CM, WnR |
 | a page past end-of-file (`SIGBUS`/`BUS_ADRERR`) | the address | the translation fault the kernel took (DFSC level 3) |
 | SP or PC alignment (`arm64_notify_die`) | 0 | the CPU's (EC 0x26/0x22, IL) |
 | undefined instruction (`force_signal_inject`, no ESR) | 0 | none: the record goes |
@@ -201,8 +201,8 @@ fault's `si_addr` reaches a handler with its tag stripped unless the handler
 was installed with `SA_EXPOSE_TAGBITS` (`hide_si_addr_tag_bits`; a tracer is
 shown the address as the CPU gave it). qemu-user writes no `esr_context` at
 all, so `tests/arm64emu/chroot/fixtures/faultctx.c` checks itself against
-what a 6.8 kernel gave it (and `fixtures/spalign.c` the SP-alignment
-record).
+what a 6.8 kernel gave it (`fixtures/atomalign.c` the alignment faults,
+`fixtures/spalign.c` the SP-alignment record).
 
 The CPU is redirected: `x0`=signo, `x1`=&siginfo, `x2`=&ucontext, `pc`=handler,
 and — because arm64 has no `sa_restorer` — `x30` points at a hidden one-page

@@ -181,8 +181,15 @@ writes; stores bracket ordinary probed stores between a monitor-compare
 (branch to fail) and a status-write/monitor-clear, so the D-TLB probe,
 SMC write-refusal and fault-exit machinery are reused unchanged.
 LDAR/STLR translate as plain accesses (exactly what the in-order
-interpreter does); the `o2=1,o1=1` CAS space stays on `exec_a64` so
-decode.c remains authoritative for it.
+interpreter does), a CAS as a load, a compare and a conditional probed
+store, the LSE memory operations as a load, the operation and a store;
+CASP stays on `exec_a64`. Each of these, the LSE atomics
+and LDAPR among them, opens with an `IRO_ALIGN`: the alignment the
+access must have (`decode.c access_aligned` — no FEAT_LSE2 here), a
+test and a predicted-taken branch, ahead of the first probed op and, for
+a store-exclusive, ahead of the monitor compare. Misaligned, the
+instruction re-runs through `jit_exec1`, which raises the alignment
+fault, and the block ends.
 
 ## Known, documented deviations from the interpreter
 

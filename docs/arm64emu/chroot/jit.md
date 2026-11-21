@@ -145,7 +145,8 @@ compare-select at the access width, and `LDAR/LDAPR/STLR` become
 single-copy-atomic ordered accesses. Guest `DMB/DSB` emit one host fence
 inline, and `MRS/MSR TPIDR_EL0` (TLS) is a CPU-struct move — none of these
 end the block anymore. Any misaligned or TLB-missing atomic re-runs the
-whole instruction through `jit_exec1`. `CASP/LDXP/STXP` stay helpers.
+whole instruction through `jit_exec1`, where a misaligned one takes its
+alignment fault (`decode.c` `access_aligned`). `CASP/LDXP/STXP` stay helpers.
 
 **Inline vector / scalar FP.** The interpreter computes FP with host C
 `float`/`double`, so host FP instructions match it on the same host — with

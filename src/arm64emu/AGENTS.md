@@ -395,6 +395,11 @@ tests/arm64emu/boot/
                           run with --memory 384)
     m33_simdshift.S       AdvSIMD SLI/SRI shift-insert extremes, every lane
                           width incl. SRI by the element width (dual-mode)
+    m34_fpcrfz.S          FPCR.FZ / FPCR.FZ16 flush-to-zero
+    m35_el0priv.S         what EL0 may execute of the system instructions
+    m36_sevl.S            SEV / SEVL set the event register in every tier
+    m37_align.S           the alignment fault of a misaligned exclusive,
+                          ordered or atomic access (no FEAT_LSE2), EL1 and EL0
   scripts/
     console_mux.c         dev harness / worked example for --console-fd and
                           --ctrl-fd: a socketpair per guest terminal, output

@@ -122,7 +122,7 @@ lazily by `fpsr_sync` (`lib/arm64/exec_fpsimd.c`) only when the guest reads FPSR
 
 | Gate | Command | What it proves |
 |------|---------|----------------|
-| asm suite ×3 | `make test-arm64emu-boot` / `make test-arm64emu-boot-pd` / `make test-arm64emu-boot-jit` | m1–m34 pass (`x0=0`) under every engine; values oracle-validated once via qemu-aarch64 (`-DUSERMODE` dual-mode files: m13, m19–m22, m34) |
+| asm suite ×3 | `make test-arm64emu-boot` / `make test-arm64emu-boot-pd` / `make test-arm64emu-boot-jit` | m1–m37 pass (`x0=0`) under every engine; values oracle-validated once via qemu-aarch64 (`-DUSERMODE` dual-mode files: m13, m19–m22, m34) — whose `-cpu max` has FEAT_LSE2, which this CPU does not: a misaligned ordered or atomic access runs there and faults here (m37) |
 | consistency checkpoints | inside `test-arm64emu-boot-pd` / `test-arm64emu-boot-jit` | deterministic firmware+Linux boot (harness pins `ARM64EMU_RTCLOCK=0`; runtime default is the host clock), byte-identical serial + final CPU state at 1M/4M/16M/64M/300M |
 | full-boot log gate | `make test-arm64emu-boot-jit-full` / `make test-arm64emu-boot-pd-full` (`tests/arm64emu/boot/run_bootlog_gate.sh`) | 1.6B-insn boot log identical after timestamp normalization — covers the whole boot, not just the UEFI phase the checkpoints sit in; **mandatory for frontend changes** |
 | cross-engine fuzzing | `make fuzz-arm64emu` (`tests/arm64emu/boot/run_fuzz_engines.sh` + `tests/arm64emu/boot/scripts/fuzz_gen.c`) | random blocks over the inlined surface, interpreter (`--no-predecode`) vs the predecoded tier vs `--jit` vs `--jit`+SLOWMEM/NOFUSE/NOVRA; phase 1 compares the HLT line natively-executed, phase 2 stops at the exact pre-HLT icount and compares the full register dump |

@@ -3273,6 +3273,30 @@ static void emit_atomic_up(BE *be, const IRBlock *ir, int i) {
     be->fl = FL_MEM;
 }
 
+/* IRO_ALIGN (one CPU): the alignment an exclusive, ordered or atomic access
+ * must have, ahead of the probed ops it lowers to; an SP base takes the
+ * SP-alignment check first. Misaligned, the interpreter runs the whole
+ * instruction (jit_exec1), raising the alignment fault, and the block ends
+ * whatever it did: the inline ops after this one must not run. The common
+ * case is a test and a predicted-taken branch. */
+static void emit_align(BE *be, const IROp *o) {
+    Emit *e = be->e;
+    materialize_flags(be);                        /* the test clobbers EFLAGS */
+    int ha = ra_use(be, o->a);
+    if (be->spchk && o->a == VREG_SP) emit_spchk(be, ha, o->imm2pc, o->icnt);
+    rex(e, 1, 0, 0, ha); e8(e, 0xF7);             /* test ha, mask (F7 /0 id) */
+    e8(e, (u8)(0xC0 | (ha & 7))); e32(e, o->aux);
+    u8 *aligned = jcc_fwd(e, CC_E);               /* ZF=1 => aligned, proceed */
+    slow_store_dirty(be);
+    mov_rr(e, 1, RDI, R14);                       /* jit_exec1(c, pc, insn) */
+    rex(e, 1, 0, 0, RSI); e8(e, (u8)(0xB8 | RSI)); e64(e, o->imm2pc);
+    mov_ri(e, 0, RDX, (u32)o->imm);
+    ld64(e, RAX, R15, (s32)offsetof(JitEnv, helper_exec1));
+    e8(e, 0xFF); e8(e, 0xD0);                     /* call rax */
+    exit_plain(be, o->icnt);
+    fwd_here(e, aligned);
+}
+
 static void emit_atomic_end(BE *be, const IROp *o) {
     Emit *e = be->e;
     sync_all(be);
@@ -4247,6 +4271,9 @@ static int emit_op(BE *be, const IRBlock *ir, int i) {
             break;
         case IRO_ATOMIC_END:
             emit_atomic_end(be, o);
+            break;
+        case IRO_ALIGN:
+            emit_align(be, o);
             break;
         case IRO_VOP:
             emit_vop(be, ir, i, o);

@@ -1736,6 +1736,93 @@ FCXEOF
     fi
 fi
 
+# ---- the alignment a misaligned exclusive, ordered or atomic access faults
+# on (lib/arm64/decode.c access_aligned; the JIT's one-CPU IRO_ALIGN is boot
+# mode's, m37_align): SIGBUS/BUS_ADRALN with DFSC 0x21 in the frame, ahead
+# of translation and permission, a store-exclusive whatever the monitor
+# holds; a byte and a plain access never. Self-checking: qemu-user keeps no
+# ESR record. The block is what a 6.8 kernel gave this program under
+# qemu-system as a Neoverse-N1 (Armv8.2: LSE, LDAPR, no LSE2, no LRCPC2), the
+# four LRCPC2 lines as a Neoverse-N2, whose LSE2 still faults the 16-byte
+# crossing each of them makes -- except the six store-exclusives whose
+# monitor does not cover their address (stxr, stlxr m, stxrh, stxp, stlxp w,
+# ro stxr): qemu answers those with status 1 before it looks at the
+# alignment, which its own source calls out of spec, where the
+# architecture's AArch64.ExclusiveMonitorsPass checks the alignment first.
+# The two whose monitor does (stxrh m, stxp m) fault there as here. ----
+if [ -n "$AGCC" ]; then
+    AAL=build/tests/arm64emu/chroot/fixtures/atomalign.bin
+    if "$AGCC" -static -O2 -o "$AAL" tests/arm64emu/chroot/fixtures/atomalign.c 2>/dev/null; then
+        aal_want=$(cat <<'AALEOF'
+ldxrh     SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000021 (record 1)
+ldxr w    SIGBUS code 1 addr b+2 | fault_address b+2 | esr 0x92000021 (record 1)
+ldaxr     SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000021 (record 1)
+ldaxr 16  SIGBUS code 1 addr b+12 | fault_address b+12 | esr 0x92000021 (record 1)
+stxr      SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+stlxr m   SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+stxrh     SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000061 (record 1)
+ldxp w    SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000021 (record 1)
+ldaxp     SIGBUS code 1 addr b+8 | fault_address b+8 | esr 0x92000021 (record 1)
+stxp      SIGBUS code 1 addr b+8 | fault_address b+8 | esr 0x92000061 (record 1)
+stlxp w   SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+stxrh m   SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000061 (record 1)
+stxp m    SIGBUS code 1 addr b+8 | fault_address b+8 | esr 0x92000061 (record 1)
+ldarh     SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000021 (record 1)
+ldar w    SIGBUS code 1 addr b+2 | fault_address b+2 | esr 0x92000021 (record 1)
+ldar      SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000021 (record 1)
+stlrh     SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000061 (record 1)
+stlr w    SIGBUS code 1 addr b+2 | fault_address b+2 | esr 0x92000061 (record 1)
+stlr      SIGBUS code 1 addr b+12 | fault_address b+12 | esr 0x92000061 (record 1)
+ldaprh    SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000021 (record 1)
+ldapr w   SIGBUS code 1 addr b+2 | fault_address b+2 | esr 0x92000021 (record 1)
+ldapr     SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000021 (record 1)
+ldapur    SIGBUS code 1 addr b+12 | fault_address b+12 | esr 0x92000021 (record 1)
+ldapursh  SIGBUS code 1 addr b+15 | fault_address b+15 | esr 0x92000021 (record 1)
+stlur w   SIGBUS code 1 addr b+14 | fault_address b+14 | esr 0x92000061 (record 1)
+stlur     SIGBUS code 1 addr b+9 | fault_address b+9 | esr 0x92000061 (record 1)
+ldadd     SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+ldaddh    SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000061 (record 1)
+stset w   SIGBUS code 1 addr b+2 | fault_address b+2 | esr 0x92000061 (record 1)
+swpal     SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+ldumax    SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+ldsminh   SIGBUS code 1 addr b+1 | fault_address b+1 | esr 0x92000061 (record 1)
+cas w     SIGBUS code 1 addr b+2 | fault_address b+2 | esr 0x92000061 (record 1)
+casal     SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+casp w    SIGBUS code 1 addr b+4 | fault_address b+4 | esr 0x92000061 (record 1)
+casp      SIGBUS code 1 addr b+8 | fault_address b+8 | esr 0x92000061 (record 1)
+hole      SIGBUS code 1 addr hole+4 | fault_address hole+4 | esr 0x92000021 (record 1)
+hole al   SIGSEGV code 1 addr hole | fault_address hole | esr 0x92000007 (record 1)
+ro stxr   SIGBUS code 1 addr ro+4 | fault_address ro+4 | esr 0x92000061 (record 1)
+ro ldadd  SIGBUS code 1 addr ro+4 | fault_address ro+4 | esr 0x92000061 (record 1)
+ro al     SIGSEGV code 2 addr ro | fault_address ro | esr 0x9200004f (record 1)
+cross     SIGBUS code 1 addr cross | fault_address cross | esr 0x92000021 (record 1)
+tagged    SIGBUS code 1 addr b+2 | fault_address b+2 | esr 0x92000021 (record 1)
+ldxrb     no signal
+stxrb     no signal
+ldarb     no signal
+stlrb     no signal
+ldaddb    no signal
+casb      no signal
+ldr       no signal
+str       no signal
+AALEOF
+)
+        for eng in "" "--no-predecode" "--jit"; do
+            lbl="atomalign: ${eng:-predecoded}"
+            got=$(timeout -k 5 60 "$EMU" chroot $eng / "$AAL" 2>/dev/null); rc=$?
+            if [ "$got" = "$aal_want" ] && [ "$rc" = 0 ]; then
+                pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl (rc=$rc)"
+                diff <(printf '%s\n' "$aal_want") <(printf '%s\n' "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm "$AAL"
+    else
+        skip_build "fixtures/atomalign"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom

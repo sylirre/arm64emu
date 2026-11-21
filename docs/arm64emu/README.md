@@ -626,6 +626,15 @@ Both modes run one AArch64 CPU (`lib/arm64`):
   (`BUS_ADRALN`, `si_addr` the SP). A prefetch never checks. qemu-aarch64
   checks SP alignment in neither mode, so a program that misaligns SP runs
   under it but not on hardware or here.
+- **Exclusive, ordered and atomic accesses** must be aligned to their size, a
+  pair to the whole pair (the CPU has no FEAT_LSE2): a misaligned LDXR/STXR,
+  LDAR/STLR, LDAPR/LDAPUR/STLUR, LD\<op\>, SWP, CAS or CASP takes an alignment
+  fault in every engine and both modes, ahead of translation, and a
+  store-exclusive whatever the monitor holds — in chroot mode `SIGBUS`
+  (`BUS_ADRALN`, `si_addr` the address). A plain load or store is never
+  checked. A CPU with FEAT_LSE2 lets an atomic or ordered access misaligned
+  within 16 bytes run, so code that relies on it runs there but not here, as
+  on any CPU without it.
 
 What remains unimplemented is deliberately unadvertised (PAuth/BTI/MTE/SVE —
 see [todo/TODO_OPCODES.md](todo/TODO_OPCODES.md)).

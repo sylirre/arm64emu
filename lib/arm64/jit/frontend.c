@@ -199,6 +199,18 @@ static u8 base_stage(IRBlock *ir, unsigned rn) {
     return VREG_TMP2;
 }
 
+/* One CPU: the alignment an exclusive, ordered or atomic access must have
+ * (IRO_ALIGN), ahead of the first probed op it lowers to. `base` is the
+ * guest register (VREG_SP for SP, so the SP-alignment check stays first); a
+ * byte needs none. */
+static void put_align(IRBlock *ir, unsigned rn, unsigned bytes, u32 insn,
+                      u64 pc) {
+    if (bytes < 2) return;
+    IROp *o = ir_put(ir, IRO_ALIGN, 1, VREG_ZERO, rsp(rn), VREG_ZERO, 0,
+                     insn, bytes - 1);
+    o->imm2pc = pc;
+}
+
 /* Pre/post-indexed load: the interpreter computes the writeback value from
  * the OLD base and applies it AFTER the register write (base wins when
  * rt == rn), so a base-clobbering load must stash the base in TMP2 first. */
@@ -701,13 +713,15 @@ static int fe_fpsimd(IRBlock *ir, u32 insn, u64 pc) {
  * Inline the LSE atomic memory operations (decode.c ldst_atomic_up is the
  * reference). On one CPU the LSE is a plain read-modify-write through the
  * MMU — a generated load->ALU->store is atomic w.r.t. the guest and
- * byte-identical to the interpreter, so no host LOCK/fence is needed and no
- * backend change: everything lowers to existing probed IR ops. The store is an
+ * byte-identical to the interpreter, so no host LOCK/fence is needed: it
+ * lowers to ordinary probed IR ops, after the IRO_ALIGN that checks its
+ * alignment first, as decode.c's ldst_atomic does. The store is an
  * ordinary IRO_ST, so a store fault exits the block with the guest pc baked in
  * and Rt still unwritten — decode.c re-runs the whole insn. Register ordering
  * mirrors the interpreter (base snapshot first so Rt may alias Rn; Rt written
- * LAST so it may alias Rs). Byte/half *signed* min/max and CAS/CASP are left on
- * the CALL1 helper (return 0). Returns 1 when it emitted the op. */
+ * LAST so it may alias Rs). Byte/half min/max are left on the CALL1 helper
+ * (return 0, before anything is emitted), CAS is fe_lse_cas's below. Returns
+ * 1 when it emitted the op. */
 static int fe_lse_memop(IRBlock *ir, u32 insn, u64 pc) {
     unsigned szl = insn >> 30, o3 = (insn >> 15) & 1, opc = (insn >> 12) & 7;
     unsigned rs = (insn >> 16) & 31, rn = (insn >> 5) & 31, rt = insn & 31;
@@ -715,14 +729,17 @@ static int fe_lse_memop(IRBlock *ir, u32 insn, u64 pc) {
 
     if (o3 && opc != 0) {                        /* SWP is o3&opc==0; else... */
         if (opc == 4) {                          /* LDAPR: plain load-acquire */
+            put_align(ir, rn, 1u << szl, insn, pc);
             put_ld(ir, rsp(rn), 0, rt, szl, 0, w, pc);
             ir->ninsns++;
             return 1;
         }
         return 0;                                /* unallocated: helper */
     }
+    if (!o3 && opc >= 4 && szl < 2) return 0;    /* byte/half min/max: helper */
 
     /* base -> TMP2 (Rt may alias Rn); old -> TMP1; result -> TMP0. */
+    put_align(ir, rn, 1u << szl, insn, pc);
     u8 abase = base_stage(ir, rn);
     put_ld_tmp(ir, abase, 0, 1, szl, 0, w, pc);   /* TMP1 = old, zero-ext */
 
@@ -733,7 +750,6 @@ static int fe_lse_memop(IRBlock *ir, u32 insn, u64 pc) {
         put_alu(ir, aop[opc], (u8)w, VREG_TMP0, VREG_TMP1, rx(rs));
         put_st(ir, abase, 0, VREG_TMP0, szl, pc);
     } else {                                      /* LDSMAX/LDSMIN/LDUMAX/LDUMIN */
-        if (szl < 2) return 0;                    /* byte/half signed-safe: helper */
         /* result = cc ? old : Rs, cc comparing old vs Rs (SUBS old,Rs). */
         static const u8 cc[4] = { 12, 11, 8, 3 }; /* GT, LT, HI, LO */
         put_alu(ir, IRO_SUBS, (u8)w, VREG_ZERO, VREG_TMP1, rx(rs));
@@ -758,6 +774,7 @@ static int fe_lse_cas(IRBlock *ir, u32 insn, u64 pc) {
     unsigned rs = (insn >> 16) & 31, rn = (insn >> 5) & 31, rt = insn & 31;
     u8 w = (u8)(szl == 3);
 
+    put_align(ir, rn, 1u << szl, insn, pc);
     u8 cbase = base_stage(ir, rn);               /* base (Rt may alias Rn) */
     put_ld_tmp(ir, cbase, 0, 1, szl, 0, w, pc);              /* TMP1 = old, zero-ext */
 
@@ -788,7 +805,9 @@ static int fe_lse_cas(IRBlock *ir, u32 insn, u64 pc) {
  * Stores wrap probed IRO_STs between IRO_ATOMIC (monitor compare,
  * branches to the fail label) and IRO_ATOMIC_END (status write + monitor
  * clear) — a store fault exits the block with the monitor still set and
- * Rs unwritten. Counted in ninsns here like any inline insn. */
+ * Rs unwritten. Both take IRO_ALIGN first, the stores ahead of the bracket:
+ * decode.c checks a store-exclusive's alignment before its monitor. Counted
+ * in ninsns here like any inline insn. */
 static int fe_atomic_up(IRBlock *ir, u32 insn, u64 pc) {
     /* bit 26 (V) MUST be in the mask: the atomic-memory-operation page is
      * defined for V=0 only, and decode.c reaches ldst_atomic through
@@ -809,6 +828,9 @@ static int fe_atomic_up(IRBlock *ir, u32 insn, u64 pc) {
     unsigned rt = insn & 31, rn = (insn >> 5) & 31;
     unsigned rt2 = (insn >> 10) & 31, rs = (insn >> 16) & 31;
 
+    /* Aligned to the access, a pair to the whole pair; a store-exclusive
+     * whatever the monitor holds, so ahead of the bracket. */
+    put_align(ir, rn, bytes << o1, insn, pc);
     if (L) {                                     /* LDXR/LDAXR/LDXP/LDAXP */
         /* va first: rt may alias rn, and excl_addr is the OLD base. */
         u8 xbase = base_stage(ir, rn);
@@ -1811,11 +1833,12 @@ static int fe_insn(IRBlock *ir, const PDEnt *e, u64 pc) {
                 /* LDAR/STLR (and anything else with o2=1, o1=0 that decode.c
                  * accepts leniently) on one CPU: the in-order interpreter runs these as
                  * plain mem_read/mem_write — no monitor effect, no fence —
-                 * so plain accesses match it exactly. The o2=1, o1=1 CAS
-                 * space stays CALL1: exec_a64 remains authoritative for
-                 * whatever it does with those encodings today or after a
-                 * fix. */
+                 * so plain accesses match it exactly, once IRO_ALIGN has
+                 * checked the alignment an ordered access must have. The
+                 * o2=1, o1=1 CAS space never gets here: fe_atomic took it
+                 * (fe_lse_cas). */
                 unsigned szl = insn >> 30, rt = insn & 31, rn = (insn >> 5) & 31;
+                put_align(ir, rn, 1u << szl, insn, pc);
                 if ((insn >> 22) & 1)
                     put_ld(ir, rsp(rn), 0, rt, szl, 0, szl == 3, pc);
                 else

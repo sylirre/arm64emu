@@ -345,9 +345,9 @@ int emu_loop(CPU *c) {
                         fault_note_abort(far, (esr & ~0x3fULL) | FSC_TRANS_L3);
                         sig_deliver_fault(c, SIGBUS, 2 /*BUS_ADRERR*/, far);
                     } else if (fsc == FSC_ALIGN) {
-                        /* An unaligned atomic (decode.c atomic_align_fault):
-                         * do_alignment_fault's SIGBUS/BUS_ADRALN. It was
-                         * delivered as SIGSEGV/SEGV_MAPERR. */
+                        /* A misaligned exclusive, ordered or atomic access
+                         * (decode.c access_aligned): do_alignment_fault's
+                         * SIGBUS/BUS_ADRALN. */
                         fault_note_abort(far, esr);
                         sig_deliver_fault(c, SIGBUS, 1 /*BUS_ADRALN*/, far);
                     } else {

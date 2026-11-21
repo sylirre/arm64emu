@@ -150,6 +150,18 @@ enum {
                              * writes Rs = old on both join paths, touches no
                              * monitor. */
 
+    /* One CPU only: the alignment an exclusive, ordered or atomic access must
+     * have (decode.c access_aligned), checked ahead of the probed loads and
+     * stores fe_atomic_up and fe_insn lower it to -- the first of them would
+     * otherwise run, and a store-exclusive's monitor miss would skip them
+     * all. a = base, aux = the mask (alignment - 1), imm = the insn word,
+     * imm2pc = its pc. An SP base takes the SP-alignment check first, as in
+     * the interpreter. Misaligned, the instruction re-runs through jit_exec1,
+     * which raises the alignment fault, and the block ends. Where guest
+     * threads run concurrently IRO_ATOMIC gates its own alignment, so only
+     * the 64-bit backends, the only ones a full system runs on, have it. */
+    IRO_ALIGN,
+
     IRO_N_
 };
 
@@ -407,15 +419,19 @@ typedef struct IROp {
  * Named because it also fixes the worst case below; keep the two together. */
 #define DCZVA_STORES 8
 
-/* Worst-case IR ops emitted for ONE guest instruction. DC ZVA is the outlier
- * by a wide margin — an address-mask op plus DCZVA_STORES stores — where the
- * next largest (LDP with writeback) is 6. jit_fe_block must leave this much
- * headroom free before translating another instruction, PLUS one slot for the
- * IRO_JMP it appends when the budget runs out. Under-reserving does not merely
- * truncate a block: the append runs off the end of ops[], and the liveness
- * pass then indexes live_after[] one past its last element, which is 8 bytes
- * past the end of the heap allocation. */
-#define IR_MAX_OPS_PER_INSN (DCZVA_STORES + 1)
+/* Worst-case IR ops emitted for ONE guest instruction: an LDXP or LDAXP on
+ * one CPU (fe_atomic_up), 11 -- the alignment check, the base staged, two
+ * loads, two moves, five ops recording the monitor -- ahead of DC ZVA, an
+ * address-mask op plus DCZVA_STORES stores; the next largest (LDP with
+ * writeback) is 6. jit_fe_block must leave this much headroom free before
+ * translating another instruction, PLUS one slot for the IRO_JMP it appends
+ * when the budget runs out. Under-reserving does not merely truncate a block:
+ * the append runs off the end of ops[], and the liveness pass then indexes
+ * live_after[] one past its last element, which is 8 bytes past the end of
+ * the heap allocation. */
+#define IR_MAX_OPS_PER_INSN 11
+_Static_assert(IR_MAX_OPS_PER_INSN >= DCZVA_STORES + 1,
+               "DC ZVA must fit the per-instruction budget");
 
 /* Sized from an ~4-ops-per-instruction average, not from the worst case: a
  * block whose instructions expand more simply ends early on the headroom

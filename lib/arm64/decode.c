@@ -659,20 +659,47 @@ static bool vreg_store(CPU *c, unsigned Vt, u64 va, unsigned bytes) {
  * selects these via HWCAP_ATOMICS; -march=armv8.1-a+ code uses them
  * unconditionally. Two implementations, by the CPU's mode: plain
  * read-modify-writes on one CPU, host atomics where guest threads run
- * concurrently (CpuEngine.smp). */
+ * concurrently (CpuEngine.smp). Both are reached with the access's alignment
+ * already checked (access_aligned, below). */
+
+/* The alignment fault of an access that must be aligned and is not: a data
+ * abort, DFSC 0x21, at the address the access names. A load says so (WnR 0);
+ * a store, and an atomic that reads and writes, fault as a write (WnR 1, what
+ * qemu-system reports for an LDADD). */
+__attribute__((cold)) static void align_fault(CPU *c, u64 va, bool write) {
+    cpu_raise_sync(c, esr_make(c->el ? EC_DABORT_SAME : EC_DABORT_LOWER,
+                               iss_dabort(write, FSC_ALIGN)), va);
+}
+
+/* An exclusive (LDXR, STXR and their acquire/release and pair forms), an
+ * ordered access (LDAR, STLR, LDAPR, LDAPUR, STLUR, LDLAR, STLLR) and an LSE
+ * atomic (LD<op>, SWP, CAS, CASP) must be aligned to the size they access,
+ * a pair to the whole pair, whatever SCTLR_ELx.A says: without FEAT_LSE2,
+ * which this CPU does not have (ID_AA64MMFR2_EL1.AT is 0),
+ * AArch64.CheckAlignment checks every atomic and ordered access. The check
+ * comes after the SP-alignment check and ahead of translation, so a
+ * misaligned access to an unmapped page takes the alignment fault; and a
+ * store-exclusive takes it whatever the monitor holds
+ * (AArch64.ExclusiveMonitorsPass checks the alignment first). Plain loads and
+ * stores are never checked: that is SCTLR_ELx.A's, which Linux leaves 0 and
+ * no engine models. Returns true if the access may proceed. */
+static inline bool access_aligned(CPU *c, u64 va, unsigned bytes, bool write) {
+    if (LIKELY(!(va & (bytes - 1)))) return true;
+    align_fault(c, va, write);
+    return false;
+}
 
 /* ---- one CPU ----
  * A plain read-modify-write through mem_read/mem_write is architecturally
  * atomic on a single in-order CPU, and the A/R acquire/release bits need no
  * fences. A fault from either access aborts the whole instruction with no
- * register update (mem_read/mem_write raise the data abort). Alignment is not
- * checked, matching the exclusives below; the compare-fail path of CAS skips
- * the architectural write-permission check (documented laxity, same family
- * as TODO_OPCODES §5). These are also the concurrent forms' way through
- * memory with no host pointer to operate on (mem_host_ptr): the access then
- * faults where the architecture does -- CAS `strict`, writing the old value
- * back when the comparison fails, since the architecture translates a CAS as
- * a write whatever it compares. */
+ * register update (mem_read/mem_write raise the data abort). The compare-fail
+ * path of CAS skips the architectural write-permission check (documented
+ * laxity, same family as TODO_OPCODES §5). These are also the concurrent
+ * forms' way through memory with no host pointer to operate on
+ * (mem_host_ptr): the access then faults where the architecture does -- CAS
+ * `strict`, writing the old value back when the comparison fails, since the
+ * architecture translates a CAS as a write whatever it compares. */
 
 static NOINL void ldst_atomic_up(CPU *c, u32 insn) {
     unsigned size = BITS(31, 30);
@@ -681,14 +708,11 @@ static NOINL void ldst_atomic_up(CPU *c, u32 insn) {
     unsigned bytes = 1u << size, esize = 8u * bytes;
     u64 va = reg_xsp(c, Rn);
 
-    /* o3==1 is SWP (opc==0) or LDAPR (opc==4); other opc are LD<op>. */
-    if (o3 && opc != 0) {
-        if (opc == 4) {                          /* LDAPR: load-acquire RCpc */
-            u64 v;
-            if (mem_read(c, va, bytes, &v)) set_x(c, Rt, v);
-            return;
-        }
-        undefined(c, insn);
+    /* o3==1 is SWP (opc==0) or LDAPR (opc==4, the only other one
+     * ldst_atomic lets through); other opc are LD<op>. */
+    if (o3 && opc != 0) {                        /* LDAPR: load-acquire RCpc */
+        u64 v;
+        if (mem_read(c, va, bytes, &v)) set_x(c, Rt, v);
         return;
     }
 
@@ -766,12 +790,6 @@ static int lse_order(bool acq, bool rel) {
     return __ATOMIC_RELAXED;
 }
 
-/* Raise an alignment fault (unaligned atomic) as a data abort -> SIGBUS. */
-static void atomic_align_fault(CPU *c, u64 va, bool write) {
-    cpu_raise_sync(c, esr_make(c->el ? EC_DABORT_SAME : EC_DABORT_LOWER,
-                               iss_dabort(write, FSC_ALIGN)), va);
-}
-
 /* Perform one LD<op>/SWP on a `bytes`-wide host location. Returns the old value
  * (zero-extended). opc/o3 select the operation. */
 #define LSE_RMW(TY, STY)                                                        \
@@ -804,21 +822,17 @@ static NOINL void ldst_atomic_smp(CPU *c, u32 insn) {
     unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
     unsigned bytes = 1u << size;
 
-    /* o3==1 is SWP (opc==0) or LDAPR (opc==4); other opc are LD<op>. */
-    if (o3 && opc != 0) {
-        if (opc == 4) {                          /* LDAPR: load-acquire RCpc */
-            u64 v;
-            if (!mem_read(c, reg_xsp(c, Rn), bytes, &v)) return;
-            set_x(c, Rt, v);
-            return;
-        }
-        undefined(c, insn);
+    /* o3==1 is SWP (opc==0) or LDAPR (opc==4, the only other one
+     * ldst_atomic lets through); other opc are LD<op>. */
+    if (o3 && opc != 0) {                        /* LDAPR: load-acquire RCpc */
+        u64 v;
+        if (!mem_read(c, reg_xsp(c, Rn), bytes, &v)) return;
+        set_x(c, Rt, v);
         return;
     }
 
     u64 va = reg_xsp(c, Rn);
     u64 operand = reg_x(c, Rs);
-    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
     void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
     if (!hp) { ldst_atomic_up(c, insn); return; }   /* faults as it should */
 
@@ -840,7 +854,6 @@ static NOINL void ldst_cas_smp(CPU *c, u32 insn) {
     unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
     unsigned bytes = 1u << size;
     u64 va = reg_xsp(c, Rn);
-    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
     void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
     if (!hp) { ldst_cas_up(c, insn, true); return; }
     int mo = lse_order(A, R);
@@ -865,7 +878,6 @@ static NOINL void ldst_casp_smp(CPU *c, u32 insn) {
     unsigned Rs = BITS(20, 16), Rn = BITS(9, 5), Rt = BITS(4, 0);
     unsigned bytes = sz ? 16 : 8;
     u64 va = reg_xsp(c, Rn);
-    if (va & (bytes - 1)) { atomic_align_fault(c, va, true); return; }
     void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
     if (!hp) { ldst_casp_up(c, insn, true); return; }
     int mo = lse_order(A, R);
@@ -908,13 +920,25 @@ static NOINL void ldst_casp_smp(CPU *c, u32 insn) {
     }
 }
 
+/* Each form by the CPU's mode, once its alignment is checked. Only LDAPR of
+ * them all reads without writing; an o3 opc other than SWP's or LDAPR's is
+ * unallocated, which comes ahead of any alignment. */
 static void ldst_atomic(CPU *c, u32 insn) {
+    unsigned o3 = BIT(15), opc = BITS(14, 12);
+    if (o3 && opc != 0 && opc != 4) { undefined(c, insn); return; }
+    if (!access_aligned(c, reg_xsp(c, BITS(9, 5)), 1u << BITS(31, 30),
+                        !(o3 && opc == 4)))
+        return;
     if (c->eng.smp) ldst_atomic_smp(c, insn); else ldst_atomic_up(c, insn);
 }
 static void ldst_cas(CPU *c, u32 insn) {
+    if (!access_aligned(c, reg_xsp(c, BITS(9, 5)), 1u << BITS(31, 30), true))
+        return;
     if (c->eng.smp) ldst_cas_smp(c, insn); else ldst_cas_up(c, insn, false);
 }
-static void ldst_casp(CPU *c, u32 insn) {
+static void ldst_casp(CPU *c, u32 insn) {              /* the pair's size */
+    if (!access_aligned(c, reg_xsp(c, BITS(9, 5)), BIT(30) ? 16 : 8, true))
+        return;
     if (c->eng.smp) ldst_casp_smp(c, insn); else ldst_casp_up(c, insn, false);
 }
 /* ============ end LSE atomics ============ */
@@ -943,8 +967,8 @@ static inline bool sp_align_ok(CPU *c, unsigned Rn) {
  * unscaled 9-bit immediate. The acquire/release ordering takes nothing extra
  * here: a full system's single in-order CPU has none to give, and in user mode
  * it piggybacks on the host's ordinary load/store ordering (same as LDAR/LDAPR).
- * The access is an ordinary unscaled load/store. No writeback, and no SIMD&FP
- * forms at LRCPC=2. */
+ * The access is an ordinary unscaled load/store, aligned as an ordered one
+ * must be (access_aligned). No writeback, and no SIMD&FP forms at LRCPC=2. */
 static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
     unsigned size = BITS(31, 30), opc = BITS(23, 22);
     unsigned Rn = BITS(9, 5), Rt = BITS(4, 0);
@@ -956,6 +980,7 @@ static void ldst_rcpc_unscaled(CPU *c, u32 insn) {
     }
     if (!sp_align_ok(c, Rn)) return;
     u64 va = reg_xsp(c, Rn) + (u64)(s64)sign_extend(BITS(20, 12), 9);
+    if (!access_aligned(c, va, 1u << size, opc == 0)) return;
     if (opc == 0) mem_write(c, va, 1u << size, reg_x(c, Rt));   /* STLUR */
     else do_load(c, Rt, va, size, opc);                         /* LDAPUR* */
 }
@@ -1416,7 +1441,7 @@ static NOINL void excl_smp(CPU *c, u32 insn, u64 va) {
          * ATOMIC accesses, not plain memcpy, or a release store races
          * non-atomically with another thread's CAS and the lock loses updates.
          * Falls back to a fenced plain access only when a stable host pointer
-         * isn't available (page-crossing/unmapped). */
+         * isn't available (unmapped; aligned, the access crosses no page). */
         void *hp = mem_host_ptr(c, va, bytes, L ? ACC_READ : ACC_WRITE);
         if (L) {                               /* LDAR: load-acquire */
             u64 v;
@@ -1464,7 +1489,7 @@ static NOINL void excl_smp(CPU *c, u32 insn, u64 va) {
                  * A concurrent write by another guest thread changed memory ->
                  * the CAS fails -> STXR fails, exactly as the architecture
                  * requires. Falls back to a plain store only when the address
-                 * can't be a stable host pointer (page-crossing/unmapped). */
+                 * can't be a stable host pointer (unmapped). */
                 void *hp = mem_host_ptr(c, va, bytes, ACC_WRITE);
                 if (hp) {
                     u64 want = reg_x(c, Rt), exp = c->excl_val;
@@ -1549,7 +1574,7 @@ static NOINL void excl_smp(CPU *c, u32 insn, u64 va) {
 }
 
 static void ldst_exclusive(CPU *c, u32 insn) {
-    bool o2 = BIT(23), o1 = BIT(21);
+    bool o2 = BIT(23), L = BIT(22), o1 = BIT(21);
     unsigned Rn = BITS(9, 5);
     u64 va = reg_xsp(c, Rn);
     if (!sp_align_ok(c, Rn)) return;
@@ -1562,7 +1587,9 @@ static void ldst_exclusive(CPU *c, u32 insn) {
         ldst_casp(c, insn);
         return;
     }
-    /* Ordered and exclusive accesses, by the CPU's mode. */
+    /* Ordered and exclusive accesses, by the CPU's mode, once aligned: to
+     * the access's size, an LDXP/STXP's (o1) to the pair's. */
+    if (!access_aligned(c, va, (1u << BITS(31, 30)) << o1, !L)) return;
     if (c->eng.smp) excl_smp(c, insn, va);
     else excl_up(c, insn, va);
 }
