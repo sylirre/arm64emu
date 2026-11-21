@@ -21,7 +21,8 @@
 typedef struct {
     u64 handler;              /* SIG_DFL=0, SIG_IGN=1, or guest handler VA */
     u64 flags;                /* guest SA_* flags */
-    u64 restorer;             /* unused on arm64 (vDSO-less trampoline used) */
+    u64 restorer;             /* what a handler returns to under SA_RESTORER;
+                               * the trampoline page (sigtramp_va) otherwise */
     u64 mask;                 /* guest sigset (64 bits) */
 } GSigAction;
 
@@ -696,11 +697,12 @@ u64 sig_action_handler(struct Machine *m, int sig);
  * sees the signal-delivery-stop and the WIFSIGNALED death. */
 void sig_trace_update_all(struct Machine *m);
 /* Deliver one deliverable queued signal, if any (called from the run loop).
- * Never on the rt_sigreturn trampoline: that waits for the sigreturn. */
+ * Never on an rt_sigreturn trampoline: that waits for the sigreturn. */
 void sig_deliver_pending(CPU *c);
-/* Is `pc` one of the rt_sigreturn trampoline's two instructions? No signal
- * is delivered there (signal.c); the run loop and the JIT ask. */
-int sig_on_trampoline(struct Machine *m, u64 pc);
+/* Is `pc` on an rt_sigreturn trampoline -- `mov x8, #139; svc #0`, ours or
+ * a restorer of the guest's -- about to make the call? No signal is
+ * delivered there (signal.c); the run loop asks. */
+int sig_on_trampoline(CPU *c, u64 pc);
 /* Would sig_deliver_pending act on this thread's queue right now?
  * (rt_sigsuspend's sleep gate; see signal.c.) */
 int sig_pending_deliverable(struct Machine *m);
@@ -905,8 +907,11 @@ void thr_kick_all(s32 self);
  * (known_siginfo_layout)? If not, a siginfo read from userspace must be zero
  * past kernel_siginfo's 48 bytes (sys_sig.c). */
 int  sig_layout_known(int sig, s32 code);
-/* rt_sigreturn implementation. */
-void sig_return(CPU *c);
+/* rt_sigreturn: the context of the frame at the stack pointer back, and
+ * what the call returns -- x0 as restored, or 0 for a frame it refuses, whose
+ * SIGSEGV sig_badframe_deliver raises once the call has returned. */
+u64  sig_return(CPU *c);
+void sig_badframe_deliver(CPU *c);
 /* Reset host handlers we installed (guest execve keeps only IGN). */
 void sig_reset_for_exec(struct Machine *m);
 /* The calling thread's guest blocked set becomes its host mask (signal.c,

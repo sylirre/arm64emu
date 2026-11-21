@@ -709,6 +709,11 @@ void syscall_dispatch(CPU *c) {
     }
     syscall_return(c, ret);
 
+    /* An rt_sigreturn that refused its frame: the SIGSEGV is delivered on
+     * the way back to user space, after the exit stop, with the call's 0 in
+     * x0 -- the kernel's order (sig_return). */
+    if (UNLIKELY(g_tls.badframe)) sig_badframe_deliver(c);
+
     /* SECCOMP_RET_TRAP: now that the result is in x0, the SIGSYS frame
      * captures it and the guest's handler runs with x0..x2 as its arguments;
      * sigreturn restores the result the guest then observes. */

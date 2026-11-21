@@ -2350,6 +2350,16 @@ void as_publish(AddrSpace *as) {
     as_unlock();
 }
 
+static int mincore_denied(void) {
+    /* A host that will not answer. mincore(2) is old enough (2.4) that no
+     * kernel we run on lacks it, but a sandbox or a seccomp policy between
+     * the emulator and the kernel can deny it, and then the resident set is
+     * simply not knowable from in here. ARM64EMU_MINCORE_FORCE_FAIL selects that
+     * tier anywhere, which is how it is exercised off such a host. */
+    static int no_mincore = -1;
+    return PROBE_ONCE(no_mincore, getenv("ARM64EMU_MINCORE_FORCE_FAIL") != NULL);
+}
+
 /* Resident bytes of one region, measured on the host backing that IS the
  * guest's memory for it.
  *
@@ -2363,13 +2373,8 @@ void as_publish(AddrSpace *as) {
  * pointer need not be host-page aligned (head trims, shared-file offset pads),
  * so the probe is aligned outward from it. */
 static u64 region_resident(const Region *r, int *ok) {
-    /* A host that will not answer. mincore(2) is old enough (2.4) that no
-     * kernel we run on lacks it, but a sandbox or a seccomp policy between
-     * the emulator and the kernel can deny it, and then the resident set is
-     * simply not knowable from in here. ARM64EMU_MINCORE_FORCE_FAIL selects that
-     * tier anywhere, which is how it is exercised off such a host. */
-    static int no_mincore = -1;
-    if (PROBE_ONCE(no_mincore, getenv("ARM64EMU_MINCORE_FORCE_FAIL") != NULL)) {
+    /* A host that will not answer (mincore_denied). */
+    if (mincore_denied()) {
         *ok = 0;
         return 0;
     }
@@ -2563,19 +2568,99 @@ static uintptr_t __attribute__((cold)) as_write_heal(CPU *c, u64 va) {
     return out;
 }
 
-/* Is `va` a page of a file mapping that lies past end-of-file? Such a page is
- * deliberately left out of the page table (guest_map_file_impl), so it looks
- * unmapped to the walk -- but the kernel answers it with a bus error, not a
- * segmentation fault, and the distinction is what a guest handling SIGBUS on a
- * shrinking file is looking for. Cold: only reached once an access has already
- * failed. */
-static int __attribute__((cold)) va_is_file_hole(CPU *c, u64 va) {
+/* ---- the fault status of a failed access ----
+ *
+ * The DFSC a kernel's page tables would give the fault, which a handler reads
+ * in its frame's esr_context: the level the walk stopped at, and whether it
+ * found an entry to refuse the access (a permission fault) or none (a
+ * translation fault). A kernel fills its tables in as pages are faulted in,
+ * so the answer is its history, not the mappings' -- which this address space
+ * does not keep. What it does know stands in for it:
+ *
+ *   - the level: a table exists where a mapping someone could have touched
+ *     does, so the walk stops at the first level whose entry spans no
+ *     accessible mapping -- 512 GB at level 0, 1 GB at 1, 2 MB at 2 -- and
+ *     reaches the page's own, level 3, otherwise. A NULL dereference in a
+ *     PIE program, nothing mapped in its first 512 GB, is the kernel's
+ *     level-0 fault;
+ *   - an entry of the page's own: a page the host has backed is one the
+ *     guest touched, or the kernel would have faulted in for it (mincore of
+ *     the host page behind it). A mapping that refuses the access is then a
+ *     permission fault, at level 3; one never touched is a translation
+ *     fault, as on a kernel, which has no entry to refuse with yet;
+ *   - PROT_NONE: no valid entry ever, so a translation fault always -- at
+ *     level 3 for a page that has been touched (its entry is there, not
+ *     valid), at the layout's level for one that never was.
+ *
+ * What it cannot see is a kernel's own: a table freed when the last mapping
+ * under it went, kept after an munmap of less, a 2 MB span of mappings never
+ * touched (a level-2 fault on a kernel, level 3 here), fault-around, huge
+ * pages, a page swapped out. And a host whose pages are bigger than the
+ * guest's 4 KB answers residency per host page. A host that will not answer
+ * mincore -- or ARM64EMU_MINCORE_FORCE_FAIL -- leaves a refused access a
+ * permission fault, as it always was before.
+ *
+ * A page of a file mapping past end-of-file is FSC_EXTERNAL, which the run
+ * loop answers with SIGBUS (loop.c): it is deliberately left out of the page
+ * table (guest_map_file_impl), so it looks unmapped to the walk, but the
+ * kernel answers it with a bus error, and the distinction is what a guest
+ * handling SIGBUS on a shrinking file is looking for.
+ *
+ * Cold: only reached once an access has already failed (raise_dabort,
+ * as_ifetch_slow). */
+
+/* Is the host page behind a PTE resident: 1, 0, or -1 for not knowable. */
+static int pte_resident(uintptr_t pte) {
+    uintptr_t h = pte & ~(uintptr_t)PTE_FLAGS;
+    if (!h || mincore_denied()) return -1;
+    if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
+    unsigned char v = 0;
+    if (mincore((void *)(h & ~((uintptr_t)g_host_pagesz - 1)), (size_t)g_host_pagesz, &v) != 0)
+        return -1;
+    return v & 1;
+}
+
+/* The level the walk stops at for `va`, by the layout: the first whose
+ * table entry spans no accessible mapping, or 3. Regions are sorted. */
+static unsigned walk_level(AddrSpace *as, u64 va) {
+    for (unsigned l = 0; l < 3; l++) {
+        unsigned shift = 39 - 9 * l;
+        u64 lo = va & ~((1ULL << shift) - 1), hi = lo + (1ULL << shift);
+        int any = 0;
+        for (int i = 0; i < as->nregions && as->regions[i].start < hi && !any; i++)
+            any = as->regions[i].end > lo && (as->regions[i].prot & PTE_FLAGS);
+        if (!any) return l;
+    }
+    return 3;
+}
+
+/* The fault status of an access translate() refused: `perm` when the page
+ * has an entry that refuses it, not when it has none. */
+static unsigned __attribute__((cold)) fault_status(CPU *c, u64 va, bool perm) {
     AddrSpace *as = cpu_as(c);
+    u64 a = a64_untag(va);
+    unsigned fsc;
     as_lock();
-    const Region *r = as_find_region(as, va);
-    int hole = r && r->hostmap;
+    if (!perm) {
+        const Region *r = as_find_region(as, a);
+        fsc = r && r->hostmap ? FSC_EXTERNAL : FSC_TRANS_L0 + walk_level(as, a);
+    } else {
+        uintptr_t pte = pte_get(as, a);
+        int res = pte_resident(pte);
+        if (!(pte & PTE_FLAGS))
+            fsc = FSC_TRANS_L0 + (res == 1 ? 3 : walk_level(as, a));
+        else
+            fsc = res == 0 ? FSC_TRANS_L3 : FSC_PERM_L3;
+    }
     as_unlock();
-    return hole;
+    return fsc;
+}
+
+int as_fault_mapped(CPU *c, u64 va) {
+    as_lock();
+    int r = as_find_region(cpu_as(c), a64_untag(va)) != NULL;
+    as_unlock();
+    return r;
 }
 
 /* Will the kernel hand this host page over right now? The question has to be
@@ -2898,14 +2983,13 @@ int as_stack_grow_shared(CPU *c, u64 was, u64 start) {
     return r;
 }
 
-/* Raise the guest-visible abort for a failed data access. The DFSC encodes
- * unmapped (translation fault -> SEGV_MAPERR) vs permission (-> SEGV_ACCERR)
- * for precise siginfo later, and a hole in a file mapping as an external abort
- * (-> SIGBUS/BUS_ADRERR), which is what the kernel reports past end-of-file. */
+/* Raise the guest-visible abort for a failed data access, with the fault
+ * status a kernel's tables would give it (fault_status): a hole in a file
+ * mapping as an external abort (-> SIGBUS/BUS_ADRERR), which is what the
+ * kernel reports past end-of-file. The signal's si_code is the mapping's, not
+ * the status's (loop.c, as_fault_mapped). */
 static void __attribute__((cold)) raise_dabort(CPU *c, u64 va, bool write, bool perm) {
-    unsigned fsc = perm ? FSC_PERM_L3
-                        : (va_is_file_hole(c, va) ? FSC_EXTERNAL : FSC_TRANS_L3);
-    cpu_raise_sync(c, esr_make(EC_DABORT_LOWER, iss_dabort(write, fsc)), va);
+    cpu_raise_sync(c, esr_make(EC_DABORT_LOWER, iss_dabort(write, fault_status(c, va, perm))), va);
 }
 
 /* ---- host bus-error recovery ----
@@ -3252,9 +3336,7 @@ static bool as_ifetch_slow(CPU *c, u64 va, u32 *insn_out) {
     u8 *p = translate(c, va, PTE_X, &perm);
     if (!p) {
         /* As raise_dabort: executing from past end-of-file is a bus error. */
-        unsigned fsc = perm ? FSC_PERM_L3
-                            : (va_is_file_hole(c, va) ? FSC_EXTERNAL : FSC_TRANS_L3);
-        cpu_raise_sync(c, esr_make(EC_IABORT_LOWER, fsc), va);
+        cpu_raise_sync(c, esr_make(EC_IABORT_LOWER, fault_status(c, va, perm)), va);
         return false;
     }
     FetchCache *f = &c->eng.fetch[0];       /* the current EL's */

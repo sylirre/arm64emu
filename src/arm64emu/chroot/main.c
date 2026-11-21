@@ -189,7 +189,10 @@ static void help(void) {
                         "by): the sizes the guest reads about its own memory "
                         "stay its own, and the Rss figures fall back to the "
                         "host's, bounded by what the guest mapped -- which is "
-                        "what every reader of ANOTHER process already gets."},
+                        "what every reader of ANOTHER process already gets; "
+                        "and a fault on a page a mapping refuses is a "
+                        "permission fault in the frame's ESR whether or not "
+                        "the page was ever touched."},
         {"ARM64EMU_MEMFD_FORCE_FILE", "Force guest memfd_create(2) onto the "
                         "unlinked-file fallback tier with broker-held seals "
                         "(what a host kernel without memfd_create is served "

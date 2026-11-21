@@ -86,8 +86,9 @@ SYSDEF(rt_sigprocmask) {
 
 SYSDEF(rt_sigreturn) {
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    sig_return(c);
-    return c->x[0];   /* x0 was restored from the frame; keep it */
+    /* x0 as the frame restored it, or 0 for a frame refused -- whose SIGSEGV
+     * comes once this has returned (syscall_dispatch). */
+    return sig_return(c);
 }
 
 SYSDEF(rt_sigpending) {
@@ -207,7 +208,7 @@ SYSDEF(sigaltstack) {
     if (a0) {
         struct { u64 sp; s32 flags; s32 pad; u64 size; } ss;
         if (copy_from_guest(c, &ss, a0, sizeof ss) < 0) return (u64)(s64)-EFAULT;
-        int r = sig_altstack_set(ss.sp, (u32)ss.flags, ss.size, on, 2048 /*MINSIGSTKSZ*/);
+        int r = sig_altstack_set(ss.sp, (u32)ss.flags, ss.size, on, G_MINSIGSTKSZ);
         if (r < 0) return (u64)(s64)r;
     }
     return 0;

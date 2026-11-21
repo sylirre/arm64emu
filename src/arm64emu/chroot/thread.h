@@ -27,6 +27,12 @@ typedef struct {
      * exec'ing thread's, whichever thread then runs the image (Machine,
      * dethread_fault_address/_code). */
     u64 fault_address, fault_code;
+    /* An rt_sigreturn refused its frame (signal.c, sig_return): the SIGSEGV
+     * arm64_notify_segfault raises is due once the call has returned its 0
+     * (syscall_dispatch, sig_badframe_deliver) -- its si_code and address. */
+    u8  badframe;
+    int badframe_code;
+    u64 badframe_addr;
     u64 clear_child_tid;      /* CLONE_CHILD_CLEARTID address (futex on exit) */
     u64 robust_head;          /* set_robust_list head, echoed by get_robust_list */
     /* Guest blocked-signal set: a per-thread attribute (POSIX), inherited

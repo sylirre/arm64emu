@@ -57,9 +57,14 @@ leaves are host pointers. The same table works unchanged on 64-bit hosts.
 
 `translate()` walks the table, checks the requested permission, and returns
 `host_page + (va & 0xfff)` or `NULL`. On `NULL` it distinguishes **unmapped**
-(translation fault → `SEGV_MAPERR`) from **permission** (→ `SEGV_ACCERR`) and
-raises the appropriate data/instruction abort ESR via `cpu_raise_sync`, so later
-`SIGSEGV` `si_code` is precise.
+from **permission** — a page with no entry from one whose entry refuses the
+access — and raises the data/instruction abort via `cpu_raise_sync`, with the
+fault status a kernel's page tables would give it (`fault_status`: the walk's
+level from the mappings around the address, translation or permission from
+whether the host has backed the page; see
+[signals-and-processes.md](signals-and-processes.md#guest-delivery)). The
+`SIGSEGV`'s `si_code` is then the mapping's: `SEGV_ACCERR` where one covers
+the address, `SEGV_MAPERR` where none does (`as_fault_mapped`).
 
 In front of the walk sits a **data-side TLB**: a 1024-entry direct-mapped
 VA-page → PTE cache, so a hit is one tag compare instead of the two dependent

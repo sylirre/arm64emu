@@ -146,13 +146,13 @@ void force_sig_fault(CPU *c, int sig, int code, u64 addr) {
  * blocks leaves set. The SVC dispatch below asks it before running a call.
  *
  * `at` is where a frame for the signal would say the thread was: none is
- * delivered on the rt_sigreturn trampoline (sig_deliver_pending), so a
- * signal is not due there, and the trampoline gets to run. */
+ * delivered on an rt_sigreturn trampoline (sig_on_trampoline), so a signal
+ * is not due there, and the trampoline gets to run. */
 int emu_callout_due(CPU *c, u64 at) {
     if (!g_sig_npend) return 0;
     return g_ptrace_kick ||
            __atomic_load_n(&c->m->stop_gen, __ATOMIC_ACQUIRE) != g_tls.stop_gen ||
-           (!sig_on_trampoline(c->m, at) && sig_pending_deliverable(c->m));
+           (!sig_on_trampoline(c, at) && sig_pending_deliverable(c->m));
 }
 
 /* ARM64EMU_PROF's ranking for the program this process runs, which ends here
@@ -318,10 +318,10 @@ int emu_loop(CPU *c) {
                      * capture between the two is seen by the check or arms
                      * the timer -- never neither.
                      *
-                     * A signal is not delivered at the rt_sigreturn
-                     * trampoline's SVC: it waits for the context the sigreturn
-                     * restores (sig_deliver_pending says why), and the frame
-                     * built here would be at that SVC. */
+                     * A signal is not delivered at an rt_sigreturn's SVC:
+                     * it waits for the context the sigreturn restores
+                     * (sig_on_trampoline says why), and the frame built here
+                     * would be at that SVC. */
                     g_sig_in_syscall = 1;
                     if (UNLIKELY(g_sig_npend) && emu_callout_due(c, c->pc - 4)) {
                         g_sig_in_syscall = 0;
@@ -351,15 +351,16 @@ int emu_loop(CPU *c) {
                         fault_note_abort(far, esr);
                         sig_deliver_fault(c, SIGBUS, 1 /*BUS_ADRALN*/, far);
                     } else {
-                        /* A permission fault -- the page is mapped, just not
-                         * readable, writable or executable as asked -- is
-                         * SEGV_ACCERR, and only a page with no mapping at all
-                         * SEGV_MAPERR (the kernel's do_page_fault answers
-                         * VM_FAULT_BADACCESS for the first). */
+                        /* A page that is mapped, just not readable, writable
+                         * or executable as asked, is SEGV_ACCERR, and only a
+                         * page with no mapping at all SEGV_MAPERR -- the
+                         * kernel's do_page_fault, VM_FAULT_BADACCESS and
+                         * _BADMAP. Decided by the mapping, not the status:
+                         * a PROT_NONE page, or one never faulted in, is a
+                         * translation fault of a mapping (mem.c,
+                         * fault_status). */
                         fault_note_abort(far, esr);
-                        sig_deliver_fault(c, SIGSEGV,
-                                          (fsc >= FSC_PERM_L0 && fsc <= FSC_PERM_L3) ? 2 : 1,
-                                          far);
+                        sig_deliver_fault(c, SIGSEGV, as_fault_mapped(c, far) ? 2 : 1, far);
                     }
                     break;
                 }

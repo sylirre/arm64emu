@@ -547,6 +547,17 @@ typedef struct {
     /* char d_name[]; */
 } GDirent64;
 
+/* The signal frame (arch/arm64/kernel/signal.c): sizeof(struct rt_sigframe),
+ * the 128-byte siginfo and a ucontext whose sigcontext keeps 4096 bytes of
+ * records -- what every frame takes on a CPU with no SVE or SME, whatever it
+ * holds (sigframe_size) -- with a 16-byte frame record above it. The least
+ * stack a delivery needs is that, the record and 16 bytes of alignment
+ * (minsigstksz_setup: AT_MINSIGSTKSZ), and the least an alternate stack may
+ * be is the ABI's MINSIGSTKSZ, which do_sigaltstack checks. */
+#define G_SIGFRAME_SIZE   4688
+#define G_SIGFRAME_MIN    (G_SIGFRAME_SIZE + 16 + 16)
+#define G_MINSIGSTKSZ     5120
+
 /* struct sigaction (arm64 kernel layout: handler, flags, restorer, mask) */
 typedef struct {
     u64 handler;

@@ -1823,6 +1823,127 @@ AALEOF
     fi
 fi
 
+# ---- the signal frame as the kernel builds it and takes it back
+# (src/arm64emu/chroot/signal.c deliver_to_handler / sig_return): 4688 bytes
+# under a frame record of the interrupted x29/x30 that x29 points at, x30 the
+# SA_RESTORER restorer when there is one, x1/x2 for an SA_SIGINFO handler
+# only, flags the kernel does not know dropped, AT_MINSIGSTKSZ and
+# sigaltstack's MINSIGSTKSZ; an rt_sigreturn checked step by step -- stack
+# pointer, access_ok, each register on its own, pstate, the records -- and a
+# frame refused a SIGSEGV for the handler, not death; a frame that cannot be
+# written a SIGSEGV of the kernel's own, fatal for a SIGSEGV. Self-checking:
+# qemu-user builds its frames and refuses them its own way, so the block
+# below is what a 6.8 kernel gave this program (qemu-system, neoverse-n1). ----
+if [ -n "$AGCC" ]; then
+    SFR=build/tests/arm64emu/chroot/fixtures/sigframe.bin
+    if "$AGCC" -static -O2 -o "$SFR" tests/arm64emu/chroot/fixtures/sigframe.c 2>/dev/null; then
+        sfr_want=$(cat <<'SFREOF'
+siginfo     below-sp 4704 record 4688 fp ok lr ok ret sigreturn x1 siginfo x2 ucontext
+plain       below-sp 4704 record 4688 fp ok lr ok ret sigreturn x1 signo x2 marker
+misaligned  below-sp 4712 record 4688 fp ok lr ok ret sigreturn x1 siginfo x2 ucontext
+onstack     below-top 4704 record 4688 fp ok lr ok ret sigreturn x1 siginfo x2 ucontext
+restorer    lr the restorer, ran 1
+readback    flags 0x4000004 restorer kept
+unknown     flags 0x4
+libc        flags 0x8000004
+minsigstksz AT_MINSIGSTKSZ 4720
+sigaltstack 2048:ENOMEM 4096:ENOMEM 5119:ENOMEM 5120:ok
+prime       SIGSEGV code 1 addr hole | fault_address hole esr 0x92000007
+good        resumed x0 0x5a5a x1 0x101 x28 0x11c sp lsp nzcv 0x20000000
+sp-mis      SIGSEGV code 2 addr frame+8 | pc after-svc sp frame+8 x0 0 x1 0x1111 x2 0x2222 x28 0x2828 pstate 0x40000000 | mask as called | fault_address 0 esr none
+tagged      SIGSEGV code 2 addr frame | pc after-svc sp frame, tag 0x5a x0 0 x1 0x1111 x2 0x2222 x28 0x2828 pstate 0x40000000 | mask as called | fault_address 0 esr none
+toohigh     SIGSEGV code 1 addr 2^48 | pc after-svc sp 2^48 x0 0 x1 0x1111 x2 0x2222 x28 0x2828 pstate 0x40000000 | mask as called | fault_address 0 esr none
+unmapped    SIGSEGV code 2 addr 0 | pc 0 sp 0 x0 0 x1 0 x2 0 x28 0 pstate 0 | mask as called | fault_address 0 esr none
+half        SIGSEGV code 2 addr 0 | pc 0 sp 0 x0 0 x1 0x101 x2 0x102 x28 0 pstate 0 | usr2 blocked | fault_address 0 esr none
+pstate-el1  SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+pstate-daif SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+pstate-32   SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+pstate-res0 resumed x0 0x5a5a x1 0x101 x28 0x11c sp lsp nzcv 0x60000000
+no-fpsimd   SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+fpsimd-512  SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+two-fpsimd  SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+unknown     SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+sve         SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+esr         resumed x0 0x5a5a x1 0x101 x28 0x11c sp lsp nzcv 0x60000000
+esr-first   resumed x0 0x5a5a x1 0x101 x28 0x11c sp lsp nzcv 0x60000000
+esr-24      SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+esr-4       SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+esr-8192    SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+end-16      SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+no-end      SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+extra       resumed x0 0x5a5a x1 0x101 x28 0x11c sp lsp nzcv 0x60000000
+extra-fp    resumed x0 0x5a5a x1 0x101 x28 0x11c sp lsp nzcv 0x60000000
+extra-bad   SIGSEGV code 2 addr lsp | pc landed sp lsp x0 0 x1 0x101 x2 0x102 x28 0x11c pstate 0x60000000 | usr2 blocked | fault_address 0 esr none
+prime       SIGSEGV code 1 addr hole | fault_address hole esr 0x92000007
+nostack     SIGSEGV code 128 addr 0 | pc after-svc sp none-top x0 0 | fault_address hole esr 0x92000007 | usr1 ran 0, handler reset, flags 0x80000000, gone
+segv-nost   child killed by Segmentation fault
+usr1-nost   child killed by Segmentation fault
+restorer-0  child killed by Segmentation fault
+done
+SFREOF
+)
+        for eng in "" "--no-predecode" "--jit"; do
+            lbl="sigframe: ${eng:-predecoded}"
+            got=$(timeout -k 5 60 "$EMU" chroot $eng / "$SFR" 2>/dev/null); rc=$?
+            if [ "$got" = "$sfr_want" ] && [ "$rc" = 0 ]; then
+                pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl (rc=$rc)"
+                diff <(printf '%s\n' "$sfr_want") <(printf '%s\n' "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm "$SFR"
+    else
+        skip_build "fixtures/sigframe"
+    fi
+fi
+
+# ---- the fault status a kernel's page tables give a fault, in the frame's
+# esr_context (src/arm64emu/chroot/mem.c fault_status): the level the walk
+# stops at as an area of its own fills in, a PROT_NONE page a translation
+# fault, a mapped page that refuses the access a permission fault only once
+# it has been faulted in, and SEGV_ACCERR wherever there is a mapping.
+# Self-checking: qemu-user keeps no esr_context; the block is what a 6.8
+# kernel gave this program (qemu-system, neoverse-n1). ----
+if [ -n "$AGCC" ]; then
+    FLV=build/tests/arm64emu/chroot/fixtures/faultlevel.bin
+    if "$AGCC" -static -O2 -o "$FLV" tests/arm64emu/chroot/fixtures/faultlevel.c 2>/dev/null; then
+        flv_want=$(cat <<'FLVEOF'
+level0       SIGSEGV code 1 addr ok esr 0x92000004
+level0-x     SIGSEGV code 1 addr ok esr 0x82000004
+level1       SIGSEGV code 1 addr ok esr 0x92000005
+level2       SIGSEGV code 1 addr ok esr 0x92000006
+level2-w     SIGSEGV code 1 addr ok esr 0x92000046
+level3       SIGSEGV code 1 addr ok esr 0x92000007
+level3-w     SIGSEGV code 1 addr ok esr 0x92000047
+level3-x     SIGSEGV code 1 addr ok esr 0x82000007
+none         SIGSEGV code 2 addr ok esr 0x92000007
+none-alone   SIGSEGV code 2 addr ok esr 0x92000006
+none-was-rw  SIGSEGV code 2 addr ok esr 0x92000047
+ro-fresh     SIGSEGV code 2 addr ok esr 0x92000047
+ro-read      SIGSEGV code 2 addr ok esr 0x9200004f
+nx-fresh     SIGSEGV code 2 addr ok esr 0x82000007
+nx-touched   SIGSEGV code 2 addr ok esr 0x8200000f
+hole         SIGSEGV code 1 addr ok esr 0x92000007
+done
+FLVEOF
+)
+        for eng in "" "--no-predecode" "--jit"; do
+            lbl="faultlevel: ${eng:-predecoded}"
+            got=$(timeout -k 5 60 "$EMU" chroot $eng / "$FLV" 2>/dev/null); rc=$?
+            if [ "$got" = "$flv_want" ] && [ "$rc" = 0 ]; then
+                pass=$((pass+1)); echo "PASS $lbl"
+            else
+                fail=$((fail+1)); echo "FAIL $lbl (rc=$rc)"
+                diff <(printf '%s\n' "$flv_want") <(printf '%s\n' "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm "$FLV"
+    else
+        skip_build "fixtures/faultlevel"
+    fi
+fi
+
 # ---- the sandbox-helper stack: tmpfs mounts, a faked user namespace's id maps
 # (written by the process itself AND, the usual arrangement, by its parent), a
 # private mount namespace, and pivot_root (bubblewrap's stack-then-detach idiom

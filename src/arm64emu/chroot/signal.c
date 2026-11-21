@@ -9,13 +9,16 @@
  * the interpreter as pending exceptions and are delivered directly.
  *
  * Guest side: an arm64 kernel rt_sigframe is built on the guest stack (or the
- * guest sigaltstack): 128-byte siginfo + ucontext with sigcontext (x0-x30, sp,
- * pc, pstate, fault_address) + fpsimd_context (magic 0x46508001) in
- * __reserved, then esr_context (magic 0x45535201) while the thread's fault
- * record holds one (thread.h), terminator record, x30 pointed at a trampoline
- * page containing `mov x8, #139; svc #0` (arm64 has no sa_restorer; the kernel
- * uses the vDSO for this). rt_sigreturn restores everything from the frame at
- * SP. */
+ * guest sigaltstack), the kernel's 4688 bytes whatever it holds: 128-byte
+ * siginfo + ucontext with sigcontext (x0-x30, sp, pc, pstate, fault_address)
+ * + fpsimd_context (magic 0x46508001) in __reserved, then esr_context (magic
+ * 0x45535201) while the thread's fault record holds one (thread.h),
+ * terminator record; above it a frame record of the interrupted x29/x30,
+ * which x29 points at. x30 is the handler's SA_RESTORER restorer, or a
+ * trampoline page containing `mov x8, #139; svc #0` standing for the vDSO's
+ * sigreturn the kernel uses otherwise. rt_sigreturn restores everything from
+ * the frame at SP, checked as the kernel checks it, and a frame it refuses
+ * is the guest's SIGSEGV (sig_return). */
 #include <dirent.h>
 #include <limits.h>
 #include <errno.h>
@@ -55,6 +58,13 @@
 #define G_SA_NODEFER   0x40000000
 #define G_SA_RESETHAND 0x80000000
 #define G_SA_EXPOSE_TAGBITS 0x00000800
+#define G_SA_RESTORER  0x04000000
+/* do_sigaction's UAPI_SA_FLAGS: the flags a kernel knows, all an action keeps
+ * -- any other is dropped as it is installed, SA_UNSUPPORTED (0x400) among
+ * them, which is there for a program to see that happen. */
+#define G_UAPI_SA_FLAGS (G_SA_NOCLDSTOP | G_SA_NOCLDWAIT | G_SA_SIGINFO | G_SA_ONSTACK | \
+                         G_SA_RESTART | G_SA_NODEFER | G_SA_RESETHAND |            \
+                         G_SA_EXPOSE_TAGBITS | G_SA_RESTORER)
 
 /* ---- host-side capture queue (async-signal-safe: handlers are installed
  * with everything masked, so they never nest) ----
@@ -3722,6 +3732,7 @@ void sig_action_swap(struct Machine *m, int sig, const GSigAction *act,
          * is what makes the oldact a later call reads back the kernel's own
          * answer instead of the bits the caller happened to pass in. */
         m->sigact[sig].mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        m->sigact[sig].flags &= G_UAPI_SA_FLAGS;
         sig_host_update_locked(m, sig);
     }
     EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
@@ -3827,10 +3838,20 @@ int sig_altstack_set(u64 sp, u32 flags, u64 size, int on, u64 min_size) {
 #ifndef ESR_MAGIC
 #define ESR_MAGIC     0x45535201u
 #endif
+#ifndef EXTRA_MAGIC
+#define EXTRA_MAGIC   0x45585401u
+#endif
 #define MC_ESR        (MC_RESERVED + 528)  /* after the fpsimd_context */
-/* Room for the esr_context whether or not this delivery has one, so where the
- * frame lands never depends on the thread's fault record. */
-#define FRAME_SIZE    ((MC_ESR + 16 + 16 + 15) & ~15)
+/* The kernel's frame, sizeof(struct rt_sigframe) whatever it holds: the
+ * records' 4096 bytes are all there, used or not. Then the frame record on
+ * top of it: {x29, x30} of the interrupted code, which the handler's x29
+ * points at, so a frame-pointer walk goes from the handler into the code it
+ * interrupted. */
+#define SIGFRAME_SIZE (MC_RESERVED + 4096)
+#define FRAME_SIZE    (SIGFRAME_SIZE + 16)
+_Static_assert(SIGFRAME_SIZE == G_SIGFRAME_SIZE, "rt_sigframe is 4688 bytes");
+/* parse_user_sigframe's bound on an extra_context's data, from the frame. */
+#define SIGFRAME_MAXSZ (256u << 10)
 
 /* Frame fields are laid into a host-side image of the frame, not written to
  * the guest one at a time -- see deliver_to_handler. */
@@ -4061,6 +4082,17 @@ static void pendsig_from_guest(PendSig *p, int sig, const u8 *si) {
     }
 }
 
+/* access_ok, as a frame's delivery and its rt_sigreturn check the range:
+ * below the top of user space, a tagged address only for a thread that took
+ * the tagged-address ABI (sys.h guest_access_ok, which is the same test). */
+static int frame_access_ok(u64 va, u64 len) {
+    if (va >> 56) {
+        if (!(g_tls.tagged_addr_ctrl & 1)) return 0;
+        va = a64_untag(va);
+    }
+    return len <= GUEST_TASK_SIZE && va <= GUEST_TASK_SIZE - len;
+}
+
 /* Deliver `sig` to the guest handler in m->sigact[sig] (caller checked it is
  * a real handler). Builds the frame and redirects the CPU. */
 static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
@@ -4077,11 +4109,32 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     u64 saved_pc = c->pc, saved_x0 = c->x[0];
     if (restart) { saved_pc = g_tls.sc_svc_pc; saved_x0 = g_tls.sc_orig_x0; }
 
-    /* Pick the stack: guest sigaltstack if requested and configured. */
+    /* SA_RESETHAND is get_signal's, as it takes the signal for a handler --
+     * before the frame is written, so a delivery that fails below resets it
+     * all the same -- and it resets the handler alone: the flags and the mask
+     * stay (a SIGCHLD's SA_NOCLDWAIT goes on reaping), and read back as they
+     * were. They used to be cleared with it. Only if this is still the
+     * disposition being delivered: a sibling that installed a new handler in
+     * the meantime must not have it cleared. */
+    if (act->flags & G_SA_RESETHAND) {
+        EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+        if (m->sigact[sig].handler == snap.handler &&
+            m->sigact[sig].flags == snap.flags) {
+            m->sigact[sig].handler = GSIG_DFL;
+            sig_host_update_locked(m, sig);
+        }
+        EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
+    }
+
+    /* Pick the stack: guest sigaltstack if requested and configured. Then
+     * get_sigframe's layout: the frame record 16 bytes under it, rounded
+     * down to 16, and the frame right under the record. */
     u64 sp = *cpu_cur_sp(c);
     if ((act->flags & G_SA_ONSTACK) && g_tls.sig_altstack_size && !sig_on_altstack(sp))
         sp = g_tls.sig_altstack_sp + g_tls.sig_altstack_size;
-    u64 frame = (sp - FRAME_SIZE) & ~15ULL;
+    u64 record = (sp - 16) & ~15ULL;
+    u64 frame = record - SIGFRAME_SIZE;
+    int siginfo = (act->flags & G_SA_SIGINFO) != 0;
 
     /* Build the frame in an image of our own and write it out once.
      *
@@ -4092,15 +4145,19 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
      * the shrinking of a file mapping the stack came from -- therefore left a
      * half-built frame that was delivered anyway, with a handler entered on
      * whatever the guest happened to have there. A kernel has no such window:
-     * every __put_user in setup_rt_frame is checked, and one failure is
-     * force_sigsegv for the whole delivery.
+     * every __put_user in setup_rt_frame is checked, and one failure fails
+     * the whole delivery.
      *
      * One copy also means the zero pass costs nothing extra (it is a memset of
-     * this image) and the whole frame crosses in one guest walk. */
+     * this image) and the whole frame crosses in one guest walk. The parts of
+     * the frame a kernel leaves as the stack had them -- the padding, the
+     * records' unused room -- are zeroes here instead, which nothing reads. */
     u8 fr[FRAME_SIZE];
     memset(fr, 0, sizeof fr);
 
-    /* siginfo (LP64 layout: signo, errno, code, pad, fields at +16) */
+    /* siginfo (LP64 layout: signo, errno, code, pad, fields at +16): an
+     * SA_SIGINFO handler's alone, which is given x1 and x2 to find it by;
+     * for any other the kernel writes none, and none is written below. */
     siginfo_to_guest(fr + SI_OFF, sig, info);
     /* hide_si_addr_tag_bits: a fault's si_addr reaches a handler untagged
      * (arch_untagged_si_addr) unless the handler asked for the tag with
@@ -4130,7 +4187,12 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
                                       (i == 0) ? saved_x0 : c->x[i]);
     wr64(fr, MC_SP, *cpu_cur_sp(c));
     wr64(fr, MC_PC, saved_pc);
-    wr64(fr, MC_PSTATE, cpu_pack_spsr(c));
+    /* The pstate of EL0 as a kernel saves it: EL0t, AArch64, D, A, I and F
+     * clear -- what rt_sigreturn insists on getting back -- and NZCV, all of
+     * PSTATE this CPU keeps at EL0. cpu_pack_spsr would give the CPU's own
+     * mode bits, which in user mode are the reset state's (SPSel 1, DAIF
+     * masked), and no kernel frame ever shows. */
+    wr64(fr, MC_PSTATE, c->nzcv & (PS_N | PS_Z | PS_C | PS_V));
 
     /* fpsimd_context + terminator. The flags are accumulated lazily, so
      * c->fpsr is only current once fpsr_sync has folded what is pending --
@@ -4154,25 +4216,54 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     }
     /* terminator record is already zero */
 
-    if (copy_to_guest(c, frame, fr, sizeof fr) < 0) {
-        /* Unwritable stack: force default SIGSEGV (matches the kernel). */
-        fprintf(stderr, "arm64emu: cannot write sigframe, killing\n");
-        proctab_unregister((s32)getpid());
-        signal(SIGSEGV, SIG_DFL);
-        raise(SIGSEGV);
-        _exit(128 + SIGSEGV);
+    /* The frame record: the interrupted code's frame pointer and link. */
+    wr64(fr, SIGFRAME_SIZE + 0, c->x[29]);
+    wr64(fr, SIGFRAME_SIZE + 8, c->x[30]);
+
+    /* get_sigframe's access_ok over all of it, up to the stack pointer it
+     * was laid under, and then the writes. */
+    u64 from = siginfo ? 0 : UC_OFF;
+    if (!frame_access_ok(frame, sp - frame) ||
+        copy_to_guest(c, frame + from, fr + from, sizeof fr - from) < 0) {
+        /* signal_setup_done(failed): force_sigsegv. The signal is gone and
+         * nothing of the handler's is installed -- no mask, no altstack
+         * disarm -- but the restart the kernel decided before the frame was
+         * tried stands, and a SIGSEGV of the kernel's own (SI_KERNEL) is
+         * delivered in its place, to a handler of SIGSEGV that can take it:
+         * a stack overflow caught on an alternate stack, whatever signal ran
+         * into it. When it is the SIGSEGV whose frame failed, it is fatal
+         * (force_fatal_sig): its handler goes back to SIG_DFL, the signal is
+         * unblocked, and only a tracer may still stop it. */
+        if (restart) { c->pc = saved_pc; c->x[0] = saved_x0; }
+        g_tls.sc_ret_eintr = 0;
+        if (sig == SIGSEGV) {
+            EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
+            m->sigact[SIGSEGV].handler = GSIG_DFL;
+            sig_host_update_locked(m, SIGSEGV);
+            EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
+            g_tls.sigmask &= ~(1ULL << (SIGSEGV - 1));
+            sig_sync_host_mask(m);
+        }
+        sig_deliver_fault(c, SIGSEGV, 0x80 /*SI_KERNEL*/, 0);
+        return;
     }
 
     /* Only now is the delivery committed: nothing above this point has changed
-     * any state the guest can see, so the fatal path is the clean force_sigsegv
-     * a kernel takes rather than a half-delivered signal. */
+     * any state the guest can see but SA_RESETHAND, which the kernel's
+     * get_signal applies before the frame too. */
     g_tls.have_saved_sigmask = 0;
 
-    /* Redirect the CPU into the handler. */
+    /* Redirect the CPU into the handler (setup_return): x0 the signal, x1
+     * and x2 the siginfo and the ucontext for an SA_SIGINFO handler (any
+     * other keeps the interrupted ones), x29 the frame record, x30 what the
+     * handler returns to. */
     c->x[0] = (u64)sig;
-    c->x[1] = frame + SI_OFF;
-    c->x[2] = frame + UC_OFF;
-    c->x[30] = m->sigtramp_va;
+    if (siginfo) {
+        c->x[1] = frame + SI_OFF;
+        c->x[2] = frame + UC_OFF;
+    }
+    c->x[29] = record;
+    c->x[30] = (act->flags & G_SA_RESTORER) ? act->restorer : m->sigtramp_va;
     *cpu_cur_sp(c) = frame;
     c->pc = act->handler;
     /* SS_AUTODISARM: the alternate stack is disabled for the handler's run
@@ -4193,69 +4284,139 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     if (!(act->flags & G_SA_NODEFER)) g_tls.sigmask |= 1ULL << (sig - 1);
     g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     sig_sync_host_mask(m);
-
-    if (act->flags & G_SA_RESETHAND) {
-        /* Only if this is still the disposition we delivered: a sibling that
-         * installed a new handler in the meantime must not have it cleared. */
-        EMU_LOCK(&sigact_lock, EMU_LK_SIGACT);
-        if (m->sigact[sig].handler == snap.handler &&
-            m->sigact[sig].flags == snap.flags) {
-            m->sigact[sig].handler = GSIG_DFL;
-            m->sigact[sig].flags = 0;
-            sig_host_update_locked(m, sig);
-        }
-        EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
-    }
     g_tls.sc_ret_eintr = 0;
 }
 
-void sig_return(CPU *c) {
+/* One word of the frame, as __get_user_error reads it: 0 where it cannot be
+ * read, and the failure noted -- the rest are read all the same. */
+static int frame_rd64(CPU *c, u64 va, u64 *out) {
+    if (copy_from_guest(c, out, va, 8) == 0) return 0;
+    *out = 0;
+    return 1;
+}
+
+/* parse_user_sigframe and restore_fpsimd_context: the records in the frame's
+ * __reserved walked as the kernel walks them -- each 16-byte aligned and
+ * inside what holds it, a zero magic of size 0 ending them, one
+ * fpsimd_context and exactly 528 bytes of it, an esr_context passed over, an
+ * extra_context followed into the data it names (which must start right
+ * after the terminator that follows it, and stay within SIGFRAME_MAXSZ of the
+ * frame), every other magic refused (this CPU has no SVE, SME, TPIDR2, ZA or
+ * ZT) -- and the FP state taken from it. -1 for a frame the kernel refuses,
+ * EFAULT and EINVAL alike, with nothing of the FP state changed. */
+static int frame_records(CPU *c, u64 frame) {
+    u64 base = frame + MC_RESERVED, off = 0, limit = 4096, fp = 0;
+    u32 fp_size = 0;
+    int have_extra = 0;
+    for (;;) {
+        u32 hd[2];
+        if (limit - off < 8 || (off & 15)) return -1;
+        if (copy_from_guest(c, hd, base + off, 8) < 0) return -1;
+        u32 magic = hd[0], size = hd[1];
+        if (limit - off < size) return -1;
+        switch (magic) {
+        case 0:
+            if (size) return -1;
+            goto done;
+        case FPSIMD_MAGIC:
+            if (fp) return -1;
+            fp = base + off;
+            fp_size = size;
+            break;
+        case ESR_MAGIC:
+            break;
+        case EXTRA_MAGIC: {
+            u64 datap;
+            u32 xsize, end[2];
+            if (have_extra || size < 32) return -1;
+            if (copy_from_guest(c, &datap, base + off + 8, 8) < 0 ||
+                copy_from_guest(c, &xsize, base + off + 16, 4) < 0)
+                return -1;
+            if (limit - off - size < 16) return -1;
+            u64 userp = base + off + size;   /* the terminator after it */
+            if (copy_from_guest(c, end, userp, 8) < 0) return -1;
+            if (end[0] || end[1]) return -1;
+            userp += 16;
+            have_extra = 1;
+            if ((datap & 15) || (xsize & 15) || datap != userp) return -1;
+            if (xsize > frame + SIGFRAME_MAXSZ - userp) return -1;
+            base = datap;
+            off = 0;
+            limit = xsize;
+            if (!frame_access_ok(base, limit)) return -1;
+            continue;
+        }
+        default:
+            return -1;
+        }
+        if (size < 8 || limit - off < size) return -1;
+        off += size;
+    }
+done:
+    if (!fp || fp_size != 528) return -1;
+    u32 fpsr, fpcr;
+    V128 v128[32];
+    if (copy_from_guest(c, v128, fp + 16, sizeof v128) < 0 ||
+        copy_from_guest(c, &fpsr, fp + 8, 4) < 0 ||
+        copy_from_guest(c, &fpcr, fp + 12, 4) < 0)
+        return -1;
+    /* Committed only once all of it is in hand. What is pending is discarded
+     * before the frame's value is taken, exactly as a guest MSR does: a
+     * handler that cleared FPSR in the frame must not have flags raised
+     * before the signal come back after it. */
+    fpsr_sync(c);
+    c->fpsr = fpsr;
+    c->fpcr = fpcr;
+    memcpy(c->v, v128, sizeof v128);
+    return 0;
+}
+
+/* SPSR_EL1_AARCH64_RES0_BITS (arch/arm64/kernel/ptrace.c): what
+ * valid_native_regs drops from a frame's pstate before it judges it. */
+#define PSTATE_RES0 (0xffffffff00000000ULL | 0x0c000000u | 0x00c00000u | \
+                     0x001fe000u | 0x20u)
+
+/* rt_sigreturn, as the kernel takes a frame back. The stack pointer must be
+ * 16-aligned and the frame in user space (access_ok), or nothing is
+ * restored. Then the mask, if it can be read; every register, each read on
+ * its own, one that faults reading 0; the pstate, which must be EL0t AArch64
+ * with D, A, I and F clear once its RES0 bits are gone (valid_user_regs: any
+ * other is cut to NZCV, and refused); the records (frame_records); and the
+ * alternate stack, from uc_stack. All this CPU keeps of the pstate at EL0 is
+ * NZCV.
+ *
+ * A frame refused at any step is arm64_notify_segfault(regs->sp): a SIGSEGV
+ * at the stack pointer as far as it was restored -- SEGV_MAPERR when no
+ * mapping lies at or above it (find_vma), SEGV_ACCERR otherwise -- with the
+ * fault record cleared (arm64_notify_die) and the call returning 0, which is
+ * what the frame then shows in x0. It is due once the call has returned
+ * (sig_badframe_deliver), and goes to a handler that can take it like any
+ * fault: a bad frame used to kill the process whatever the guest had set up
+ * for SIGSEGV. Nothing restarts after it, as nothing restarts after a frame
+ * taken back (forget_syscall). */
+u64 sig_return(CPU *c) {
     u64 frame = *cpu_cur_sp(c);
+    int err = 0;
+    c->excl_valid = false;
+    if ((frame & 15) || !frame_access_ok(frame, SIGFRAME_SIZE)) goto bad;
     u64 v;
-    for (int i = 0; i < 31; i++) {
-        if (copy_from_guest(c, &c->x[i], frame + MC_REGS + 8u * (unsigned)i, 8) < 0)
-            goto bad;
+    if (copy_from_guest(c, &v, frame + UC_SIGMASK, 8) == 0) {
+        g_tls.sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        sig_sync_host_mask(c->m);
+    } else {
+        err = 1;
     }
-    if (copy_from_guest(c, &v, frame + MC_SP, 8) < 0) goto bad;
+    for (int i = 0; i < 31; i++)
+        err |= frame_rd64(c, frame + MC_REGS + 8u * (unsigned)i, &c->x[i]);
+    err |= frame_rd64(c, frame + MC_SP, &v);
     *cpu_cur_sp(c) = v;
-    if (copy_from_guest(c, &v, frame + MC_PC, 8) < 0) goto bad;
+    err |= frame_rd64(c, frame + MC_PC, &v);
     c->pc = v;
-    if (copy_from_guest(c, &v, frame + MC_PSTATE, 8) < 0) goto bad;
+    err |= frame_rd64(c, frame + MC_PSTATE, &v);
+    v &= ~PSTATE_RES0;
+    if (v & (0x1fu /*M[4:0]: EL0t, AArch64*/ | PS_D | PS_A | PS_I | PS_F)) err = 1;
     c->nzcv = (u32)v & (PS_N | PS_Z | PS_C | PS_V);
-    if (copy_from_guest(c, &v, frame + UC_SIGMASK, 8) < 0) goto bad;
-    g_tls.sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-    sig_sync_host_mask(c->m);
-    /* fpsimd. Every read here is checked like the ones above: a frame whose
-     * FP context cannot be read is a bad frame, and parse_user_sigframe says
-     * so too -- any __get_user failure walking uc_mcontext.__reserved ends in
-     * arm64_notify_segfault. Ignoring the failures left the FP registers
-     * holding the handler's values while the general-purpose ones came from
-     * the frame, and read c->fpsr and c->fpcr out of an uninitialised local.
-     * A record that is simply not there stays permissive (a kernel insists on
-     * one, but a guest that builds its own frame without FP context is asking
-     * for its FP state to be left alone, and this is the more forgiving
-     * reading of that). */
-    u32 magic = 0;
-    if (copy_from_guest(c, &magic, frame + MC_RESERVED, 4) < 0) goto bad;
-    if (magic == FPSIMD_MAGIC) {
-        u32 fpsr, fpcr;
-        V128 v128[32];
-        if (copy_from_guest(c, &fpsr, frame + MC_RESERVED + 8, 4) < 0) goto bad;
-        if (copy_from_guest(c, &fpcr, frame + MC_RESERVED + 12, 4) < 0) goto bad;
-        for (int i = 0; i < 32; i++)
-            if (copy_from_guest(c, &v128[i],
-                                frame + MC_RESERVED + 16 + 16u * (unsigned)i, 16) < 0)
-                goto bad;
-        /* Committed only once all of it is in hand, so a frame that faults
-         * part way through leaves no half-restored FP state behind. */
-        /* Discard what is pending before taking the frame's value, exactly
-         * as a guest MSR does: a handler that cleared FPSR in the frame must
-         * not have flags raised before the signal come back after it. */
-        fpsr_sync(c);
-        c->fpsr = fpsr;
-        c->fpcr = fpcr;
-        memcpy(c->v, v128, sizeof v128);
-    }
+    if (err || frame_records(c, frame) < 0) goto bad;
     /* restore_altstack: the alternate stack comes back from the frame's
      * uc_stack -- what SS_AUTODISARM took away at delivery, or whatever the
      * handler wrote there -- judged against the restored stack pointer
@@ -4269,17 +4430,28 @@ void sig_return(CPU *c) {
             copy_from_guest(c, &ss_size, frame + UC_STACK + 16, 8) < 0)
             goto bad;
         sig_altstack_set(ss_sp, ss_flags, ss_size, sig_on_altstack(*cpu_cur_sp(c)),
-                         2048 /*MINSIGSTKSZ*/);
+                         G_MINSIGSTKSZ);
     }
-    c->excl_valid = false;
-    return;
-bad:
-    /* The guest is on its way out with a signal it cannot handle (a kernel
-     * forces the disposition), so this goes through the one path that reports
-     * a WIFSIGNALED death to a tracer and hands back the PID registry slot,
-     * the SEM_UNDO adjustments and any tmpfs backing. */
-    fprintf(stderr, "arm64emu: bad sigreturn frame, killing\n");
-    guest_terminate_by_signal(c, SIGSEGV);
+    return c->x[0];
+bad: {
+        u64 sp = *cpu_cur_sp(c);
+        as_lock();
+        int above = as_next_region(&c->m->as, a64_untag(sp)) != NULL;
+        as_unlock();
+        g_tls.fault_address = 0;
+        g_tls.fault_code = 0;
+        g_tls.badframe = 1;
+        g_tls.badframe_code = above ? 2 /*SEGV_ACCERR*/ : 1 /*SEGV_MAPERR*/;
+        g_tls.badframe_addr = sp;
+        return 0;
+    }
+}
+
+/* The SIGSEGV of a frame rt_sigreturn refused, now that the call has
+ * returned: a fault's, delivered as faults are (sig_deliver_fault). */
+void sig_badframe_deliver(CPU *c) {
+    g_tls.badframe = 0;
+    sig_deliver_fault(c, SIGSEGV, g_tls.badframe_code, g_tls.badframe_addr);
 }
 
 /* Does this thread's capture queue hold a signal that sig_deliver_pending
@@ -4631,10 +4803,14 @@ void guest_terminate_by_signal(CPU *c, int sig) {
     _exit(128 + sig);
 }
 
-/* Is `pc` one of the two instructions of the rt_sigreturn trampoline?
+/* Is `pc` on an rt_sigreturn trampoline, about to make the call: at its
+ * `mov x8, #139` with the `svc #0` next, or at an `svc #0` with x8 already
+ * 139? Ours (the page a handler with no SA_RESTORER returns to), or any of
+ * the guest's own -- a restorer SA_RESTORER names, musl's __restore_rt and
+ * Bionic's among them, which are the same two instructions.
  *
- * A signal is not delivered there: the trampoline runs as one step, and a
- * signal that arrives while a handler is returning is delivered after the
+ * A signal is not delivered there: the trampoline runs to its sigreturn, and
+ * a signal that arrives while a handler is returning is delivered after the
  * sigreturn, into the context it restores. A kernel may deliver at either
  * point -- a signal that arrives on the handler's way out, at the
  * trampoline's first instruction, is delivered right there, with the frame's
@@ -4651,9 +4827,21 @@ void guest_terminate_by_signal(CPU *c, int sig) {
  * as saved registers is the middle of the inner frame. A pthread_cancel
  * unwinding out of the inner handler then jumped to garbage -- a guest
  * SIGSEGV in uw_frame_state_for, one run in ten under load, in any program
- * whose handler returns while another signal is on its way. */
-int sig_on_trampoline(struct Machine *m, u64 pc) {
-    return m->sigtramp_va && pc - m->sigtramp_va < 8;
+ * whose handler returns while another signal is on its way.
+ *
+ * The postponement is at most the two instructions, and ends at an SVC,
+ * where the run loop is always back: a delivery waits for the sigreturn, and
+ * never for anything that could block. */
+#define TRAMP_MOV_X8 0xd2801168u     /* mov x8, #139 */
+#define TRAMP_MOV_W8 0x52801168u     /* mov w8, #139 */
+#define TRAMP_SVC    0xd4000001u     /* svc #0 */
+int sig_on_trampoline(CPU *c, u64 pc) {
+    u64 t = c->m->sigtramp_va;
+    if (t && pc - t < 8) return 1;
+    u32 w[2];
+    size_t n = copy_from_guest_look(c, w, pc, sizeof w);
+    if (n >= 4 && w[0] == TRAMP_SVC) return c->x[8] == 139;
+    return n == 8 && (w[0] == TRAMP_MOV_X8 || w[0] == TRAMP_MOV_W8) && w[1] == TRAMP_SVC;
 }
 
 /* get_signal found no handler to run: the mask a sigsuspend or a p-variant
@@ -4672,7 +4860,7 @@ static void sig_saved_mask_back(struct Machine *m) {
 
 void sig_deliver_pending(CPU *c) {
     struct Machine *m = c->m;
-    if (sig_on_trampoline(m, c->pc)) return;   /* after the sigreturn */
+    if (sig_on_trampoline(c, c->pc)) return;   /* after the sigreturn */
     /* get_signal's first business: a SIGCONT's notice (the real parent's
      * view, above). */
     if (UNLIKELY(__atomic_load_n(&m->jc_rp_notify, __ATOMIC_RELAXED))) jc_rp_notify();

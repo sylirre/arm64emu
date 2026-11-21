@@ -583,7 +583,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
         { G_AT_CLKTCK,  100 },
         { G_AT_PLATFORM, plat_va },
         { G_AT_EXECFN,  execfn_va },
-        { G_AT_MINSIGSTKSZ, 5120 },
+        { G_AT_MINSIGSTKSZ, G_SIGFRAME_MIN },
         { G_AT_NULL,    0 },
     };
 
@@ -706,9 +706,9 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     const char *base = strrchr(execfn, '/');
     prctl(PR_SET_NAME, base && base[1] ? base + 1 : execfn);
 
-    /* rt_sigreturn trampoline page: `mov x8, #139; svc #0`. arm64 has no
-     * sa_restorer; the kernel points lr at the vDSO sigtramp — we host it on a
-     * hidden guest page. */
+    /* rt_sigreturn trampoline page: `mov x8, #139; svc #0`. A handler whose
+     * sigaction names no SA_RESTORER returns to it: the kernel points lr at
+     * the vDSO's sigtramp, which this page stands for. */
     u64 tramp = as_find_free(&m->as, GUEST_PAGE_SIZE);
     if (tramp) {
         guest_map_anon(&m->as, tramp, GUEST_PAGE_SIZE, PTE_R | PTE_W | PTE_X);

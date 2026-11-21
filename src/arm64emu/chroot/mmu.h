@@ -471,6 +471,10 @@ char *as_path_dup(const char *path);
 /* Caller must hold as_lock: the region array is realloc'd/memmove'd by
  * concurrent mappers, and the returned pointer is only valid while held. */
 const Region *as_find_region(AddrSpace *as, u64 va);
+/* Does a mapping cover `va` (untagged)? What a page fault's si_code says --
+ * SEGV_ACCERR for the access a mapping refuses, SEGV_MAPERR where there is
+ * none -- whatever the fault status (mem.c, fault_status). Takes the lock. */
+int as_fault_mapped(CPU *c, u64 va);
 /* The lowest-addressed mapping that ends above `va` (it may contain `va`), or
  * NULL if nothing does. Lets a walker cross an unmapped gap in one step
  * instead of a page at a time -- a range the guest names can span the whole

@@ -165,16 +165,21 @@ is empty, leaves it raised while one of those is still unserved
 service and the delivery went unseen by the check at the next `SVC`, and a
 tracee went back into its `pause()` with a `PTRACE_INTERRUPT` its tracer then
 waited for forever (a quarter of `tests/arm64emu/chroot/ptrace/execstopped.c`'s runs under
-qemu-user). The frame:
+qemu-user). The frame is the kernel's (`setup_rt_frame`, `get_sigframe`):
+`sizeof(struct rt_sigframe)`, 4688 bytes whatever it holds, under a 16-byte
+frame record, which is 16 bytes under the stack pointer rounded down to 16:
 
-- 128-byte guest `siginfo`,
+- 128-byte guest `siginfo` — written for an `SA_SIGINFO` handler only; any
+  other gets none, as from a kernel,
 - `ucontext` with `uc_stack`, `uc_sigmask`, and a `sigcontext` holding `x0..x30`,
-  `sp`, `pc`, `pstate`, `fault_address`,
-- an `fpsimd_context` record (magic `0x46508001`, 528 bytes: `fpsr`, `fpcr`,
-  32×`V128`),
-- an `esr_context` record (magic `0x45535201`, 16 bytes: the ESR), while the
-  thread's fault record holds one,
-- a terminator record.
+  `sp`, `pc`, `pstate` (EL0t with DAIF clear, and NZCV, all of PSTATE the CPU
+  keeps at EL0), `fault_address`,
+- in its 4096 bytes of records, an `fpsimd_context` (magic `0x46508001`, 528
+  bytes: `fpsr`, `fpcr`, 32×`V128`), an `esr_context` (magic `0x45535201`,
+  16 bytes: the ESR) while the thread's fault record holds one, and a
+  terminator; the rest of the room is zeroes, where a kernel leaves what the
+  stack had,
+- above it all, the frame record: the interrupted `x29` and `x30`.
 
 `sigcontext.fault_address` and the `esr_context` are not the signal's: they
 are the kernel's `thread.fault_address` and `thread.fault_code`, a record
@@ -194,9 +199,23 @@ So a `SIGUSR1` after a `SIGSEGV` still carries the `SIGSEGV`'s ESR. A new
 thread starts with its creator's record and a fork child with its parent's
 (`arch_dup_task_struct` copies the task), and an `execve` keeps the exec'ing
 thread's, whichever thread then runs the new image (`dethread_fault_*`).
-The data-abort syndrome is `mem.c`'s: DFSC level 3 always, where a kernel
-reports the level of the first missing table, and a permission fault where
-a page the kernel never faulted in would give it a translation fault. A
+The abort syndrome's fault status is `mem.c`'s (`fault_status`), standing
+in for the kernel's page tables, which it does not keep: the level is that
+of the first table whose span holds no accessible mapping (512 GB, 1 GB,
+2 MB; level 3, the page's own, otherwise), so a NULL dereference in a PIE
+program is the kernel's level-0 fault; a mapped page that refuses the access
+is a permission fault once the host has backed it (`mincore` of the host
+page: the guest touched it) and a translation fault before, as a kernel has
+no entry to refuse with yet; a `PROT_NONE` page is a translation fault
+always, at level 3 once touched. What it cannot see is the kernel's own
+history — a table kept after an `munmap` of less, a 2 MB span of mappings
+never touched (level 2 on a kernel, 3 here), fault-around, huge pages, swap
+— and a host with pages bigger than 4 KB answers residency per host page; a
+host that will not answer `mincore` (`ARM64EMU_MINCORE_FORCE_FAIL`) leaves a
+refused access a permission fault. The `si_code` is the mapping's, not the
+status's: `SEGV_ACCERR` wherever a mapping covers the address, `SEGV_MAPERR`
+where none does (`do_page_fault`'s `VM_FAULT_BADACCESS` and `_BADMAP`;
+`tests/arm64emu/chroot/fixtures/faultlevel.c`). A
 fault's `si_addr` reaches a handler with its tag stripped unless the handler
 was installed with `SA_EXPOSE_TAGBITS` (`hide_si_addr_tag_bits`; a tracer is
 shown the address as the CPU gave it). qemu-user writes no `esr_context` at
@@ -204,21 +223,52 @@ all, so `tests/arm64emu/chroot/fixtures/faultctx.c` checks itself against
 what a 6.8 kernel gave it (`fixtures/atomalign.c` the alignment faults,
 `fixtures/spalign.c` the SP-alignment record).
 
-The CPU is redirected: `x0`=signo, `x1`=&siginfo, `x2`=&ucontext, `pc`=handler,
-and — because arm64 has no `sa_restorer` — `x30` points at a hidden one-page
-**sigreturn trampoline** (`mov x8,#139; svc #0`) mapped by `elf.c` at load time.
-`rt_sigreturn` restores the full CPU + fpsimd + sigmask from the frame. Every
-read of it is checked and the FP part is staged before it is committed: the
-frame is the guest's own memory, so nothing promises it is still readable when
-sigreturn arrives, and a thread resumed with general-purpose registers from the
-frame and FP registers from somewhere else is the worst possible answer. A
-frame that cannot be read is a bad frame, and the guest dies of `SIGSEGV` --
-what `parse_user_sigframe` does with a failed `__get_user`.
+The CPU is redirected (`setup_return`): `x0`=signo, `x1`=&siginfo and
+`x2`=&ucontext for an `SA_SIGINFO` handler (any other keeps the interrupted
+ones), `x29`=the frame record, so a frame-pointer walk goes from the handler
+into the code it interrupted, `sp`=the frame, `pc`=handler, and `x30` the
+handler's `sa_restorer` when its `sigaction` set `SA_RESTORER` (musl and
+Bionic do, with their own `__restore_rt`; glibc does not) — otherwise a
+hidden one-page **sigreturn trampoline** (`mov x8,#139; svc #0`) mapped by
+`elf.c` at load time, standing for the vDSO's that a kernel uses. An action
+keeps only the flags a kernel knows (`do_sigaction`'s `UAPI_SA_FLAGS`, so
+`SA_UNSUPPORTED` reads back clear), and `SA_RESTORER` with its restorer is
+one of them. `AT_MINSIGSTKSZ` is 4720 — the frame, the record and 16 bytes
+of alignment (`minsigstksz_setup`) — and `sigaltstack` refuses less than
+`MINSIGSTKSZ`, 5120 (`ENOMEM`).
 
-No signal is delivered *on* the trampoline: one that is pending when a handler
-returns waits the two instructions for the sigreturn and is delivered into the
+A frame that cannot be written — a stack overflowed, an alternate stack too
+small, a stack pointer at nothing — is the kernel's `force_sigsegv`: the
+signal is gone (its `SA_RESETHAND` applied all the same, as `get_signal`
+applies it before the frame is tried), a `SIGSEGV` of the kernel's own (`SI_KERNEL`)
+goes to a handler that can take it — one on an alternate stack catches the
+overflow, whatever signal ran into it — and when the frame that failed was a
+`SIGSEGV`'s, that one is fatal (`force_fatal_sig`).
+
+`rt_sigreturn` takes the frame back as the kernel's `restore_sigframe` does,
+step by step: the stack pointer 16-aligned and the frame in user space
+(`access_ok`), or nothing is restored; the mask, if it can be read; each
+register read on its own, one that faults reading 0; a `pstate` that must be
+EL0t AArch64 with DAIF clear once its RES0 bits are gone (anything else is
+cut to NZCV and refused); the records walked as `parse_user_sigframe` walks
+them (16-aligned, within bounds, exactly one `fpsimd_context` of exactly 528
+bytes, an `esr_context` passed over, an `extra_context` followed, any other
+magic refused — this CPU has no SVE or SME), the FP state staged and
+committed whole; and the alternate stack from `uc_stack`. A frame refused at
+any step is `arm64_notify_segfault`: a `SIGSEGV` at the stack pointer as far
+as it was restored (`SEGV_MAPERR` when no mapping lies at or above it,
+`SEGV_ACCERR` otherwise), with `x0` 0, the call's return, and the fault
+record cleared, delivered once the call has returned (`syscall_dispatch`,
+`sig_badframe_deliver`) to whatever handler the guest has for it — it used
+to kill the process outright (`tests/arm64emu/chroot/fixtures/sigframe.c`,
+which checks itself against a 6.8 kernel).
+
+No signal is delivered *on* a sigreturn trampoline — ours, or a restorer of
+the guest's: any `mov x8, #139` with an `svc #0` next, or an `svc #0` with
+`x8` 139 (`sig_on_trampoline`). One that is pending when a handler returns
+waits the two instructions for the sigreturn and is delivered into the
 context it restores (`sig_deliver_pending`, and the run loop's
-deliver-before-the-`SVC` rule stands aside for the trampoline's `SVC`). A
+deliver-before-the-`SVC` rule stands aside for the sigreturn's `SVC`). A
 kernel can deliver there — only when an interrupt lands on those two
 instructions — but here the trampoline is a block of its own, so it was where
 nearly every such signal went, and an unwinder cannot step through that frame:
@@ -834,9 +884,11 @@ a `u64` is two stores) jump to a handler address that was never installed at all
 and every read and write goes through it: `sig_action_swap` for the syscall,
 `sig_action_handler` for the one-word tests, and a single snapshot at the top of
 `deliver_to_handler` that the whole delivery then works from. `SA_RESETHAND`
-clears the disposition back under the lock, and only if it is still the one that
-was delivered, so a handler a sibling installed in the meantime is not thrown
-away.
+puts the handler back to `SIG_DFL` under the lock — the handler alone, as
+`get_signal` does it: the flags and the mask stay, and read back as they were
+(a `SIGCHLD`'s `SA_NOCLDWAIT` goes on reaping) — and only if it is still the
+one that was delivered, so a handler a sibling installed in the meantime is not
+thrown away.
 
 The syscall's *order* is the kernel's too, which only a call mixing a good
 pointer with a bad one can see: the set size, then the new action in from the
