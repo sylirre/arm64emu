@@ -4892,6 +4892,36 @@ kernel 3.18 (Galaxy S7).
     the full suite passes on the Zenfone 10 (5.15), the Pixel 5 (4.19) and
     the Galaxy S7 (3.18).
 
+- [x] **M109 — NT_ARM_TLS was one word**
+  Since 5.19 the kernel's `NT_ARM_TLS` is two words, `TPIDR_EL0` and SME's
+  `TPIDR2_EL0`, the second reading 0 and its write ignored on a CPU without
+  SME (`tls_get`, `tls_set`), and 6.1 is the kernel uname advertises. The
+  emulation gave one word: a 16-byte read came back with `iov_len` 8, and a
+  16-byte write was cut to `TPIDR_EL0` alone.
+  - The regset is 16 bytes in units of 8. A short write lays what it
+    carries over the two words as they stand, so 8 bytes set `TPIDR_EL0`
+    alone.
+  - `TPIDR2_EL0` is read and written only where `AT_HWCAP2` has
+    `HWCAP2_SME`. A stop with a signal frame takes it from the frame's
+    TPIDR2 record, which sigreturn puts back (6.3 on), and which is the
+    only place the guest's value is under a kernel since 6.16, which zeroes
+    the register as it enters a handler. A stop with no frame, or a frame
+    with no record, uses the live register.
+  - Test: m18 `ptrace tls`. A tracee blocked in a read is attached to; its
+    regset is read and written whole and short, with the length rules; and
+    the tracee then reports what the two registers held when the read
+    returned, putting its own `TPIDR_EL0` back before libc runs. It needs
+    an AArch64 kernel as its oracle, so on an x86-64 host it is skipped, and
+    on one older than 5.19 it is skipped as no reference. It matches the
+    kernel on both tiers on the arm64 VM (6.8, no SME), where the whole of
+    m18 passes; the M108 build answers `iov_len` 8. No kernel here has SME
+    (Ubuntu's 6.8 is built without it), so that half was run under
+    qemu-aarch64, whose max CPU has it in user mode: `TPIDR2_EL0` read,
+    written by a 16-byte write, kept by an 8-byte one and seen by the
+    tracee afterwards, as `tls_get` and `tls_set` have it. qemu 8.2 puts no
+    TPIDR2 record in its frames, so the record path is exercised by nothing
+    here yet.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

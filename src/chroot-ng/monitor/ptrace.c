@@ -700,6 +700,7 @@ struct cng_ucontext *cng_pt_cur_uc(void) {
 #define PT_FPSIMD_MAGIC 0x46508001
 #define PT_SVE_MAGIC    0x53564501
 #define PT_EXTRA_MAGIC  0x45585401
+#define PT_TPIDR2_MAGIC 0x54504902 /* struct tpidr2_context { head; u64 tpidr2; } */
 
 struct pt_aarch64_ctx {
     u32 magic, size;
@@ -869,6 +870,57 @@ static void pt_fp_set(struct pt_self *s, struct cng_uregs *r, const u8 *in,
         memcpy(z + 16 + (u64)vl * i, st + PT_FP_VREGS + 16 * i, 16);
 }
 
+/* SME's TPIDR2_EL0, the second word of NT_ARM_TLS. The kernel has it where
+ * the CPU has SME (system_supports_tpidr2), which is what AT_HWCAP2's
+ * HWCAP2_SME says -- forwarded from the host verbatim -- and the register is
+ * not even there to read otherwise.
+ *
+ * A stop with a signal frame finds the guest's value in the frame's TPIDR2
+ * record (6.3 on), which sigreturn puts back, and which is the only place it
+ * is: a kernel since 6.16 zeroes the register as it enters a handler, ours
+ * included. With no frame, or no record in it (5.19 to 6.2 touched nothing),
+ * the register is the guest's own. Spelled as its encoding, S3_3_C13_C0_5,
+ * for an assembler that does not know SME. */
+#define PT_HWCAP2_SME (1UL << 23)
+
+/* The host's auxiliary vector, which the guest's is forwarded from. */
+static unsigned long pt_auxval(unsigned long tag) {
+    unsigned long *a = cng_host_auxv;
+    if (!a)
+        return 0;
+    for (; a[0]; a += 2)
+        if (a[0] == tag)
+            return a[1];
+    return 0;
+}
+
+static int pt_has_sme(void) {
+    return (pt_auxval(26 /*AT_HWCAP2*/) & PT_HWCAP2_SME) != 0;
+}
+
+static u8 *pt_tpidr2_rec(struct pt_self *s, struct cng_uregs *r) {
+    u8 *t = pt_frame_rec(s, r, PT_TPIDR2_MAGIC);
+    return t && ((struct pt_aarch64_ctx *)t)->size >= 16 ? t : 0;
+}
+
+static u64 pt_tpidr2_get(struct pt_self *s, struct cng_uregs *r) {
+    u64 v;
+    u8 *t = pt_tpidr2_rec(s, r);
+    if (t)
+        memcpy(&v, t + 8, 8);
+    else
+        __asm__ volatile("mrs %0, s3_3_c13_c0_5" : "=r"(v));
+    return v;
+}
+
+static void pt_tpidr2_set(struct pt_self *s, struct cng_uregs *r, u64 v) {
+    u8 *t = pt_tpidr2_rec(s, r);
+    if (t)
+        memcpy(t + 8, &v, 8);
+    else
+        __asm__ volatile("msr s3_3_c13_c0_5, %0" ::"r"(v));
+}
+
 /* PACIA <Xd>, <Xn>: 0xDAC10000 | (Rn << 5) | Rd, spelled as a raw instruction
  * word so a baseline armv8-a assembler accepts it. Only ever executed once
  * AT_HWCAP has said the CPU has address authentication — it is UNDEFINED, not a
@@ -878,16 +930,6 @@ static u64 pt_pac_sign(u64 ptr, u64 mod) {
     register u64 x1 __asm__("x1") = mod;
     __asm__ volatile(".inst 0xdac10020" : "+r"(x0) : "r"(x1));
     return x0;
-}
-
-static unsigned long pt_auxval(unsigned long tag) {
-    unsigned long *a = cng_host_auxv;
-    if (!a)
-        return 0;
-    for (; a[0]; a += 2)
-        if (a[0] == tag)
-            return a[1];
-    return 0;
 }
 
 /* The pointer-authentication mask, for NT_ARM_PAC_MASK.
@@ -936,7 +978,9 @@ static u32 pt_regset_geom(u64 which, u32 *size) {
     case CNG_NT_PRFPREG:
         *size = PT_FPSIMD_SZ;
         return 4;
-    case CNG_NT_ARM_TLS:
+    case CNG_NT_ARM_TLS: /* TPIDR_EL0 and TPIDR2_EL0: two words since 5.19 */
+        *size = 16;
+        return 8;
     case CNG_NT_ARM_TAGGED_ADDR_CTRL:
         *size = 8;
         return 8;
@@ -966,10 +1010,13 @@ static u32 pt_build_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
         pt_fp_get(s, r, out);
         return PT_FPSIMD_SZ;
     case CNG_NT_ARM_TLS: {
-        u64 tls;
-        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
-        memcpy(out, &tls, 8);
-        return 8;
+        /* tls_get: TPIDR_EL0, then TPIDR2_EL0 -- 0 on a CPU without SME. */
+        u64 tls[2] = {0, 0};
+        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls[0]));
+        if (pt_has_sme())
+            tls[1] = pt_tpidr2_get(s, r);
+        memcpy(out, tls, sizeof tls);
+        return (u32)sizeof tls;
     }
     case CNG_NT_ARM_SYSTEM_CALL: {
         s32 nr = s && s->link ? (s32)s->link->sc_nr : -1;
@@ -1020,11 +1067,15 @@ static long pt_apply_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
         pt_fp_set(s, r, in, len);
         return 0;
     case CNG_NT_ARM_TLS: {
-        u64 tls;
-        if (len < 8)
-            return -EINVAL;
-        memcpy(&tls, in, 8);
-        __asm__ volatile("msr tpidr_el0, %0" ::"r"(tls));
+        /* tls_set: the write over the two words as they stand -- 8 bytes
+         * are TPIDR_EL0 alone -- and TPIDR2_EL0 taken only where the CPU has
+         * it, a write of it ignored elsewhere. */
+        u64 tls[2];
+        pt_build_regset(s, r, CNG_NT_ARM_TLS, (u8 *)tls);
+        memcpy(tls, in, len > sizeof tls ? sizeof tls : len);
+        __asm__ volatile("msr tpidr_el0, %0" ::"r"(tls[0]));
+        if (pt_has_sme())
+            pt_tpidr2_set(s, r, tls[1]);
         return 0;
     }
     case CNG_NT_ARM_TAGGED_ADDR_CTRL: {

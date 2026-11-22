@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -1623,6 +1624,151 @@ static int sc_fpregs(void) {
     return 0;
 }
 
+/* NT_ARM_TLS: TPIDR_EL0 and, since 5.19, SME's TPIDR2_EL0 -- two words,
+ * the second 0 and its write ignored on a CPU without SME (tls_get, tls_set).
+ * chroot-ng gave one word. A tracee blocked in a read is attached to and its
+ * regset read and written, whole and short, with the length rules every
+ * regset has; then the tracee says what the two registers held as the read
+ * returned. It puts its own TPIDR_EL0 back before anything of libc's runs,
+ * TLS being where libc keeps errno. AArch64's alone: the x86 kernel has no
+ * such regset to compare with. */
+#if defined(__aarch64__)
+#define TLS_MARK2A 0x2aa2a22a2aa2a22aULL
+#define TLS_MARK2B 0x2bb2b22b2bb2b22bULL
+#define TLS_MARKT  0x0000aaaa5555f000ULL
+#define TLS_MARKT2 0x0000bbbb6666e000ULL
+#ifndef NT_ARM_TLS
+#define NT_ARM_TLS 0x401
+#endif
+#define TLS_HWCAP2_SME (1UL << 23)
+
+static int tls_sme(void) {
+    return (getauxval(26 /*AT_HWCAP2*/) & TLS_HWCAP2_SME) != 0;
+}
+
+/* Say so on `wfd`, then block in read(rfd), retried across EINTR; return
+ * what TPIDR_EL0 held when the read returned, and in *t2 TPIDR2_EL0 (which
+ * is set to TLS_MARK2A first) where there is SME. */
+static unsigned long long tls_hold(int rfd, int wfd, int sme, unsigned long long *t2) {
+    char c = 'r';
+    unsigned long long tp, own, v2 = 0;
+    __asm__ volatile("mrs %[own], tpidr_el0" : [own] "=r"(own));
+    if (sme)
+        __asm__ volatile("msr s3_3_c13_c0_5, %0" ::"r"(TLS_MARK2A));
+    __asm__ volatile("mov x0, %[w]\n\tmov x1, %[b]\n\tmov x2, #1\n\t"
+                     "mov x8, #64\n\t" /* write */
+                     "svc #0\n"
+                     "1:\n\t"
+                     "mov x0, %[r]\n\tmov x1, %[b]\n\tmov x2, #1\n\t"
+                     "mov x8, #63\n\t" /* read */
+                     "svc #0\n\t"
+                     "cmn x0, #4\n\t" /* -EINTR */
+                     "b.eq 1b\n\t"
+                     "mrs %[tp], tpidr_el0\n\t"
+                     "msr tpidr_el0, %[own]"
+                     : [tp] "=&r"(tp)
+                     : [own] "r"(own), [w] "r"((long)wfd), [r] "r"((long)rfd),
+                       [b] "r"(&c)
+                     : "x0", "x1", "x2", "x8", "memory", "cc");
+    if (sme)
+        __asm__ volatile("mrs %0, s3_3_c13_c0_5" : "=r"(v2));
+    *t2 = v2;
+    return tp;
+}
+
+static const char *tls_word(unsigned long long v, unsigned long long own) {
+    return v == own          ? "the tracer's own"
+           : v == 0          ? "zero"
+           : v == TLS_MARK2A ? "the tracee's marker"
+           : v == TLS_MARK2B ? "the second marker"
+           : v == TLS_MARKT  ? "the first write"
+           : v == TLS_MARKT2 ? "the second write"
+                             : "other";
+}
+
+/* GETREGSET of `len`: what came back, and the two words. */
+static void tls_get(pid_t pid, size_t len, unsigned long long own) {
+    unsigned long long w[4] = {1, 1, 1, 1};
+    struct iovec io = {w, len};
+    errno = 0;
+    long r = ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_TLS, &io);
+    if (r != 0) {
+        printf("tls get %zu: %s\n", len, ptres(r));
+        return;
+    }
+    printf("tls get %zu: iov_len %zu, %s, %s\n", len, io.iov_len,
+           tls_word(w[0], own), io.iov_len > 8 ? tls_word(w[1], own) : "-");
+}
+
+static void tls_set(pid_t pid, size_t len, unsigned long long a,
+                    unsigned long long b) {
+    unsigned long long w[4] = {a, b, 0, 0};
+    struct iovec io = {w, len};
+    errno = 0;
+    long r = ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_TLS, &io);
+    if (r != 0)
+        printf("tls set %zu: %s\n", len, ptres(r));
+    else
+        printf("tls set %zu: iov_len %zu\n", len, io.iov_len);
+}
+
+static int sc_tls(void) {
+    int in[2], ready[2], rep[2];
+    if (pipe(in) != 0 || pipe(ready) != 0 || pipe(rep) != 0)
+        return 1;
+    int sme = tls_sme();
+    unsigned long long own;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(own));
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsigned long long v[2];
+        v[0] = tls_hold(in[0], ready[1], sme, &v[1]);
+        ssize_t ignore = write(rep[1], v, sizeof v);
+        (void)ignore;
+        _exit(0);
+    }
+    char c;
+    if (read(ready[0], &c, 1) != 1)
+        return 1;
+    usleep(100000);
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    int st;
+    wait_for(pid, &st);
+    printf("attach %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP) ? "stopped" : "odd");
+    /* What the CPU has is the host's, either side: not compared, but what
+     * the second word should be follows from it. */
+    tls_get(pid, 16, own);
+    tls_get(pid, 8, own);
+    tls_get(pid, 4, own);
+    tls_get(pid, 12, own);
+    tls_get(pid, 32, own);
+    tls_set(pid, 12, TLS_MARKT, TLS_MARK2B);
+    tls_get(pid, 16, own);
+    tls_set(pid, 32, TLS_MARKT, TLS_MARK2B);
+    tls_get(pid, 16, own);
+    tls_set(pid, 8, TLS_MARKT2, 0);
+    tls_get(pid, 16, own);
+    ssize_t ignore = write(in[1], "x", 1);
+    (void)ignore;
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    unsigned long long v[2] = {0, 0};
+    ssize_t n = read(rep[0], v, sizeof v);
+    if (n != (ssize_t)sizeof v)
+        printf("tracee saw nothing\n");
+    else
+        printf("tracee saw %s, %s\n", tls_word(v[0], own),
+               sme ? tls_word(v[1], own) : "-");
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+#endif
+
 /* PTRACE_ATTACH to a thread blocked in a syscall — the state a crash reporter
  * or a debugger finds most threads in. The kernel stops it mid-call and shows
  * the call as one it is going to restart: the registers are the thread's own,
@@ -2130,6 +2276,10 @@ int main(int argc, char **argv) {
         return sc_options();
     if (!strcmp(s, "fpregs"))
         return sc_fpregs();
+#if defined(__aarch64__)
+    if (!strcmp(s, "tls"))
+        return sc_tls();
+#endif
     if (!strcmp(s, "blocked"))
         return sc_blocked(0);
     if (!strcmp(s, "blockedmask"))

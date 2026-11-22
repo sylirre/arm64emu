@@ -200,6 +200,16 @@ else
     # FPSIMD record was also read as if it were the ptrace layout, so even a
     # stop that had one returned the registers shifted and lost a write.
     pt_case fpregs
+    # NT_ARM_TLS: TPIDR_EL0 and SME's TPIDR2_EL0 since 5.19, the second 0 and
+    # a write of it ignored on a CPU without SME. The emulation gave one word,
+    # so a two-word read was cut short and a write of 16 bytes refused. The
+    # regset is AArch64's: an x86-64 kernel has none to compare with.
+    if [ -z "$CHROOTNG_QEMU" ]; then
+        pt_case tls "tls get 16: iov_len 8" \
+            "the host kernel predates the two-word NT_ARM_TLS (5.19), so it is no reference"
+    else
+        skip "ptrace tls: NT_ARM_TLS is AArch64's, and the oracle here is an x86-64 kernel"
+    fi
     # PTRACE_ATTACH to a thread blocked in a syscall, which is where a crash
     # reporter finds most threads: the stop shows the call the kernel's way —
     # the thread's own registers, its arguments in place, pc at the syscall
@@ -327,6 +337,10 @@ else
         done
         pt_case sysinfo "syscall_info unsupported" \
             "the host kernel predates PTRACE_GET_SYSCALL_INFO (5.3), so it is no reference"
+        if [ -z "$CHROOTNG_QEMU" ]; then
+            pt_case tls "tls get 16: iov_len 8" \
+                "the host kernel predates the two-word NT_ARM_TLS (5.19), so it is no reference"
+        fi
         pt_case vmrw "vmrw wrapcnt EINVAL" \
             "the host kernel refuses an iovec count it does not narrow first (pre-import_iovec), so it is no reference"
         PT_TIER=-R
