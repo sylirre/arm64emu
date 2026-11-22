@@ -373,10 +373,14 @@ int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int 
             return 1;
         }
         ptrace_report_event(c, G_PTRACE_EVENT_SECCOMP, action & G_SECCOMP_RET_DATA);
-        if ((s64)c->x[8] < 0) { *ret = (s64)c->x[0]; return 1; }
+        /* The call is syscall_get_nr's, regs->syscallno, which the tracer
+         * changes through NT_ARM_SYSTEM_CALL (x8 is not the number any
+         * more): any negative one skips it. */
+        s32 now_nr = g_ptrace_scno;
+        if (now_nr < 0) { *ret = (s64)c->x[0]; return 1; }
         u64 now[6];
         for (int i = 0; i < 6; i++) now[i] = c->x[i];
-        int r = seccomp_gate(c, c->x[8], now, ret, trap_data, 1);
+        int r = seccomp_gate(c, (u64)now_nr, now, ret, trap_data, 1);
         return r ? r : 3;   /* allowed: the call as the tracer left it */
     }
     case G_SECCOMP_RET_KILL_THREAD:

@@ -1990,6 +1990,25 @@ nothing does nothing. `NT_ARM_TLS` is two words, `TPIDR_EL0` and a
 `TPIDR2_EL0` that reads 0 and takes no write, this CPU having no SME. The
 regset is the address cut to 32 bits, `ptrace_regset`'s `unsigned int`
 (`tests/arm64emu/chroot/ptrace/regset_len.c`, checked against a 6.8 kernel).
+`NT_ARM_SYSTEM_CALL` is the kernel's `regs->syscallno` (`g_ptrace_scno`,
+`ptrace.h`), not x8. `el0_svc_common` takes the number from x8's low 32 bits
+as the SVC finds them, an `int`, and from then on that is the call made: the
+dispatcher reads it after the entry stop (and after a seccomp stop), so a
+tracer changes the call through the regset, -1 skipping it with the x0 it
+leaves; a change of x8 changes x8 only, and x8 is never written back. A call
+of -1 answers `-ENOSYS`, which a traced one already has in x0 at its entry
+stop. The entry and exit stops and the events a call reports from inside
+itself (fork, clone, exec, exit, seccomp) show the call's number; the main
+thread that takes an exec over reports the exec'ing thread's. Every other stop
+is `get_signal`'s, after `do_signal`'s `forget_syscall`, or follows an
+exception entered with `NO_SYSCALL`, and starts at -1: the run loop resets it
+each time the engine hands back (`ptrace_kernel_entry`), and the dispatcher
+forgets the number once the call's exit stop is past. A write at such a stop
+lasts until then: a fatal signal's exit event, the next signal's stop and a
+group stop of the same `get_signal` show it. The emulator used to read and
+write x8 there: a signal stop showed the last call's number, and a write
+rewrote x8, which a call restarted after the stop then used
+(`tests/arm64emu/chroot/ptrace/syscallno.c`, checked against a 6.8 kernel).
 arm64 has no user area: `PEEKUSR` and `POKEUSR` are `EIO` at any offset, as
 `arch_ptrace` leaves them to `ptrace_request`'s default
 (`tests/arm64emu/chroot/ptrace/peekusr.c`). `pstate` is the kernel's

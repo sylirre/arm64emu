@@ -57,6 +57,8 @@ __thread int g_ptrace_singlestep;
  * at a syscall-entry stop) is not reported and does not desync the tracer's
  * entry/exit pairing. */
 __thread int g_ptrace_skip_syscall_stop;
+__thread s32 g_ptrace_scno = -1;
+__thread int g_ptrace_in_call;
 /* Set by the reserved-signal kick handler; drained by ptrace_service_kick. */
 __thread volatile sig_atomic_t g_ptrace_kick;
 
@@ -487,7 +489,8 @@ static u32 pt_build_regset(CPU *c, u32 which, u8 *out) {
         return (u32)sizeof tls;
     }
     case G_NT_ARM_SYSTEM_CALL: {
-        s32 nr = (s32)c->x[8];
+        /* system_call_get: regs->syscallno, not x8 (g_ptrace_scno). */
+        s32 nr = g_ptrace_scno;
         memcpy(out, &nr, sizeof nr);
         return (u32)sizeof nr;
     }
@@ -548,9 +551,12 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in) {
         return 0;
     }
     case G_NT_ARM_SYSTEM_CALL: {
+        /* system_call_set: the call a syscall stop goes on to make, -1 none
+         * (syscall_dispatch); x8 is left alone. Outside a call it stays
+         * until the next entry to the kernel (ptrace.h). */
         s32 nr;
         memcpy(&nr, in, sizeof nr);
-        c->x[8] = (u64)(s64)nr;   /* redirect/cancel the in-flight syscall */
+        g_ptrace_scno = nr;
         return 0;
     }
     default:
@@ -821,6 +827,18 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
     e->has_siginfo = si != NULL;
     s32 tracer = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
     s32 tracer_task = pt_tracer_task(e);   /* read now: a detach frees e */
+    /* regs->syscallno at this stop (g_ptrace_scno). A syscall stop and the
+     * events a call reports from inside itself (fork, clone, exec, exit,
+     * seccomp, ...) show the call's; every other is get_signal's -- a
+     * signal-delivery stop, a group stop, an INTERRUPT -- after do_signal's
+     * forget_syscall, and shows what the thread has outside a call. Some of
+     * those the emulator takes before the call it is in is done (a fork
+     * child's first stop, a legacy exec's SIGTRAP): -1 for the stop, what a
+     * tracer writes there gone with it, and the call's number back for the
+     * rest of the call. */
+    int own = g_ptrace_in_call && !syscall_stop && (!event || event == G_PTRACE_EVENT_STOP);
+    s32 scno = g_ptrace_scno;
+    if (own) g_ptrace_scno = -1;
     pt_ru_stamp(e);
     __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
@@ -845,6 +863,7 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
     } else
         pt_notify_stop(tracer, CLD_TRAPPED, stop_sig);
     int ns = pt_service_loop(c, e, seen, si);
+    if (own) g_ptrace_scno = scno;
     if (ns == PT_RETRAP) return ns;
     /* What the stop did not answer -- an INTERRUPT or a trap_notify that
      * came during it, a group stop begun meanwhile -- is taken at the next
@@ -916,8 +935,16 @@ void ptrace_report_exec(CPU *c, s32 old_tid) {
      * exec'ing thread had, which a tracer following threads needs to retire
      * that tid (it will never hear of it again). */
     g_self_link->eventmsg = (u64)(u32)old_tid;
-    if (event) pt_event_stop(c, event);
-    else       pt_signal_stop(c, SIGTRAP, 0, SI_USER, (s32)getpid(), 0);
+    if (event) {
+        pt_event_stop(c, event);
+    } else {
+        /* send_sig's SIGTRAP is taken by get_signal once the call has
+         * returned: -1. Inside the call pt_stop sees to that; a main thread
+         * that took the exec over at a boundary holds the exec's number
+         * (ptrace_exec_takeover) with no call to finish. */
+        if (!g_ptrace_in_call) g_ptrace_scno = -1;
+        pt_signal_stop(c, SIGTRAP, 0, SI_USER, (s32)getpid(), 0);
+    }
 }
 
 /* Release the calling thread's own link without a report: the kernel's
@@ -940,10 +967,16 @@ static void pt_release_silent(struct Machine *m) {
     pt_wake_tracer(tr);
 }
 
+/* The call the exec'ing thread is in (execve or execveat), which the main
+ * thread reports the exec from (ptrace_exec_takeover): one exec at a time
+ * hands over, under the dethread rendezvous. */
+static s32 pt_handover_scno = -1;
+
 void *ptrace_exec_handover(void) {
     PtLink *e = g_self_link;
     /* The link, and the process's count of traced threads with it, pass to
      * the main thread as they are: nothing is reported, and nothing freed. */
+    pt_handover_scno = g_ptrace_scno;
     g_self_link = NULL;
     g_ptrace_active = 0;
     g_ptrace_syscall_armed = 0;
@@ -954,6 +987,10 @@ void *ptrace_exec_handover(void) {
 
 void ptrace_exec_takeover(CPU *c, void *link) {
     pt_release_silent(c->m);
+    /* The exec'ing thread's regs, syscallno and all (start_thread keeps
+     * it), are what the main thread goes on with: the exec stop, and the
+     * exit stop of the call, show the exec's number. */
+    g_ptrace_scno = pt_handover_scno;
     PtLink *e = link;
     if (!e) return;
     /* Keyed by the main tid from here on: the tracer finds the new image's

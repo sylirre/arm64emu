@@ -4799,7 +4799,11 @@ void guest_terminate_by_signal(CPU *c, int sig) {
      * word -- for every traced thread of this process, since the signal kills
      * them all without their own exit paths running. Without this a tracer
      * that is not our host parent (strace -p / a followed child) never learns
-     * we died and its wait4 poll hangs. */
+     * we died and its wait4 poll hangs. A death by signal is get_signal's,
+     * outside any call, whatever call it ends: its exit stop shows what the
+     * thread has outside one -- -1, or what a tracer wrote at the signal's
+     * own stop, the two being one get_signal (ptrace.h). */
+    ptrace_leave_syscall();
     ptrace_report_exit_stop(c, sig & 0x7f);
     ptrace_report_exit_group(sig & 0x7f);
     ptrace_tracer_exit();                /* a tracer's tracees: detached, or

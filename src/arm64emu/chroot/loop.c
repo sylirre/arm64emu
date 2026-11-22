@@ -267,6 +267,13 @@ int emu_loop(CPU *c) {
         }
         }
         as_bus_disarm();
+        /* Whatever brought the engine back is an entry to the kernel --
+         * an exception, an SVC, an interrupt (a signal, a kick) -- which
+         * kernel_entry gives NO_SYSCALL; the dispatcher sets an SVC's
+         * number itself. A round with no guest instruction in it is
+         * do_notify_resume's next do_signal, whose forget_syscall does the
+         * same (ptrace.h). */
+        ptrace_kernel_entry();
 
         /* --max-insn, counted per thread (its icount, from the start of the
          * program it runs), or the coverage finder's stop: before the loop

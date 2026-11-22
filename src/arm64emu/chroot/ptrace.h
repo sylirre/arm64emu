@@ -24,6 +24,34 @@ extern __thread int g_ptrace_active;         /* this thread is a ptrace tracee *
 extern __thread int g_ptrace_syscall_armed;  /* + stop at syscall entry/exit (PTRACE_SYSCALL) */
 extern __thread int g_ptrace_singlestep;     /* + stop after each instruction (PTRACE_SINGLESTEP) */
 extern __thread int g_ptrace_skip_syscall_stop;  /* one-shot: skip the next syscall-exit stop */
+/* The kernel's regs->syscallno, which a tracer reads and writes as
+ * NT_ARM_SYSTEM_CALL. el0_svc_common takes it from x8's low 32 bits as the
+ * SVC finds them, and from then on it -- never x8 again -- is the call made:
+ * -1 skips it, and x8 is left as it was. Every other entry to the kernel
+ * makes it NO_SYSCALL, -1, and so does do_signal's forget_syscall before
+ * each get_signal: a stop outside a call starts at -1, and what a tracer
+ * writes there stays until the next entry or do_signal -- a fatal signal's
+ * exit event, the next signal's stop, a group stop see it.
+ *
+ * Here: the run loop's return from the engines is the entry
+ * (ptrace_kernel_entry); the dispatcher sets the number (g_ptrace_in_call
+ * while it is in the call) and forgets it once the call's exit stop is
+ * past (ptrace_leave_syscall). */
+extern __thread s32 g_ptrace_scno;
+extern __thread int g_ptrace_in_call;
+static inline void ptrace_kernel_entry(void) { g_ptrace_scno = -1; }
+static inline void ptrace_enter_syscall(s32 nr) {
+    g_ptrace_scno = nr;
+    g_ptrace_in_call = 1;
+}
+/* Out of the call (do_signal's forget_syscall): also what a death by signal
+ * taken inside one does, get_signal's being outside it. */
+static inline void ptrace_leave_syscall(void) {
+    if (g_ptrace_in_call) {
+        g_ptrace_scno = -1;
+        g_ptrace_in_call = 0;
+    }
+}
 /* Set by the reserved-signal kick handler (a tracer's PTRACE_ATTACH/SEIZE/
  * INTERRUPT, a group stop calling a thread out, a SIGCONT's trap_notify);
  * serviced at the run-loop boundary by ptrace_service_kick. */

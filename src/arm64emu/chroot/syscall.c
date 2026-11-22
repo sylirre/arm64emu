@@ -556,21 +556,36 @@ void syscall_dispatch(CPU *c) {
 
     struct Machine *m = c->m;
 
+    /* el0_svc_common: the call is x8's low 32 bits as the SVC finds them, an
+     * int -- regs->syscallno (g_ptrace_scno), which from here on is the
+     * number, x8 never being read again: a tracer changes the call through
+     * NT_ARM_SYSTEM_CALL (a change of x8 is a change of x8), and the number
+     * above 32 bits is no part of it. -1 is no call. With syscall work to do
+     * -- a stop to report, a filter to run -- such a call answers what x0
+     * holds after it, which is -ENOSYS unless a tracer leaves another, and
+     * the tracer sees it at the entry stop; with none, it is an unknown
+     * number, -ENOSYS too. */
+    s32 scno = (s32)(u32)c->x[8];
+    ptrace_enter_syscall(scno);
+    int scwork = g_ptrace_syscall_armed ||
+                 __atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED);
+    if (UNLIKELY(scno == -1) && scwork) c->x[0] = (u64)(s64)-ENOSYS;
+
     /* ptrace syscall-entry stop: a tracer that issued PTRACE_SYSCALL parks the
-     * tracee here and may rewrite the syscall number or arguments — or set the
-     * number to -1 to cancel the call — before it runs. Read the register file
-     * afterwards so those edits take effect. Gated on a near-always-zero int so
-     * the untraced hot path is unchanged. */
+     * tracee here and may rewrite the arguments, or the call (-1 to cancel
+     * it), before it runs. Read the register file and the number afterwards
+     * so those edits take effect. Gated on a near-always-zero int so the
+     * untraced hot path is unchanged. */
     if (UNLIKELY(g_ptrace_syscall_armed)) {
         ptrace_report_syscall(c, 0);
         /* Left the stop because another thread's execve is dismantling this
          * thread group: the kernel's SIGKILL ends a traced stop too, and the
          * call it was stopped at the entry of is never made. The safepoint
          * the run loop reaches next is where this thread goes. */
-        if (dethread_callout(c->m)) return;
+        if (dethread_callout(c->m)) { ptrace_leave_syscall(); return; }
     }
 
-    u64 nr = c->x[8];
+    u64 nr = (u64)(s64)g_ptrace_scno;
     u64 a0 = c->x[0], a1 = c->x[1], a2 = c->x[2],
         a3 = c->x[3], a4 = c->x[4], a5 = c->x[5];
 
@@ -612,9 +627,9 @@ void syscall_dispatch(CPU *c) {
         scskip = seccomp_gate(c, nr, av, &scret, &sctrap, 0);
     if (UNLIKELY(scskip == 3)) {
         /* Allowed after a PTRACE_EVENT_SECCOMP stop: the call is what the
-         * tracer left in the registers. */
+         * tracer left, in the registers and in its number. */
         scskip = 0;
-        nr = c->x[8];
+        nr = (u64)(s64)g_ptrace_scno;
         a0 = c->x[0]; a1 = c->x[1]; a2 = c->x[2];
         a3 = c->x[3]; a4 = c->x[4]; a5 = c->x[5];
         av[0] = a0; av[1] = a1; av[2] = a2; av[3] = a3; av[4] = a4; av[5] = a5;
@@ -626,8 +641,8 @@ void syscall_dispatch(CPU *c) {
     u64 ret;
     if (scskip) {
         ret = (u64)scret;   /* filtered out: the call never runs */
-    } else if (nr == (u64)-1) {
-        ret = c->x[0];   /* tracer cancelled the syscall (nr := -1) */
+    } else if (nr == (u64)-1 && scwork) {
+        ret = c->x[0];   /* no call: x0 as the tracer left it, or -ENOSYS */
     } else if (fn) {
         /* A handler may block for a long time (read, wait4, futex), and while it
          * does this thread cannot run generated code, so its D-TLB must stop
@@ -676,6 +691,9 @@ void syscall_dispatch(CPU *c) {
             ret = c->x[0];
         }
     }
+    /* Out of the call: whatever stops on the way back to user space are
+     * get_signal's, after do_signal's forget_syscall. */
+    ptrace_leave_syscall();
 
     /* Note EINTR so a pending signal with SA_RESTART -- or one of the emulator's
      * own interruptions (syscall_restart_internal) -- can rewind the SVC. Read
