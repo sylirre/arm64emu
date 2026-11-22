@@ -33,6 +33,13 @@ typedef struct {
     u8  badframe;
     int badframe_code;
     u64 badframe_addr;
+    /* The bits of the kernel's regs->pstate this CPU does not have (DIT,
+     * TCO, BTYPE, SSBS, SS): what a tracer's SETREGSET or an rt_sigreturn
+     * wrote there, which a kernel keeps as written until the thread returns
+     * to user space -- a GETREGSET and a signal frame see them meanwhile --
+     * and the hardware then never had. Cleared as guest code runs (loop.c);
+     * NZCV is the CPU's own (signal.c, el0_pstate). */
+    u32 pstate_extra;
     u64 clear_child_tid;      /* CLONE_CHILD_CLEARTID address (futex on exit) */
     u64 robust_head;          /* set_robust_list head, echoed by get_robust_list */
     /* Guest blocked-signal set: a per-thread attribute (POSIX), inherited

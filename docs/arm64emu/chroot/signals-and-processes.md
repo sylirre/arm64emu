@@ -172,8 +172,9 @@ frame record, which is 16 bytes under the stack pointer rounded down to 16:
 - 128-byte guest `siginfo` — written for an `SA_SIGINFO` handler only; any
   other gets none, as from a kernel,
 - `ucontext` with `uc_stack`, `uc_sigmask`, and a `sigcontext` holding `x0..x30`,
-  `sp`, `pc`, `pstate` (EL0t with DAIF clear, and NZCV, all of PSTATE the CPU
-  keeps at EL0), `fault_address`,
+  `sp`, `pc`, `pstate` (`regs->pstate`: EL0t with DAIF clear, and NZCV, all
+  of PSTATE the CPU keeps at EL0, with any bits a tracer wrote that it lacks),
+  `fault_address`,
 - in its 4096 bytes of records, an `fpsimd_context` (magic `0x46508001`, 528
   bytes: `fpsr`, `fpcr`, 32×`V128`), an `esr_context` (magic `0x45535201`,
   16 bytes: the ESR) while the thread's fault record holds one, and a
@@ -1977,7 +1978,19 @@ Registers marshal 1:1 between the flat `CPU` struct and arm64
 `user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
 `NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`); as in the kernel, both write
 the *clamped* `iov_len` back — `min(the caller's length, the regset size)` — so
-a short buffer is never reported as a full transfer. `PTRACE_SINGLESTEP` runs
+a short buffer is never reported as a full transfer. `pstate` is the kernel's
+`regs->pstate` (`el0_pstate`, `signal.c`): EL0t, AArch64, DAIF clear, and the
+CPU's NZCV — not the CPU's own mode, which in user mode is the reset state's
+SPSel 1 and DAIF masked, and which a tracer used to be shown. A `SETREGSET`'s
+is judged as `gpr_set` judges it (`valid_user_regs`): its RES0 bits dropped,
+and one that is not EL0t AArch64 with DAIF clear `EINVAL`, nothing of the write
+taken — it used to be handed to `cpu_unpack_spsr` as it was, which would have
+run the tracee at EL1 for a tracer that asked. The bits a valid one carries
+that the CPU does not implement (DIT, TCO, BTYPE, SSBS, SS) are kept as
+written until the tracee runs guest code again (`pstate_extra`, `thread.h`):
+a `GETREGSET` in the same stop and a signal frame built before it runs show
+them, as a kernel's do (`tests/arm64emu/chroot/ptrace/pstate.c`, checked
+against a 6.8 kernel). `PTRACE_SINGLESTEP` runs
 exactly one guest instruction through the interpreter (`cpu_step`, bypassing the
 JIT/predecode chunk — like `--debug`) and then reports a `SIGTRAP` stop; syscall
 and signal stops work under `--jit` unchanged.

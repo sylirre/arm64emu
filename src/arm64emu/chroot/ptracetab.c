@@ -467,7 +467,7 @@ static u32 pt_build_regset(CPU *c, u32 which, u8 *out) {
         for (int i = 0; i < 31; i++) r.regs[i] = c->x[i];
         r.sp = *cpu_cur_sp(c);
         r.pc = c->pc;
-        r.pstate = cpu_pack_spsr(c);
+        r.pstate = el0_pstate(c);   /* regs->pstate, not the CPU's own mode */
         memcpy(out, &r, sizeof r);
         return (u32)sizeof r;
     }
@@ -515,10 +515,16 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
         GUserRegs r;
         if (len < sizeof r) return -EINVAL;
         memcpy(&r, in, sizeof r);
+        /* gpr_set's valid_user_regs: a pstate that is not EL0t AArch64 with
+         * DAIF clear is EINVAL, and nothing of the write is taken. It used
+         * to go to cpu_unpack_spsr as it was, which would have had the
+         * tracee run at EL1 for a tracer that asked. */
+        u64 ps = r.pstate;
+        if (!el0_pstate_valid(&ps)) return -EINVAL;
         for (int i = 0; i < 31; i++) c->x[i] = r.regs[i];
         *cpu_cur_sp(c) = r.sp;
         c->pc = r.pc;
-        cpu_unpack_spsr(c, (u32)r.pstate);
+        el0_pstate_put(c, ps);
         return 0;
     }
     case G_NT_PRFPREG: {

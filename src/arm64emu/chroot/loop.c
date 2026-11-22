@@ -213,6 +213,9 @@ int emu_loop(CPU *c) {
          * unwind must not leave it indeterminate. It stays 0 on that path,
          * which is right — an instruction that faulted did not single-step. */
         volatile int stepped = 0;
+        /* What of regs->pstate this CPU does not have, a tracer's or a
+         * frame's (thread.h, pstate_extra), is gone as guest code runs. */
+        if (UNLIKELY(g_tls.pstate_extra)) g_tls.pstate_extra = 0;
         /* Bus-error recovery bracket (mem.c). A file truncated from outside
          * this address space leaves PTEs pointing at host pages the kernel now
          * refuses; the handler records the guest abort and unwinds to here,

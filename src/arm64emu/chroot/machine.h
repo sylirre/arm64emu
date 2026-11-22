@@ -912,6 +912,15 @@ int  sig_layout_known(int sig, s32 code);
  * SIGSEGV sig_badframe_deliver raises once the call has returned. */
 u64  sig_return(CPU *c);
 void sig_badframe_deliver(CPU *c);
+/* The kernel's regs->pstate of this thread, which a tracer's GETREGSET and a
+ * signal frame show: EL0t, AArch64, DAIF clear, the CPU's NZCV and whatever
+ * else was last written there (thread.h, pstate_extra). el0_pstate_valid is
+ * valid_user_regs: `*v` with its RES0 bits dropped, and 0 for one that is not
+ * EL0t AArch64 with DAIF clear, `*v` then cut to NZCV; el0_pstate_put makes
+ * `v` the thread's. */
+u64  el0_pstate(CPU *c);
+int  el0_pstate_valid(u64 *v);
+void el0_pstate_put(CPU *c, u64 v);
 /* Reset host handlers we installed (guest execve keeps only IGN). */
 void sig_reset_for_exec(struct Machine *m);
 /* The calling thread's guest blocked set becomes its host mask (signal.c,

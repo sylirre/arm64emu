@@ -723,6 +723,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     }
 
     cpu_reset(&m->cpu, entry, 0);
+    g_tls.pstate_extra = 0;   /* start_thread's pstate: EL0t, nothing else */
     *cpu_cur_sp(&m->cpu) = sp;
     return 0;
 }

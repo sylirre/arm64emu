@@ -4187,12 +4187,9 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
                                       (i == 0) ? saved_x0 : c->x[i]);
     wr64(fr, MC_SP, *cpu_cur_sp(c));
     wr64(fr, MC_PC, saved_pc);
-    /* The pstate of EL0 as a kernel saves it: EL0t, AArch64, D, A, I and F
-     * clear -- what rt_sigreturn insists on getting back -- and NZCV, all of
-     * PSTATE this CPU keeps at EL0. cpu_pack_spsr would give the CPU's own
-     * mode bits, which in user mode are the reset state's (SPSel 1, DAIF
-     * masked), and no kernel frame ever shows. */
-    wr64(fr, MC_PSTATE, c->nzcv & (PS_N | PS_Z | PS_C | PS_V));
+    /* regs->pstate as a kernel saves it (el0_pstate): EL0t with DAIF clear,
+     * what rt_sigreturn insists on getting back, and NZCV. */
+    wr64(fr, MC_PSTATE, el0_pstate(c));
 
     /* fpsimd_context + terminator. The flags are accumulated lazily, so
      * c->fpsr is only current once fpsr_sync has folded what is pending --
@@ -4372,9 +4369,33 @@ done:
 }
 
 /* SPSR_EL1_AARCH64_RES0_BITS (arch/arm64/kernel/ptrace.c): what
- * valid_native_regs drops from a frame's pstate before it judges it. */
+ * valid_native_regs drops from a pstate before it judges it. */
 #define PSTATE_RES0 (0xffffffff00000000ULL | 0x0c000000u | 0x00c00000u | \
                      0x001fe000u | 0x20u)
+#define PSTATE_NZCV (PS_N | PS_Z | PS_C | PS_V)
+
+/* regs->pstate at EL0, and how one is taken in (machine.h). NZCV is all of
+ * PSTATE this CPU keeps at EL0: the rest of a valid one -- BTYPE, SSBS, SS,
+ * DIT, TCO, none of which it implements -- lasts in pstate_extra until guest
+ * code runs. cpu_pack_spsr is the CPU's own view, which in user mode is the
+ * reset state's mode bits (SPSel 1, DAIF masked): no kernel shows those. */
+u64 el0_pstate(CPU *c) {
+    return (c->nzcv & PSTATE_NZCV) | g_tls.pstate_extra;
+}
+
+int el0_pstate_valid(u64 *v) {
+    *v &= ~PSTATE_RES0;
+    if (*v & (0x1fu /*M[4:0]: EL0t, AArch64*/ | PS_D | PS_A | PS_I | PS_F)) {
+        *v &= PSTATE_NZCV;
+        return 0;
+    }
+    return 1;
+}
+
+void el0_pstate_put(CPU *c, u64 v) {
+    c->nzcv = (u32)v & PSTATE_NZCV;
+    g_tls.pstate_extra = (u32)v & ~(u32)PSTATE_NZCV;
+}
 
 /* rt_sigreturn, as the kernel takes a frame back. The stack pointer must be
  * 16-aligned and the frame in user space (access_ok), or nothing is
@@ -4382,8 +4403,8 @@ done:
  * its own, one that faults reading 0; the pstate, which must be EL0t AArch64
  * with D, A, I and F clear once its RES0 bits are gone (valid_user_regs: any
  * other is cut to NZCV, and refused); the records (frame_records); and the
- * alternate stack, from uc_stack. All this CPU keeps of the pstate at EL0 is
- * NZCV.
+ * alternate stack, from uc_stack. The pstate is taken as el0_pstate_put
+ * takes it.
  *
  * A frame refused at any step is arm64_notify_segfault(regs->sp): a SIGSEGV
  * at the stack pointer as far as it was restored -- SEGV_MAPERR when no
@@ -4413,9 +4434,8 @@ u64 sig_return(CPU *c) {
     err |= frame_rd64(c, frame + MC_PC, &v);
     c->pc = v;
     err |= frame_rd64(c, frame + MC_PSTATE, &v);
-    v &= ~PSTATE_RES0;
-    if (v & (0x1fu /*M[4:0]: EL0t, AArch64*/ | PS_D | PS_A | PS_I | PS_F)) err = 1;
-    c->nzcv = (u32)v & (PS_N | PS_Z | PS_C | PS_V);
+    if (!el0_pstate_valid(&v)) err = 1;
+    el0_pstate_put(c, v);
     if (err || frame_records(c, frame) < 0) goto bad;
     /* restore_altstack: the alternate stack comes back from the frame's
      * uc_stack -- what SS_AUTODISARM took away at delivery, or whatever the
