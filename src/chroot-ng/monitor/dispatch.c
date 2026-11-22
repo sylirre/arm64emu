@@ -681,14 +681,51 @@ static int g_disp_bounced;
  * call, as for any call of its own, and not on our scratch stack — where a
  * collector that scans the interrupted thread's stack from the handler's sp
  * (a conservative GC's suspend signal) would be scanning ours. */
+/* A tracee's signal held back from the dispatch (ptrace.c,
+ * cng_pt_signal_frame), pending as the guest's call is about to be made: the
+ * kernel's call would have been cut short by it at once, so it is let go
+ * here, and one it delivers cuts this call short before it is made -- it is
+ * made after the signal instead -- before the dispatch's first call for the
+ * guest only: one it makes after that is a part of a call already made. 1 when
+ * the call is not to be made: cut short already, by this or by a signal
+ * earlier in the dispatch. */
+static int reissue_unhold(struct cng_gframe *gf) {
+    if (gf->held && !gf->sigcut && !gf->reissued) {
+        unsigned long h = gf->held;
+        gf->held = 0;
+        cng_pt_unhold(&h);
+    }
+    return gf->sigcut;
+}
+
 static long reissue_svc(const long *a, long nr) {
     if (__atomic_load_n(&g_disp_bounced, __ATOMIC_RELAXED)) {
         struct cng_gframe *gf = cng_gframe_cur();
-        if (gf && gf->gsp)
-            return cng_syscall6_on(a[0], a[1], a[2], a[3], a[4], a[5], nr,
-                                   gf->gsp);
+        if (gf && gf->gsp) {
+            if (cng_pt_active() && reissue_unhold(gf))
+                return -EINTR;
+            gf->reissuing = 1;
+            long r = cng_syscall6_on(a[0], a[1], a[2], a[3], a[4], a[5], nr,
+                                     gf->gsp);
+            gf->reissuing = 0;
+            gf->reissued = 1;
+            return r;
+        }
     }
-    return cng_syscall6(a[0], a[1], a[2], a[3], a[4], a[5], nr);
+    /* A tracee's dispatch from guest context marks the call it makes for
+     * the guest: a signal that interrupts it there interrupts the guest's
+     * call (cng_pt_signal_frame). */
+    struct cng_gframe *gf = cng_pt_active() ? cng_gframe_cur() : 0;
+    if (gf && reissue_unhold(gf))
+        return -EINTR;
+    if (gf)
+        gf->reissuing = 1;
+    long r = cng_syscall6(a[0], a[1], a[2], a[3], a[4], a[5], nr);
+    if (gf) {
+        gf->reissuing = 0;
+        gf->reissued = 1;
+    }
+    return r;
 }
 
 static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
@@ -5312,7 +5349,10 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
     case __NR_read:
     case __NR_readv: {
         cng_procfs_pre_read((int)a0, -1);
-        long r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        /* The guest's call as it stands (reissue_svc: a tracee's signal
+         * that interrupts it interrupts the guest's call). */
+        long av[6] = {a0, a1, a2, a3, a4, a5};
+        long r = reissue_svc(av, nr);
         /* A netlink stand-in is a socketpair end, so the read itself works,
          * and a blocking one waits for the daemon's reply like any other (an
          * EAGAIN from it is its SO_RCVTIMEO, already waited out). One that
@@ -5328,9 +5368,11 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
     }
     case __NR_pread64:
     case __NR_preadv:
-    case __NR_preadv2:
+    case __NR_preadv2: {
         cng_procfs_pre_read((int)a0, a3);
-        return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        long av[6] = {a0, a1, a2, a3, a4, a5};
+        return reissue_svc(av, nr);
+    }
 
     /* execve/execveat: only reached via an M8 trampoline (-R); the SIGSYS path
      * intercepts them in cng_sigsys_body (it must rewrite the signal context).
@@ -7305,6 +7347,7 @@ static void tramp_body(void *p) {
             c->owed = cng_pt_entry_owed();
         }
         c->f.owed = c->owed;
+        c->f.orig_x0 = cng_pt_orig_x0(r->x[0]);
         tramp_syscall(c, nr);
         /* Active now, if not before: an attach can land in the call, and a
          * tracer that resumed into syscall tracing then saw its restart's
@@ -7312,18 +7355,26 @@ static void tramp_body(void *p) {
          * that blocked has had stops of its own, which settle the flag for
          * theirs. */
         if (!c->f.abandon && cng_pt_active()) {
-            cng_pt_entry_set(c->f.owed);
+            cng_pt_call_set(c->f.owed, nr);
             cng_pt_syscall_exit(r);
             cng_pt_step_report(r);
         }
         if (!c->f.abandon)
             return;
+        /* Cut short by a signal, which gave the call's exit stop: the thread
+         * goes back to the guest, at the svc to make the call again or past
+         * it with the tracer's answer, once the signal has been taken there
+         * (cng_pt_dispatch_end). */
+        if (c->f.sigcut) {
+            cng_pt_cut_exit(r, &c->f);
+            return;
+        }
         /* Abandoned at the restart's own entry stop: made again as the tracer
          * left it, that stop already given — or, cancelled there, answered. */
         if (c->f.entered) {
             c->owed = c->f.owed;
             if (c->f.nr == -1) {
-                cng_pt_entry_set(c->owed);
+                cng_pt_call_set(c->owed, -1);
                 cng_pt_syscall_exit(r);
                 return;
             }
@@ -7342,19 +7393,30 @@ static void tramp_body(void *p) {
             c->owed = 0;
             entered = 0;
         }
-        c->f.abandon = c->f.done = c->f.entered = 0;
+        c->f.abandon = c->f.done = c->f.entered = c->f.reissued = 0;
     }
 }
 
 void cng_tramp_dispatch(struct cng_uregs *r) {
-    struct tramp_call c = {.f = {.r = r}, .nr = (long)r->x[8],
-                           .mode = CNG_DISP_TRAMP};
-    /* On the guest's own stack this is the same overflow the SIGSYS tier has a
-     * 256 KiB scratch stack to avoid, and here it is not even a fault: the
-     * dispatcher's frame is larger than a guard page, so it steps over the
-     * guard and writes into ordinary guest memory below, silently. */
-    if (!cng_run_scratch_in(tramp_body, &c, &c.f))
-        tramp_body(&c);
+    for (;;) {
+        struct tramp_call c = {.f = {.r = r}, .nr = (long)r->x[8],
+                               .mode = CNG_DISP_TRAMP};
+        /* On the guest's own stack this is the same overflow the SIGSYS tier
+         * has a 256 KiB scratch stack to avoid, and here it is not even a
+         * fault: the dispatcher's frame is larger than a guard page, so it
+         * steps over the guard and writes into ordinary guest memory below,
+         * silently. */
+        if (!cng_run_scratch_in(tramp_body, &c, &c.f))
+            tramp_body(&c);
+        /* What a tracee's call held back, taken now that the call is over,
+         * on the guest's registers (cng_pt_dispatch_end) — which does not
+         * come back if a signal is delivered. One cut short by a signal
+         * that, after all, nothing took is made again here rather than from
+         * the site, as an abandoned call is (tramp_body). */
+        if (!cng_pt_dispatch_end(r, &c.f))
+            return;
+        r->pc += 4;
+    }
 }
 
 void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed) {
@@ -7367,4 +7429,7 @@ void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed) {
     if (!cng_run_scratch_in(tramp_body, &c, &c.f))
         tramp_body(&c);
     __atomic_sub_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
+    /* ...and the same here: held back until the call is over, and taken on
+     * the record's registers, the completion trap then never made. */
+    cng_pt_dispatch_end(r, &c.f);
 }

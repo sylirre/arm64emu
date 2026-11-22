@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #ifndef NT_PRSTATUS
@@ -2127,6 +2128,321 @@ static void after_fork(void) {
         ;
 }
 
+/* A signal a call sends its own thread is taken on the way back to user
+ * space, after the call's exit stop: a tgkill of its own thread, and a write
+ * to a pipe nobody reads (SIGPIPE). The kill(SIGSTOP) before them is the mark
+ * PTRACE_SYSCALL starts from, with nothing in between. A dispatch running
+ * from guest context (-R, a bounced call) took the stop in the middle of the
+ * call, ahead of its exit stop. */
+static int sc_sigafter(void) {
+    int pp[2];
+    if (pipe(pp) != 0)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        pid_t p = getpid(), t = (pid_t)syscall(SYS_gettid);
+        close(pp[0]);
+        child_start();
+        syscall(SYS_kill, p, SIGSTOP);
+        syscall(SYS_tgkill, p, t, SIGUSR1);
+        syscall(SYS_write, pp[1], "x", 1);
+        _exit(5);
+    }
+    close(pp[0]);
+    close(pp[1]);
+    expect_first_stop(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)(long)O_TRACESYSGOOD);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st;
+    wait_for(pid, &st);
+    show(st); /* stop 19: the mark */
+    /* tgkill's entry and exit, its SIGUSR1; write's entry and exit, its
+     * SIGPIPE; exit_group's entry -- each signal suppressed. */
+    for (int i = 0; i < 7; i++) {
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        wait_for(pid, &st);
+        show(st);
+    }
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
+/* A death by signal under PTRACE_O_TRACEEXIT: the signal's stop, then the
+ * exit event with the signal as its code, then the death. The event used to
+ * be skipped. */
+static int sc_sigdeath(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        raise(SIGTERM);
+        _exit(5);
+    }
+    expect_first_stop(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)(long)O_TRACEEXIT);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st;
+    wait_for(pid, &st);
+    show(st); /* stop 15 */
+    ptrace(PTRACE_CONT, pid, 0, (void *)(long)SIGTERM);
+    wait_for(pid, &st);
+    show(st); /* event 6 */
+    unsigned long msg = 0;
+    ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+    printf("exit event code %lu\n", msg);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
+/* Two signals pending at once are stopped for one at a time, lowest first --
+ * raised here the other way round. The second used to nest over the first and
+ * be stopped for ahead of it. */
+static int sc_sigpair(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        sigset_t ss;
+        sigemptyset(&ss);
+        sigaddset(&ss, SIGUSR1);
+        sigaddset(&ss, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &ss, 0);
+        child_start();
+        raise(SIGUSR2);
+        raise(SIGUSR1);
+        sigprocmask(SIG_UNBLOCK, &ss, 0);
+        _exit(5);
+    }
+    expect_first_stop(pid);
+    int st;
+    for (int i = 0; i < 3; i++) {
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        wait_for(pid, &st);
+        show(st); /* stop 10, stop 12, exited 5 */
+    }
+    return 0;
+}
+
+/* A signal the tracer substitutes at a signal-delivery stop is delivered in
+ * the stop's place, by its own disposition, and stopped for no second time;
+ * a substituted SIGSTOP makes a group stop. The substitute used to be raised
+ * anew: stopped for again, and a SIGSTOP stopped the process for real, the
+ * tracer then waiting on it forever. */
+static volatile sig_atomic_t g_subst_got;
+
+static void subst_handler(int sig) {
+    g_subst_got = sig;
+}
+
+static int sc_subst(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        signal(SIGUSR2, subst_handler);
+        child_start();
+        raise(SIGUSR1);
+        int got = g_subst_got;
+        raise(SIGUSR1);
+        _exit(got == SIGUSR2 ? 7 : 8);
+    }
+    expect_first_stop(pid);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st;
+    wait_for(pid, &st);
+    show(st); /* stop 10 */
+    ptrace(PTRACE_CONT, pid, 0, (void *)(long)SIGUSR2);
+    wait_for(pid, &st);
+    show(st); /* stop 10: the second raise, SIGUSR2's handler having run */
+    ptrace(PTRACE_CONT, pid, 0, (void *)(long)SIGSTOP);
+    wait_for(pid, &st);
+    show(st); /* stop 19: the group stop */
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st); /* exited 7 */
+    return 0;
+}
+
+#if defined(__aarch64__)
+/* kill(self, SIGSTOP), then at once one svc of `nr` with x0..x2: nothing in
+ * between for a PTRACE_SYSCALL from the stop to land on. pt_site is the
+ * second svc. */
+extern char pt_site[];
+__attribute__((noinline)) static long stop_then(long self, long nr, long a0,
+                                                long a1, long a2) {
+    register long x0 __asm__("x0") = self;
+    register long x1 __asm__("x1") = SIGSTOP;
+    register long x2 __asm__("x2") = a2;
+    register long x8 __asm__("x8") = 129; /* kill */
+    __asm__ volatile("svc #0\n\t"
+                     "mov x0, %[a0]\n\tmov x1, %[a1]\n\tmov x8, %[nr]\n\t"
+                     ".globl pt_site\npt_site:\n\tsvc #0"
+                     : "+r"(x0), "+r"(x1), "+r"(x8)
+                     : [a0] "r"(a0), [a1] "r"(a1), [nr] "r"(nr), "r"(x2)
+                     : "memory");
+    return x0;
+}
+
+static int scnum(pid_t pid) {
+    int n = 0x7777;
+    struct iovec io = {&n, sizeof n};
+    ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &io);
+    return n;
+}
+
+static void set_scnum(pid_t pid, int n) {
+    struct iovec io = {&n, sizeof n};
+    ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &io);
+}
+
+/* NT_ARM_SYSTEM_CALL, the kernel's regs->syscallno: the call's number at its
+ * entry and exit stops, and -1 at every other stop -- a signal's, the first
+ * stop of all -- where a write lasts until the kernel is entered again: the
+ * next signal's stop of the same way back to user space and the group stop a
+ * substituted SIGSTOP makes both show it. The emulation showed the last
+ * call's number everywhere. */
+static int sc_scnum(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        sigset_t ss;
+        sigemptyset(&ss);
+        sigaddset(&ss, SIGUSR1);
+        sigaddset(&ss, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &ss, 0);
+        child_start();
+        stop_then(getpid(), 173 /*getppid*/, 0, 0, 0);
+        raise(SIGUSR1);
+        raise(SIGUSR2);
+        sigprocmask(SIG_UNBLOCK, &ss, 0);
+        _exit(5);
+    }
+    expect_first_stop(pid);
+    printf("first stop: %d\n", scnum(pid));
+    ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)(long)O_TRACESYSGOOD);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st;
+    wait_for(pid, &st);
+    show(st);
+    printf("kill's stop: %d\n", scnum(pid));
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    wait_for(pid, &st);
+    printf("entry stop: %d\n", scnum(pid));
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    wait_for(pid, &st);
+    printf("exit stop: %d\n", scnum(pid));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st); /* stop 10 */
+    printf("signal stop: %d\n", scnum(pid));
+    set_scnum(pid, 55);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st); /* stop 12 */
+    printf("next signal's stop: %d\n", scnum(pid));
+    ptrace(PTRACE_CONT, pid, 0, (void *)(long)SIGSTOP);
+    wait_for(pid, &st);
+    show(st); /* stop 19 */
+    printf("group stop: %d\n", scnum(pid));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
+/* A read whose descriptor the tracer changed at the entry stop, cut short by
+ * a signal: the exit stop shows ERESTARTSYS, the signal's stop shows the read
+ * about to be made again -- pc at the svc, x0 its own descriptor, as the svc
+ * found it -- and the restart is that read: with an SA_RESTART handler, with
+ * the signal suppressed; a handler without SA_RESTART gets EINTR. The
+ * emulation stopped for the signal in the middle of the call, with its own
+ * pc and registers, and a restart was made with the tracer's descriptor. */
+static volatile unsigned long long g_rs_x0, g_rs_pc;
+static volatile int g_rs_sig;
+
+static void rs_handler(int sig, siginfo_t *si, void *uv) {
+    (void)si;
+    ucontext_t *uc = uv;
+    g_rs_sig = sig;
+    g_rs_x0 = uc->uc_mcontext.regs[0];
+    g_rs_pc = uc->uc_mcontext.pc;
+}
+
+static void rs_case(const char *name, int flags) {
+    int a[2], b[2], rep[2];
+    if (pipe(a) || pipe(b) || pipe(rep) || write(a[1], "A", 1) != 1)
+        return;
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (flags >= 0) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = rs_handler;
+            sa.sa_flags = SA_SIGINFO | flags;
+            sigaction(SIGUSR1, &sa, 0);
+        }
+        child_start();
+        char c = 0;
+        long r = stop_then(getpid(), 63 /*read*/, a[0], (long)&c, 1);
+        long out[5] = {r, c, g_rs_sig, (long)g_rs_x0, (long)g_rs_pc};
+        _exit(write(rep[1], out, sizeof out) == (ssize_t)sizeof out ? 0 : 1);
+    }
+    unsigned long long site = (unsigned long long)pt_site;
+    struct uregs r;
+    int st;
+    printf("%s:\n", name);
+    expect_first_stop(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)(long)O_TRACESYSGOOD);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st); /* stop 19 */
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    wait_for(pid, &st);
+    getregs(pid, &r);
+    printf("entry: x0 %s\n", r.x[0] == (unsigned long long)a[0] ? "own" : "other");
+    r.x[0] = (unsigned long long)b[0];
+    setregs(pid, &r);
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    usleep(200000);
+    kill(pid, SIGUSR1);
+    wait_for(pid, &st);
+    getregs(pid, &r);
+    printf("exit: %ld\n", (long)r.x[0]);
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    wait_for(pid, &st);
+    show(st); /* stop 10 */
+    getregs(pid, &r);
+    printf("signal stop: pc %s, x0 %s\n",
+           r.pc == site ? "at the svc" : r.pc == site + 4 ? "past the svc" : "elsewhere",
+           r.x[0] == (unsigned long long)a[0] ? "own" : "other");
+    /* Delivered to the handler, or suppressed where there is none. */
+    ptrace(PTRACE_CONT, pid, 0, (void *)(long)(flags >= 0 ? SIGUSR1 : 0));
+    long out[5] = {0};
+    if (read(rep[0], out, sizeof out) != (ssize_t)sizeof out) {
+        /* A restart with the tracer's descriptor blocks: end it. */
+        if (write(b[1], "B", 1) != 1)
+            return;
+        if (read(rep[0], out, sizeof out) != (ssize_t)sizeof out)
+            return;
+    }
+    wait_for(pid, &st);
+    show(st);
+    printf("read: %ld '%c'\n", out[0], out[1] ? (char)out[1] : '-');
+    if (flags >= 0)
+        printf("handler: x0 %s, pc %s\n",
+               out[3] == a[0] ? "own" : out[3] == -EINTR ? "EINTR" : "other",
+               out[4] == (long)site ? "at the svc"
+               : out[4] == (long)site + 4 ? "past the svc" : "elsewhere");
+    close(a[0]); close(a[1]); close(b[0]); close(b[1]);
+    close(rep[0]); close(rep[1]);
+}
+
+static int sc_restart(void) {
+    rs_case("SA_RESTART handler", SA_RESTART);
+    rs_case("handler", 0);
+    rs_case("suppressed", -1);
+    return 0;
+}
+#endif
+
 static int sc_threadafter(void) {
     return after_run(after_thread, "a thread made after the attach");
 }
@@ -2286,6 +2602,20 @@ int main(int argc, char **argv) {
         return sc_blocked(1);
     if (!strcmp(s, "blockspin"))
         return sc_blockspin(argc > 2 ? argv[2] : argv[0]);
+    if (!strcmp(s, "sigafter"))
+        return sc_sigafter();
+    if (!strcmp(s, "sigdeath"))
+        return sc_sigdeath();
+    if (!strcmp(s, "sigpair"))
+        return sc_sigpair();
+    if (!strcmp(s, "subst"))
+        return sc_subst();
+#if defined(__aarch64__)
+    if (!strcmp(s, "scnum"))
+        return sc_scnum();
+    if (!strcmp(s, "restart"))
+        return sc_restart();
+#endif
     if (!strcmp(s, "threadafter"))
         return sc_threadafter();
     if (!strcmp(s, "forkafter"))

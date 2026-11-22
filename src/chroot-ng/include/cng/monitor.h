@@ -314,7 +314,14 @@ void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed);
  * tracer cancelled. `gsp`, when set, is a stack pointer on the guest's own
  * stack for the blocking call the dispatch makes (reissue in dispatch.c): a
  * guest handler that runs while it blocks is then delivered there, as for a
- * call of its own, and not onto the scratch stack. */
+ * call of its own, and not onto the scratch stack. `orig_x0` is x0 as the
+ * trap found it, before the entry stop, which a restart starts from;
+ * `reissuing` is set while the dispatch makes the guest's call itself
+ * (reissue_svc), where a signal cuts the call short rather than waiting for
+ * it; `sigcut` says one did, and the call is to be made again from its svc
+ * once the signal has been taken (cng_pt_signal_frame), not here; `held`
+ * the signals a tracee's handler put back pending and blocked, to be taken
+ * once the call is over (cng_pt_dispatch_end). */
 struct cng_gframe {
     struct cng_uregs *r;
     struct cng_gframe *prev;
@@ -324,6 +331,12 @@ struct cng_gframe {
     int entered;
     long nr;
     unsigned long gsp;
+    unsigned long long orig_x0;
+    int reissuing;
+    int reissued;          /* ...and has made it */
+    int sigcut;
+    long cutcode;          /* sigcut: what the kernel's call came back with */
+    unsigned long held;    /* signals held back for the end of the call */
 };
 /* The innermost one on this thread, or 0. */
 struct cng_gframe *cng_gframe_cur(void);
@@ -607,15 +620,18 @@ int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f);
  * started (CNG_UNWIND_UNDONE: pc at the guest's svc, its arguments in x0..x5)
  * or as if it had returned (CNG_UNWIND_DONE: pc after it, x0 its result), so
  * that a stop taken on the frame shows the guest and a write to it is what the
- * thread resumes with. `*owed` says an exit stop is owed for the call, and
- * `*rval` is the result the tracer should see there (-ERESTARTSYS for an undo).
+ * thread resumes with. An undo puts back x0 as the trap found it (orig_x0),
+ * which is what the kernel's restart is made with. `*owed` says an exit stop
+ * is owed for the call, and `*rval` is the result the tracer should see there
+ * (-ERESTARTSYS for an undo); `*nr`, when asked for, is the call's number.
  * An undo with `stop` 0 is made only for a wait the kernel would have
  * restarted, and a frame left alone otherwise. CNG_UNWIND_NONE when `uc` is
  * not in a stub, or was left alone. */
 #define CNG_UNWIND_NONE   0
 #define CNG_UNWIND_UNDONE 1
 #define CNG_UNWIND_DONE   2
-int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed, long *rval);
+int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed, long *rval,
+                      long *nr);
 
 /* The same allocator for a TID the caller names, with the slot's stack top (0
  * when there is no slot). Exposed for testing: filling the table takes hundreds

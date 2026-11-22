@@ -16,11 +16,14 @@
  * poked into the text, and it reaches the tracer as a SIGTRAP stop.
  *
  * So while a task is traced we take its signals over: our handler is installed
- * for every catchable signal, mirroring the flags and mask the guest asked for
- * (so restart semantics, SA_ONSTACK and blocking behave as the guest expects),
- * the stop is reported, and only then is the signal handed to the guest's own
- * disposition — its handler, or the default action emulated in place. Leaving
- * traced state puts the guest's real dispositions back.
+ * for every catchable signal, mirroring the flags the guest asked for (so
+ * restart semantics and SA_ONSTACK behave as the guest expects) and with every
+ * other signal blocked while it works, the stop is reported, and only then is
+ * the signal handed to the guest's own disposition — its handler, under the
+ * mask the kernel would give it, or the default action emulated in place. A
+ * signal that finds the thread in a call made from guest context is held back
+ * until the call is over (ptrace.c, cng_pt_signal_frame). Leaving traced state
+ * puts the guest's real dispositions back.
  *
  * The kick signal is separate and always installed: it is how a tracer reaches
  * a *running* task (PTRACE_ATTACH/SEIZE/INTERRUPT, a cooperative group-stop) and
@@ -81,10 +84,16 @@ static long sys_rt_sigaction(int s, const struct pt_ksigaction *a,
 
 /* ---- delivering a signal to the guest's own disposition ---- */
 
-/* Die the way the default action would, after telling the tracer. Restores the
- * real disposition and re-raises, so the parent's wait sees WIFSIGNALED with
- * the right signal rather than a synthetic exit code. */
-static void pt_die_by_signal(int sig) {
+/* Die the way the default action would, after telling the tracer: its
+ * PTRACE_EVENT_EXIT stop first, if it asked for one (do_exit's ptrace_event,
+ * with the signal as the exit code -- it used to be skipped, the death
+ * reported with no stop before it), on the frame the signal was taken on.
+ * Not for SIGKILL, which stops for nothing. Restores the real disposition and
+ * re-raises, so the parent's wait sees WIFSIGNALED with the right signal
+ * rather than a synthetic exit code. */
+static void pt_die_by_signal(int sig, struct cng_ucontext *uc) {
+    if (uc && sig != SIG_KILL_)
+        cng_pt_exit_stop(cng_pt_uregs(uc), sig);
     cng_pt_exit_report(sig);
     struct pt_ksigaction dfl;
     memset(&dfl, 0, sizeof dfl);
@@ -107,16 +116,30 @@ static void pt_deliver_to_guest(int sig, cng_siginfo_t *si, void *ucv) {
     void *h = g_disp_set[sig] ? g_disp[sig].handler : 0;
     unsigned long flags = g_disp_set[sig] ? g_disp[sig].flags : 0;
     unsigned long smask = g_disp_set[sig] ? g_disp[sig].mask.sig[0] : 0;
-    if (h == (void *)1) /* SIG_IGN */
-        return;
-    if (!h) {           /* SIG_DFL */
-        if (sig_default_ignores(sig))
-            return;
-        if (sig_default_stops(sig))
-            return; /* the stop was the report; the tracer resumed us */
-        pt_die_by_signal(sig);
+    /* With no handler to run, a call the signal cut short is made again
+     * (cng_pt_restart_settle); a handler decides it by its SA_RESTART. */
+    if (h == (void *)1) { /* SIG_IGN */
+        cng_pt_restart_settle(uc, 0, 0);
         return;
     }
+    if (!h) {           /* SIG_DFL */
+        if (sig_default_ignores(sig)) {
+            cng_pt_restart_settle(uc, 0, 0);
+            return;
+        }
+        if (sig_default_stops(sig)) {
+            /* do_signal_stop: a group stop, which a traced thread's tracer
+             * sees -- after the signal's own stop, for a signal the tracer
+             * let through or substituted. */
+            if (cng_pt_active())
+                cng_pt_group_stop(uc, sig);
+            cng_pt_restart_settle(uc, 0, 0);
+            return;
+        }
+        pt_die_by_signal(sig, uc);
+        return;
+    }
+    cng_pt_restart_settle(uc, 1, flags);
     /* What get_signal() does on the way to a handler. SA_RESETHAND puts the
      * default back before the handler runs, so a second arrival takes the
      * default action — and the mirror is the only record there is of it here,
@@ -152,22 +175,27 @@ static void pt_deliver_to_guest(int sig, cng_siginfo_t *si, void *ucv) {
  * rt_sigaction (answered from the mirror, see cng_pt_sigaction). Delivered the
  * way the trace hook delivers any other signal: a traced task reports the
  * signal-delivery-stop first and the tracer may suppress or substitute it. */
+static int pt_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc,
+                     int deliver, int *dsig, cng_siginfo_t *dsi);
+
 void cng_pt_deliver_sigsys(cng_siginfo_t *si, void *ucv) {
     struct cng_ucontext *uc = ucv;
     struct cng_uregs *r = cng_pt_uregs(uc);
     cng_pt_set_frame(r, uc);
     cng_sig_in_handler(1); /* as pt_trace_handler does around its stop */
-    int deliver = cng_pt_report_signal(r, CNG_SIGSYS, si->si_code, 0);
+    cng_pt_signal_frame(uc, CNG_SIGSYS, si); /* never held: put back only */
+    int dsig = CNG_SIGSYS;
+    cng_siginfo_t dsi;
+    int run = pt_report(CNG_SIGSYS, si, uc,
+                        cng_pt_report_signal(r, CNG_SIGSYS, si->si_code, 0),
+                        &dsig, &dsi);
     cng_sig_in_handler(-1);
     if (cng_sig_take_deferred())
         cng_pt_sigsys_kick(uc, 0);
-    if (deliver == 0)
-        return;
-    if (deliver != CNG_SIGSYS) {
-        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), deliver, 0, 0, 0);
-        return;
-    }
-    pt_deliver_to_guest(CNG_SIGSYS, si, uc);
+    if (run)
+        pt_deliver_to_guest(dsig, run == 2 ? &dsi : si, uc);
+    else
+        cng_pt_restart_settle(uc, 0, 0);
 }
 
 /* si_addr of a fault siginfo (offset 16 on arm64: after signo/errno/code and
@@ -184,8 +212,10 @@ static int sig_is_fault(int s) {
 /* ---- our handler for a traced task's signals ---- */
 
 /* The handler's own work, up to the guest's disposition: 1 when that is to
- * run, with the signal the tracer left as it was. */
-static int pt_trace_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc) {
+ * run with the signal as it came, 2 with the tracer's substitute (`*dsig`,
+ * `*dsi`), 0 when nothing is delivered. */
+static int pt_trace_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc,
+                           int *dsig, cng_siginfo_t *dsi) {
     struct cng_uregs *r = cng_pt_uregs(uc);
     cng_pt_set_frame(r, uc);
 
@@ -209,16 +239,41 @@ static int pt_trace_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc) 
     }
     int code = si->si_code;
     u64 addr = sig_is_fault(sig) ? pt_si_addr(si) : 0;
-    int deliver = cng_pt_report_signal(r, sig, code, addr);
+    return pt_report(sig, si, uc, cng_pt_report_signal(r, sig, code, addr),
+                     dsig, dsi);
+}
+
+/* What ptrace_signal does with the signal a stop returns, `deliver`: 0, the
+ * tracer suppressed it; the stop's own, delivered as it came (1); another,
+ * the tracer's substitute, delivered in its place (2, `*dsig` and `*dsi`)
+ * with the siginfo the kernel gives one -- SI_USER from the tracer -- by its
+ * own disposition, with no stop of its own: it is not stopped for again, and
+ * a stop signal's default action makes the group stop. One the thread holds
+ * blocked is queued for later instead, and is stopped for when it comes. The
+ * substitute used to be raised: stopped for a second time, and a SIGSTOP
+ * stopped the process for real, which its tracer then waited for forever. */
+static int pt_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc,
+                     int deliver, int *dsig, cng_siginfo_t *dsi) {
+    (void)si;
     if (deliver == 0)
         return 0; /* suppressed by the tracer */
-    if (deliver != sig) {
-        /* Substituted: raise the replacement instead. It goes through the same
-         * mediation (our handler is installed for it too). */
-        CNG_SYS(__NR_tgkill, sys_getpid(), sys_gettid(), deliver, 0, 0, 0);
+    if (deliver == sig)
+        return 1;
+    memset(dsi, 0, sizeof *dsi);
+    dsi->si_signo = deliver;
+    dsi->si_code = 0; /* SI_USER */
+    ((int *)&dsi->_u)[0] = (int)cng_pt_tracer_pid();
+    ((int *)&dsi->_u)[1] = (int)cng_remap_uid((unsigned)sys_getuid());
+    *dsig = deliver;
+    if (deliver < 1 || deliver > PT_NSIG)
+        return 0;
+    if (deliver != SIG_KILL_ && deliver != SIG_STOP_ &&
+        (uc->uc_sigmask.sig[0] & (1UL << (deliver - 1)))) {
+        CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), sys_gettid(), deliver,
+                dsi, 0, 0);
         return 0;
     }
-    return 1;
+    return 2;
 }
 
 /* A ptrace request carried by SIGSYS that lands while this handler does its
@@ -228,12 +283,23 @@ static int pt_trace_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc) 
 static void pt_trace_handler(int sig, cng_siginfo_t *si, void *ucv) {
     struct cng_ucontext *uc = (struct cng_ucontext *)ucv;
     cng_sig_in_handler(1);
-    int run = pt_trace_report(sig, si, uc);
+    /* Where it landed first: held back for the end of a call the thread is
+     * in from guest context, or put back onto the guest's own registers
+     * (cng_pt_signal_frame). */
+    if (cng_pt_signal_frame(uc, sig, si)) {
+        cng_sig_in_handler(-1);
+        return;
+    }
+    int dsig = sig;
+    cng_siginfo_t dsi;
+    int run = pt_trace_report(sig, si, uc, &dsig, &dsi);
     cng_sig_in_handler(-1);
     if (cng_sig_take_deferred())
         cng_pt_sigsys_kick(uc, 0);
     if (run)
-        pt_deliver_to_guest(sig, si, uc);
+        pt_deliver_to_guest(dsig, run == 2 ? &dsi : si, uc);
+    else
+        cng_pt_restart_settle(uc, 0, 0);
 }
 
 /* ---- the kick signal ---- */
@@ -330,8 +396,14 @@ static void pt_install(int sig, cng_sighandler_t h) {
      * syscall; our handler would, so ask the kernel to restart instead. */
     if (!gh || gh == (void *)1)
         sa.flags |= CNG_SA_RESTART;
-    sa.mask = g_disp_set[sig] ? g_disp[sig].mask : (cng_sigset_t){{0}};
-    sa.mask.sig[0] &= ~(1UL << (CNG_SIGSYS - 1));
+    /* Every other signal blocked while the handler does its own work: the
+     * kernel's get_signal takes one signal at a time, lowest first, and stops
+     * for each before the next -- a second pending one nested over the first
+     * was stopped for ahead of it. The guest's handler runs under the mask
+     * the kernel would give it (pt_deliver_to_guest), which is where the
+     * next one comes, as the kernel builds its frame over the first's.
+     * SIGSYS is never blocked. */
+    sa.mask.sig[0] = ~0UL & ~(1UL << (CNG_SIGSYS - 1));
     sa.restorer = (void *)cng_sigrestore;
     sys_rt_sigaction(sig, &sa, 0);
 }

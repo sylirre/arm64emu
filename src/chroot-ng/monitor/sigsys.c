@@ -123,6 +123,8 @@ struct cng_bounce {
     long nr;              /* the call made, which a tracer may have redirected */
     int kind;             /* BOUNCE_* */
     int owed;             /* its entry stop was reported: an exit stop is owed */
+    unsigned long long orig_x0; /* x0 as the trap found it, before the entry
+                                 * stop: what a restart is made with */
 };
 #define CNG_BOUNCE_MAGIC 0x636e67426f756e63UL
 #define BOUNCE_WAIT 0 /* a mask-taking wait, its mask the record's copy */
@@ -142,6 +144,7 @@ static void bounce_fill(struct cng_bounce *b, const struct cng_ucontext *uc,
     b->kind = kind;
     b->nr = nr;
     b->owed = cng_pt_entry_owed();
+    b->orig_x0 = cng_pt_orig_x0(uc->uc_mcontext.regs[0]);
     for (int i = 0; i < 31; i++)
         b->regs[i] = uc->uc_mcontext.regs[i];
     b->sp = uc->uc_mcontext.sp;
@@ -312,7 +315,7 @@ static int bounce_nohand(long nr) {
 }
 
 int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
-                      long *rval) {
+                      long *rval, long *nr) {
     unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
     unsigned long long *r = uc->uc_mcontext.regs;
     unsigned long wait = (unsigned long)cng_bounce_wait,
@@ -340,8 +343,12 @@ int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
     if (!undo && !stop)
         return CNG_UNWIND_NONE;
     *owed = b.owed;
+    if (nr)
+        *nr = b.nr;
     if (undo) {
-        bounce_restore(uc, &b, b.regs[0]);
+        /* ...from orig_x0: the restart do_signal sets up, whatever a tracer
+         * changed at the entry stop. */
+        bounce_restore(uc, &b, b.orig_x0);
         uc->uc_mcontext.pc = b.pc - 4;
         *rval = restart ? -514 /*ERESTARTNOHAND*/ : -512 /*ERESTARTSYS*/;
         return CNG_UNWIND_UNDONE;
@@ -510,7 +517,8 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
      * entry stop reported for it owes an exit stop first, with the restart
      * code the kernel's tracer sees there. */
     if (res == -CNG_ERESTART) {
-        unsigned long long a0 = r[0];
+        /* The restart is made from orig_x0, as do_signal makes it. */
+        unsigned long long a0 = cng_pt_orig_x0(r[0]);
         r[0] = (unsigned long long)(long)-512 /*ERESTARTSYS*/;
         cng_pt_syscall_exit(ur);
         /* ...where a tracer that changes the code takes the restart away, as
@@ -574,7 +582,7 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
             cng_pt_active()) {
             struct cng_uregs *ur = cng_pt_uregs(uc);
             cng_pt_set_frame(ur, uc);
-            cng_pt_entry_set(b.owed);
+            cng_pt_call_set(b.owed, b.nr);
             cng_pt_syscall_exit(ur);
             cng_pt_step_report(ur);
         }

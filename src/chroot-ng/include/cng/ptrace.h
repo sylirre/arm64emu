@@ -179,11 +179,18 @@ int cng_pt_syscall_entry(struct cng_uregs *r, long *nr_out);
 void cng_pt_syscall_exit(struct cng_uregs *r);
 
 /* Is an exit stop owed — was the entry stop of the call in flight reported?
- * And the same put back, by a caller that kept it across a call that blocked:
- * a guest handler can run on top of such a call, and the stops of its own
- * syscalls settle the flag for theirs. */
+ * And the call put back — the flag and the call's number `nr` (-1 for one
+ * the tracer cancelled) — by a caller that kept it across a call that
+ * blocked: a guest handler can run on top of such a call, and the stops of
+ * its own syscalls settle the flag for theirs. */
 int cng_pt_entry_owed(void);
-void cng_pt_entry_set(int owed);
+void cng_pt_call_set(int owed, long nr);
+
+/* x0 as the trap of the calling task's call in progress found it, before its
+ * entry stop: the kernel's orig_x0, which a restart starts from — or `x0`,
+ * for a task that is no tracee or in no call (where there was no stop to
+ * change it). */
+u64 cng_pt_orig_x0(u64 x0);
 
 /* Post-execve stop (PTRACE_EVENT_EXEC, or a plain SIGTRAP without the option).
  * Called by the emulated execve once the new image is in place. */
@@ -219,6 +226,42 @@ void cng_pt_exit_report(int wstatus);
 
 /* Wake every tracer polling in wait4 (a guest process died). */
 void cng_pt_wake_waiters(void);
+
+/* ---- a tracee's own signals (ptrace.c, "where they find it") ----
+ *
+ * One of ours landed on `uc`, as the handler standing in for the guest's
+ * disposition. 1: held back until the call the thread is in from guest
+ * context is over — pending again, blocked by the frame's mask — and the
+ * handler returns at once. 0: to be taken here, the frame put back to the
+ * guest's own registers first where it was one of our places. */
+struct cng_gframe;
+int cng_pt_signal_frame(struct cng_ucontext *uc, int sig,
+                        const cng_siginfo_t *si);
+/* A dispatch a signal cut short (cng_gframe.sigcut), returned: its exit stop
+ * with the kernel's restart code, and the frame `r` left at the call's svc
+ * with orig_x0 for the signal's stop to show — or past it with the tracer's
+ * answer. */
+void cng_pt_cut_exit(struct cng_uregs *r, struct cng_gframe *gf);
+/* The end of a dispatch from guest context, `r` the guest's registers: the
+ * stops it held back, and its held signals let go (cng_pt_deliver), one
+ * delivered resuming the guest from `r` and never coming back here. 1 when a
+ * call cut short was left to be made again and nothing took the signal. */
+int cng_pt_dispatch_end(struct cng_uregs *r, struct cng_gframe *gf);
+/* After a signal's stop: a restart the stop showed, made or turned into
+ * EINTR by do_signal's rule — `handler` says one runs, with `flags`. */
+void cng_pt_restart_settle(struct cng_ucontext *uc, int handler,
+                           unsigned long flags);
+/* A stop signal's default action for a traced thread: a group stop. */
+void cng_pt_group_stop(struct cng_ucontext *uc, int sig);
+/* The calling task's tracer, 0 when none. */
+s32 cng_pt_tracer_pid(void);
+/* What the kernel's call `nr` (arguments `a`) comes back with, cut short by a
+ * signal: a restart code, or -EINTR. */
+long cng_pt_restart_code(long nr, const u64 *a);
+/* rt_sigprocmask(SIG_UNBLOCK, set), at the two points a held signal is let
+ * go at (rt/gate.S). */
+void cng_pt_deliver(const unsigned long *set);
+void cng_pt_unhold(const unsigned long *set);
 
 /* Signal-delivery / fault stop: report `sig` to the tracer and return the signal
  * to actually deliver (0 = suppressed, or a substitute the tracer chose).

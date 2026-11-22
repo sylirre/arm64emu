@@ -382,9 +382,38 @@ sigcontext's `regs/sp/pc/pstate` tail *is* a `struct user_pt_regs`. Two things
 have to be added on top: a traced task stacks a second filter that traps every
 syscall (the base filter only traps the path-bearing set, and strace must see
 all of them), and while traced its signals are mediated by handlers of ours that
-mirror the guest's own flags and mask — which is what makes a gdb breakpoint, a
-`brk` poked into read-only text, arrive as a stop rather than kill the guest.
-See `src/chroot-ng/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
+mirror the guest's own flags — which is what makes a gdb breakpoint, a `brk`
+poked into read-only text, arrive as a stop rather than kill the guest. Such a
+handler blocks every other signal while it works, as `get_signal` takes one
+signal at a time, and runs the guest's handler under the mask the kernel would
+give it. The signal a tracer resumes a stop with is delivered by its own
+disposition with no stop of its own, and a stop signal's default action is a
+group stop. See `src/chroot-ng/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
+
+`NT_ARM_SYSTEM_CALL` is the kernel's `regs->syscallno`: the number of the call
+in progress — x8's low 32 bits, as the tracer left it at the entry stop — at
+the call's own stops (entry, exit, the events it reports), and -1 at every
+other, where what a tracer writes lasts until the kernel is entered again: the
+next trap, or a frame other than the one the last such stop left, which the
+guest ran on to. `orig_x0`, x0 as the trap found it before the entry stop, is
+kept with the call, and a restart is made from it.
+
+A signal of the guest's also lands wherever the thread is. In guest code it is
+stopped for there, the kernel's place. In a call the dispatcher makes from
+guest context (an `-R` trampoline's, a bounced one) it is not: the kernel stops
+for a signal on the way back to user space, after the call's exit stop. So the
+handler holds it back — pending again with its own siginfo, blocked by the
+frame's mask — and the end of the dispatch lets it go at a point of ours
+(`cng_pt_deliver` in the gate), where the handler puts the frame back to the
+guest's registers before the stop is reported and the guest's handler runs. One
+that interrupts the guest's own call (`reissue_svc`) cuts the call short as the
+kernel's would: the exit stop shows the call's restart code (`-ERESTARTSYS` for
+a read), and the signal's stop finds the call at its `svc` with `orig_x0`, to
+be made again after it, or turned into `EINTR` by a handler without
+`SA_RESTART`. One pending as that call is about to be made is let go just
+before it (`cng_pt_unhold`), and the call is made after it. The bounce stubs
+and the trampolines are put back in place, as for a kick. A stop signal a call
+sends its own thread is taken once the call is over, the same way.
 
 A running task is reached by a kick signal of ours, and the kick lands wherever
 the thread is — which, for a thread blocked in a call made on its behalf, is

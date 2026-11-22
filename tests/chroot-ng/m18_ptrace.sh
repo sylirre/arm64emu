@@ -210,6 +210,30 @@ else
     else
         skip "ptrace tls: NT_ARM_TLS is AArch64's, and the oracle here is an x86-64 kernel"
     fi
+    # The order of a tracee's stops around its signals, the kernel's: a
+    # signal a call sends its own thread (a tgkill of itself, a write's
+    # SIGPIPE) after that call's exit stop, two pending signals lowest first,
+    # one at a time; a death by signal with its PTRACE_EVENT_EXIT; a signal
+    # the tracer substitutes delivered by its own disposition with no second
+    # stop, a substituted SIGSTOP making a group stop. A call made from guest
+    # context (-R, and a bounced one) was stopped in the middle of, ahead of
+    # its exit stop; the second of two signals nested over the first; the
+    # exit event was skipped; a substitute was raised anew -- stopped for
+    # again, and a SIGSTOP stopped the process for real.
+    for _sc in sigafter sigdeath sigpair subst; do
+        pt_case "$_sc"
+    done
+    # NT_ARM_SYSTEM_CALL, regs->syscallno: the call's number at its stops, -1
+    # at every other, a write there lasting the way back to user space; and a
+    # read cut short by a signal -- ERESTARTSYS at its exit stop, the signal's
+    # stop at the svc with x0 as the read was made, the restart that read.
+    # Both are AArch64's: an x86-64 kernel shows neither.
+    if [ -z "$CHROOTNG_QEMU" ]; then
+        pt_case scnum
+        pt_case restart
+    else
+        skip "ptrace scnum, restart: NT_ARM_SYSTEM_CALL and arm64's restart are AArch64's, and the oracle here is an x86-64 kernel"
+    fi
     # PTRACE_ATTACH to a thread blocked in a syscall, which is where a crash
     # reporter finds most threads: the stop shows the call the kernel's way —
     # the thread's own registers, its arguments in place, pc at the syscall
@@ -332,9 +356,14 @@ else
         for _sc in basic sysstop cancel poke signal deliver fork exec \
             execstart patharg exitstop break step step2 attach fpregs blocked \
             blockedmask blockspin threadafter forkafter spinafter attachmany \
-            sigact sigchld sigchldw waitid waitnowait options; do
+            sigact sigchld sigchldw waitid waitnowait options sigafter \
+            sigdeath sigpair subst; do
             pt_case "$_sc"
         done
+        if [ -z "$CHROOTNG_QEMU" ]; then
+            pt_case scnum
+            pt_case restart
+        fi
         pt_case sysinfo "syscall_info unsupported" \
             "the host kernel predates PTRACE_GET_SYSCALL_INFO (5.3), so it is no reference"
         if [ -z "$CHROOTNG_QEMU" ]; then

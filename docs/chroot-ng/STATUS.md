@@ -4922,6 +4922,72 @@ kernel 3.18 (Galaxy S7).
     TPIDR2 record in its frames, so the record path is exercised by nothing
     here yet.
 
+- [x] **M110 — a tracee's syscall number and signal stops, as the kernel's**
+  Found running arm64emu's `ptrace/syscallno.c` under chroot-ng on the
+  arm64 VM (6.8), whose kernel is the reference throughout.
+  - `NT_ARM_SYSTEM_CALL` is `regs->syscallno`. It was the last call's
+    number at every stop (131 at `raise`'s `SIGSTOP`), and 0 at a fork
+    child's first stop; it is now the call's number at the call's own
+    stops — x8's low 32 bits as an `int`, so 0xffffffff is a call of -1 —
+    and -1 at every other. A write at such a stop lasts until the kernel
+    is entered again: the next trap, or a frame other than the one the last
+    such stop left. So a fatal signal's exit event, the next signal's stop
+    and the group stop of the same way back to user space show it.
+  - A signal a call sent its own thread (`raise`, a `tgkill` of itself, a
+    write's `SIGPIPE`) was stopped for in the middle of the call, before
+    its exit stop. That happened under `-R` and for a bounced call, where
+    the dispatcher runs from guest context on the guest's mask, and with
+    chroot-ng's own `pc` and registers. One that cut a blocked call short
+    was reported the same way, with no `-ERESTARTSYS` exit stop before it
+    and no restart entry stop after; the restart then used x0 as the
+    tracer had left it. Such a signal is now held back: put pending again
+    with its own siginfo, and blocked by the frame's mask, until the call
+    is over. It is then let go at a point of ours (`cng_pt_deliver`),
+    where the handler puts the frame back to the guest's registers before
+    the stop and the guest's handler.
+    - One that interrupts the guest's own call (`reissue_svc`, the read
+      family now among its users) cuts the call short. The exit stop shows
+      the kernel's restart code for the call (`cng_pt_restart_code`). The
+      signal's stop finds the call at its `svc` with `orig_x0`, and the
+      call is made again after it, or turned into `EINTR` by a handler
+      without `SA_RESTART`.
+    - One pending as that call is about to be made is let go just before
+      it (`cng_pt_unhold`), and the call is made after it.
+    - The bounce stubs show the same, from the restart code per call. A
+      stop signal a call routes to its own thread is taken once the call
+      is over.
+    - The kick's in-flight restart, and the `SIGSYS` tier's restart of a
+      wait a kick cut short, start from `orig_x0` too.
+  - Two pending signals were stopped for highest first: the hook blocked
+    only the guest's `sa_mask`, so the second nested over the first. The
+    hook now blocks every signal but `SIGSYS` while it works, and the
+    guest's handler runs under the kernel's mask, as before.
+  - A signal the tracer substitutes at a delivery stop was raised anew, so
+    it was stopped for a second time. A `SIGSTOP` was a real host stop,
+    which froze the tracee while its tracer waited forever: that was the
+    hang under `syscallno.c`, not the `SIGTERM` death. It is now delivered
+    by its own disposition, with the kernel's siginfo (`SI_USER` from the
+    tracer), or queued if blocked. A stop signal's default action, after a
+    stop the tracer let it through, is a group stop.
+  - A death by signal skipped `PTRACE_EVENT_EXIT`. The event now comes
+    first, with the signal as its code, except for `SIGKILL`.
+  - Kept as it was, by the owner's choice: an x8-only write at an entry
+    stop still changes the call, a channel for tracers with x86 habits
+    that the kernel does not have.
+  - Not done: `rt_sigreturn`'s syscall stops are not reported at all, the
+    trap-everything filter letting it run untrapped. A restart from
+    `ERESTART_RESTARTBLOCK` is made as the call itself, where the kernel
+    makes `restart_syscall`.
+  - Tests: m18 `sigafter`, `sigdeath`, `sigpair` and `subst` on both
+    tiers and every host (the x86-64 kernel prints the same lines), and
+    `scnum` and `restart` where the oracle is AArch64. On the arm64 VM all
+    twelve legs match the kernel; the M109 build diverges on all twelve.
+    `syscallno.c` under chroot-ng now fails only the two lines of its
+    x8-only write.
+  - The whole suite passes: 1501 on the dev host (qemu-aarch64, where -R
+    carries translation) and 1801 natively on the arm64 VM, none failing.
+    No device run yet.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

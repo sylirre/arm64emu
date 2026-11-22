@@ -79,6 +79,44 @@ cng_wait_unless_bail:
     ret
     .size cng_wait_unless, . - cng_wait_unless
 
+/* The two points a tracee's held-back signals are let go at (ptrace.c,
+ * cng_pt_signal_frame): rt_sigprocmask(SIG_UNBLOCK, set, 0, 8), and a signal
+ * it delivers lands on the instruction after the svc, which tells the
+ * handler where it is.
+ *
+ * void cng_pt_deliver(const unsigned long *set): a dispatch from guest
+ *   context is over, and the guest's registers are the record its handler
+ *   resumes the thread with (cng_pt_dispatch_end).
+ * void cng_pt_unhold(const unsigned long *set): the guest's own call is about
+ *   to be made, which a signal pending then is to cut short (reissue_svc). */
+    .global cng_pt_deliver
+    .type cng_pt_deliver, %function
+cng_pt_deliver:
+    mov     x1, x0
+    mov     x0, #1                  /* SIG_UNBLOCK */
+    mov     x2, #0
+    mov     x3, #8
+    mov     x8, #135                /* __NR_rt_sigprocmask */
+    svc     #0
+    .global cng_pt_deliver_ret
+cng_pt_deliver_ret:
+    ret
+    .size cng_pt_deliver, . - cng_pt_deliver
+
+    .global cng_pt_unhold
+    .type cng_pt_unhold, %function
+cng_pt_unhold:
+    mov     x1, x0
+    mov     x0, #1                  /* SIG_UNBLOCK */
+    mov     x2, #0
+    mov     x3, #8
+    mov     x8, #135                /* __NR_rt_sigprocmask */
+    svc     #0
+    .global cng_pt_unhold_ret
+cng_pt_unhold_ret:
+    ret
+    .size cng_pt_unhold, . - cng_pt_unhold
+
 /* The bounce (sigsys.c): a syscall the SIGSYS handler must not run itself —
  * a wait that installs a signal mask of its own for its duration — is run from
  * here instead, in the guest's own context, with the guest's own registers.
