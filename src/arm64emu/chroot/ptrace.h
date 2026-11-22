@@ -36,10 +36,13 @@ extern __thread int g_ptrace_skip_syscall_stop;  /* one-shot: skip the next sysc
  * Here: the run loop's return from the engines is the entry
  * (ptrace_kernel_entry); the dispatcher sets the number (g_ptrace_in_call
  * while it is in the call) and forgets it once the call's exit stop is
- * past (ptrace_leave_syscall). */
+ * past (ptrace_leave_syscall). rt_sigreturn forgets its own as it takes the
+ * frame back (restore_sigframe's forget_syscall), so that its exit stop
+ * shows -1 and nothing restarts after it (ptrace_forget_syscall). */
 extern __thread s32 g_ptrace_scno;
 extern __thread int g_ptrace_in_call;
 static inline void ptrace_kernel_entry(void) { g_ptrace_scno = -1; }
+static inline void ptrace_forget_syscall(void) { g_ptrace_scno = -1; }
 static inline void ptrace_enter_syscall(s32 nr) {
     g_ptrace_scno = nr;
     g_ptrace_in_call = 1;

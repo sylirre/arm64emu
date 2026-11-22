@@ -283,7 +283,9 @@ on its way (`tests/arm64emu/chroot/fixtures/sigtramp.c`).
 `SA_RESTART` is honored by rewinding to the `SVC` and re-running it when the
 interrupted syscall returned `-EINTR` (bookkeeping in `g_tls`) — for the
 syscalls a kernel restarts, which it decides by the errno the call came back
-with (`sc_restart_wanted`, `signal.c`): `ERESTARTSYS` (the blocking file and
+with: the dispatcher works out that code as the call returns
+(`sc_restart_code`, `signal.c`; `g_tls.sc_rcode`), and the delivery goes by
+it (`sc_restart_wanted`): `ERESTARTSYS` (the blocking file and
 socket calls, `openat` of a FIFO, `wait4`/`waitid`, `ioctl`, `fcntl`'s
 `F_SETLKW`/`F_OFD_SETLKW`, `flock`, the `splice` family, an *untimed*
 `FUTEX_WAIT`) is restarted under `SA_RESTART`; `ERESTART_RESTARTBLOCK` and
@@ -301,6 +303,28 @@ to be sixteen syscall numbers with no rule at all: `accept4`, `flock`,
 handler where a kernel resumes them (the FIFO open then left a writer blocked
 forever), and a timed futex wait was restarted where a kernel reports it
 (`tests/arm64emu/chroot/fixtures/sarestart.c`; qemu-user has a restart list of its own).
+
+The restart starts from `orig_x0` — x0 as the `SVC` found it
+(`g_tls.sc_orig_x0`), before a tracer's entry stop changed it — as
+`do_signal`'s does, which rewinds pc to the `SVC` and puts `orig_x0` back in
+x0 *before* `get_signal` takes a single stop. A tracer is shown the kernel's
+whole sequence: the interrupted call's exit stop has the restart code in x0
+(`-ERESTARTSYS` for a read, not `-EINTR`), and a stop on the way back to user
+space from it — a signal-delivery stop, a group stop, an `INTERRUPT` trap —
+has pc at the `SVC` and `orig_x0` in x0 (`syscall_restart_view`,
+`syscall.c`), the emulator's own registers (pc past the `SVC`, `-EINTR`)
+being put back after the stop. What the tracer leaves there is what the
+restart is made with (`g_tls.sc_restart_x0`), unless a handler without
+`SA_RESTART` turns it into `EINTR`; a tracer that moves pc takes the restart
+away, and one that answers the call at its exit stop with anything but a
+restart code is answering it. `rt_sigreturn` forgets its call as it takes a
+frame back: its exit stop shows `NT_ARM_SYSTEM_CALL` -1, and a restored
+`-EINTR` is restarted by nothing. An interruption of the emulator's own (below)
+is restarted with the call's own x0, a kernel never having made it
+(`tests/arm64emu/chroot/ptrace/origx0.c`, checked against a 6.8 kernel).
+`ERESTART_RESTARTBLOCK`'s restart, which a kernel makes as `restart_syscall`
+(x8 = 128) when no handler runs, is made here as the call itself with what is
+left of its time.
 
 #### The emulator's own interruptions are invisible to the guest
 
@@ -2009,6 +2033,16 @@ group stop of the same `get_signal` show it. The emulator used to read and
 write x8 there: a signal stop showed the last call's number, and a write
 rewrote x8, which a call restarted after the stop then used
 (`tests/arm64emu/chroot/ptrace/syscallno.c`, checked against a 6.8 kernel).
+`PTRACE_GET_SYSCALL_INFO` reads the stop as the kernel's does, by its siginfo
+and `ptrace_message`: a syscall stop's message is 1 at the entry and 2 at the
+exit (`PTRACE_GETEVENTMSG` reads it too, and 0 once the stop is over), and
+only a stop with `PTRACE_O_TRACESYSGOOD`'s `si_code` is one, a seccomp stop
+by its event; any other is op `NONE`, the registers alone (24 bytes). The
+entry and seccomp stops give the number (sign-extended) and the arguments,
+the first being `orig_x0` whatever the tracer has written to x0 since, and the
+seccomp stop the filter's data (80 and 84 bytes); the exit stop the result,
+flagged an error for -4095..-1 (33 bytes) (`pt_scinfo`,
+`tests/arm64emu/chroot/ptrace/origx0.c`). It used to be `EIO`.
 arm64 has no user area: `PEEKUSR` and `POKEUSR` are `EIO` at any offset, as
 `arch_ptrace` leaves them to `ptrace_request`'s default
 (`tests/arm64emu/chroot/ptrace/peekusr.c`). `pstate` is the kernel's
@@ -2467,7 +2501,8 @@ privileged tracer — `EPERM` otherwise; any other bit is `EINVAL`, and `EIO` on
 `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
 `GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`, `POKETEXT`/`POKEDATA`
 (writable *and* read-only code pages — software breakpoints),
-`GETSIGINFO`/`SETSIGINFO` (each stop's own, above), `GETEVENTMSG`, `LISTEN`, and the syscall /
+`GETSIGINFO`/`SETSIGINFO` (each stop's own, above), `GETEVENTMSG`, `LISTEN`,
+`GET_SYSCALL_INFO`, and the syscall /
 signal / group / synchronous-fault / execve / fork-clone-thread / attach /
 pre-exit stops above. Everything works under both the interpreter and `--jit`.
 Unimplemented requests return `-EIO`/`-ESRCH` rather than misbehaving.

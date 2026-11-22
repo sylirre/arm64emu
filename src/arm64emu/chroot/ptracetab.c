@@ -110,10 +110,15 @@ enum {
     PT_CMD_SETREGS,     /* addr = NT_* which, its first rlen bytes in data[] */
     PT_CMD_RESUME,      /* addr = inject sig, arg = PT_RES_* submode */
     PT_CMD_DETACH,      /* addr = inject sig */
+    PT_CMD_SCINFO,      /* -> what PTRACE_GET_SYSCALL_INFO reads, in data[]
+                         * (pt_scinfo) */
 };
 
 /* Resume submodes. */
 enum { PT_RES_CONT = 0, PT_RES_SYSCALL = 1, PT_RES_SINGLESTEP = 2 };
+
+/* PT_CMD_SCINFO's answer: pc, sp, the syscall number, orig_x0, x0..x5. */
+#define PT_SCINFO_N 10
 
 typedef struct {
     s32 tracee;          /* 0 = free (CAS-claimed); tracee tid (== host tid;
@@ -772,6 +777,21 @@ static int pt_service_loop_run(CPU *c, PtLink *e, u32 seen, u8 *si) {
             e->result = size ? pt_apply_regset(c, (u32)e->addr, img) : -EINVAL;
             break;
         }
+        case PT_CMD_SCINFO: {
+            /* The registers as they are now, the number, and orig_x0 --
+             * which syscall_get_arguments gives as the first argument, x0
+             * being only the second-hand copy a tracer can change. */
+            u64 v[PT_SCINFO_N];
+            v[0] = c->pc;
+            v[1] = *cpu_cur_sp(c);
+            v[2] = (u64)(s64)g_ptrace_scno;
+            v[3] = g_tls.sc_orig_x0;
+            for (int i = 0; i < 6; i++) v[4 + i] = c->x[i];
+            memcpy(e->data, v, sizeof v);
+            e->rlen = (u32)sizeof v;
+            e->result = 0;
+            break;
+        }
         case PT_CMD_RESUME:
             g_ptrace_syscall_armed = (e->arg == PT_RES_SYSCALL);
             g_ptrace_singlestep    = (e->arg == PT_RES_SINGLESTEP);
@@ -862,7 +882,12 @@ static int pt_stop(CPU *c, int stop_sig, int event, int syscall_stop, u8 *si) {
         pt_notify_stop(tracer, CLD_STOPPED, code);
     } else
         pt_notify_stop(tracer, CLD_TRAPPED, stop_sig);
+    /* A stop outside a call, on the way back from one a signal interrupted,
+     * shows the restart do_signal set up before get_signal: pc at the SVC,
+     * orig_x0 (syscall_restart_view). */
+    int rview = !g_ptrace_in_call && syscall_restart_view(c);
     int ns = pt_service_loop(c, e, seen, si);
+    if (rview) syscall_restart_unview(c);
     if (own) g_ptrace_scno = scno;
     if (ns == PT_RETRAP) return ns;
     /* What the stop did not answer -- an INTERRUPT or a trap_notify that
@@ -906,11 +931,16 @@ static void pt_signal_stop(CPU *c, int sig, int event, int code, s32 pid, u64 ad
 
 void ptrace_report_syscall(CPU *c, int is_exit) {
     if (!g_ptrace_active || !g_self_link) return;
-    (void)is_exit;
     u8 si[128];
     pt_si_notify(si, SIGTRAP, SIGTRAP |
                  ((g_self_link->options & G_PTRACE_O_TRACESYSGOOD) ? 0x80 : 0));
+    /* ptrace_report_syscall's ptrace_message: which of the two stops this
+     * is, for PTRACE_GETEVENTMSG and PTRACE_GET_SYSCALL_INFO, and 0 again
+     * once it is over. */
+    g_self_link->eventmsg = is_exit ? G_PTRACE_EVENTMSG_SYSCALL_EXIT
+                                    : G_PTRACE_EVENTMSG_SYSCALL_ENTRY;
     pt_stop(c, SIGTRAP, 0, 1 /* syscall stop */, si);
+    if (g_self_link) g_self_link->eventmsg = 0;
 }
 
 /* An event stop (fork, clone, exec, exit, ...): ptrace_event's trap. */
@@ -1753,6 +1783,56 @@ static long pt_check_options(CPU *c, u64 data) {
     return 0;
 }
 
+/* PTRACE_GET_SYSCALL_INFO (ptrace_get_syscall_info): struct
+ * ptrace_syscall_info for the stop the tracee is in, `size` bytes of it at
+ * most copied to `data`, and its whole size the answer. Which stop it is
+ * comes from the stop's siginfo, as the kernel reads last_siginfo -- a
+ * syscall stop only with PTRACE_O_TRACESYSGOOD's si_code, its ptrace_message
+ * telling entry from exit, and a seccomp stop by its event -- so a stop of
+ * any other kind, or a syscall stop without the option, is op NONE with the
+ * registers alone. The entry and the seccomp stop give the number
+ * (syscallno, sign-extended) and the arguments, the first being orig_x0;
+ * the exit stop the result, as an error when it is one of -4095..-1. */
+static long pt_scinfo(CPU *c, PtLink *e, s32 pid, u64 size, u64 data) {
+    if (pt_cmd(e, pid, PT_CMD_SCINFO, 0, 0) < 0) return -ESRCH;
+    u64 v[PT_SCINFO_N];
+    memcpy(v, e->data, sizeof v);
+    u8 info[88];
+    memset(info, 0, sizeof info);
+    pt_w32(info, 4, G_AUDIT_ARCH_AARCH64);
+    memcpy(info + 8, &v[0], 8);    /* instruction_pointer */
+    memcpy(info + 16, &v[1], 8);   /* stack_pointer */
+    u32 actual = 24;               /* offsetof(entry) */
+    u32 code = e->has_siginfo ? pt_r32(e->siginfo, 8) : 0;
+    int op = G_PTRACE_SYSCALL_INFO_NONE;
+    if (code == (SIGTRAP | 0x80) && e->eventmsg == G_PTRACE_EVENTMSG_SYSCALL_ENTRY)
+        op = G_PTRACE_SYSCALL_INFO_ENTRY;
+    else if (code == (SIGTRAP | 0x80) && e->eventmsg == G_PTRACE_EVENTMSG_SYSCALL_EXIT)
+        op = G_PTRACE_SYSCALL_INFO_EXIT;
+    else if (code == (u32)(SIGTRAP | (G_PTRACE_EVENT_SECCOMP << 8)))
+        op = G_PTRACE_SYSCALL_INFO_SECCOMP;
+    if (op == G_PTRACE_SYSCALL_INFO_ENTRY || op == G_PTRACE_SYSCALL_INFO_SECCOMP) {
+        memcpy(info + 24, &v[2], 8);                  /* nr */
+        memcpy(info + 32, &v[3], 8);                  /* args[0]: orig_x0 */
+        memcpy(info + 40, &v[5], 5 * 8);              /* args[1..5] */
+        actual = 80;                                  /* offsetofend(entry.args) */
+        if (op == G_PTRACE_SYSCALL_INFO_SECCOMP) {
+            pt_w32(info, 80, (u32)e->eventmsg);       /* ret_data */
+            actual = 84;
+        }
+    } else if (op == G_PTRACE_SYSCALL_INFO_EXIT) {
+        s64 rval = (s64)v[4];
+        u8 is_error = rval < 0 && rval >= -4095;
+        memcpy(info + 24, &rval, 8);
+        info[32] = is_error;
+        actual = 33;                                  /* offsetofend(exit.is_error) */
+    }
+    info[0] = (u8)op;
+    u32 n = size < actual ? (u32)size : actual;
+    if (n && copy_to_guest(c, data, info, n) < 0) return -EFAULT;
+    return actual;
+}
+
 /* ---- tracer: guest ptrace(2) dispatch ---- */
 long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
     if (req == G_PTRACE_TRACEME)
@@ -1923,6 +2003,8 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         u64 msg = e->eventmsg;
         return copy_to_guest(c, data, &msg, 8) < 0 ? -EFAULT : 0;
     }
+    case G_PTRACE_GET_SYSCALL_INFO:
+        return pt_scinfo(c, e, pid, addr, data);
     case G_PTRACE_GETSIGINFO:
         /* The stop's own siginfo (ptrace_getsiginfo): EINVAL for a stop that
          * has none, an ATTACHed tracee's group-stop. */

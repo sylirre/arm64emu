@@ -5,7 +5,9 @@
  * block in run_tests.sh was taken from a real kernel running this same program
  * natively -- only the value left in the return register after a TRAP handler
  * returns differs, which the man page calls architecture-specific (x86 leaves
- * the syscall number, arm64 leaves -ENOSYS).
+ * the syscall number, arm64 the call's first argument: syscall_rollback's
+ * orig_x0, here getpriority's 0 -- measured on a 6.8 kernel; it used to say
+ * -ENOSYS, which was the emulator's answer, not arm64's).
  *
  * Covers: the no_new_privs precondition and what the kernel refuses BEFORE
  * it (the order libseccomp's flag probe depends on), ERRNO with and without

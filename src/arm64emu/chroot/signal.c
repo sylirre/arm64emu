@@ -3874,109 +3874,105 @@ static int sock_timeo_set(int fd, int opt) {
     return tv.tv_sec != 0 || tv.tv_usec != 0;
 }
 
-/* Is the syscall a handler is about to interrupt one the kernel would restart
- * once the handler returns? Decided by the syscall, as the kernel decides it
- * by the errno the syscall came back with:
+/* What the kernel's call would have come back with, interrupted by a signal,
+ * where this one came back EINTR: decided by the syscall, as the kernel's
+ * call decides it itself --
  *
- *   ERESTARTSYS          -- restarted if the handler has SA_RESTART, else EINTR.
- *                           The blocking file and socket calls, the waits, the
- *                           locks, an untimed FUTEX_WAIT.
- *   ERESTARTNOINTR       -- restarted whatever the handler's flags: the PI
- *                           futex ops, whose callers (pthread_mutex_lock) are
- *                           never shown EINTR.
- *   ERESTART_RESTARTBLOCK, ERESTARTNOHAND, EINTR
- *                        -- EINTR to a handler, always: every sleep and poll
- *                           (nanosleep, ppoll, pselect6, epoll_pwait,
- *                           rt_sigtimedwait), a timed FUTEX_WAIT, the SysV
- *                           IPC waits.
+ *   ERESTARTSYS          -- the blocking file and socket calls, the waits, the
+ *                           locks, an untimed FUTEX_WAIT: restarted if the
+ *                           handler has SA_RESTART, else EINTR.
+ *   ERESTARTNOINTR       -- the PI futex ops, whose callers
+ *                           (pthread_mutex_lock) are never shown EINTR:
+ *                           restarted whatever the handler's flags.
+ *   ERESTARTNOHAND       -- ppoll, pselect6, an absolute clock_nanosleep, the
+ *                           SysV message waits, and whatever is not named
+ *                           here: EINTR to a handler, restarted without one.
+ *   ERESTART_RESTARTBLOCK -- a relative sleep, a timed FUTEX_WAIT: the same,
+ *                           its restart going on with what was left of the
+ *                           time (syscall_wait_begin).
+ *   EINTR                -- epoll_pwait, sigtimedwait, semop: never
+ *                           restarted, the ones signal(7) names as failing
+ *                           with EINTR even with no handler.
  *
  * The socket calls carry one more rule (sock_intr_errno): a socket with a
  * timeout of its own (SO_RCVTIMEO for the receive side, SO_SNDTIMEO for the
  * send side) answers EINTR and is never restarted, and read/write on a socket
- * are socket calls. The list used to be sixteen numbers with no rule at all:
- * accept4, flock, fcntl(F_SETLKW) and the open of a FIFO came back EINTR
- * under an SA_RESTART handler where a kernel resumes them (the FIFO open
- * then left a writer blocked forever), and a timed futex wait was restarted
+ * are socket calls. ppoll and pselect6 under personality(STICKY_TIMEOUTS)
+ * with a timeout answer EINTR as well (poll_select_finish: a timeout left as
+ * it was given cannot be restarted from). `a0` is x0 as the call was made,
+ * x1..x5 still holding the rest of its arguments. A tracer at the exit stop
+ * is shown the code (syscall_dispatch). The handler-side rules used to be a
+ * list of sixteen numbers with no rule at all: accept4, flock,
+ * fcntl(F_SETLKW) and the open of a FIFO came back EINTR under an SA_RESTART
+ * handler where a kernel resumes them, and a timed futex wait was restarted
  * where a kernel reports it. */
-static int sc_restart_wanted(CPU *c, unsigned saflags) {
-    if (!g_tls.sc_ret_eintr) return 0;
-    int sa_restart = (saflags & G_SA_RESTART) != 0;
-    int fd = (int)(s32)g_tls.sc_orig_x0;   /* the descriptor, where there is one */
-    switch (g_tls.sc_nr) {
+s64 sc_restart_code(CPU *c, u64 nr, u64 a0) {
+    int fd = (int)(s32)a0;   /* the descriptor, where there is one */
+    switch (nr) {
     case G_NR_futex: {
-        int op = (int)c->x[1] & 127;   /* x1..x5 still hold the call's args */
+        int op = (int)c->x[1] & 127;
         switch (op) {
         case 6: case 13: case 11:   /* LOCK_PI, LOCK_PI2, WAIT_REQUEUE_PI */
-            return 1;               /* ERESTARTNOINTR */
+            return -G_ERESTARTNOINTR;
         case 0: case 9:             /* WAIT, WAIT_BITSET */
-            return c->x[3] == 0 && sa_restart;   /* timed: RESTARTBLOCK */
+            return c->x[3] ? -G_ERESTART_RESTARTBLOCK : -G_ERESTARTSYS;
         default:
-            return 0;
+            return -G_ERESTARTNOHAND;
         }
     }
     case G_NR_read: case G_NR_readv: case G_NR_pread64:
     case G_NR_preadv: case G_NR_preadv2:
     case G_NR_accept: case G_NR_accept4: case G_NR_recvfrom:
     case G_NR_recvmsg: case G_NR_recvmmsg:
-        return sa_restart && !sock_timeo_set(fd, SO_RCVTIMEO);
+        return sock_timeo_set(fd, SO_RCVTIMEO) ? -EINTR : -G_ERESTARTSYS;
     case G_NR_write: case G_NR_writev: case G_NR_pwrite64:
     case G_NR_pwritev: case G_NR_pwritev2:
     case G_NR_connect: case G_NR_sendto: case G_NR_sendmsg: case G_NR_sendmmsg:
     case G_NR_sendfile:   /* out_fd is x0 */
-        return sa_restart && !sock_timeo_set(fd, SO_SNDTIMEO);
+        return sock_timeo_set(fd, SO_SNDTIMEO) ? -EINTR : -G_ERESTARTSYS;
     case G_NR_splice:     /* a socket may sit on either side */
-        return sa_restart && !sock_timeo_set(fd, SO_RCVTIMEO) &&
-               !sock_timeo_set((int)(s32)c->x[2], SO_SNDTIMEO);
+        return sock_timeo_set(fd, SO_RCVTIMEO) ||
+               sock_timeo_set((int)(s32)c->x[2], SO_SNDTIMEO) ? -EINTR : -G_ERESTARTSYS;
     case G_NR_openat: case G_NR_openat2:   /* a FIFO's wait for its partner */
     case G_NR_wait4: case G_NR_waitid:
     case G_NR_ioctl: case G_NR_fcntl: case G_NR_flock:
     case G_NR_tee: case G_NR_vmsplice: case G_NR_getrandom:
-        return sa_restart;
+        return -G_ERESTARTSYS;
+    case G_NR_epoll_pwait: case G_NR_epoll_pwait2:
+    case G_NR_rt_sigtimedwait:
+    case G_NR_semop: case G_NR_semtimedop:
+        return -EINTR;
+    case G_NR_ppoll:
+    case G_NR_pselect6:
+        /* A stop of the host's makes the sticky case EINTR itself, on the
+         * host thread whose personality carries the bit (sys_proc.c); a
+         * stop of the emulator's -- a tracee's -- comes here. */
+        return (g_tls.personality & G_STICKY_TIMEOUTS) &&
+               c->x[nr == G_NR_ppoll ? 2 : 4] ? -EINTR : -G_ERESTARTNOHAND;
+    case G_NR_nanosleep:
+        return -G_ERESTART_RESTARTBLOCK;
+    case G_NR_clock_nanosleep:   /* hrtimer_nanosleep: HRTIMER_MODE_ABS */
+        return (c->x[1] & 1 /*TIMER_ABSTIME*/) ? -G_ERESTARTNOHAND
+                                               : -G_ERESTART_RESTARTBLOCK;
     default:
-        return 0;
+        return -G_ERESTARTNOHAND;
     }
+}
+
+/* Is the call a handler is about to interrupt one the kernel restarts once
+ * the handler returns -- do_signal's rule, by the code the call came back
+ * with (and a tracer may have changed at its exit stop)? */
+static int sc_restart_wanted(unsigned saflags) {
+    if (!g_tls.sc_ret_eintr) return 0;
+    return g_tls.sc_rcode == -G_ERESTARTNOINTR ||
+           (g_tls.sc_rcode == -G_ERESTARTSYS && (saflags & G_SA_RESTART));
 }
 
 /* ...and when no handler runs at all -- get_signal found the signal ignored,
  * or its default ignores, continues or stops: every restart code restarts
- * then (ERESTARTNOHAND and ERESTART_RESTARTBLOCK too), and only a call that
- * answered a plain EINTR is left with it -- the ones signal(7) names as
- * failing with EINTR after a stop even with no handler: epoll_pwait, semop,
- * sigtimedwait, and a socket with a timeout of its own (sock_intr_errno). */
-static int sc_restart_nohandler(CPU *c) {
-    if (!g_tls.sc_ret_eintr) return 0;
-    int fd = (int)(s32)g_tls.sc_orig_x0;
-    switch (g_tls.sc_nr) {
-    case G_NR_epoll_pwait: case G_NR_epoll_pwait2:
-    case G_NR_rt_sigtimedwait:
-    case G_NR_semop: case G_NR_semtimedop:
-        return 0;
-    case G_NR_read: case G_NR_readv: case G_NR_pread64:
-    case G_NR_preadv: case G_NR_preadv2:
-    case G_NR_accept: case G_NR_accept4: case G_NR_recvfrom:
-    case G_NR_recvmsg: case G_NR_recvmmsg:
-        return !sock_timeo_set(fd, SO_RCVTIMEO);
-    case G_NR_write: case G_NR_writev: case G_NR_pwrite64:
-    case G_NR_pwritev: case G_NR_pwritev2:
-    case G_NR_connect: case G_NR_sendto: case G_NR_sendmsg: case G_NR_sendmmsg:
-    case G_NR_sendfile:
-        return !sock_timeo_set(fd, SO_SNDTIMEO);
-    case G_NR_splice:
-        return !sock_timeo_set(fd, SO_RCVTIMEO) &&
-               !sock_timeo_set((int)(s32)c->x[2], SO_SNDTIMEO);
-    case G_NR_ppoll:
-    case G_NR_pselect6:
-        /* poll_select_finish: a timeout left as it was given -- under
-         * personality(STICKY_TIMEOUTS) -- cannot be restarted from, so the
-         * restart a stop would give the call is EINTR. A stop of the host's
-         * makes it so itself, on the host thread whose personality carries
-         * the bit (sys_proc.c); a stop of the emulator's -- a tracee's --
-         * comes here. */
-        return !((g_tls.personality & G_STICKY_TIMEOUTS) &&
-                 c->x[g_tls.sc_nr == G_NR_ppoll ? 2 : 4]);
-    default:
-        return 1;
-    }
+ * then, and only a call that answered a plain EINTR is left with it. */
+static int sc_restart_nohandler(void) {
+    return g_tls.sc_ret_eintr && sc_rcode_restarts(g_tls.sc_rcode);
 }
 
 /* A signal taken with no handler to run: the host call it interrupted --
@@ -3991,7 +3987,7 @@ static int sc_restart_nohandler(CPU *c) {
 static void sig_taken_quietly(CPU *c, int traced) {
     /* A traced one, or a stop: the kernel did take it, and its rule settles
      * the call outright -- whatever mark of ours an EINTR came with. */
-    g_sig_selfintr = !traced || sc_restart_nohandler(c);
+    g_sig_selfintr = !traced || sc_restart_nohandler();
 }
 
 /* A ptrace trap a tracer's request caused (PTRACE_INTERRUPT's): the call its
@@ -4000,7 +3996,7 @@ static void sig_taken_quietly(CPU *c, int traced) {
  * and resumes by the rule for a call no handler ran for. */
 void sig_after_trap(CPU *c) {
     g_sig_selfintr = 0;
-    if (sc_restart_nohandler(c)) g_sig_selfintr = 1;
+    if (sc_restart_nohandler()) g_sig_selfintr = 1;
 }
 
 /* One PendSig as the guest's 128-byte siginfo, into `si` (zeroed here). The
@@ -4105,9 +4101,9 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     sig_action_snapshot(m, sig, &snap);
     const GSigAction *act = &snap;
 
-    int restart = sc_restart_wanted(c, (unsigned)act->flags);
+    int restart = sc_restart_wanted((unsigned)act->flags);
     u64 saved_pc = c->pc, saved_x0 = c->x[0];
-    if (restart) { saved_pc = g_tls.sc_svc_pc; saved_x0 = g_tls.sc_orig_x0; }
+    if (restart) { saved_pc = g_tls.sc_svc_pc; saved_x0 = syscall_restart_x0(); }
 
     /* SA_RESETHAND is get_signal's, as it takes the signal for a handler --
      * before the frame is written, so a delivery that fails below resets it

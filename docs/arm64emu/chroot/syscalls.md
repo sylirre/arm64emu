@@ -1176,7 +1176,11 @@ its first mismatch would kill the emulator rather than the guest. But the
 emulator already sees every guest syscall at one choke point, so the filter is
 simply evaluated there, between the ptrace syscall-entry stop and the handler —
 the kernel's own order, since a tracer may have rewritten the number the filter
-is meant to judge.
+is meant to judge. The first argument it judges is `orig_x0`, x0 as the `SVC`
+found it (`syscall_get_arguments`): a tracer's change of x0 at the entry stop
+or at a `TRACE` stop is not the filter's business, nor is the `-ENOSYS` a call
+of -1 has in x0 by then (`tests/arm64emu/chroot/ptrace/origx0.c`, checked
+against a 6.8 kernel).
 
 What that buys: `bwrap --seccomp`, flatpak's syscall blacklists and any
 libseccomp-generated program behave as they would on a kernel. The accepted
@@ -1200,7 +1204,10 @@ do by themselves; it used to end the program here (`tests/arm64emu/chroot/fixtur
 `SECCOMP_RET_ALLOW`/`LOG`, `ERRNO` (with the kernel's `MAX_ERRNO` clamp),
 `TRAP` (SIGSYS carrying `si_call_addr`/`si_syscall`/`si_arch`, plus the filter's
 own `SECCOMP_RET_DATA` in `si_errno` — that is how one filter tells its several
-traps apart — with the call skipped and `-ENOSYS` left behind), `TRACE` (a
+traps apart — with the call skipped and x0 put back as it was made,
+`syscall_rollback`'s `orig_x0`: the handler's frame holds it, a libseccomp-style
+handler reading the call's arguments there, and the call answers it if the
+handler leaves it; it used to be `-ENOSYS`, which arm64 never leaves), `TRACE` (a
 `PTRACE_EVENT_SECCOMP` stop for a tracer that set `PTRACE_O_TRACESECCOMP`, the
 filter's data as its event message, after which the call runs as the tracer left
 it — renumbered, and judged again, a second `TRACE` allowing it, or skipped

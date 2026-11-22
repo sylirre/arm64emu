@@ -494,6 +494,14 @@ typedef struct { u16 code; u8 jt; u8 jf; u32 k; } GSockFilter;
 typedef struct { u16 len; u16 __pad[3]; u64 filter; } GSockFprog;
 
 #define G_AUDIT_ARCH_AARCH64 0xc00000b7u   /* EM_AARCH64 | 64BIT | LE */
+
+/* The kernel's restart codes (linux/errno.h): what a call a signal interrupts
+ * comes back with, which a tracer sees at its exit stop and do_signal turns
+ * into a restart or EINTR. Never returned to user space by a kernel. */
+#define G_ERESTARTSYS           512
+#define G_ERESTARTNOINTR        513
+#define G_ERESTARTNOHAND        514
+#define G_ERESTART_RESTARTBLOCK 516
 #define G_BPF_MAXINSNS 4096
 
 /* struct signalfd_siginfo: what a read(2) on a signalfd returns, one per
@@ -652,6 +660,16 @@ typedef struct {
 #define G_PTRACE_SEIZE         0x4206
 #define G_PTRACE_INTERRUPT     0x4207
 #define G_PTRACE_LISTEN        0x4208
+#define G_PTRACE_GET_SYSCALL_INFO 0x420e
+
+/* PTRACE_GET_SYSCALL_INFO: struct ptrace_syscall_info's op, and the
+ * ptrace_message a syscall stop carries, which tells its two kinds apart. */
+#define G_PTRACE_SYSCALL_INFO_NONE    0
+#define G_PTRACE_SYSCALL_INFO_ENTRY   1
+#define G_PTRACE_SYSCALL_INFO_EXIT    2
+#define G_PTRACE_SYSCALL_INFO_SECCOMP 3
+#define G_PTRACE_EVENTMSG_SYSCALL_ENTRY 1
+#define G_PTRACE_EVENTMSG_SYSCALL_EXIT  2
 
 /* prctl: the arm64 tagged-address ABI. */
 #define G_PR_SET_TAGGED_ADDR_CTRL 55

@@ -347,15 +347,19 @@ int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int 
         return 1;
     }
     case G_SECCOMP_RET_TRAP:
-        /* SIGSYS to the guest, syscall skipped, -ENOSYS left behind as the
-         * result like the kernel. A handler that inspects si_syscall/si_arch
-         * sees them; that is how a libseccomp-style trap handler identifies
-         * the call. The filter's low 16 bits ride along in si_errno, which is
-         * how one filter distinguishes several traps it installed. Delivery is
-         * deferred to the dispatcher (return 2): the signal frame has to
-         * capture the *result* in x0, and the handler's own arguments go into
-         * x0..x2 after that -- doing it here would have both overwritten. */
-        *ret = -ENOSYS;
+        /* SIGSYS to the guest and the syscall skipped, with x0 put back as
+         * the call was made (syscall_rollback: regs[0] = orig_x0) -- what
+         * the handler's frame holds, a libseccomp-style handler reading the
+         * call's arguments there, and what the call answers if the handler
+         * leaves it. It used to be -ENOSYS, which arm64 never leaves. A
+         * handler that inspects si_syscall/si_arch sees them; that is how
+         * such a handler identifies the call. The filter's low 16 bits ride
+         * along in si_errno, which is how one filter distinguishes several
+         * traps it installed. Delivery is deferred to the dispatcher (return
+         * 2): the signal frame has to capture the *result* in x0, and the
+         * handler's own arguments go into x0..x2 after that -- doing it here
+         * would have both overwritten. */
+        *ret = (s64)args[0];
         *trap_data = (u16)(action & G_SECCOMP_RET_DATA);
         return 2;
     case G_SECCOMP_RET_TRACE: {
@@ -378,8 +382,12 @@ int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int 
          * more): any negative one skips it. */
         s32 now_nr = g_ptrace_scno;
         if (now_nr < 0) { *ret = (s64)c->x[0]; return 1; }
+        /* ...judged on the arguments as they stand, the first being
+         * orig_x0 still: a tracer's x0 is no more the filter's here than at
+         * the entry stop. */
         u64 now[6];
         for (int i = 0; i < 6; i++) now[i] = c->x[i];
+        now[0] = g_tls.sc_orig_x0;
         int r = seccomp_gate(c, (u64)now_nr, now, ret, trap_data, 1);
         return r ? r : 3;   /* allowed: the call as the tracer left it */
     }

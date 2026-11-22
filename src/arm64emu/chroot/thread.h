@@ -83,9 +83,24 @@ typedef struct {
      * the host moves anything. */
     u8  xfer_hole;
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
-     * internal wakeups -- syscall_restart_internal, src/arm64emu/chroot/syscall.c). */
-    u64 sc_svc_pc, sc_orig_x0, sc_nr;
+     * internal wakeups -- syscall_restart_internal, src/arm64emu/chroot/syscall.c).
+     * sc_orig_x0 is the kernel's regs->orig_x0, x0 as the SVC found it, before
+     * a tracer's entry stop or the -ENOSYS of a call of -1: what seccomp
+     * judges as args[0], what RET_TRAP puts back, what a restart the kernel
+     * shows starts from. sc_restart_x0 is the x0 a restart is made with: the
+     * call's own (an interruption of the emulator's, which no kernel would
+     * have made, is invisible), until a stop or a handler -- the kernel's
+     * do_signal -- has shown the restart, from orig_x0 (syscall.c,
+     * syscall_restart_view). sc_rcode is what the kernel's call came back with
+     * when this one came back EINTR (sc_ret_eintr): -ERESTARTSYS and the
+     * other three restart codes, or a plain -EINTR (signal.c,
+     * sc_restart_code); sc_icount the instruction count as the call
+     * returned, which tells a stop on the way back to user space from one
+     * after guest code has run. */
+    u64 sc_svc_pc, sc_orig_x0, sc_restart_x0, sc_nr, sc_icount;
+    s64 sc_rcode;
     int sc_ret_eintr;
+    int sc_shown;             /* the restart has been shown (sc_restart_x0) */
     int sc_restarted;         /* this dispatch re-runs the SVC we rewound to */
     u64 sc_wait_t0;           /* CLOCK_MONOTONIC ns this attempt began to wait
                                * (syscall_wait_begin); 0 = not a timed wait */

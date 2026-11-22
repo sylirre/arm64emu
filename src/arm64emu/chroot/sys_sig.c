@@ -86,6 +86,9 @@ SYSDEF(rt_sigprocmask) {
 
 SYSDEF(rt_sigreturn) {
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    /* No call in progress once a frame is taken back (forget_syscall): the
+     * exit stop shows -1, and a restored -EINTR is not one to restart. */
+    ptrace_forget_syscall();
     /* x0 as the frame restored it, or 0 for a frame refused -- whose SIGSEGV
      * comes once this has returned (syscall_dispatch). */
     return sig_return(c);

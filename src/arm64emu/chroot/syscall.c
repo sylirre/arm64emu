@@ -479,7 +479,7 @@ void syscall_restart_internal(CPU *c) {
         g_tls.sc_wait_t0 = 0;
     }
     c->pc = g_tls.sc_svc_pc;
-    c->x[0] = g_tls.sc_orig_x0;
+    c->x[0] = g_tls.sc_restart_x0;
     g_tls.sc_ret_eintr = 0;
     g_tls.sc_restarted = 1;
 }
@@ -501,6 +501,45 @@ void syscall_unrewind(CPU *c) {
     c->x[0] = (u64)(s64)-EINTR;
     g_tls.sc_ret_eintr = 1;
     g_sig_selfintr = 1;
+}
+
+/* do_signal's half of a restart, as a stop on the way back to user space
+ * shows it. The kernel's do_signal finds the call's restart code in x0 and,
+ * before get_signal takes a single stop, rewinds pc to the SVC and puts
+ * orig_x0 back: a tracer at a signal-delivery stop, a group stop or an
+ * INTERRUPT trap sees the call about to be made again, as it was made --
+ * whatever it changed at the entry stop -- and what it leaves there is what
+ * the restart is made with, unless a handler without SA_RESTART turns it into
+ * EINTR. The emulator decides the restart later, at the delivery, from x0 =
+ * -EINTR just past the SVC (sc_restart_wanted, syscall_restart_internal); so
+ * the stop is shown the kernel's registers and the emulator's are put back
+ * after it, the tracer's x0 kept as the restart's (sc_restart_x0) -- or, if
+ * it sent the thread elsewhere, no restart at all. Only on the way back from
+ * the call, which no guest instruction since tells (sc_icount), and only for
+ * a code do_signal restarts from. The two used to show the emulator's own:
+ * pc past the SVC, x0 -EINTR. */
+int syscall_restart_view(CPU *c) {
+    if (!g_tls.sc_ret_eintr || !sc_rcode_restarts(g_tls.sc_rcode) ||
+        c->pc != g_tls.sc_svc_pc + 4 || c->icount != g_tls.sc_icount ||
+        (s64)c->x[0] != -EINTR)
+        return 0;
+    if (!g_tls.sc_shown) {
+        g_tls.sc_shown = 1;
+        g_tls.sc_restart_x0 = g_tls.sc_orig_x0;
+    }
+    c->pc = g_tls.sc_svc_pc;
+    c->x[0] = g_tls.sc_restart_x0;
+    return 1;
+}
+
+void syscall_restart_unview(CPU *c) {
+    if (c->pc == g_tls.sc_svc_pc) {
+        g_tls.sc_restart_x0 = c->x[0];
+        c->pc = g_tls.sc_svc_pc + 4;
+        c->x[0] = (u64)(s64)-EINTR;
+    } else {
+        g_tls.sc_ret_eintr = 0;   /* "a debugger has chosen to restart at a different PC" */
+    }
 }
 
 /* Called by a blocking handler once it has the host-form timeout in hand, just
@@ -567,6 +606,11 @@ void syscall_dispatch(CPU *c) {
      * number, -ENOSYS too. */
     s32 scno = (s32)(u32)c->x[8];
     ptrace_enter_syscall(scno);
+    /* ...and regs->orig_x0: x0 as the SVC found it, before anything below
+     * changes it -- what seccomp judges as the first argument, what a
+     * RET_TRAP puts back, what a restart the kernel shows starts from
+     * (thread.h). */
+    g_tls.sc_orig_x0 = c->x[0];
     int scwork = g_ptrace_syscall_armed ||
                  __atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED);
     if (UNLIKELY(scno == -1) && scwork) c->x[0] = (u64)(s64)-ENOSYS;
@@ -591,7 +635,6 @@ void syscall_dispatch(CPU *c) {
 
     /* Restart bookkeeping: the SVC is 4 bytes before the resume PC. */
     g_tls.sc_svc_pc = c->pc - 4;
-    g_tls.sc_orig_x0 = a0;
     g_tls.sc_nr = nr;
     /* Only an interruption that lands from here on interrupted *this* call; one
      * already flagged was serviced, or is about to be, at a boundary. */
@@ -619,12 +662,16 @@ void syscall_dispatch(CPU *c) {
     /* seccomp-BPF, after the ptrace entry stop (a tracer may have rewritten the
      * number the filter is meant to judge) and before the handler, which is the
      * kernel's order. Gated on a mode byte that is zero for every guest that
-     * never installed a filter. */
+     * never installed a filter. The first argument the filter is given is
+     * orig_x0 (syscall_get_arguments), not x0: neither a tracer's change at
+     * the entry stop nor a call of -1's -ENOSYS is any of its business. */
     s64 scret = 0;
     u16 sctrap = 0;   /* SECCOMP_RET_DATA of a trapping filter -> si_errno */
     int scskip = 0;   /* 1 = filtered out, 2 = filtered out + SIGSYS to deliver */
-    if (UNLIKELY(__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED)))
-        scskip = seccomp_gate(c, nr, av, &scret, &sctrap, 0);
+    if (UNLIKELY(__atomic_load_n(&m->seccomp_mode, __ATOMIC_RELAXED))) {
+        u64 sd[6] = { g_tls.sc_orig_x0, a1, a2, a3, a4, a5 };
+        scskip = seccomp_gate(c, nr, sd, &scret, &sctrap, 0);
+    }
     if (UNLIKELY(scskip == 3)) {
         /* Allowed after a PTRACE_EVENT_SECCOMP stop: the call is what the
          * tracer left, in the registers and in its number. */
@@ -633,9 +680,13 @@ void syscall_dispatch(CPU *c) {
         a0 = c->x[0]; a1 = c->x[1]; a2 = c->x[2];
         a3 = c->x[3]; a4 = c->x[4]; a5 = c->x[5];
         av[0] = a0; av[1] = a1; av[2] = a2; av[3] = a3; av[4] = a4; av[5] = a5;
-        g_tls.sc_orig_x0 = a0;
         g_tls.sc_nr = nr;
     }
+    /* The x0 a restart nobody is shown is made with: the call's own. An
+     * interruption of the emulator's is invisible to the guest -- no kernel
+     * would have made it -- and the call goes on as it was (thread.h). */
+    g_tls.sc_restart_x0 = a0;
+    g_tls.sc_shown = 0;
 
     sysfn fn = (nr < G_NR_MAX) ? table[nr] : NULL;
     u64 ret;
@@ -678,28 +729,60 @@ void syscall_dispatch(CPU *c) {
         ret = (u64)(s64)-ENOSYS;
     }
 
+    /* A call that ran and came back EINTR was interrupted -- by a signal of
+     * the guest's, or one of the emulator's own (syscall_restart_internal) --
+     * and the kernel's would have come back with the code do_signal restarts
+     * it by (sc_restart_code). Not a call filtered out, which never ran, nor
+     * one whose number is -1 by now (rt_sigreturn forgets its own). */
+    int intr = (s64)ret == -EINTR && !scskip && fn && g_ptrace_scno != -1;
+    s64 rcode = intr ? sc_restart_code(c, nr, a0) : 0;
+
     /* ptrace syscall-exit stop: publish the result in x0 so the tracer's
-     * GETREGSET sees it, then let it inspect or override the return value. An
-     * auto-attached fork child skips one exit stop (the clone it was born from,
-     * which it never entered) to keep the tracer's entry/exit pairing aligned. */
+     * GETREGSET sees it -- an interrupted call's restart code, as the
+     * kernel's tracer sees it -- then let it inspect or override the return
+     * value. A code left as it was is the interruption still; another
+     * restart code is the one do_signal goes by; anything else is the call's
+     * answer, restarted by nothing. An auto-attached fork child skips one
+     * exit stop (the clone it was born from, which it never entered) to keep
+     * the tracer's entry/exit pairing aligned. */
     if (UNLIKELY(g_ptrace_syscall_armed)) {
         if (g_ptrace_skip_syscall_stop) {
             g_ptrace_skip_syscall_stop = 0;
         } else {
-            c->x[0] = ret;
+            c->x[0] = intr ? (u64)rcode : ret;
             ptrace_report_syscall(c, 1);
-            ret = c->x[0];
+            s64 now = (s64)c->x[0];
+            if (intr && now == rcode) {
+                ret = (u64)(s64)-EINTR;
+            } else if (intr && sc_rcode_restarts(now)) {
+                rcode = now;
+            } else {
+                intr = 0;
+                ret = (u64)now;
+            }
         }
+    }
+    /* do_signal restarts only a call it finds in progress (in_syscall): one
+     * whose number a tracer made -1 at the exit stop is not, and its code
+     * reaches user space as it is. */
+    if (UNLIKELY(intr && g_ptrace_scno == -1)) {
+        if (rcode != -EINTR) ret = (u64)rcode;
+        intr = 0;
     }
     /* Out of the call: whatever stops on the way back to user space are
      * get_signal's, after do_signal's forget_syscall. */
     ptrace_leave_syscall();
 
-    /* Note EINTR so a pending signal with SA_RESTART -- or one of the emulator's
-     * own interruptions (syscall_restart_internal) -- can rewind the SVC. Read
-     * after the exit stop above, so a tracer that overrode the return value
-     * decides whether this still counts as interrupted. */
-    g_tls.sc_ret_eintr = ((s64)ret == -EINTR);
+    /* Note the interruption so a pending signal -- or one of the emulator's
+     * own interruptions (syscall_restart_internal) -- can rewind the SVC: x0
+     * stays -EINTR, the code (sc_rcode) deciding what the kernel would do
+     * with it. Settled after the exit stop above, so a tracer that overrode
+     * the return value decides whether this still counts as interrupted. The
+     * instruction count marks the way back to user space, where a stop shows
+     * the restart do_signal has set up (syscall_restart_view). */
+    g_tls.sc_ret_eintr = intr;
+    g_tls.sc_rcode = rcode;
+    g_tls.sc_icount = c->icount;
 
     if (m->strace) {
         char namebuf[32];

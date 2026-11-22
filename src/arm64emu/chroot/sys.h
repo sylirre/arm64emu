@@ -730,7 +730,9 @@ int  sigfd_track_dup(struct Machine *m, int oldfd, int newfd);   /* 0 or -ENOMEM
  * proceed, 3 to proceed with the call as a tracer's PTRACE_EVENT_SECCOMP stop
  * left it in the registers, and does not return at all for a killing action.
  * `recheck`: the filters' second look after such a stop, where a RET_TRACE
- * allows. seccomp_prctl_set backs prctl(PR_SET_SECCOMP). */
+ * allows. `args` are the call's arguments as seccomp_data has them, the
+ * first being orig_x0 (thread.h). seccomp_prctl_set backs
+ * prctl(PR_SET_SECCOMP). */
 int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int recheck);
 s64 seccomp_prctl_set(CPU *c, u64 mode, u64 prog_va);
 /* This process's seccomp mode (G_SECCOMP_MODE_*) and installed filter count,

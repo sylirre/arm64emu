@@ -590,6 +590,23 @@ void syscall_dispatch(CPU *c);
  * boundary that has just serviced one of those interruptions. */
 void syscall_restart_internal(CPU *c);
 void syscall_unrewind(CPU *c);
+/* One of the four restart codes, which do_signal restarts a call from when
+ * no handler runs (thread.h, sc_rcode)? */
+static inline int sc_rcode_restarts(s64 r) {
+    return r == -G_ERESTARTSYS || r == -G_ERESTARTNOINTR ||
+           r == -G_ERESTARTNOHAND || r == -G_ERESTART_RESTARTBLOCK;
+}
+/* A stop on the way back to user space from an interrupted call, shown the
+ * restart do_signal has set up -- pc at the SVC, orig_x0 -- and the
+ * emulator's own registers put back after it (1 when there was one to show;
+ * syscall.c has the story). */
+int syscall_restart_view(CPU *c);
+void syscall_restart_unview(CPU *c);
+/* The x0 a restart the kernel shows is made with: orig_x0, or what a tracer
+ * left at a stop that showed it (syscall_restart_view). */
+static inline u64 syscall_restart_x0(void) {
+    return g_tls.sc_shown ? g_tls.sc_restart_x0 : g_tls.sc_orig_x0;
+}
 /* For a blocking handler, called with the host-form *relative* timeout in hand
  * just before it sleeps: shrinks it by what earlier attempts at this same call
  * already waited, so restarting the call does not restart its timeout. NULL /
@@ -846,6 +863,10 @@ void sig_inject_local(int sig, const u8 *si, u32 gen);
  * trap cut short (signal.c). */
 void sig_raise_attach_stop(void);
 void sig_after_trap(CPU *c);
+/* What the kernel's call `nr`, made with x0 = `a0` and x1..x5 as the CPU
+ * holds them, comes back with when a signal interrupts it: one of the
+ * restart codes, or -EINTR (thread.h, sc_rcode). */
+s64 sc_restart_code(CPU *c, u64 nr, u64 a0);
 /* A guest's job-control signal (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT)
  * for a process a tracer holds threads of (ptrace.h, ptrace_group_traced):
  * sent to thread group `tgid` (through `pidfd` if it is one, >= 0), or its
