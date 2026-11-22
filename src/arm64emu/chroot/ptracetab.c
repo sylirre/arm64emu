@@ -101,12 +101,11 @@ enum { PT_ST_RUNNING = 0, PT_ST_STOPPED = 1, PT_ST_EXITED = 2 };
 enum {
     PT_CMD_NONE = 0,
     PT_CMD_PEEK,        /* addr -> 8-byte word in data[] */
-    PT_CMD_PEEKUSR,     /* addr = user-area offset -> word */
     PT_CMD_POKE,        /* addr, arg = value */
     PT_CMD_READ,        /* addr, arg = len (<= PT_MBOX): guest mem -> data[]; result = bytes */
     PT_CMD_WRITE,       /* addr, arg = len (<= PT_MBOX): data[] -> guest mem; result = bytes */
     PT_CMD_GETREGS,     /* addr = NT_* which -> regset in data[] */
-    PT_CMD_SETREGS,     /* addr = NT_* which, rlen bytes in data[] */
+    PT_CMD_SETREGS,     /* addr = NT_* which, its first rlen bytes in data[] */
     PT_CMD_RESUME,      /* addr = inject sig, arg = PT_RES_* submode */
     PT_CMD_DETACH,      /* addr = inject sig */
 };
@@ -482,8 +481,9 @@ static u32 pt_build_regset(CPU *c, u32 which, u8 *out) {
         return (u32)sizeof f;
     }
     case G_NT_ARM_TLS: {
-        u64 tls = c->tpidr[0];
-        memcpy(out, &tls, sizeof tls);
+        /* tls_get: TPIDR_EL0, then TPIDR2_EL0 -- 0, this CPU having no SME. */
+        u64 tls[2] = { c->tpidr[0], 0 };
+        memcpy(out, tls, sizeof tls);
         return (u32)sizeof tls;
     }
     case G_NT_ARM_SYSTEM_CALL: {
@@ -496,24 +496,28 @@ static u32 pt_build_regset(CPU *c, u32 which, u8 *out) {
     }
 }
 
-/* How many bytes the regset `which` holds (0 = not modelled). The kernel
- * clamps a GETREGSET/SETREGSET iov_len to this and writes the clamped value
- * back, so the tracer needs the size even for a write. */
-static u32 pt_regset_size(u32 which) {
+/* The kernel's geometry of each regset modelled here (aarch64_regsets: n
+ * units of `size` bytes), which ptrace_regset applies before the regset is
+ * so much as asked, for a write as for a read: a length that is not a whole
+ * number of units is EINVAL, a longer one is cut to the regset, and the cut
+ * length is what iov_len says afterwards. Returns the unit and sets *size to
+ * what pt_build_regset writes; 0 for a regset not modelled. */
+static u32 pt_regset_geom(u32 which, u32 *size) {
     switch (which) {
-    case G_NT_PRSTATUS:        return (u32)sizeof(GUserRegs);
-    case G_NT_PRFPREG:         return (u32)sizeof(GUserFpsimd);
-    case G_NT_ARM_TLS:         return 8;
-    case G_NT_ARM_SYSTEM_CALL: return 4;
-    default:                   return 0;
+    case G_NT_PRSTATUS:        *size = (u32)sizeof(GUserRegs);   return 8;
+    case G_NT_PRFPREG:         *size = (u32)sizeof(GUserFpsimd); return 4;
+    case G_NT_ARM_TLS:         *size = 16;                       return 8;
+    case G_NT_ARM_SYSTEM_CALL: *size = 4;                        return 4;
+    default:                   *size = 0;                        return 0;
     }
 }
 
-static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
+/* Takes a whole regset image, as pt_build_regset writes it: a short write
+ * has been laid over the regset as it stands (PT_CMD_SETREGS). */
+static int pt_apply_regset(CPU *c, u32 which, const u8 *in) {
     switch (which) {
     case G_NT_PRSTATUS: {
         GUserRegs r;
-        if (len < sizeof r) return -EINVAL;
         memcpy(&r, in, sizeof r);
         /* gpr_set's valid_user_regs: a pstate that is not EL0t AArch64 with
          * DAIF clear is EINVAL, and nothing of the write is taken. It used
@@ -529,7 +533,6 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
     }
     case G_NT_PRFPREG: {
         GUserFpsimd f;
-        if (len < sizeof f) return -EINVAL;
         memcpy(&f, in, sizeof f);
         for (int i = 0; i < 32; i++) c->v[i] = f.vregs[i];
         fpsr_sync(c);           /* drop pending, or it resurrects after this */
@@ -538,15 +541,14 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in, u32 len) {
         return 0;
     }
     case G_NT_ARM_TLS: {
+        /* tls_set takes TPIDR2_EL0 only where the CPU has it. */
         u64 tls;
-        if (len < sizeof tls) return -EINVAL;
         memcpy(&tls, in, sizeof tls);
         c->tpidr[0] = tls;
         return 0;
     }
     case G_NT_ARM_SYSTEM_CALL: {
         s32 nr;
-        if (len < sizeof nr) return -EINVAL;
         memcpy(&nr, in, sizeof nr);
         c->x[8] = (u64)(s64)nr;   /* redirect/cancel the in-flight syscall */
         return 0;
@@ -717,23 +719,6 @@ static int pt_service_loop_run(CPU *c, PtLink *e, u32 seen, u8 *si) {
             e->rlen = 8;
             break;
         }
-        case PT_CMD_PEEKUSR: {
-            u64 w = 0;
-            /* Bound written so it cannot wrap: `addr + 8 <= size` is true for
-             * an addr just below 2^64, and the read then lands before the
-             * image (our own stack). The offset is guest-controlled. */
-            if (e->addr <= (u64)sizeof(GUserRegs) - 8 && (e->addr & 7) == 0) {
-                u8 buf[sizeof(GUserRegs)];
-                pt_build_regset(c, G_NT_PRSTATUS, buf);
-                memcpy(&w, buf + e->addr, 8);
-                e->result = 0;
-            } else {
-                e->result = -EIO;
-            }
-            memcpy(e->data, &w, 8);
-            e->rlen = 8;
-            break;
-        }
         case PT_CMD_POKE:
             /* POKETEXT/POKEDATA write regardless of page write-permission (real
              * ptrace copies-on-write); the code path also patches a read-only
@@ -770,12 +755,17 @@ static int pt_service_loop_run(CPU *c, PtLink *e, u32 seen, u8 *si) {
             e->result = n ? 0 : -EINVAL;
             break;
         }
-        case PT_CMD_SETREGS:
-            e->result = pt_apply_regset(c, (u32)e->addr, e->data, e->rlen);
-            /* Hand the regset's own size back so the tracer can report the
-             * kernel's clamped iov_len. */
-            if (e->result == 0) e->rlen = pt_regset_size((u32)e->addr);
+        case PT_CMD_SETREGS: {
+            /* A short write is the regset as it stands with the tracer's
+             * first rlen bytes over it -- gpr_set's newregs, __fpr_set's
+             * newstate, tls_set's tls[] -- judged and taken whole: 8 bytes
+             * of NT_PRSTATUS are x0 alone. */
+            u8 img[PT_MBOX];
+            u32 size = pt_build_regset(c, (u32)e->addr, img);
+            memcpy(img, e->data, e->rlen < size ? e->rlen : size);
+            e->result = size ? pt_apply_regset(c, (u32)e->addr, img) : -EINVAL;
             break;
+        }
         case PT_CMD_RESUME:
             g_ptrace_syscall_armed = (e->arg == PT_RES_SYSCALL);
             g_ptrace_singlestep    = (e->arg == PT_RES_SINGLESTEP);
@@ -1906,16 +1896,18 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         if (pt_cmd(e, pid, PT_CMD_PEEK, addr, 0) < 0) return -ESRCH;
         if (e->result < 0) return -EIO;
         return copy_to_guest(c, data, e->data, 8) < 0 ? -EFAULT : 0;
-    case G_PTRACE_PEEKUSR:
-        if (pt_cmd(e, pid, PT_CMD_PEEKUSR, addr, 0) < 0) return -ESRCH;
-        if (e->result < 0) return -EIO;
-        return copy_to_guest(c, data, e->data, 8) < 0 ? -EFAULT : 0;
     case G_PTRACE_POKETEXT:
     case G_PTRACE_POKEDATA:
         if (pt_cmd(e, pid, PT_CMD_POKE, addr, data) < 0) return -ESRCH;
         return e->result < 0 ? -EIO : 0;
+    case G_PTRACE_PEEKUSR:
     case G_PTRACE_POKEUSR:
-        return -EIO;   /* user-area writes not modelled (gdb uses SETREGSET) */
+        /* arm64 has no user area: arch_ptrace has no case for either, and
+         * ptrace_request answers EIO to a request it does not know. A tracer
+         * reads and writes registers with GETREGSET/SETREGSET (gdb, strace
+         * and lldb do). PEEKUSR used to be answered from the NT_PRSTATUS
+         * image, which no arm64 kernel does. */
+        return -EIO;
     case G_PTRACE_SETSIGINFO: {
         /* ptrace_setsiginfo: the tracer's siginfo replaces the stop's, read as
          * copy_siginfo_from_user reads one -- kernel_siginfo's 48 bytes, and
@@ -1936,29 +1928,35 @@ long ptrace_syscall(CPU *c, long req, s32 pid, u64 addr, u64 data) {
         memcpy(e->siginfo, si, sizeof si);
         return 0;
     }
-    case G_PTRACE_GETREGSET: {
-        GIovec iov;
-        if (copy_from_guest(c, &iov, data, sizeof iov) < 0) return -EFAULT;
-        if (pt_cmd(e, pid, PT_CMD_GETREGS, addr, 0) < 0) return -ESRCH;
-        if (e->result < 0) return -EINVAL;
-        u32 n = e->rlen;
-        if (iov.iov_len < n) n = (u32)iov.iov_len;
-        if (n && copy_to_guest(c, iov.iov_base, e->data, n) < 0) return -EFAULT;
-        /* The kernel returns iov_len clamped to what it copied, not the
-         * regset's full size: a caller with a short buffer must not be told
-         * more was written than fits in it. */
-        iov.iov_len = n;
-        return copy_to_guest(c, data, &iov, sizeof iov) < 0 ? -EFAULT : 0;
-    }
+    case G_PTRACE_GETREGSET:
     case G_PTRACE_SETREGSET: {
+        /* ptrace_regset. The type is the address cut to 32 bits (its
+         * unsigned int), and the length is judged by the regset's geometry
+         * before anything is copied: not a whole number of its units,
+         * EINVAL, iov_len left alone; longer than the regset, cut to it.
+         * Only the cut length is copied -- a buffer that ends with the
+         * regset reads and writes whatever length it claims -- and is what
+         * iov_len says afterwards, so a short buffer is never reported as
+         * a full transfer. A short write leaves the rest of the regset as
+         * it is (PT_CMD_SETREGS); one of nothing does nothing. The length
+         * used to go unjudged: 4 bytes read half of x0, and a short write
+         * was EINVAL. */
         GIovec iov;
         if (copy_from_guest(c, &iov, data, sizeof iov) < 0) return -EFAULT;
-        u32 n = iov.iov_len > PT_MBOX ? PT_MBOX : (u32)iov.iov_len;
-        if (n && copy_from_guest(c, e->data, iov.iov_base, n) < 0) return -EFAULT;
-        e->rlen = n;
-        if (pt_cmd(e, pid, PT_CMD_SETREGS, addr, 0) < 0) return -ESRCH;
-        if (e->result < 0) return (long)e->result;
-        if (e->rlen < iov.iov_len) iov.iov_len = e->rlen;   /* clamped, as above */
+        u32 size, unit = pt_regset_geom((u32)addr, &size);
+        if (!unit || iov.iov_len % unit) return -EINVAL;
+        u32 n = iov.iov_len < size ? (u32)iov.iov_len : size;
+        if (req == G_PTRACE_GETREGSET) {
+            if (pt_cmd(e, pid, PT_CMD_GETREGS, (u32)addr, 0) < 0) return -ESRCH;
+            if (e->result < 0) return (long)e->result;
+            if (n && copy_to_guest(c, iov.iov_base, e->data, n) < 0) return -EFAULT;
+        } else if (n) {
+            if (copy_from_guest(c, e->data, iov.iov_base, n) < 0) return -EFAULT;
+            e->rlen = n;
+            if (pt_cmd(e, pid, PT_CMD_SETREGS, (u32)addr, 0) < 0) return -ESRCH;
+            if (e->result < 0) return (long)e->result;
+        }
+        iov.iov_len = n;
         return copy_to_guest(c, data, &iov, sizeof iov) < 0 ? -EFAULT : 0;
     }
     case G_PTRACE_CONT:

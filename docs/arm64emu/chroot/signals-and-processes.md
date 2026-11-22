@@ -1976,9 +1976,23 @@ its tracer on two channels at once:
 
 Registers marshal 1:1 between the flat `CPU` struct and arm64
 `user_pt_regs`/`user_fpsimd_state` (`GETREGSET`/`SETREGSET` with `NT_PRSTATUS`,
-`NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`); as in the kernel, both write
-the *clamped* `iov_len` back — `min(the caller's length, the regset size)` — so
-a short buffer is never reported as a full transfer. `pstate` is the kernel's
+`NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`). The length is judged as
+`ptrace_regset` judges it, by the regset's geometry (`pt_regset_geom`), before
+anything is copied: one that is not a whole number of the regset's units — 8
+bytes for `NT_PRSTATUS` and `NT_ARM_TLS`, 4 for `NT_PRFPREG` and
+`NT_ARM_SYSTEM_CALL` — is `EINVAL`, for a write as for a read; any other is cut
+to the regset, only that much is copied (a buffer that ends with the regset may
+claim any length), and the cut length is what `iov_len` says afterwards, so a
+short buffer is never reported as a full transfer. A short `SETREGSET` writes
+what it carries over the regset as it stands — `gpr_set`'s `newregs`,
+`__fpr_set`'s `newstate` — so 8 bytes of `NT_PRSTATUS` set x0 alone; one of
+nothing does nothing. `NT_ARM_TLS` is two words, `TPIDR_EL0` and a
+`TPIDR2_EL0` that reads 0 and takes no write, this CPU having no SME. The
+regset is the address cut to 32 bits, `ptrace_regset`'s `unsigned int`
+(`tests/arm64emu/chroot/ptrace/regset_len.c`, checked against a 6.8 kernel).
+arm64 has no user area: `PEEKUSR` and `POKEUSR` are `EIO` at any offset, as
+`arch_ptrace` leaves them to `ptrace_request`'s default
+(`tests/arm64emu/chroot/ptrace/peekusr.c`). `pstate` is the kernel's
 `regs->pstate` (`el0_pstate`, `signal.c`): EL0t, AArch64, DAIF clear, and the
 CPU's NZCV — not the CPU's own mode, which in user mode is the reset state's
 SPSel 1 and DAIF masked, and which a tracer used to be shown. A `SETREGSET`'s
@@ -2432,7 +2446,7 @@ individually; `strace -p` attaches "with N threads", `gdb -p` lists them in
 privileged tracer — `EPERM` otherwise; any other bit is `EINVAL`, and `EIO` on a
 `SEIZE`, as the kernel answers: `tests/arm64emu/chroot/ptrace/options.c`),
 `CONT`/`SYSCALL`/`SINGLESTEP`/`DETACH`/`KILL`,
-`GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`/`PEEKUSR`, `POKETEXT`/`POKEDATA`
+`GETREGSET`/`SETREGSET`, `PEEKTEXT`/`PEEKDATA`, `POKETEXT`/`POKEDATA`
 (writable *and* read-only code pages — software breakpoints),
 `GETSIGINFO`/`SETSIGINFO` (each stop's own, above), `GETEVENTMSG`, `LISTEN`, and the syscall /
 signal / group / synchronous-fault / execve / fork-clone-thread / attach /
