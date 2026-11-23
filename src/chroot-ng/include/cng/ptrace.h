@@ -192,9 +192,14 @@ void cng_pt_call_set(int owed, long nr);
  * change it). */
 u64 cng_pt_orig_x0(u64 x0);
 
-/* Post-execve stop (PTRACE_EVENT_EXEC, or a plain SIGTRAP without the option).
- * Called by the emulated execve once the new image is in place. */
-void cng_pt_report_exec(struct cng_uregs *r);
+/* The post-execve stops, called by the emulated execve once the new image is
+ * in place: PTRACE_EVENT_EXEC (or, without the option and without SEIZE, the
+ * legacy SIGTRAP after the exit) and the call's exit stop. `nr` and `owed` are
+ * the exec'ing thread's call and whether its exit stop is owed, from
+ * cng_pt_exec_call on that thread, for a leader carrying a sibling's exec;
+ * nr < 0 is the calling thread's own. */
+void cng_pt_report_exec(struct cng_uregs *r, s32 nr, int owed);
+void cng_pt_exec_call(s32 *nr, int *owed);
 
 /* Was the last resume a PTRACE_SINGLESTEP? And the step stop that follows a
  * syscall, which completes without a breakpoint (both no-ops when untraced or
@@ -247,6 +252,11 @@ void cng_pt_cut_exit(struct cng_uregs *r, struct cng_gframe *gf);
  * delivered resuming the guest from `r` and never coming back here. 1 when a
  * call cut short was left to be made again and nothing took the signal. */
 int cng_pt_dispatch_end(struct cng_uregs *r, struct cng_gframe *gf);
+/* The restart a signal stop is about to show, for a call the SIGSYS handler
+ * cut short and left at its svc `svc` with orig_x0: settled by the signal's
+ * delivery (cng_pt_restart_settle), as do_signal decides it. */
+void cng_pt_restart_arm(u64 svc, long code);
+
 /* After a signal's stop: a restart the stop showed, made or turned into
  * EINTR by do_signal's rule — `handler` says one runs, with `flags`. */
 void cng_pt_restart_settle(struct cng_ucontext *uc, int handler,
@@ -264,10 +274,16 @@ void cng_pt_deliver(const unsigned long *set);
 void cng_pt_unhold(const unsigned long *set);
 
 /* Signal-delivery / fault stop: report `sig` to the tracer and return the signal
- * to actually deliver (0 = suppressed, or a substitute the tracer chose).
- * `si_code`/`addr` carry the precise siginfo of a fault stop (0/0 otherwise).
- * Returns `sig` unchanged when the task is not traced. */
-int cng_pt_report_signal(struct cng_uregs *r, int sig, int si_code, u64 addr);
+ * to actually deliver (0 = suppressed, or a substitute the tracer chose). `si`
+ * is the signal's siginfo, which GETSIGINFO hands over whole. Returns `sig`
+ * unchanged when the task is not traced. */
+int cng_pt_report_signal(struct cng_uregs *r, int sig, const cng_siginfo_t *si);
+/* Is `sig`, arriving now, one a tracer already let through at a stop of ours
+ * (a stop signal sent to the tracee, cng_pt_signal_route) and queued after
+ * it? Then it is delivered by its disposition with no stop of its own. */
+int cng_pt_nostop(int sig);
+/* Is the guest's disposition for `sig` the default (ptsig.c's mirror)? */
+int cng_pt_sig_default(int sig);
 
 /* The kick signal arrived (see CNG_PT_KICK_*): adopt a pending attach, service
  * a pending PTRACE_INTERRUPT or a cooperative group-stop. Called from the
@@ -344,11 +360,14 @@ void cng_pt_sigsys_kick(struct cng_ucontext *uc, int direct);
 int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
                  u64 flags, long *out);
 
-/* A stop signal (SIGSTOP/SIGTSTP/...) or SIGCONT aimed at a task with tracees:
- * routed into cooperative group-stops instead of a real host stop, which would
- * freeze the tracee inside its service loop and deadlock the tracer. Returns 1
- * when the signal was consumed (the caller must not also send it). */
-int cng_pt_signal_route(long pid, int sig);
+/* A stop signal (SIGSTOP/SIGTSTP/...) aimed at a traced task: taken
+ * cooperatively instead of as a real host stop, which would freeze the tracee
+ * inside its service loop and deadlock the tracer -- its delivery stop, then
+ * the group stop if the tracer lets it through. `thread` for tkill/tgkill,
+ * which name the thread. SIGCONT does its job-control part here and is still
+ * sent. Returns 1 when the signal was consumed (the caller must not also send
+ * it). */
+int cng_pt_signal_route(long pid, int sig, int thread);
 
 /* A child was reaped by the host wait: drop any link it still holds. */
 void cng_pt_note_reaped(long pid);

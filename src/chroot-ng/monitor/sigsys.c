@@ -315,7 +315,7 @@ static int bounce_nohand(long nr) {
 }
 
 int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
-                      long *rval, long *nr) {
+                      long *rval, long *nr, unsigned long long *ox) {
     unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
     unsigned long long *r = uc->uc_mcontext.regs;
     unsigned long wait = (unsigned long)cng_bounce_wait,
@@ -345,6 +345,8 @@ int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
     *owed = b.owed;
     if (nr)
         *nr = b.nr;
+    if (ox)
+        *ox = b.orig_x0;
     if (undo) {
         /* ...from orig_x0: the restart do_signal sets up, whatever a tracer
          * changed at the entry stop. */
@@ -409,7 +411,8 @@ static long sigsys_altstack(struct cng_ucontext *uc, const void *uss,
  * signal context), then the dispatcher for everything else. Returns 1 when the
  * result is in x0 and the caller still owes a syscall-exit stop, 0 when the
  * context was redirected instead — an emulated execve enters the new program
- * and reports its own post-exec stop, so there is no exit stop to give. */
+ * and reports its own post-exec stops, its exit stop among them
+ * (cng_pt_report_exec), so there is none left to give here. */
 static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
     unsigned long long *r = uc->uc_mcontext.regs;
     struct cng_uregs *ur = cng_pt_uregs(uc);
@@ -510,6 +513,32 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
             return 0;
         res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
                            (long)r[4], (long)r[5], CNG_DISP_TRAP);
+    }
+    /* A wait polled here, cut short by a signal the guest takes delivery of
+     * (cng_pt_wait4): the kernel's do_wait answers ERESTARTSYS. A tracee's
+     * exit stop shows it, and the signal's delivery, on its stop, decides the
+     * restart as do_signal does (cng_pt_restart_settle): made again from its
+     * svc with orig_x0, or EINTR by a handler without SA_RESTART. Anyone
+     * else's call is decided here, by the signal the kernel will deliver once
+     * this handler returns. It used to be EINTR every time, and a traced
+     * program's wait4 failed where a kernel's is made again. */
+    if (res == -CNG_ESIGCUT) {
+        unsigned long long a0 = cng_pt_orig_x0(r[0]);
+        int traced = cng_pt_active();
+        r[0] = (unsigned long long)(long)-512 /*ERESTARTSYS*/;
+        if (traced)
+            cng_pt_syscall_exit(ur);
+        if ((long)r[0] == -512) {
+            if (traced || cng_sig_restarts(uc, -512)) {
+                r[0] = a0;
+                uc->uc_mcontext.pc -= 4;
+                if (traced)
+                    cng_pt_restart_arm(uc->uc_mcontext.pc, -512);
+            } else {
+                r[0] = (unsigned long long)(long)-EINTR;
+            }
+        }
+        return 0;
     }
     /* A wait made here that a ptrace kick is waiting to interrupt: undone, so
      * that the kick lands at the guest's svc, which is where the kernel shows
@@ -625,7 +654,7 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
         return;
     }
     if (!sigsys_syscall(uc, nr))
-        return; /* redirected into a new program, which reported its own stop */
+        return; /* redirected into a new program, which reported its stops */
     cng_pt_syscall_exit(ur);
     /* A single-step over a syscall stops once the syscall is done and before
      * the next instruction — where TIF_SINGLESTEP reports it — so it needs no
@@ -1368,7 +1397,9 @@ void cng_scratch_leave(void) {
  *
  * The -R trampoline tier has no signal frame; there the live mask is already the
  * guest's, so it is read straight from the kernel (`uc` is then NULL). A caller
- * that already holds the frame passes it; cng_sig_deliverable() below finds it. */
+ * that already holds the frame passes it; cng_sig_deliverable() below finds it.
+ * The answer is the signal, the lowest such, which get_signal takes first (0:
+ * none). */
 int cng_sig_deliverable_in(const struct cng_ucontext *uc) {
     unsigned long pend = 0;
     if (CNG_SYS(__NR_rt_sigpending, &pend, sizeof pend, 0, 0, 0, 0) < 0 || !pend)
@@ -1401,16 +1432,33 @@ int cng_sig_deliverable_in(const struct cng_ucontext *uc) {
         memset(&sa, 0, sizeof sa);
         if (CNG_SYS(__NR_rt_sigaction, sig, 0, &sa, sizeof(cng_sigset_t), 0,
                     0) < 0)
-            return 1; /* cannot ask: assume it interrupts, as the kernel would */
+            return sig; /* cannot ask: assume it interrupts, as the kernel would */
         if (sa.handler == (void *)1) /* SIG_IGN */
             continue;
         if (!sa.handler && /* SIG_DFL */
             (sig == 17 /*CHLD*/ || sig == 18 /*CONT*/ || sig == 23 /*URG*/ ||
              sig == 28 /*WINCH*/))
             continue;
-        return 1;
+        return sig;
     }
     return 0;
+}
+
+/* Is a call the handler cut short, with the kernel's restart code `code`, made
+ * again? do_signal's rule, for the signal get_signal will take: a handler makes
+ * an ERESTARTNOINTR call again, and an ERESTARTSYS one when it has SA_RESTART;
+ * every other code it turns into EINTR. A default action (a stop, after which
+ * the call goes on) and nothing to take at all make the call again. */
+int cng_sig_restarts(const struct cng_ucontext *uc, long code) {
+    int sig = cng_sig_deliverable_in(uc);
+    if (!sig)
+        return 1;
+    struct cng_ksigaction sa;
+    memset(&sa, 0, sizeof sa);
+    if (CNG_SYS(__NR_rt_sigaction, sig, 0, &sa, sizeof(cng_sigset_t), 0, 0) < 0 ||
+        !sa.handler || sa.handler == (void *)1)
+        return 1;
+    return code == -513 || (code == -512 && (sa.flags & CNG_SA_RESTART));
 }
 
 /* Is a ptrace kick waiting for a wait made inside the handler to end — queued,

@@ -82,6 +82,10 @@ static long sys_rt_sigaction(int s, const struct pt_ksigaction *a,
     return CNG_SYS(__NR_rt_sigaction, s, a, o, sizeof(cng_sigset_t), 0, 0);
 }
 
+int cng_pt_sig_default(int sig) {
+    return sig < 1 || sig > PT_NSIG || !g_disp_set[sig] || !g_disp[sig].handler;
+}
+
 /* ---- delivering a signal to the guest's own disposition ---- */
 
 /* Die the way the default action would, after telling the tracer: its
@@ -187,7 +191,7 @@ void cng_pt_deliver_sigsys(cng_siginfo_t *si, void *ucv) {
     int dsig = CNG_SIGSYS;
     cng_siginfo_t dsi;
     int run = pt_report(CNG_SIGSYS, si, uc,
-                        cng_pt_report_signal(r, CNG_SIGSYS, si->si_code, 0),
+                        cng_pt_report_signal(r, CNG_SIGSYS, si),
                         &dsig, &dsi);
     cng_sig_in_handler(-1);
     if (cng_sig_take_deferred())
@@ -196,17 +200,6 @@ void cng_pt_deliver_sigsys(cng_siginfo_t *si, void *ucv) {
         pt_deliver_to_guest(dsig, run == 2 ? &dsi : si, uc);
     else
         cng_pt_restart_settle(uc, 0, 0);
-}
-
-/* si_addr of a fault siginfo (offset 16 on arm64: after signo/errno/code and
- * the pointer-alignment pad — the same place _pad starts). */
-static u64 pt_si_addr(const cng_siginfo_t *si) {
-    return (u64)si->_u._pad[0];
-}
-
-static int sig_is_fault(int s) {
-    return s == 4 /*ILL*/ || s == SIG_TRAP_ || s == 7 /*BUS*/ ||
-           s == 8 /*FPE*/ || s == 11 /*SEGV*/;
 }
 
 /* ---- our handler for a traced task's signals ---- */
@@ -237,10 +230,11 @@ static int pt_trace_report(int sig, cng_siginfo_t *si, struct cng_ucontext *uc,
             CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
         return 0;
     }
-    int code = si->si_code;
-    u64 addr = sig_is_fault(sig) ? pt_si_addr(si) : 0;
-    return pt_report(sig, si, uc, cng_pt_report_signal(r, sig, code, addr),
-                     dsig, dsi);
+    /* Let through already, at the stop it was queued after (pt_send_stop):
+     * the guest's disposition runs, and nothing is reported again. */
+    if (cng_pt_nostop(sig))
+        return 1;
+    return pt_report(sig, si, uc, cng_pt_report_signal(r, sig, si), dsig, dsi);
 }
 
 /* What ptrace_signal does with the signal a stop returns, `deliver`: 0, the

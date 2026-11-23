@@ -399,7 +399,7 @@ int cng_tramp_unwind(struct cng_uregs *u) {
          * been spent but sp. */
         if (o == clone || o < 8) {
             if (o != clone && o >= 4)
-                u->sp += 288;
+                u->sp += CNG_TRAMP_FRAME;
             u->pc = site4 - 4;
             return 1;
         }
@@ -414,7 +414,7 @@ int cng_tramp_unwind(struct cng_uregs *u) {
             *u = f;
             return 1;
         }
-        u->sp += 288;
+        u->sp += CNG_TRAMP_FRAME;
         u->x[16] = f.x[16];
         u->x[17] = f.x[17];
         if (o >= 20) /* the clone test has spent the flags */

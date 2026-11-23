@@ -28,6 +28,7 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -71,6 +72,7 @@ struct uregs {
 #define R_SETPC(r, v)  ((r).pc = (unsigned long long)(v))
 #define R_ARG1(r)      ((r).x[1])
 #define NR_GETPID      172
+#define NR_EXECVE      221
 #define NR_OPENAT      56
 #define BP_STEP_BACK   0 /* BRK leaves PC on the breakpoint itself */
 typedef unsigned int bp_word;
@@ -88,6 +90,7 @@ struct uregs {
 #define R_SETPC(r, v)  ((r).rip = (unsigned long long)(v))
 #define R_ARG1(r)      ((r).rsi)
 #define NR_GETPID      39
+#define NR_EXECVE      59
 #define NR_OPENAT      257
 #define BP_STEP_BACK   1 /* INT3 leaves RIP one past the trap byte */
 typedef unsigned char bp_word;
@@ -2443,6 +2446,277 @@ static int sc_restart(void) {
 }
 #endif
 
+/* The stops around an execve followed with PTRACE_SYSCALL, counted the way
+ * strace counts them, entry and exit in turn: its entry, PTRACE_EVENT_EXEC
+ * with the option, then its exit stop with 0 -- or, without the option, the
+ * exit stop and then the legacy SIGTRAP. The exit stop used to be left out,
+ * and every stop after an exec was taken for the other kind. */
+static int sc_execsys(const char *self, int opt) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        execl(self, self, "hello", (char *)0);
+        _exit(88);
+    }
+    expect_first_stop(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0,
+           (void *)(long)(O_TRACESYSGOOD | (opt ? O_TRACEEXEC : 0)));
+    int st, in = 0, seen = 0;
+    for (;;) {
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        wait_for(pid, &st);
+        if (!WIFSTOPPED(st)) {
+            show(st);
+            return 0;
+        }
+        if (WSTOPSIG(st) != (SIGTRAP | 0x80)) {
+            show(st); /* event 4, or the legacy stop 5 */
+            continue;
+        }
+        struct uregs r;
+        getregs(pid, &r);
+        in = !in;
+        if (in && !seen && R_SYSNO(r) == NR_EXECVE) {
+            printf("execve entry\n");
+            seen = 1;
+        } else if (!in && seen == 1) {
+            /* The stop's own number tells an exit stop of the execve from
+             * the next call's entry, whose x0 may well be 0 too (brk). */
+#if defined(__aarch64__)
+            long nr = scnum(pid);
+#else
+            long nr = R_SYSNO(r);
+#endif
+            printf("execve exit %ld%s\n", R_RET(r),
+                   nr == NR_EXECVE ? "" : " at another call's stop");
+            seen = 2;
+        }
+    }
+}
+
+/* A child the tracer follows from a fork: each call it makes has an entry
+ * and an exit stop, its first included. That first exit stop used to be
+ * skipped -- a skip meant for the clone the child came out of, which it had
+ * no stop for to begin with -- and strace -f took every stop of the child
+ * after it for the other kind. The child is a raw clone, so its first calls
+ * are the ones below, whatever the libc. */
+static int sc_forksys(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        long c = syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+        if (c == 0) {
+            syscall(SYS_getpid);
+            syscall(SYS_getpid);
+            syscall(SYS_exit, 3);
+        }
+        int s2 = 0;
+        waitpid((pid_t)c, &s2, 0);
+        _exit(WIFEXITED(s2) ? WEXITSTATUS(s2) : 99);
+    }
+    expect_first_stop(pid);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)(long)(O_TRACESYSGOOD | O_TRACEFORK));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st, pst = 0, in = 0, pdone = 0, kdone = 0;
+    while (!pdone || !kdone) {
+        pid_t w = waitpid(-1, &st, __WALL);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            printf("wait failed %d\n", errno);
+            return 1;
+        }
+        if (w == pid) {
+            if (!WIFSTOPPED(st)) {
+                pst = st;
+                pdone = 1;
+                continue;
+            }
+            int sig = (st >> 16) || WSTOPSIG(st) == SIGTRAP ? 0 : WSTOPSIG(st);
+            ptrace(PTRACE_CONT, pid, 0, (void *)(long)sig);
+            continue;
+        }
+        if (!WIFSTOPPED(st)) {
+            show(st);
+            kdone = 1;
+            continue;
+        }
+        if (WSTOPSIG(st) == (SIGTRAP | 0x80)) {
+            struct uregs r;
+            getregs(w, &r);
+            in = !in;
+            if (in)
+                printf("entry %s\n", R_SYSNO(r) == NR_GETPID ? "getpid" : "other");
+            else
+                printf("exit %s\n", R_RET(r) == w ? "self" : "other");
+        } else {
+            show(st); /* the first stop of an auto-attached child */
+        }
+        ptrace(PTRACE_SYSCALL, w, 0, 0);
+    }
+    show(pst);
+    return 0;
+}
+
+/* A traced program's wait4 cut short by a signal: made again under an
+ * SA_RESTART handler, EINTR without one, as do_wait's ERESTARTSYS has it.
+ * The wait the emulation polls for a traced program answered EINTR both
+ * times. The exit code says which came out right (1 and 2). */
+static volatile sig_atomic_t g_wr_hits;
+
+static void wr_alarm(int sig) {
+    (void)sig;
+    g_wr_hits++;
+}
+
+static int sc_waitrestart(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_start();
+        int code = 0;
+        for (int k = 0; k < 2; k++) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_handler = wr_alarm;
+            sa.sa_flags = k ? 0 : SA_RESTART;
+            sigaction(SIGALRM, &sa, 0);
+            pid_t c = fork();
+            if (c == 0) {
+                usleep(300000);
+                _exit(7);
+            }
+            struct itimerval it = {{0, 0}, {0, 50000}};
+            setitimer(ITIMER_REAL, &it, 0);
+            int s2 = 0;
+            pid_t r = waitpid(c, &s2, 0);
+            if (k == 0 && r == c && WIFEXITED(s2) && WEXITSTATUS(s2) == 7)
+                code |= 1;
+            if (k == 1 && r < 0 && errno == EINTR) {
+                code |= 2;
+                waitpid(c, &s2, 0);
+            }
+        }
+        _exit(code);
+    }
+    expect_first_stop(pid);
+    int st, sig = 0;
+    for (;;) {
+        ptrace(PTRACE_CONT, pid, 0, (void *)(long)sig);
+        wait_for(pid, &st);
+        if (!WIFSTOPPED(st)) {
+            show(st);
+            return 0;
+        }
+        sig = WSTOPSIG(st);
+        if (sig == SIGALRM)
+            show(st);
+    }
+}
+
+/* Job control of a traced child, seen by its parent while a third process
+ * traces both: the child stopped by the parent's SIGSTOP for the parent's
+ * waitpid(WUNTRACED), continued by its SIGCONT for waitpid(WCONTINUED). The
+ * tracer sees the SIGSTOP's own signal-delivery stop, the group stop after it
+ * let the signal through, and SIGCONT's delivery stop, after which the
+ * child's SIGCONT handler runs and says so. The group stop used to come
+ * without the delivery stop, the parent's wait waited forever (nothing told
+ * it of a stop its child never made in the kernel), and SIGCONT was never
+ * delivered at all. The parent's exit code says which came out right (1, 2,
+ * 4 and 8). */
+static int g_jc_fd = -1;
+
+static void jc_cont(int sig) {
+    (void)sig;
+    syscall(SYS_write, g_jc_fd, "c", 1);
+}
+
+/* A build that gets this wrong leaves the parent waiting forever and the
+ * child stopped, both holding the harness's pipe after the tracer is timed
+ * out; so the tracer gives up first, and takes its whole group with it. */
+static void jc_timeout(int sig) {
+    (void)sig;
+    printf("timed out\n");
+    kill(0, SIGKILL);
+}
+
+static int sc_jobctl(void) {
+    setpgid(0, 0);
+    signal(SIGALRM, jc_timeout);
+    alarm(30);
+    pid_t p = fork();
+    if (p == 0) {
+        child_start();
+        int pp[2];
+        if (pipe(pp) != 0)
+            _exit(98);
+        pid_t c = fork();
+        if (c == 0) {
+            g_jc_fd = pp[1];
+            signal(SIGCONT, jc_cont);
+            syscall(SYS_write, pp[1], "x", 1);
+            for (;;)
+                pause();
+        }
+        char b = 0;
+        while (read(pp[0], &b, 1) < 0 && errno == EINTR)
+            ;
+        int code = 0, s2 = 0;
+        kill(c, SIGSTOP);
+        if (waitpid(c, &s2, WUNTRACED) == c && WIFSTOPPED(s2) &&
+            WSTOPSIG(s2) == SIGSTOP)
+            code |= 1;
+        kill(c, SIGCONT);
+        if (waitpid(c, &s2, WCONTINUED) == c && WIFCONTINUED(s2))
+            code |= 2;
+        while (read(pp[0], &b, 1) < 0 && errno == EINTR)
+            ;
+        if (b == 'c')
+            code |= 8;
+        kill(c, SIGKILL);
+        if (waitpid(c, &s2, 0) == c && WIFSIGNALED(s2) && WTERMSIG(s2) == SIGKILL)
+            code |= 4;
+        _exit(code);
+    }
+    expect_first_stop(p);
+    ptrace(PTRACE_SETOPTIONS, p, 0, (void *)(long)O_TRACEFORK);
+    ptrace(PTRACE_CONT, p, 0, 0);
+    int st, pst = 0, n = 0, pdone = 0, cdone = 0;
+    while (!pdone || !cdone) {
+        pid_t w = waitpid(-1, &st, __WALL);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            printf("wait failed %d\n", errno);
+            return 1;
+        }
+        if (w == p) {
+            if (!WIFSTOPPED(st)) {
+                pst = st;
+                pdone = 1;
+                continue;
+            }
+            int sig = (st >> 16) || WSTOPSIG(st) == SIGTRAP ? 0 : WSTOPSIG(st);
+            ptrace(PTRACE_CONT, p, 0, (void *)(long)sig);
+            continue;
+        }
+        if (!WIFSTOPPED(st)) {
+            show(st); /* killed 9 */
+            cdone = 1;
+            continue;
+        }
+        /* 1 the child's first stop, 2 the SIGSTOP's delivery stop (let
+         * through), 3 the group stop, 4 SIGCONT's delivery stop (let
+         * through). */
+        n++;
+        show(st);
+        int inj = n == 2 ? SIGSTOP : n == 4 ? SIGCONT : 0;
+        ptrace(PTRACE_CONT, w, 0, (void *)(long)inj);
+    }
+    alarm(0);
+    show(pst);
+    return 0;
+}
+
 static int sc_threadafter(void) {
     return after_run(after_thread, "a thread made after the attach");
 }
@@ -2616,6 +2890,16 @@ int main(int argc, char **argv) {
     if (!strcmp(s, "restart"))
         return sc_restart();
 #endif
+    if (!strcmp(s, "execsys"))
+        return sc_execsys(argc > 2 ? argv[2] : argv[0], 1);
+    if (!strcmp(s, "execsys0"))
+        return sc_execsys(argc > 2 ? argv[2] : argv[0], 0);
+    if (!strcmp(s, "forksys"))
+        return sc_forksys();
+    if (!strcmp(s, "waitrestart"))
+        return sc_waitrestart();
+    if (!strcmp(s, "jobctl"))
+        return sc_jobctl();
     if (!strcmp(s, "threadafter"))
         return sc_threadafter();
     if (!strcmp(s, "forkafter"))

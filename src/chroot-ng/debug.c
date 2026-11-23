@@ -9288,7 +9288,7 @@ static int pt_sim_child(int wfd) {
     /* Stop cooperatively so the tracer can arm us, the way a tracee's own
      * SIGSTOP is routed. The kick lands as soon as the queueing syscall
      * returns, and its handler parks us. */
-    cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/);
+    cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/, 0);
 
     /* Now the synthesized trap. */
     static struct cng_ucontext uc;
@@ -9630,7 +9630,7 @@ static int pt_sim_nwait(void) {
             CNG_SYS(__NR_nanosleep, &ts, 0, 0, 0, 0, 0);
         if (cng_pt_syscall(CNG_PTRACE_TRACEME, 0, 0, 0) != 0)
             sys_exit_group(91);
-        cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/);
+        cng_pt_signal_route(sys_getpid(), 19 /*SIGSTOP*/, 0);
         sys_exit_group(4);
     }
     sys_close(p[0]);

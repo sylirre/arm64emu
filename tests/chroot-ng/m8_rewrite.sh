@@ -333,6 +333,20 @@ if guest_xlate_ready "small-stack syscall leg" &&
 fi
 rm -rf "$SSR"
 
+# ...and the 64 bytes just below sp are the guest's across a rewritten
+# syscall, as across a kernel's: the trampoline's frame starts below them
+# (CNG_TRAMP_GAP). Go keeps a new thread's m, g and function there through its
+# first syscall, and with the frame right under sp every Go program died at
+# its first thread under -R. The guest fills them, makes a gettid, and counts
+# the words that changed: six did.
+BSP=$(mktemp -d)
+if guest_cc_report "$BSP/belowsp" tests/chroot-ng/guests/belowsp.c; then
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$BSP" /belowsp 2>/dev/null)
+    check "the 64 bytes below sp survive a rewritten syscall" "clobbered=0" "$out"
+fi
+rm -rf "$BSP"
+
 # A thread that frees its own stack on the way out. musl's __unmapself and
 # bionic's _exit_with_stack_teardown are an munmap of the stack under the caller
 # and an exit, with nothing between that touches the stack — which is how every

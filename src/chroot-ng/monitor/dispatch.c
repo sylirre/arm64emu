@@ -3596,7 +3596,7 @@ static long sig_target(long pid) {
 /* One process of a group or broadcast kill: as kill(pid, sig) would, a
  * tracee's stop signal included. */
 static long kill_one(int pid, int sig) {
-    if (cng_pt_signal_route(pid, sig))
+    if (cng_pt_signal_route(pid, sig, 0))
         return 0;
     return reissue(pid, sig, 0, 0, 0, 0, __NR_kill);
 }
@@ -6516,19 +6516,28 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
     case __NR_wait4:
     case __NR_waitid: {
         long w;
-        if ((trapped == CNG_DISP_TRAMP || trapped == CNG_DISP_BOUNCED) &&
-            cng_pt_wait_native(nr, a0, a1, a2, a3, a4, &w))
+        int guest = trapped == CNG_DISP_TRAMP || trapped == CNG_DISP_BOUNCED;
+        if (guest && cng_pt_wait_native(nr, a0, a1, a2, a3, a4, &w))
             return w;
-        if (nr == __NR_wait4)
-            return cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc());
-        return cng_pt_waitid(a0, a1, (u64)a2, a3, (u64)a4, cng_pt_cur_uc());
+        w = nr == __NR_wait4
+                ? cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc())
+                : cng_pt_waitid(a0, a1, (u64)a2, a3, (u64)a4, cng_pt_cur_uc());
+        /* Cut short by a signal: the SIGSYS handler makes the kernel's
+         * restart of it (sigsys_syscall). From guest context a signal is
+         * taken where it lands, before the poll can see it pending, so this
+         * is rare there, and answered EINTR as it was. */
+        if (w == -CNG_ESIGCUT && guest)
+            w = -EINTR;
+        return w;
     }
 
-    /* A stop signal aimed at a tracee becomes a cooperative group-stop: a real
-     * SIGSTOP would freeze it inside its ptrace service loop, and every later
-     * tracer request would deadlock (strace sends exactly that on ^C). SIGCONT
-     * ends a PTRACE_LISTEN group-stop the same way. Everything else, and every
-     * target that is not a tracee, is sent for real.
+    /* A stop signal aimed at a tracee is taken cooperatively, its delivery
+     * stop and then the group stop: a real SIGSTOP would freeze it inside its
+     * ptrace service loop, and every later tracer request would deadlock
+     * (strace sends exactly that on ^C). SIGCONT ends a PTRACE_LISTEN
+     * group-stop and continues a stopped group for its parent, and is sent
+     * too. Everything else, and every target that is not a tracee, is sent
+     * for real.
      *
      * The family is also trapped for every guest while there is a view (with
      * a registry: sig_view), because a signal names a process by pid and /proc
@@ -6542,18 +6551,18 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * a pid of zero or below — and pidfd_send_signal needs a pidfd, which
      * pidfd_open hands out only for a process the view shows. */
     case __NR_kill:
-        if (cng_pt_signal_route(a0, (int)a1))
+        if (cng_pt_signal_route(a0, (int)a1, 0))
             return 0;
         /* INT_MIN negates to no group; the kernel answers it with ESRCH. */
         if (sig_view() && (int)a0 <= 0 && (int)a0 != -0x7fffffff - 1)
             return kill_some((int)a0, (int)a1);
         return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
     case __NR_tkill:
-        if (cng_pt_signal_route(a0, (int)a1))
+        if (cng_pt_signal_route(a0, (int)a1, 1))
             return 0;
         return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
     case __NR_tgkill:
-        if (cng_pt_signal_route(a1, (int)a2))
+        if (cng_pt_signal_route(a1, (int)a2, 1))
             return 0;
         return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
     case __NR_rt_sigqueueinfo:

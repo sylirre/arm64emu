@@ -276,7 +276,11 @@ its identity in `/proc/self/maps`; only `MAP_PRIVATE` can be served this way,
 since a copy cannot carry `MAP_SHARED`'s visibility.
 
 **Rewriting needs no seccomp** (a rewritten site is a plain `b` to a trampoline
-that calls the dispatcher directly). So the rewriting tier is not only the speed
+that calls the dispatcher directly). The trampoline saves the guest's registers
+in a frame on the guest's stack, `CNG_TRAMP_GAP` bytes below its `sp` rather
+than right under it: a kernel's `svc` touches no memory of the caller's, and Go
+keeps a new thread's m, g and function just below its `sp` through the thread's
+first syscall. So the rewriting tier is not only the speed
 path — it is also a *seccomp-free interception mechanism*, extending translation
 to kernels below the 3.5 seccomp-BPF floor (e.g. 3.4) and to environments where
 seccomp is unavailable. Its limit is coverage: it only catches statically
@@ -389,6 +393,31 @@ signal at a time, and runs the guest's handler under the mask the kernel would
 give it. The signal a tracer resumes a stop with is delivered by its own
 disposition with no stop of its own, and a stop signal's default action is a
 group stop. See `src/chroot-ng/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
+
+A signal stop publishes the signal's whole siginfo, which `PTRACE_GETSIGINFO`
+hands over: the sender, a `SIGCHLD`'s status. An emulated execve gives the
+stops a kernel's gives, in its order: the entry stop, `PTRACE_EVENT_EXEC`, and
+the exit stop with 0 — or, without the option, the exit stop and then the
+legacy `SIGTRAP` (none for a `SEIZE`'d tracee). strace pairs entry and exit
+stops by counting them, so one left out puts a whole trace out by a stop.
+
+A stop signal sent to a tracee cannot be a real one, which would freeze the
+tracee in its service loop and its tracer with it. It is taken cooperatively,
+as the kernel takes one: by one thread, with its signal-delivery stop and the
+sender's siginfo first, and then what the tracer resumed it with — nothing, the
+group stop for a stop signal at its default (each traced thread of the group
+takes one), or delivery by the signal's own disposition. The real parent of a
+traced child, when it is not the tracer, is told of the group stop and of the
+`SIGCONT` that ends it, as `do_notify_parent_cldstop` tells one: `SIGCHLD`,
+and a report in the child's link that the parent's wait collects for
+`WUNTRACED` or `WCONTINUED`, since the kernel's own wait never sees a stop the
+child did not make in the kernel. That reaches a parent whose waits come to
+chroot-ng — a tracer's, a tracee's, any `-R` one; an untraced parent's wait in
+the `SIGSYS` tier goes to the kernel and does not see it. `SIGCONT` itself is
+sent as well, to be stopped for and delivered like any other signal. A wait the
+`SIGSYS` handler polls for a tracer or a tracee is cut short by a signal the
+guest takes delivery of the way `do_wait` is, with `ERESTARTSYS`: made again
+under an `SA_RESTART` handler, `EINTR` without one.
 
 `NT_ARM_SYSTEM_CALL` is the kernel's `regs->syscallno`: the number of the call
 in progress — x8's low 32 bits, as the tracer left it at the entry stop — at

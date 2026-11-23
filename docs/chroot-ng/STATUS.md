@@ -4988,6 +4988,86 @@ kernel 3.18 (Galaxy S7).
     carries translation) and 1801 natively on the arm64 VM, none failing.
     No device run yet.
 
+- [x] **M111 — strace, gdb, job control and Go, as real workloads use them**
+  Found running real workloads on the Zenfone 10 (Android 15, 5.15) and
+  the Pixel 5 (Android 14, 4.19): a Go build, node and npm, git, gcc, Java,
+  and strace and gdb of a probe of interrupted calls. Everything ran right
+  except the tracers and Go under `-R`, all of it reproduced on the M108
+  build too, with the native kernels as the oracle.
+  - strace was one stop out from the first `execve` on, so every trace was
+    garbled (`write(3, "hi\n", 3) = 0` for `write(1, ...) = 3`). An
+    emulated execve reported its entry stop and its exec event but not its
+    exit stop, and strace pairs entry and exit stops by counting them. The
+    exit stop now follows, with 0, in the kernel's order:
+    `PTRACE_EVENT_EXEC`, then the exit stop to a tracer that resumed from it
+    with `PTRACE_SYSCALL`; without the option, the exit stop and then the
+    legacy `SIGTRAP`, which a `PTRACE_SEIZE`'d tracee no longer gets at
+    all. A leader carrying a sibling's exec gives it with that sibling's
+    call.
+  - strace -f was one stop out in every child from its first call on. The
+    skip meant for the exit stop of the clone a fork child came out of
+    outlived that call in the `SIGSYS` tier, which owes the clone nothing
+    to begin with, and took the exit stop of the child's first call. It
+    now goes when that call is over.
+  - A traced program's `wait4` and `waitid` answered `EINTR` to every
+    signal, where the kernel's `do_wait` answers `ERESTARTSYS`: made again
+    under an `SA_RESTART` handler. The wait the `SIGSYS` handler polls for
+    them returns `CNG_ESIGCUT` now. A tracee shows the code at its exit
+    stop and the signal's delivery decides the restart, as do_signal does;
+    anyone else's is decided by the signal the kernel will deliver.
+  - Stop signals under tracing:
+    - A stop signal sent to a tracee became its group stop at once: no
+      signal-delivery stop for the tracer to see or suppress it at, and a
+      `SIGTSTP` the guest had a handler for stopped it all the same. It is
+      now taken as the kernel takes one, by one thread (the one named, for
+      `tkill`/`tgkill`), with its delivery stop and the sender's siginfo
+      first; what the tracer resumes with decides: nothing, the group stop
+      (for a stop signal at its default), or delivery by its disposition.
+    - The real parent of a traced child never heard of its stop (the child
+      never stopped in the kernel), and a `waitpid(WUNTRACED)` waited
+      forever. When the tracer is not the parent, the parent now gets
+      `SIGCHLD` and its wait collects the stop, and after `SIGCONT` the
+      continue for `WCONTINUED` (`pt_jc_stop`, `pt_collect_jc`) — a parent
+      whose waits reach chroot-ng: a tracer's, a tracee's, any `-R` one. An
+      untraced parent's wait in the `SIGSYS` tier goes to the kernel, which
+      never sees an emulated stop; that is left as it is. The `SIGCHLD` is
+      `SI_USER`, as a tracer's has been, and comes whether or not the
+      parent asked for `SA_NOCLDSTOP`, which chroot-ng cannot read.
+    - `SIGCONT` to a traced group was consumed: the guest's handler never
+      ran. It is sent as well now, stopped for and delivered by its
+      disposition.
+    - A `SEIZE`'d tracee's stop signal reported its delivery stop as a
+      `PTRACE_EVENT_STOP`, and then the group stop as a second one. The
+      delivery stop is a plain one for every tracer now.
+    - A call a kick cut short in a bounce came back `EINTR` (a sleep cut by
+      a stop, for one), and one cut in flight showed `ERESTARTSYS` whatever
+      the call. Both use the call's restart code now, `-516` for a relative
+      sleep, and the call is made again from the bounce record's
+      `orig_x0` — the one record of it for a thread attached in the call.
+  - `PTRACE_GETSIGINFO` gave signo, errno and code alone, so strace showed
+    every sender as pid 0 and every `SIGCHLD` with no status. A signal
+    stop publishes its whole siginfo now.
+  - `-R` crashed every Go program at its first thread (`SIGSEGV` at
+    0x60000000). The trampoline built its frame right under the guest's
+    `sp`, and a thread Go clones keeps its m, g and function 8 to 32 bytes
+    below its new `sp` through its first syscall; the saved flags (`Z` and
+    `C`) went over the function. The frame now starts `CNG_TRAMP_GAP` (64)
+    bytes further down, as the kernel leaves the caller's memory alone.
+  - Not done, as before: `rt_sigreturn`'s stops are not reported, a
+    restart from `ERESTART_RESTARTBLOCK` is the call itself where the
+    kernel makes `restart_syscall`, and a process-group `kill` of a stop
+    signal reaches a tracee for real.
+  - Tests: m18 `execsys`, `execsys0`, `forksys`, `waitrestart` and
+    `jobctl` on both tiers and every host; m8 `belowsp` (six words below
+    `sp` changed on the M110 build). m18 passes whole on the arm64 VM
+    (128), where the M110 build fails nine of the ten new legs —
+    `waitrestart` under `-R`, whose wait the kernel makes, passes there —
+    and left `jobctl`'s parent and child holding the harness's pipe, which
+    the leg now bounds itself against.
+  - The whole suite passes: 1812 natively on the arm64 VM and 1507 on the
+    dev host (qemu-aarch64, -R), none failing. The devices went offline
+    before a re-run.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -20,6 +20,20 @@
 #ifndef CNG_REWRITE_H
 #define CNG_REWRITE_H
 
+/* The trampoline's frame (tramp.S): the struct cng_uregs it saves, 272 bytes
+ * rounded to 16, put CNG_TRAMP_GAP bytes below the guest's sp rather than right
+ * under it. A kernel's svc touches no memory of the caller's, so what is below
+ * sp survives a syscall, and Go counts on it: a thread its runtime clones
+ * finds its m, g and function 8 to 32 bytes under its new sp and reads them
+ * after the gettid that is its first syscall. A frame put right under sp wrote
+ * the saved flags over the function, and every Go program died at its first
+ * thread under -R (SIGSEGV at 0x60000000, NZCV's Z and C). The gap is what is
+ * left alone; the cost is that much more stack per call. */
+#define CNG_TRAMP_GAP   64
+#define CNG_TRAMP_FRAME (288 + CNG_TRAMP_GAP)
+
+#ifndef __ASSEMBLER__
+
 /* Trampoline pool reserved per loaded object (bytes). ~3200 sites at ~160 B. */
 #define CNG_TRAMP_POOL 0x80000
 
@@ -86,4 +100,5 @@ void cng_rewrite_lazy_reset(void);
 struct cng_uregs;
 int cng_tramp_unwind(struct cng_uregs *u);
 
+#endif /* __ASSEMBLER__ */
 #endif /* CNG_REWRITE_H */

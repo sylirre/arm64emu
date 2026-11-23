@@ -64,6 +64,10 @@ enum {
 /* Resume submodes. */
 enum { PT_RES_CONT = 0, PT_RES_SYSCALL = 1, PT_RES_SINGLESTEP = 2 };
 
+/* A job-control report for the real parent (pt_link.jc_state). */
+#define PT_JC_STOPPED   1
+#define PT_JC_CONTINUED 2
+
 /* PTRACE_GET_SYSCALL_INFO ops. */
 #define PT_SCI_NONE  0
 #define PT_SCI_ENTRY 1
@@ -88,6 +92,21 @@ struct pt_link {
     u64 eventmsg;          /* PTRACE_GETEVENTMSG payload */
     s32 si_signo, si_code, si_errno;
     u64 fault_addr; /* siginfo si_addr of a fault stop */
+    u8 si_raw[128];  /* a signal stop's whole siginfo, when si_full */
+    u32 si_full;
+    /* A stop signal sent to this tracee (cng_pt_signal_route), to be taken as
+     * get_signal takes one: its signal-delivery-stop first, with the sender's
+     * siginfo, and a group stop only if the tracer lets it through. */
+    u32 sendsig_pending;
+    s32 sd_code, sd_pid;
+    u32 sd_uid;
+    /* Job control, for the real parent (pt_jc_stop): the group is stopped,
+     * by the stop this link's thread took, and a report of it, or of the
+     * SIGCONT that ended it, waits for a wait of that parent's. */
+    u32 jc_stopped;
+    s32 jc_parent;
+    u32 jc_state; /* PT_JC_* */
+    u32 jc_sig;
     /* PTRACE_GET_SYSCALL_INFO, published at each syscall stop. */
     u32 sc_op;
     s64 sc_nr; /* the in-flight syscall number: the arm64 kernel's regs->syscallno,
@@ -136,7 +155,7 @@ struct pt_self {
     int entry_seen;          /* an entry stop was reported for the syscall in
                               * flight, so its exit stop is owed */
     int step;                /* resumed with PTRACE_SINGLESTEP */
-    int skip_exit_stop;      /* one-shot: skip the next syscall-exit stop */
+    int skip_exit_stop;      /* skip the exit stop of the call in flight */
     int in_stop;             /* re-entrancy guard */
     int traceall;            /* the trap-everything filter is installed here */
     int tracer_armed;        /* the tracer filter is installed here */
@@ -173,8 +192,14 @@ struct pt_self {
         cng_siginfo_t si;
     } def[PT_NDEF];
     int kick_attach, kick_intr;
-    u32 kick_ss;
+    u32 kick_sd; /* a stop signal the thread sent itself (cng_pt_signal_route) */
     struct cng_uregs *deliver; /* the frame cng_pt_deliver delivers onto */
+    /* The siginfo the next stop publishes whole, for GETSIGINFO (pt_stop). */
+    const cng_siginfo_t *stop_si;
+    /* A signal the tracer let through at a stop of ours that it is queued
+     * from (pt_send_stop): delivered by its disposition when it arrives,
+     * with no stop of its own (cng_pt_nostop). */
+    int nostop_sig;
 };
 static struct cng_tab g_self = CNG_TAB_INIT(struct pt_self);
 
@@ -1513,6 +1538,9 @@ static int pt_stop(struct pt_self *s, struct cng_uregs *r, int stop_sig,
             si_code ? si_code : (event ? ((event << 8) | 5 /*SIGTRAP*/) : 0);
         e->fault_addr = addr;
         e->si_errno = 0;
+        e->si_full = s->stop_si != 0;
+        if (s->stop_si)
+            memcpy(e->si_raw, s->stop_si, sizeof e->si_raw);
         __atomic_store_n(&e->reported, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&e->state, PT_ST_STOPPED, __ATOMIC_RELEASE);
         pt_bump_gen();
@@ -1547,6 +1575,7 @@ static int pt_stop(struct pt_self *s, struct cng_uregs *r, int stop_sig,
         sc_stop = 0;
         si_code = 2 /*TRAP_TRACE*/;
         addr = r->pc;
+        s->stop_si = 0; /* the step's own siginfo, not the stop's before it */
     }
     s->in_stop = 0;
     return inject;
@@ -1627,7 +1656,9 @@ void cng_pt_syscall_exit(struct cng_uregs *r) {
         }
     }
     /* The call is over: what stops on the way back to user space is
-     * get_signal's. */
+     * get_signal's. A skip meant for it goes with it, whether or not there
+     * was a stop to skip. */
+    s->skip_exit_stop = 0;
     s->in_call = 0;
 }
 
@@ -1671,21 +1702,51 @@ void cng_pt_step_report(struct cng_uregs *r) {
     pt_stop(s, r, 5 /*SIGTRAP*/, 0, 0, 2 /*TRAP_TRACE*/, r->pc);
 }
 
-void cng_pt_report_exec(struct cng_uregs *r) {
+void cng_pt_exec_call(s32 *nr, int *owed) {
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    int in = s && s->active && s->in_call;
+    *nr = in ? s->call_nr : __NR_execve;
+    *owed = in && s->entry_seen;
+}
+
+void cng_pt_report_exec(struct cng_uregs *r, s32 nr, int owed) {
     struct pt_self *s = pt_self_get(0);
     if (!s || !s->active || !s->link)
         return;
-    int event = (__atomic_load_n(&s->link->options, __ATOMIC_ACQUIRE) &
+    struct pt_link *e = s->link;
+    int event = (__atomic_load_n(&e->options, __ATOMIC_ACQUIRE) &
                  CNG_PTRACE_O_TRACEEXEC)
                     ? CNG_PTRACE_EVENT_EXEC
                     : 0;
-    /* A freshly exec'd tracee is stopped and must be re-armed by its tracer. */
-    s->armed = 0;
+    /* The call being finished is the exec'ing thread's: this one's own, or a
+     * sibling's this leader carries (cng_pt_exec_call there), whose number and
+     * owed exit stop are the ones de_thread hands the surviving thread. */
+    if (nr >= 0) {
+        s->call_nr = nr;
+        s->entry_seen = owed;
+    }
+    s->in_call = 1;
     s->step = 0;
-    /* PTRACE_EVENT_EXEC is the execve's own (start_thread keeps syscallno);
-     * the legacy SIGTRAP, send_sig's, is taken by get_signal once the call
-     * has returned, and shows -1 (pt_stop). The new program runs after. */
-    pt_stop(s, r, 5 /*SIGTRAP*/, event, 0, 0, 0);
+    /* The order execve has on a kernel: PTRACE_EVENT_EXEC is a stop inside the
+     * call (start_thread keeps syscallno, so it shows the call's number), and
+     * the call's exit stop follows it — owed to a tracer that resumed from that
+     * stop with PTRACE_SYSCALL, as TIF_SYSCALL_TRACE decides at the exit,
+     * whether or not it saw the entry. Without the option the exit stop is the
+     * entry stop's, and the legacy SIGTRAP (send_sig's, for a tracee attached
+     * without PTRACE_SEIZE only) is taken by get_signal after it, once the
+     * call is over, showing -1 (pt_stop). The registers are the new program's
+     * entry state, x0 the 0 the call returns. strace pairs entry and exit
+     * stops by counting them, and every trace it took through an exec here
+     * was one stop out from then on: the exit stop used to be left out. */
+    if (event) {
+        pt_stop(s, r, 5 /*SIGTRAP*/, event, 0, 0, 0);
+        s->entry_seen = 1;
+        cng_pt_syscall_exit(r);
+    } else {
+        cng_pt_syscall_exit(r);
+        if (s->link == e && !e->seize)
+            pt_stop(s, r, 5 /*SIGTRAP*/, 0, 0, 0, 0);
+    }
     s->in_call = 0;
 }
 
@@ -1839,7 +1900,12 @@ void cng_pt_fork_child(struct cng_uregs *r, int event) {
         pt_stop(s, r, 19 /*SIGSTOP*/, 0, 0, 0, 0);
     /* The tracer has typically armed PTRACE_SYSCALL by now; suppress the
      * syscall-exit stop of the clone we were born from, which we never entered
-     * at an entry stop and which would desync the tracer's entry/exit pairing. */
+     * at an entry stop and which would desync the tracer's entry/exit pairing:
+     * the -R tier's frame, a copy of the parent's, says its entry was seen.
+     * Only that call's: the SIGSYS tier owes this one nothing to begin with
+     * (entry_seen is ours, and clear), and a skip that outlived it took the
+     * exit stop of the child's first call of its own -- every child strace
+     * -f followed was one stop out from there. */
     if (s->armed)
         s->skip_exit_stop = 1;
 }
@@ -1900,15 +1966,31 @@ void cng_pt_wake_waiters(void) {
     pt_bump_gen();
 }
 
-int cng_pt_report_signal(struct cng_uregs *r, int sig, int si_code, u64 addr) {
+int cng_pt_report_signal(struct cng_uregs *r, int sig, const cng_siginfo_t *si) {
     struct pt_self *s = pt_self_get(0);
     if (!s || !s->active || !s->link || sig == 9 /*SIGKILL*/)
         return sig;
-    /* A SEIZE'd tracee reports a job-control stop signal as a group-stop
-     * (PTRACE_EVENT_STOP); an ATTACH'd one sees a plain signal-delivery-stop. */
-    int stopsig = (sig == 19 || sig == 20 || sig == 21 || sig == 22);
-    int event = (s->link->seize && stopsig) ? CNG_PTRACE_EVENT_STOP : 0;
-    return pt_stop(s, r, sig, event, 0, si_code, addr);
+    /* A signal-delivery-stop for every tracer, a stop signal's included: the
+     * group stop it makes, if the tracer lets it through, is a stop of its
+     * own after this one (cng_pt_group_stop), PTRACE_EVENT_STOP for a
+     * SEIZE'd tracee. This used to be that EVENT_STOP already for one, and
+     * the group stop a second. */
+    /* si_addr of a fault siginfo, at offset 16 on arm64 (after signo, errno,
+     * code and the pointer-alignment pad, where _pad starts). */
+    int fault = sig == 4 || sig == 5 || sig == 7 || sig == 8 || sig == 11;
+    s->stop_si = si;
+    int inject = pt_stop(s, r, sig, 0, 0, si->si_code,
+                         fault ? (u64)si->_u._pad[0] : 0);
+    s->stop_si = 0;
+    return inject;
+}
+
+int cng_pt_nostop(int sig) {
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    if (!s || !sig || s->nostop_sig != sig)
+        return 0;
+    s->nostop_sig = 0;
+    return 1;
 }
 
 extern char cng_pt_deliver_ret[], cng_pt_unhold_ret[];
@@ -1968,13 +2050,94 @@ static void pt_owed_exit(struct pt_self *s, struct cng_ucontext *uc,
 
 /* The stops a kick asks for — the attach's SIGSTOP, an INTERRUPT's event stop,
  * a routed stop signal — taken on `r`. */
+static void pt_route_stops(s32 tgid, int sig, s32 skip);
+static void pt_kick_tracer(s32 tr, int magic);
+static int pt_rcode_restarts(long c);
+
+static int pt_is_stopsig(int sig) {
+    return sig == 19 || sig == 20 || sig == 21 || sig == 22; /* STOP TSTP TTIN TTOU */
+}
+
+/* Tell the real parent that the group stopped, by the stop signal `sig` this
+ * link's thread took: as do_notify_parent_cldstop does when the group stop is
+ * complete, when the tracer is not that parent (ptrace_reparented; a tracer
+ * that is the parent has the stop itself). The report waits in the link for
+ * a wait of the parent's, which takes it with WUNTRACED (pt_collect_jc), and
+ * the parent is woken as a tracer is: SIGCHLD, the poll's futex, the kick for
+ * a native wait. A guest parent only -- the top guest's parent is not one --
+ * and only one whose waits reach us (a tracer's, a tracee's, any -R one): the
+ * kernel's own wait never sees an emulated stop. */
+static void pt_jc_stop(struct pt_link *e, int sig) {
+    s32 par = (s32)CNG_SYS(__NR_getppid, 0, 0, 0, 0, 0, 0);
+    e->jc_parent = par;
+    e->jc_sig = (u32)sig;
+    __atomic_store_n(&e->jc_stopped, 1, __ATOMIC_RELEASE);
+    if (par <= 1 || par == __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) ||
+        !cng_procreg_has(par))
+        return;
+    __atomic_store_n(&e->jc_state, PT_JC_STOPPED, __ATOMIC_RELEASE);
+    pt_bump_gen();
+    pt_kick_tracer(par, CNG_PT_KICK_WAKE);
+}
+
+/* A stop signal's default action, on a traced thread: the group stop, which
+ * every other traced thread of the group takes too, and the real parent is
+ * told of. Its tracer sees it as a plain stop of the signal for an ATTACH'd
+ * tracee, as PTRACE_EVENT_STOP for a SEIZE'd one. */
+static void pt_group_take(struct pt_self *s, struct cng_uregs *r, int sig) {
+    struct pt_link *e = s->link;
+    pt_route_stops(e->tgid, sig, (s32)sys_gettid());
+    pt_jc_stop(e, sig);
+    pt_stop(s, r, sig, e->seize ? CNG_PTRACE_EVENT_STOP : 0, 0, 0, 0);
+}
+
+/* A stop signal sent to this tracee (cng_pt_signal_route), taken as
+ * get_signal takes one: its signal-delivery-stop, with the sender's siginfo,
+ * and then what the tracer resumed it with. Nothing, and the signal is gone;
+ * a stop signal whose disposition is the default (SIGSTOP's always is), and
+ * that is the group stop, whose signal this returns; anything else -- the
+ * signal itself to a handler, or a substitute -- is queued to this thread and
+ * delivered by its disposition with no stop of its own (cng_pt_nostop), a
+ * substitute with the siginfo the kernel gives one, SI_USER from the tracer.
+ * It used to be the group stop at once, with no delivery stop to suppress it
+ * at, and a stop signal the guest had a handler for stopped it all the
+ * same. */
+static int pt_send_stop(struct pt_self *s, struct cng_uregs *r, int sig) {
+    struct pt_link *e = s->link;
+    cng_siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = sig;
+    si.si_code = e->sd_code;
+    ((s32 *)&si._u)[0] = e->sd_pid;
+    ((u32 *)&si._u)[1] = e->sd_uid;
+    s->stop_si = &si;
+    int inj = pt_stop(s, r, sig, 0, 0, si.si_code, 0);
+    s->stop_si = 0;
+    if (s->link != e || inj <= 0 || inj > 64)
+        return 0;
+    if (pt_is_stopsig(inj) && (inj == 19 || cng_pt_sig_default(inj)))
+        return inj;
+    if (inj != sig) {
+        memset(&si, 0, sizeof si);
+        si.si_signo = inj;
+        si.si_code = 0; /* SI_USER */
+        ((s32 *)&si._u)[0] = __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE);
+        ((u32 *)&si._u)[1] = cng_remap_uid((unsigned)sys_getuid());
+    }
+    s->nostop_sig = inj;
+    CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), sys_gettid(), inj, &si, 0, 0);
+    return 0;
+}
+
 static void pt_kick_take(struct pt_self *s, struct cng_uregs *r, int attach,
-                         int intr, int ss) {
+                         int intr, int ss, int sd) {
     struct pt_link *e = s->link;
     if (attach)
         pt_stop(s, r, 19 /*SIGSTOP*/, 0, 0, 0, 0);
     if (intr && s->link == e)
         pt_stop(s, r, 5 /*SIGTRAP*/, CNG_PTRACE_EVENT_STOP, 0, 0, 0);
+    if (sd && s->link == e && (sd = pt_send_stop(s, r, sd)) && s->link == e)
+        pt_group_take(s, r, sd);
     if (ss && s->link == e)
         pt_stop(s, r, ss, e->seize ? CNG_PTRACE_EVENT_STOP : 0, 0, 0, 0);
 }
@@ -1999,7 +2162,7 @@ static int pt_gate_svc(u64 pc) {
  * with whatever the tracer put in them (cng_dispatch_bounced, tramp_body). */
 static void pt_inflight_stop(struct pt_self *s, struct cng_ucontext *uc,
                              struct cng_gframe *gf, int attach, int intr,
-                             int ss) {
+                             int ss, int sd) {
     int done = gf->done;
     struct cng_uregs before = *gf->r;
     /* In flight: the call as do_signal shows the restart it sets up, at its
@@ -2011,15 +2174,25 @@ static void pt_inflight_stop(struct pt_self *s, struct cng_ucontext *uc,
     struct cng_uregs v = before;
     s->fpuc = uc;
     if (!done && gf->owed) {
-        /* The exit stop first, with the restart code; the dispatch's own is
-         * then not given. A tracer that answers it otherwise is answering the
-         * call, which is then abandoned with that answer. */
+        /* The exit stop first, with the call's restart code (a relative
+         * sleep's ERESTART_RESTARTBLOCK, a read's ERESTARTSYS: it used to be
+         * ERESTARTSYS for all); the dispatch's own is then not given. A
+         * tracer that answers it otherwise is answering the call, which is
+         * then abandoned with that answer -- and so is a call the kernel
+         * never makes again (EINTR), after the stops, which find it over. */
         gf->owed = 0;
+        u64 a[6];
+        for (int i = 0; i < 6; i++)
+            a[i] = gf->r->x[i];
+        a[0] = gf->orig_x0;
+        long code = cng_pt_restart_code(s->call_nr, a);
         struct cng_uregs ev = *gf->r;
-        ev.x[0] = (u64)(s64)-512 /*ERESTARTSYS*/;
+        ev.x[0] = (u64)code;
         s->entry_seen = 1;
         cng_pt_syscall_exit(&ev);
-        if ((s64)ev.x[0] != -512) {
+        if ((s64)ev.x[0] != code || !pt_rcode_restarts(code)) {
+            if ((s64)ev.x[0] == code)
+                pt_kick_take(s, &ev, attach, intr, ss, sd);
             s->fpuc = 0;
             *gf->r = ev;
             gf->abandon = 1;
@@ -2029,7 +2202,7 @@ static void pt_inflight_stop(struct pt_self *s, struct cng_ucontext *uc,
         v.x[0] = before.x[0];
         v.pc = before.pc;
     }
-    pt_kick_take(s, &v, attach, intr, ss);
+    pt_kick_take(s, &v, attach, intr, ss, sd);
     int changed = memcmp(&v, &before, sizeof v) != 0;
     if (done) {
         s->fpuc = 0;
@@ -2081,7 +2254,7 @@ cut:
 
 /* Take the stops, with the thread wherever the kick found it (see above). */
 static void pt_kick_stops(struct pt_self *s, struct cng_ucontext *uc,
-                          int attach, int intr, int ss) {
+                          int attach, int intr, int ss, int sd) {
     /* Already parked in a stop (a stop in a dispatch from guest context runs
      * on the guest's mask, and a request carried by SIGSYS reaches a thread
      * in any handler of ours): a stop cannot be taken inside a stop, so
@@ -2097,26 +2270,56 @@ static void pt_kick_stops(struct pt_self *s, struct cng_ucontext *uc,
         s->deliver = 0;
         s->regs = r;
         s->uc = uc;
-        pt_kick_take(s, r, attach, intr, ss);
+        pt_kick_take(s, r, attach, intr, ss, sd);
         return;
     }
     int owed = 0;
     long rval = 0, nr = 0;
-    int how = cng_bounce_unwind(uc, 1, &owed, &rval, &nr);
+    unsigned long long ox = 0;
+    int how = cng_bounce_unwind(uc, 1, &owed, &rval, &nr, &ox);
     if (how == CNG_UNWIND_NONE) {
         struct cng_gframe *gf;
         if (!cng_tramp_unwind(r) && r->pc >= (u64)__cng_image_start &&
             r->pc < (u64)__cng_image_end && (gf = cng_gframe_cur())) {
-            pt_inflight_stop(s, uc, gf, attach, intr, ss);
+            pt_inflight_stop(s, uc, gf, attach, intr, ss, sd);
             return;
         }
-    } else if (owed) {
-        s->call_nr = (s32)nr;
-        pt_owed_exit(s, uc, how == CNG_UNWIND_UNDONE, rval);
+    } else {
+        /* A bounced call the kick cut short: undone, or come back EINTR --
+         * what the kernel's restart code turns into with a handler (ours),
+         * a relative sleep's whatever its flags. The kernel shows it with
+         * that code and, a stop running no handler, makes it again from its
+         * svc and orig_x0 -- the record's, which a thread attached in the
+         * call has no other record of -- after the stop (cng_pt_signal_frame
+         * does the same for a signal); a call it never makes again stays
+         * EINTR. A sleep cut by a stop came back EINTR here, its tracee's
+         * program with it. */
+        if (how == CNG_UNWIND_UNDONE || rval == -EINTR) {
+            u64 svc = how == CNG_UNWIND_UNDONE ? r->pc : r->pc - 4;
+            u64 a[6];
+            for (int i = 0; i < 6; i++)
+                a[i] = r->x[i];
+            a[0] = ox;
+            long code = cng_pt_restart_code(nr, a);
+            if (pt_rcode_restarts(code)) {
+                r->pc = svc;
+                r->x[0] = ox;
+                how = CNG_UNWIND_UNDONE;
+            } else {
+                r->pc = svc + 4;
+                r->x[0] = (u64)(s64)-EINTR;
+                how = CNG_UNWIND_DONE;
+            }
+            rval = code;
+        }
+        if (owed) {
+            s->call_nr = (s32)nr;
+            pt_owed_exit(s, uc, how == CNG_UNWIND_UNDONE, rval);
+        }
     }
     s->regs = r;
     s->uc = uc;
-    pt_kick_take(s, r, attach, intr, ss);
+    pt_kick_take(s, r, attach, intr, ss, sd);
 }
 
 void cng_pt_service_kick(struct cng_ucontext *uc) {
@@ -2159,7 +2362,7 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
         cng_pt_arm_tracee();
         pt_traced_inc();
         if (!e->seize) {
-            pt_kick_stops(s, uc, 1, 0, 0);
+            pt_kick_stops(s, uc, 1, 0, 0, 0);
             return;
         }
         /* SEIZE attaches without a stop; fall through in case an INTERRUPT
@@ -2171,8 +2374,9 @@ void cng_pt_service_kick(struct cng_ucontext *uc) {
     /* Claimed, for the same reason as the attach above. */
     int intr = __atomic_exchange_n(&e->interrupt_pending, 0, __ATOMIC_ACQ_REL) != 0;
     u32 ss = __atomic_exchange_n(&e->stopsig_pending, 0, __ATOMIC_ACQ_REL);
-    if (intr || ss)
-        pt_kick_stops(s, uc, 0, intr, (int)ss);
+    u32 sd = __atomic_exchange_n(&e->sendsig_pending, 0, __ATOMIC_ACQ_REL);
+    if (intr || ss || sd)
+        pt_kick_stops(s, uc, 0, intr, (int)ss, (int)sd);
 }
 
 /* ---- a tracee's own signals, and where they find it ----
@@ -2276,6 +2480,12 @@ static void pt_restart_set(struct pt_self *s, u64 svc, long code) {
     s->rs_code = code;
 }
 
+void cng_pt_restart_arm(u64 svc, long code) {
+    struct pt_self *s = g_pt_local ? pt_self_get(0) : 0;
+    if (s && s->active)
+        pt_restart_set(s, svc, code);
+}
+
 /* Held back: pending again, blocked by the frame's mask until it is let go. */
 static void pt_hold(struct cng_gframe *gf, struct cng_ucontext *uc, int sig,
                     const cng_siginfo_t *si) {
@@ -2318,7 +2528,8 @@ int cng_pt_signal_frame(struct cng_ucontext *uc, int sig,
      * result. */
     int owed = 0;
     long rval = 0, nr = 0;
-    int how = cng_bounce_unwind(uc, 1, &owed, &rval, &nr);
+    unsigned long long ox = 0;
+    int how = cng_bounce_unwind(uc, 1, &owed, &rval, &nr, &ox);
     if (how != CNG_UNWIND_NONE) {
         /* Undone, or come back EINTR: the kernel's call came back with its
          * restart code -- shown at the svc, from orig_x0 -- or, a call never
@@ -2328,11 +2539,11 @@ int cng_pt_signal_frame(struct cng_ucontext *uc, int sig,
             u64 a[6];
             for (int i = 0; i < 6; i++)
                 a[i] = r->x[i];
-            a[0] = s->orig_x0;
+            a[0] = ox;
             long code = cng_pt_restart_code(nr, a);
             if (pt_rcode_restarts(code)) {
                 r->pc = svc;
-                r->x[0] = s->orig_x0;
+                r->x[0] = ox;
                 how = CNG_UNWIND_UNDONE;
             } else {
                 r->pc = svc + 4;
@@ -2417,19 +2628,19 @@ int cng_pt_dispatch_end(struct cng_uregs *r, struct cng_gframe *gf) {
     unsigned long held = gf->held;
     gf->held = 0;
     if (s && s->active && s->link &&
-        (s->kick_ss || s->kick_intr || s->kick_attach)) {
+        (s->kick_sd || s->kick_intr || s->kick_attach)) {
         /* A stop the call itself asked for (a stop signal it sent its own
-         * thread), taken on the way back from it: before any signal, as
-         * get_signal takes a group stop. Everything else blocked meanwhile,
-         * as at every stop. */
+         * thread, with its delivery stop first), taken on the way back from
+         * it: before any signal, as get_signal takes it. Everything else
+         * blocked meanwhile, as at every stop. */
         unsigned long all = ~0UL & ~(1UL << (CNG_SIGSYS - 1)), old = 0;
         CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &all, &old, 8, 0, 0);
         int at = s->kick_attach, in = s->kick_intr;
-        int ss = (int)s->kick_ss;
+        int sd = (int)s->kick_sd;
         s->kick_attach = s->kick_intr = 0;
-        s->kick_ss = 0;
+        s->kick_sd = 0;
         cng_pt_set_frame(r, 0);
-        pt_kick_take(s, r, at, in, ss);
+        pt_kick_take(s, r, at, in, 0, sd);
         CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &old, 0, 8, 0, 0);
     }
     if (held) {
@@ -2464,20 +2675,13 @@ void cng_pt_restart_settle(struct cng_ucontext *uc, int handler,
     }
 }
 
-/* A stop signal's default action, taken by a traced thread: a group stop,
- * which its tracer sees -- an ATTACHed one as a plain stop of the signal, a
- * SEIZEd one as PTRACE_EVENT_STOP -- and every other traced thread of the
- * group stops for too. */
-static void pt_route_stops(s32 tgid, int sig, s32 skip);
-
+/* A stop signal's default action, taken by a traced thread through its
+ * disposition (pt_group_take). */
 void cng_pt_group_stop(struct cng_ucontext *uc, int sig) {
     struct pt_self *s = pt_self_get(0);
     if (!s || !s->active || !s->link)
         return;
-    struct pt_link *e = s->link;
-    pt_route_stops(e->tgid, sig, (s32)sys_gettid());
-    pt_stop(s, cng_pt_uregs(uc), sig, e->seize ? CNG_PTRACE_EVENT_STOP : 0, 0,
-            0, 0);
+    pt_group_take(s, cng_pt_uregs(uc), sig);
 }
 
 s32 cng_pt_tracer_pid(void) {
@@ -2556,7 +2760,8 @@ void cng_pt_sigsys_kick(struct cng_ucontext *uc, int direct) {
 void cng_pt_kick_unwind(struct cng_ucontext *uc) {
     int owed = 0;
     long rval = 0;
-    if (cng_bounce_unwind(uc, 0, &owed, &rval, 0) != CNG_UNWIND_UNDONE || !owed)
+    if (cng_bounce_unwind(uc, 0, &owed, &rval, 0, 0) != CNG_UNWIND_UNDONE ||
+        !owed)
         return;
     struct pt_self *s = pt_self_get(0);
     if (s && s->active && s->link)
@@ -2805,6 +3010,12 @@ long cng_pt_syscall(long req, long pid, u64 addr, u64 data) {
         u8 si[128];
         memset(si, 0, sizeof si);
         s32 *w = (s32 *)si;
+        /* A signal's stop has its whole siginfo: who sent it (si_pid, si_uid)
+         * and the rest of the union -- a SIGCHLD's status, a queued value. It
+         * used to be signo, errno and code alone, and strace showed every
+         * sender as pid 0. */
+        if (e->si_full)
+            memcpy(si, e->si_raw, sizeof si);
         w[0] = e->si_signo;
         w[1] = e->si_errno;
         w[2] = e->si_code;
@@ -3023,6 +3234,54 @@ static s32 pt_collect(s32 wpid, int *status, int want, int peek) {
     return 0;
 }
 
+#define PT_WUNTRACED  2 /* WSTOPPED, for waitid */
+#define PT_WCONTINUED 8
+
+/* A job-control report of a traced child's (pt_jc_stop, pt_route_cont): its
+ * group stopped, for a wait with WUNTRACED (WSTOPPED), or continued, for one
+ * with WCONTINUED, which the kernel's own wait cannot see, the child never
+ * having stopped in the kernel. `wpid` names the child (<= 0: any) and `pg`
+ * a process group (0: any). Fills the wait status and the waitid code and
+ * returns the child's pid, or 0; taken unless `peek` (WNOWAIT). */
+static s32 pt_collect_jc(s32 wpid, s32 pg, long options, int *status,
+                         int *code, int peek) {
+    if (!g_tab || !(options & (PT_WUNTRACED | PT_WCONTINUED)))
+        return 0;
+    s32 me = (s32)sys_getpid();
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        u32 jc = __atomic_load_n(&e->jc_state, __ATOMIC_ACQUIRE);
+        if (!jc || e->jc_parent != me ||
+            !(options & (jc == PT_JC_STOPPED ? PT_WUNTRACED : PT_WCONTINUED)))
+            continue;
+        s32 c = e->tgid;
+        if (wpid > 0 && wpid != c)
+            continue;
+        if (pg > 0 && CNG_SYS(__NR_getpgid, c, 0, 0, 0, 0, 0) != pg)
+            continue;
+        if (!peek && !__atomic_compare_exchange_n(&e->jc_state, &jc, 0, 0,
+                                                  __ATOMIC_ACQ_REL,
+                                                  __ATOMIC_RELAXED))
+            continue;
+        *status = jc == PT_JC_STOPPED ? ((int)e->jc_sig << 8) | 0x7f : 0xffff;
+        *code = jc == PT_JC_STOPPED ? 5 /*CLD_STOPPED*/ : 6 /*CLD_CONTINUED*/;
+        return c;
+    }
+    return 0;
+}
+
+static int pt_have_jc(void) {
+    if (!g_tab)
+        return 0;
+    s32 me = (s32)sys_getpid();
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        if (__atomic_load_n(&e->jc_state, __ATOMIC_ACQUIRE) && e->jc_parent == me)
+            return 1;
+    }
+    return 0;
+}
+
 /* A tracee that vanished without publishing an exit was killed by an
  * uncatchable SIGKILL (every catchable death is mediated). Report a synthetic
  * WIFSIGNALED(SIGKILL) so a tracer polling on it does not hang forever. */
@@ -3086,7 +3345,9 @@ void cng_pt_note_reaped(long pid) {
 /* Is a signal pending that the guest would have taken delivery of? Our handler
  * runs with everything but SIGSYS masked, so a signal that arrives while we
  * poll here cannot interrupt the poll by itself — but the guest's wait4 must
- * still answer -EINTR for it, or a tracer becomes unkillable while waiting. The
+ * still be cut short by it (CNG_ESIGCUT: the kernel's do_wait answers
+ * ERESTARTSYS, which only a handler without SA_RESTART turns into EINTR; it
+ * used to be EINTR every time), or a tracer becomes unkillable while waiting. The
  * guest's own mask is the one the signal frame will restore, and a signal the
  * guest would not have been interrupted by — one it ignores, or SIGCHLD and its
  * kind still at the default — is no interruption: a tracee's own stop raises
@@ -3135,9 +3396,11 @@ static int pt_kick_waiting(const struct cng_ucontext *uc) {
 #define PT_WPOLL_MS  50
 
 /* May a wait be left to the kernel? Only while it cannot be owed an emulated
- * stop: this process has never been a tracer, and nothing in the registry
- * names it as one — a child's PTRACE_TRACEME does that before the kick that
- * arms us lands. Without a registry there are no emulated stops at all. */
+ * stop: this process has never been a tracer, nothing in the registry names it
+ * as one — a child's PTRACE_TRACEME does that before the kick that arms us
+ * lands — and no traced child of its has a job-control report for it, which
+ * the kick that announces one sends its native wait back here for. Without a
+ * registry there are no emulated stops at all. */
 static int pt_wait_untraced(void) {
     if (!g_tab)
         return 1;
@@ -3145,7 +3408,7 @@ static int pt_wait_untraced(void) {
         return 0;
     if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
         return 1;
-    return !pt_have_tracee(-1);
+    return !pt_have_tracee(-1) && !pt_have_jc();
 }
 
 void (*cng_g_wait_native_probe)(void); /* test aid, see ptrace.h */
@@ -3202,8 +3465,14 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
                   const struct cng_ucontext *uc) {
     for (;;) {
         u32 gen = g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
-        int st = 0;
+        int st = 0, code;
         s32 t = pt_collect((s32)pid, &st, PT_COLLECT_STOPS | PT_COLLECT_EXITS, 0);
+        if (t <= 0) {
+            s32 pg = pid == 0   ? (s32)CNG_SYS(__NR_getpgid, 0, 0, 0, 0, 0, 0)
+                     : pid < -1 ? (s32)-pid
+                                : 0;
+            t = pt_collect_jc((s32)pid, pg, options, &st, &code, 0);
+        }
         if (t > 0) {
             if (status && cng_user_copyout((void *)status, &st, sizeof st) < 0)
                 return -EFAULT;
@@ -3228,7 +3497,7 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
             return t;
         }
         if (pt_signal_pending(uc))
-            return -EINTR;
+            return -CNG_ESIGCUT;
         if (pt_kick_waiting(uc))
             return -CNG_ERESTART;
         pt_rekick_blocked();
@@ -3248,8 +3517,9 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
 long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
                    const struct cng_ucontext *uc) {
     /* P_ALL = 0, P_PID = 1, P_PGID = 2. Only a specific pid narrows the
-     * registry scan; a process-group wait cannot match an emulated stop, so it
-     * is left to the host wait entirely. */
+     * registry scan; a process-group wait cannot match an emulated ptrace stop
+     * (a tracer's tracees are named by pid), only a child's job-control
+     * report, which is looked up by its group. */
     s32 wpid = (idtype == 1) ? (s32)id : (idtype == 0) ? -1 : 0;
     for (;;) {
         u32 gen = g_tab ? __atomic_load_n(&g_tab->global_gen, __ATOMIC_ACQUIRE) : 0;
@@ -3300,6 +3570,30 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
             }
             return 0;
         }
+        /* A traced child's job-control stop or continue, for its parent:
+         * CLD_STOPPED with the stop signal, CLD_CONTINUED with SIGCONT. */
+        int code = 0;
+        if (idtype >= 0 && idtype <= 2 &&
+            (t = pt_collect_jc(idtype == 1 ? (s32)id : -1,
+                               idtype != 2 ? 0
+                               : id        ? (s32)id
+                                           : (s32)CNG_SYS(__NR_getpgid, 0, 0,
+                                                          0, 0, 0, 0),
+                               options, &st, &code, peek)) > 0) {
+            if (infop) {
+                u8 si[128];
+                memset(si, 0, sizeof si);
+                s32 *w = (s32 *)si;
+                w[0] = 17; /* SIGCHLD */
+                w[2] = code;
+                w[4] = t;
+                w[5] = (s32)cng_remap_uid((unsigned)sys_getuid());
+                w[6] = code == 5 ? (st >> 8) & 0xff : 18 /*SIGCONT*/;
+                if (cng_user_copyout((void *)infop, si, sizeof si) < 0)
+                    return -EFAULT;
+            }
+            return 0;
+        }
         if (infop) {
             u8 zero[128];
             memset(zero, 0, sizeof zero);
@@ -3323,7 +3617,7 @@ long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
             return r;
         }
         if (pt_signal_pending(uc))
-            return -EINTR;
+            return -CNG_ESIGCUT;
         if (pt_kick_waiting(uc))
             return -CNG_ERESTART;
         pt_rekick_blocked();
@@ -3455,11 +3749,49 @@ int cng_pt_vm_rw(long nr, long pid, u64 lvec, u64 lcnt, u64 rvec, u64 rcnt,
 
 /* ---- signal routing: cooperative group-stops ---- */
 
-static int pt_is_stopsig(int sig) {
-    return sig == 19 || sig == 20 || sig == 21 || sig == 22; /* STOP TSTP TTIN TTOU */
+/* SIGCONT to a traced group: a listening group stop ends with a fresh
+ * EVENT_STOP -- the tracee never left its service loop, so only the link is
+ * re-armed and the tracer woken -- and a group a stop signal stopped is
+ * continued for its real parent, as prepare_signal's SIGNAL_CLD_CONTINUED
+ * makes it: CLD_CONTINUED for a wait with WCONTINUED, in place of a stop
+ * report not yet collected, whether or not the parent is the tracer. */
+static void pt_route_cont(s32 tgid) {
+    for (int i = 0; i < PT_MAX; i++) {
+        struct pt_link *e = &g_tab->links[i];
+        s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
+        if (t <= 0 || e->tgid != tgid ||
+            __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0 ||
+            __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED)
+            continue;
+        if (__atomic_exchange_n(&e->jc_stopped, 0, __ATOMIC_ACQ_REL)) {
+            s32 par = e->jc_parent;
+            u32 jc = 0;
+            if (par > 1 && cng_procreg_has(par)) {
+                e->jc_sig = 18;
+                jc = PT_JC_CONTINUED;
+            }
+            __atomic_store_n(&e->jc_state, jc, __ATOMIC_RELEASE);
+            if (jc) {
+                pt_bump_gen();
+                pt_kick_tracer(par, CNG_PT_KICK_WAKE);
+            }
+        }
+        if (!__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE))
+            continue;
+        __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
+        e->stop_sig = 5 /*SIGTRAP*/;
+        e->event = CNG_PTRACE_EVENT_STOP;
+        e->syscall_stop = 0;
+        e->si_signo = 5;
+        e->si_code = (CNG_PTRACE_EVENT_STOP << 8) | 5;
+        e->si_full = 0;
+        __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
+        pt_bump_gen();
+        pt_wake_tracer(__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE));
+    }
 }
 
-int cng_pt_signal_route(long pid, int sig) {
+int cng_pt_signal_route(long pid, int sig, int thread) {
     if (!g_tab || pid <= 0)
         return 0;
     if (!__atomic_load_n(&g_tab->any_trace, __ATOMIC_ACQUIRE))
@@ -3471,56 +3803,56 @@ int cng_pt_signal_route(long pid, int sig) {
      * untraced). */
     struct pt_link *hit = pt_find((s32)pid);
     s32 tgid = hit ? hit->tgid : (s32)pid;
-    int routed = 0;
-    s32 self = (s32)sys_gettid();
-    struct pt_self *self_s = g_pt_local ? pt_self_get(0) : 0;
+    /* SIGCONT does its job-control work here and is sent all the same: it is
+     * a signal like any other to the tracee, stopped for and delivered by its
+     * disposition, a guest handler's included. It used to be consumed, and
+     * the guest's SIGCONT handler never ran. */
+    if (sig == 18) {
+        pt_route_cont(tgid);
+        return 0;
+    }
+    /* A real SIGSTOP would freeze the tracee inside its service loop, and
+     * every later tracer request would deadlock, so a stop signal aimed at a
+     * tracee is taken cooperatively: as the kernel delivers one, to a single
+     * thread -- the one named, for tkill and tgkill; for a process, its main
+     * thread, or another traced one -- which reports its signal-delivery-stop
+     * with the sender's siginfo and makes the group stop only if the tracer
+     * lets the signal through (pt_send_stop, pt_group_take). It used to kick
+     * every traced thread straight into the group stop. */
+    struct pt_link *to = 0;
     for (int i = 0; i < PT_MAX; i++) {
         struct pt_link *e = &g_tab->links[i];
         s32 t = __atomic_load_n(&e->tracee, __ATOMIC_ACQUIRE);
-        if (t <= 0 || e->tgid != tgid)
+        if (t <= 0 || e->tgid != tgid ||
+            __atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0 ||
+            __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED)
             continue;
-        if (__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE) <= 0)
-            continue;
-        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == PT_ST_EXITED)
-            continue;
-        if (sig == 18) {
-            /* SIGCONT ends a listening group-stop with a fresh EVENT_STOP. The
-             * tracee never left its service loop, so only the link is re-armed
-             * and the tracer woken. */
-            if (!__atomic_load_n(&e->listening, __ATOMIC_ACQUIRE))
-                continue;
-            __atomic_store_n(&e->listening, 0, __ATOMIC_RELEASE);
-            e->stop_sig = 5 /*SIGTRAP*/;
-            e->event = CNG_PTRACE_EVENT_STOP;
-            e->syscall_stop = 0;
-            e->si_signo = 5;
-            e->si_code = (CNG_PTRACE_EVENT_STOP << 8) | 5;
-            __atomic_store_n(&e->reported, 0, __ATOMIC_RELEASE);
-            pt_bump_gen();
-            pt_wake_tracer(__atomic_load_n(&e->tracer, __ATOMIC_ACQUIRE));
-            routed = 1;
-            continue;
+        if (t == (s32)pid && (thread || t == tgid)) {
+            to = e;
+            break;
         }
-        /* A real SIGSTOP would freeze the tracee inside its service loop, and
-         * every later tracer request would deadlock — so a stop signal aimed at
-         * a tracee becomes a cooperative group-stop instead. The kernel stops
-         * every thread of the group and each traced one reports its own stop;
-         * we kick each live link, which is the same thing for a group whose
-         * threads are all traced. The caller's own thread, sending from a
-         * dispatch in guest context, stops once the call is over, after its
-         * exit stop, as the kernel's does on its way back to user space: a
-         * kick to itself would land in the middle of the dispatch
-         * (cng_pt_dispatch_end). */
-        if (t == self && self_s && self_s->link == e && cng_gframe_cur()) {
-            self_s->kick_ss = (u32)sig;
-            routed = 1;
-            continue;
-        }
-        __atomic_store_n(&e->stopsig_pending, (u32)sig, __ATOMIC_RELEASE);
-        pt_kick_attach(e->tgid, t);
-        routed = 1;
+        if (!to || t == tgid)
+            to = e;
     }
-    return routed;
+    if (!to)
+        return 0;
+    s32 t = to->tracee;
+    to->sd_code = thread ? -6 /*SI_TKILL*/ : 0 /*SI_USER*/;
+    to->sd_pid = (s32)sys_getpid();
+    to->sd_uid = cng_remap_uid((unsigned)sys_getuid());
+    /* The caller's own thread, sending from a dispatch in guest context,
+     * takes it once the call is over, after its exit stop, as the kernel's
+     * does on its way back to user space: a kick to itself would land in the
+     * middle of the dispatch (cng_pt_dispatch_end). */
+    struct pt_self *self_s = g_pt_local ? pt_self_get(0) : 0;
+    if (t == (s32)sys_gettid() && self_s && self_s->link == to &&
+        cng_gframe_cur()) {
+        self_s->kick_sd = (u32)sig;
+        return 1;
+    }
+    __atomic_store_n(&to->sendsig_pending, (u32)sig, __ATOMIC_RELEASE);
+    pt_kick_attach(to->tgid, t);
+    return 1;
 }
 
 /* The group stop a traced thread's own stop signal makes, for the other

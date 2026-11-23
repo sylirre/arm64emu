@@ -223,6 +223,17 @@ else
     for _sc in sigafter sigdeath sigpair subst; do
         pt_case "$_sc"
     done
+    # What strace -f and a shell's job control lean on: an execve's exit stop
+    # after its exec event (or before the legacy SIGTRAP), a fork child's
+    # first call's exit stop, a traced program's wait4 made again under an
+    # SA_RESTART handler, and a traced child's stop and continue reaching its
+    # parent's waitpid(WUNTRACED/WCONTINUED) -- with the SIGSTOP's own delivery
+    # stop before the group stop, and SIGCONT delivered to its handler. strace
+    # was one stop out from every exec and every fork on, the wait answered
+    # EINTR, and the parent waited forever.
+    for _sc in execsys execsys0 forksys waitrestart jobctl; do
+        pt_case "$_sc"
+    done
     # NT_ARM_SYSTEM_CALL, regs->syscallno: the call's number at its stops, -1
     # at every other, a write there lasting the way back to user space; and a
     # read cut short by a signal -- ERESTARTSYS at its exit stop, the signal's
@@ -357,7 +368,8 @@ else
             execstart patharg exitstop break step step2 attach fpregs blocked \
             blockedmask blockspin threadafter forkafter spinafter attachmany \
             sigact sigchld sigchldw waitid waitnowait options sigafter \
-            sigdeath sigpair subst; do
+            sigdeath sigpair subst execsys execsys0 forksys waitrestart \
+            jobctl; do
             pt_case "$_sc"
         done
         if [ -z "$CHROOTNG_QEMU" ]; then

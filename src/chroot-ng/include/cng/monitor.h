@@ -287,6 +287,9 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 #define CNG_EBOUNCE_DISP 541 /* run this whole dispatch from guest context */
 #define CNG_ERESTART     542 /* make the call again from its svc: a ptrace kick
                               * is pending, and it has to land in guest code */
+#define CNG_ESIGCUT      543 /* a wait the handler polls, cut short by a signal
+                              * the guest takes: the kernel's ERESTARTSYS, made
+                              * again or EINTR by that signal's disposition */
 
 /* The -R trampoline's entry point (tramp.S calls it with the frame it built):
  * runs one rewritten syscall site, with the ptrace stops around it. */
@@ -562,6 +565,7 @@ extern int cng_g_openat2_deny;
  * is not an interruption. cng_sig_deliverable() (sysvipc.h) finds the frame
  * itself. Implemented in sigsys.c, which owns it. */
 int cng_sig_deliverable_in(const struct cng_ucontext *uc);
+int cng_sig_restarts(const struct cng_ucontext *uc, long code);
 /* ...and for a wait made inside the SIGSYS handler (`uc` its frame, 0 for
  * none, which is then never one): is a ptrace kick queued that the frame's mask
  * would let in? The kick is masked in the handler like everything else, so a
@@ -623,15 +627,17 @@ int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f);
  * thread resumes with. An undo puts back x0 as the trap found it (orig_x0),
  * which is what the kernel's restart is made with. `*owed` says an exit stop
  * is owed for the call, and `*rval` is the result the tracer should see there
- * (-ERESTARTSYS for an undo); `*nr`, when asked for, is the call's number.
- * An undo with `stop` 0 is made only for a wait the kernel would have
+ * (-ERESTARTSYS for an undo); `*nr` and `*ox`, when asked for, are the
+ * call's number and its orig_x0, as the record has them -- the one record of
+ * it for a thread that was attached in the call. An undo with `stop` 0 is
+ * made only for a wait the kernel would have
  * restarted, and a frame left alone otherwise. CNG_UNWIND_NONE when `uc` is
  * not in a stub, or was left alone. */
 #define CNG_UNWIND_NONE   0
 #define CNG_UNWIND_UNDONE 1
 #define CNG_UNWIND_DONE   2
 int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed, long *rval,
-                      long *nr);
+                      long *nr, unsigned long long *ox);
 
 /* The same allocator for a TID the caller names, with the slot's stack top (0
  * when there is no slot). Exposed for testing: filling the table takes hundreds

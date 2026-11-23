@@ -25,14 +25,20 @@
  * there (measured: `ldp x16, x15, [x4, 48]` before the syscall, `add x0, x0,
  * x16` after). So when the dispatcher left pc and sp alone — everything except
  * a tracer that moved them — the exit reproduces both without a register: `add
- * sp, sp, #288` and a `b` back to S+4, patched per copy like the literals. That
- * frees x16/x17 to be restored with the rest. The register exit below is kept
- * for the case where a tracer really did move pc or sp, where there is nowhere
- * else to hold them.
+ * sp, sp, #CNG_TRAMP_FRAME` and a `b` back to S+4, patched per copy like the
+ * literals. That frees x16/x17 to be restored with the rest. The register exit
+ * below is kept for the case where a tracer really did move pc or sp, where
+ * there is nowhere else to hold them.
  *
  * The two 64-bit literals (dispatcher address, return address) and that `b` are
  * patched per copy; the PC-relative LDRs survive verbatim copying.
+ *
+ * The frame is CNG_TRAMP_FRAME bytes down from the guest's sp, its top
+ * CNG_TRAMP_GAP bytes left unwritten: memory just below sp is the guest's
+ * across a syscall (cng/rewrite.h has why).
  */
+#include "cng/rewrite.h"
+
     .text
 
     .global cng_svc_tramp_tpl
@@ -48,7 +54,7 @@
     .global cng_svc_tramp_gen
     .balign 8
 cng_svc_tramp_tpl:
-    sub     sp, sp, #288
+    sub     sp, sp, #CNG_TRAMP_FRAME
     /* x16/x17 and the flags go in first, because the test below spends them and
      * every one of the three belongs to the guest.
      *
@@ -78,7 +84,7 @@ cng_svc_tramp_tpl:
     ldr     x16,      [sp, #264]
     msr     nzcv, x16
     ldp     x16, x17, [sp, #128]
-    add     sp, sp, #288
+    add     sp, sp, #CNG_TRAMP_FRAME
 cng_svc_tramp_clone:
     svc     #0                      /* exactly what an unrewritten site does */
     b       cng_svc_tramp_back      /* patched: b S+4 — the child arrives here
@@ -99,7 +105,7 @@ cng_svc_tramp_clone:
     stp     x26, x27, [sp, #208]
     stp     x28, x29, [sp, #224]
     str     x30,      [sp, #240]
-    add     x16, sp, #288           /* sp as the guest had it at the site */
+    add     x16, sp, #CNG_TRAMP_FRAME /* sp as the guest had it at the site */
     str     x16,      [sp, #248]
     ldr     x16, cng_svc_tramp_ret  /* pc = S+4 */
     str     x16,      [sp, #256]
@@ -128,13 +134,13 @@ cng_svc_tramp_call:
     ldr     x17, cng_svc_tramp_ret
     cmp     x16, x17
     ldr     x16,      [sp, #248]
-    add     x17, sp, #288
+    add     x17, sp, #CNG_TRAMP_FRAME
     ccmp    x16, x17, #0, eq
     b.ne    1f
     ldr     x16,      [sp, #264]
     msr     nzcv, x16
     ldp     x16, x17, [sp, #128]    /* the guest's own IP0/IP1, last of all */
-    add     sp, sp, #288
+    add     sp, sp, #CNG_TRAMP_FRAME
 cng_svc_tramp_back:
     brk     #0                      /* patched: b S+4 (loud if it ever is not) */
 cng_svc_tramp_gen:

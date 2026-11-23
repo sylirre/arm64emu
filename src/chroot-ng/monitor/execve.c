@@ -453,6 +453,8 @@ struct exec_job {
     struct exec_args args;  /* the snapshot: owned by whoever commits */
     unsigned long sigmask;  /* the requester's guest mask, for the leader */
     long requester;         /* its tid */
+    s32 pt_nr;              /* its call, and whether that call's exit stop */
+    int pt_owed;            /* is owed (cng_pt_exec_call), for the leader's */
     int pending;            /* a handoff the leader has not taken yet */
 };
 
@@ -2273,6 +2275,7 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
     g_job.args = a;
     g_job.sigmask = guest_mask;
     g_job.requester = me;
+    cng_pt_exec_call(&g_job.pt_nr, &g_job.pt_owed);
 
     /* A non-leader thread hands the exec to the leader and leaves (see the
      * exec-in-flight note): the program that comes out of the exec is then
@@ -2382,7 +2385,7 @@ int cng_exec_takeover_frame(struct cng_ucontext *uc) {
      * request arrived, and never returns to it. */
     cng_scratch_leave();
     cng_pt_set_frame(cng_pt_uregs(uc), uc);
-    cng_pt_report_exec(cng_pt_uregs(uc));
+    cng_pt_report_exec(cng_pt_uregs(uc), g_job.pt_nr, g_job.pt_owed);
     return 1;
 }
 
@@ -2401,7 +2404,7 @@ static _Noreturn void exec_takeover_enter(void) {
         regs.sp = sp;
         regs.pc = entry;
         cng_pt_set_frame(&regs, 0);
-        cng_pt_report_exec(&regs);
+        cng_pt_report_exec(&regs, g_job.pt_nr, g_job.pt_owed);
         sp = regs.sp;
         entry = regs.pc;
         cng_pt_set_frame(0, 0);
@@ -2433,12 +2436,13 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
      * return: rt_sigreturn resumes at `entry` with the new stack, handler and
      * filter still installed. */
     exec_frame(uc, sp, entry, 0);
-    /* The post-execve stop. A real execve traps to the tracer with SIGTRAP once
-     * the new image is in place — the stop strace waits for before it starts
-     * following the program it launched, and the one our emulation would
-     * otherwise never produce, since it never enters the kernel's exec path. */
+    /* The post-execve stops. A real execve traps to the tracer once the new
+     * image is in place (PTRACE_EVENT_EXEC, or SIGTRAP), the stop strace waits
+     * for before it starts following the program it launched, and gives the
+     * call's exit stop — stops our emulation would otherwise never produce,
+     * since it never enters the kernel's exec path. */
     cng_pt_set_frame(cng_pt_uregs(uc), uc);
-    cng_pt_report_exec(cng_pt_uregs(uc));
+    cng_pt_report_exec(cng_pt_uregs(uc), -1, 0);
 }
 
 long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
@@ -2454,7 +2458,7 @@ long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
     /* Ordinary call context (no signal frame): abandon the old program's stack
      * and enter the new image directly, like the initial `run` does. */
     if (cng_pt_active()) {
-        /* The post-execve stop, on a frame describing the entry state we are
+        /* The post-execve stops, on a frame describing the entry state we are
          * about to jump to — there is no signal context here to rewrite, so the
          * tracer's register edits are read back before the jump. */
         struct cng_uregs regs;
@@ -2462,7 +2466,7 @@ long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
         regs.sp = sp;
         regs.pc = entry;
         cng_pt_set_frame(&regs, 0);
-        cng_pt_report_exec(&regs);
+        cng_pt_report_exec(&regs, -1, 0);
         sp = regs.sp;
         entry = regs.pc;
         cng_pt_set_frame(0, 0);
