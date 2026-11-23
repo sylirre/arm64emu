@@ -2199,6 +2199,7 @@ SYSDEF(clone) {
         m->dethread_state = DT_PENDING;
         /* ...and so does a group stop: a new process is in none. */
         m->jc_active = 0;
+        m->jc_handover = 0;
         g_tls.jc_seen = m->jc_gseq;
         g_tls.stop_gen = m->stop_gen;
         g_tls.image_gen = m->image_gen;

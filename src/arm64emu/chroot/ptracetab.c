@@ -616,7 +616,8 @@ static void pt_self_detach(void) {
     if (e) { __atomic_store_n(&e->state, PT_ST_RUNNING, __ATOMIC_RELEASE); pt_free(e); }
     /* __ptrace_unlink: a group stop in force stops the thread again, now
      * untraced -- it parks at its next boundary (ptrace_jobctl_service), or,
-     * the last traced thread gone, the stop is the host's (sig_jc_untraced).
+     * the last traced thread gone, the stop is the host's (sig_jc_untraced),
+     * which one on its way to park waits out (sig_jc_handover_wait).
      * A detach, or a tracer's death, of a live thread only: one that is
      * exiting releases its link elsewhere, and does not stop. */
     if (__atomic_load_n(&g_machine.jc_active, __ATOMIC_ACQUIRE)) {
@@ -1134,8 +1135,10 @@ static void pt_jobctl_trap(CPU *c, int participate) {
  * job-control traps of a tracee (pt_jobctl_trap) -- or, untraced, the part
  * a thread takes in a group stop by parking until SIGCONT (sig_jc_park),
  * which an attach ends: the thread then traps into the stop, as the kernel's
- * attach turns a stopped task into a traced one. The call the kick cut short
- * is the stop's, and resumes as one no handler ran for (sig_after_trap). */
+ * attach turns a stopped task into a traced one. A stop handed over to the
+ * host meanwhile is waited out (sig_jc_handover_wait). The call the kick cut
+ * short is the stop's, and resumes as one no handler ran for
+ * (sig_after_trap). */
 void ptrace_jobctl_service(CPU *c) {
     pt_rparent_service();   /* a child of ours traced now (the attach's kick) */
     for (;;) {
@@ -1204,6 +1207,14 @@ void ptrace_jobctl_service(CPU *c) {
             sig_jc_park(c);
             sig_after_trap(c);
             if (g_ptrace_kick) {   /* woken by a kick: an attach, maybe */
+                g_ptrace_kick = 0;
+                continue;
+            }
+        } else if (!g_ptrace_active && sig_jc_handover_wait()) {
+            /* ...or, the stop handed over to the host as this thread came
+             * to take its part (sig_jc_untraced), its part in the host's. */
+            sig_after_trap(c);
+            if (g_ptrace_kick) {
                 g_ptrace_kick = 0;
                 continue;
             }

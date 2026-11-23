@@ -1701,9 +1701,24 @@ void sig_jc_park(CPU *c) {
  * died -- with a group stop in force: the stop is the host's now, as the
  * kernel's is after __ptrace_unlink re-arms it. That stops every thread,
  * tells the real parent (CLD_STOPPED), and ends with any SIGCONT, from
- * anyone; the threads parked in the emulator's are released into it. */
+ * anyone; the threads parked in the emulator's are released into it.
+ *
+ * Handed over (jc_handover) from before the emulator's stop is ended until
+ * the host's is: a thread detached just before this one that comes to take
+ * its part again finds the emulator's stop gone, and waits for the host's
+ * (sig_jc_handover_wait) instead of running on through it. */
+static void jc_handover_end(struct Machine *m) {
+    __atomic_store_n(&m->jc_handover, 0, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, &m->jc_handover, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
 void sig_jc_untraced(struct Machine *m) {
-    if (!__atomic_exchange_n(&m->jc_active, 0, __ATOMIC_SEQ_CST)) return;
+    if (!__atomic_load_n(&m->jc_active, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&m->jc_handover, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_exchange_n(&m->jc_active, 0, __ATOMIC_SEQ_CST)) {
+        jc_handover_end(m);   /* a SIGCONT ended it first */
+        return;
+    }
     proctab_jc_live_set(0);   /* the host's stop from here: its own 'T' */
     /* A guest parent was told of the stop as it completed, and a kernel tells
      * it nothing more as the stop goes on untraced; nor does its wait report
@@ -1712,13 +1727,33 @@ void sig_jc_untraced(struct Machine *m) {
      * stop is over. */
     int model = (proctab_jc_word((s32)getpid()) & JCW_MODEL) != 0;
     if (model) proctab_jc_art_set(JCA_STOP_CHLD | JCA_STOP_WAIT);
-    kill(getpid(), SIGSTOP);
+    /* This thread's to take, before it runs anything more: a stop signal
+     * sent to the process is taken by the thread the host picks to wake
+     * (complete_signal: the leader, maybe, parked in the emulator's stop),
+     * and this one ran on until that one had stopped the group -- back into
+     * the guest, out of the trap it was detached in. Sent to the thread, it
+     * stops the group all the same (do_signal_stop), this thread first. */
+    syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)g_tls.tid, SIGSTOP);
     if (model) {
         proctab_jc_art_set(0);
         proctab_jc_set(0, (s32)getppid());   /* continued: the host told it so */
     }
+    jc_handover_end(m);
     __atomic_add_fetch(&m->jc_contgen, 1, __ATOMIC_SEQ_CST);
     syscall(SYS_futex, &m->jc_contgen, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
+/* A thread detached with a group stop in force takes its part again untraced
+ * (pt_self_detach), as __ptrace_unlink re-arms it -- unless the stop is gone
+ * by then: ended by a SIGCONT, or handed over to the host by the last traced
+ * thread (sig_jc_untraced), whose stop is not made yet. Then it waits for the
+ * host's stop, and for its end, and never runs on meanwhile. */
+int sig_jc_handover_wait(void) {
+    struct Machine *m = &g_machine;
+    if (!__atomic_load_n(&m->jc_handover, __ATOMIC_ACQUIRE)) return 0;
+    while (__atomic_load_n(&m->jc_handover, __ATOMIC_ACQUIRE))
+        syscall(SYS_futex, &m->jc_handover, FUTEX_WAIT_PRIVATE, 1, NULL, NULL, 0);
+    return 1;
 }
 
 /* Is a siginfo of guest signal `sig` with code `code` the kernel's _sigpoll

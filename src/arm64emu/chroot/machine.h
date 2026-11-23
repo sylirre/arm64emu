@@ -139,6 +139,10 @@ struct Machine {
     u32 jc_gseq;              /* generation of the latest group stop */
     u32 jc_active;            /* one is in progress or complete (the kernel's
                                * group_stop_count || SIGNAL_STOP_STOPPED) */
+    u32 jc_handover;          /* ...being handed over to the host, the last
+                               * traced thread gone (sig_jc_untraced): set
+                               * before the emulator's stop ends, cleared
+                               * once the host's is over; a futex word */
     u32 jc_sig;               /* its stop signal (JOBCTL_STOP_SIGMASK) */
     u32 jc_contgen;           /* bumped by each SIGCONT caught: a stop signal
                                * queued before it is flushed, and a thread
@@ -908,9 +912,11 @@ int  sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
 int  sig_procpnd_trusted(int hs);
 /* The group stop (signal.c, "group stop"): an untraced thread's part in one
  * (parked until SIGCONT), and its hand-over to the host when the last traced
- * thread is gone. */
+ * thread is gone -- which a thread detached just before waits out
+ * (sig_jc_handover_wait: 1 = it did). */
 void sig_jc_park(CPU *c);
 void sig_jc_untraced(struct Machine *m);
+int  sig_jc_handover_wait(void);
 /* The real parent's view of a group stop (signal.c): this thread took its
  * part in the current one (sig_jc_took_part), or left the group with one in
  * force (sig_jc_left); an attach adopted a stop the host had made

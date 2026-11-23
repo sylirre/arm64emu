@@ -2395,6 +2395,13 @@ kernel runs it (`src/arm64emu/chroot/signal.c`, "group stop"; `src/arm64emu/chro
   thread to take part again untraced, and once no thread is traced at all the
   stop is the host's (`sig_jc_untraced`): the process stays stopped, its real
   parent is told, and any `SIGCONT` ends it (`tests/arm64emu/chroot/ptrace/mtjobctl.c`).
+  The last thread to leave stops itself with a `SIGSTOP` sent to the thread,
+  not the process: one sent to the process is taken by whichever thread the
+  host picks, and the leaving one ran on in the guest until that thread had
+  stopped the group. A thread detached just before it, which finds the
+  emulator's stop already handed over, waits for the host's
+  (`sig_jc_handover_wait`): no thread runs between its trap and the stop that
+  follows (`tests/arm64emu/chroot/ptrace/mtdetach.c`).
 - *The traps.* `PTRACE_INTERRUPT` asks for a `PTRACE_EVENT_STOP` trap: a
   running tracee is kicked to it, one in a stop takes it after that stop, and
   a listening one traps again at once. A change of group-stop state tells a
