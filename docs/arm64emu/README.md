@@ -334,11 +334,19 @@ arm64emu chroot [options] <rootfs> <program> [args...]
                           The guest does not inherit the host environment: TERM
                           and COLORTERM are passed through, PATH defaults to
                           /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
-                          /sbin:/bin and HOME to /root, everything else is
+                          /sbin:/bin, HOME is left unset, everything else is
                           dropped. -E overrides any of them.
   -0, --argv0 ARG0        Override argv[0] for the guest program
   -u, --fake-id[=ID]      Present a fake identity (fakeroot-style); ID = uid | uid:gid,
                           default 0:0 (root)
+      --setuid-root       Show set-uid executables as owned by root, so executing
+                          one raises the effective uid to 0 (su, sudo); implies
+                          --fake-id, with the invoking user's id unless -u gives
+                          one
+      --setgid-root       The same for set-gid executables and the effective gid
+  -F, --file-backed       Load the program and its interpreter by mapping their
+                          file pages (shared with the page cache) instead of
+                          copying them; a segment that cannot be mapped is copied
       --share-abstract-sockets  Do not isolate abstract-namespace AF_UNIX sockets
                           per rootfs; share the host's global abstract namespace
                           (default: isolate, like pathname sockets)
@@ -477,6 +485,18 @@ privilege rules: a fake euid of 0 is privileged, a dropped identity cannot
 regain it. Executables with setuid/setgid bit take on the file owner's
 (remapped) identity on exec (unless `no_new_privs` is set), `AT_SECURE` is
 set on such transitions, `capget` reports full capabilities for fake-root.
+
+Every file of a rootfs belongs to the invoking user on the host, so a setuid
+binary such as `su` would only ever confer the fake identity itself.
+`--setuid-root` shows set-uid executables as owned by root instead, and
+`--setgid-root` set-gid ones (with group execute) as root's group, so their
+exec raises the effective id to 0 -- `su` then works under a non-root fake
+identity. Either implies `--fake-id`, with the invoking user's ids unless `-u`
+gives others:
+
+```sh
+arm64emu chroot --setuid-root -u 1000 ./rootfs /bin/su -l   # su can become root
+```
 
 `stat` present a consistent view: a file the host reports as owned by the
 real invoking user appears owned by the fake identity. `chown` or `chmod`

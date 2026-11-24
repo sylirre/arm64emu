@@ -3,7 +3,9 @@
 /* ELF64/AArch64 loader: PT_LOAD segments, PT_INTERP (dynamic linker from the
  * rootfs), initial stack with argv/envp/auxv. Segment content is pread into
  * anonymous guest backing (equivalent to MAP_PRIVATE file pages for an
- * interpreter, and independent of the host page size). */
+ * interpreter, and independent of the host page size) -- or, under
+ * -F/--file-backed, mapped MAP_PRIVATE from the file where a segment allows
+ * it (seg_map_file). */
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -96,6 +98,43 @@ static int elf_header_check(int fd, char *interp) {
     return 0;
 }
 
+/* -F/--file-backed: map segment `i`'s file part from the image instead of
+ * copying it, as the kernel's elf_map does -- a MAP_PRIVATE mapping whose
+ * pages the page cache shares until they are written. Returns 0 when it is
+ * mapped, and anything else when it must be copied instead, which is always a
+ * correct answer: a segment whose file offset does not share the page offset
+ * of its address (a file page cannot be placed there), one whose pages another
+ * segment also occupies (mapping the file over that page would replace the
+ * other segment's bytes), a host that will not map the file at all (ENODEV
+ * and the like). guest_map_file already serves a host page larger than the
+ * guest's with a padded view, so the host page size is no reason to copy.
+ *
+ * The part of the last page past the file part is zeroed, as the copy leaves
+ * it and as the kernel's padzero does before the bss; the bytes of the first
+ * page ahead of the segment stay the file's, as they do under the kernel. */
+static int seg_map_file(struct Machine *m, int fd, const Elf64_Phdr *ph,
+                        int phnum, int i, u64 base, const char *gpath) {
+    const Elf64_Phdr *s = &ph[i];
+    if (!s->p_filesz || ((s->p_offset ^ s->p_vaddr) & GUEST_PAGE_MASK))
+        return -1;
+    u64 p0 = PG_DOWN(s->p_vaddr), fend = s->p_vaddr + s->p_filesz;
+    u64 p1 = PG_UP(fend);
+    for (int j = 0; j < phnum; j++) {
+        if (j == i || ph[j].p_type != PT_LOAD) continue;
+        u64 q0 = PG_DOWN(ph[j].p_vaddr), q1 = PG_UP(ph[j].p_vaddr + ph[j].p_memsz);
+        if (q0 < p1 && p0 < q1) return -1;
+    }
+    if (guest_map_file(&m->as, base + p0, p1 - p0, PTE_R | PTE_W, fd,
+                       PG_DOWN(s->p_offset), 0, gpath) < 0)
+        return -1;
+    if (fend != p1) {
+        static const u8 zero[GUEST_PAGE_SIZE];
+        if (copy_to_guest(&m->cpu, base + fend, zero, (size_t)(p1 - fend)) < 0)
+            return -EFAULT;   /* the mapping is there: no copy can follow */
+    }
+    return 0;
+}
+
 static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
                     const char *gpath) {
     Elf64_Ehdr eh;
@@ -144,7 +183,8 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
 
     /* One anonymous RW region for the whole span, then per-segment content and
      * protection; pages in the span not covered by any segment become
-     * no-access. */
+     * no-access. The content is copied in, or under -F mapped from the file
+     * over the span's pages (seg_map_file). */
     int r = guest_map_anon(&m->as, base + lo, hi - lo, PTE_R | PTE_W);
     if (r < 0) return r;
 
@@ -155,7 +195,13 @@ static int load_one(struct Machine *m, int fd, u64 fixed_base, LoadInfo *out,
     for (int i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;   /* PT_INTERP: read above */
         u64 va = base + ph[i].p_vaddr;
-        if (ph[i].p_filesz) {
+        int mapped = 0;
+        if (m->file_backed) {
+            int fr = seg_map_file(m, fd, ph, eh.e_phnum, i, base, gpath);
+            if (fr == -EFAULT) { free(pageprot); return -EFAULT; }
+            mapped = fr == 0;
+        }
+        if (ph[i].p_filesz && !mapped) {
             u8 buf[65536];
             u64 done = 0;
             while (done < ph[i].p_filesz) {

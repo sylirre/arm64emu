@@ -170,8 +170,10 @@ void gstat_from_host(struct Machine *m, GStat *g, const struct stat *st) {
     g->st_ino = st->st_ino;
     g->st_mode = st->st_mode;
     g->st_nlink = (u32)st->st_nlink;
-    g->st_uid = remap_uid(m, st->st_uid);   /* fake-id ownership remap */
-    g->st_gid = remap_gid(m, st->st_gid);
+    /* fake-id ownership remap, and --setuid-root/--setgid-root's root-owned
+     * set-id files (machine.h, vis_uid) */
+    g->st_uid = vis_uid(m, st->st_uid, st->st_mode);
+    g->st_gid = vis_gid(m, st->st_gid, st->st_mode);
     g->st_rdev = st->st_rdev;
     g->st_size = st->st_size;
     g->st_blksize = (s32)st->st_blksize;
@@ -1694,6 +1696,43 @@ SYSDEF(fstat) {
     return copy_to_guest(c, a1, &g, sizeof g) < 0 ? (u64)(s64)-EFAULT : 0;
 }
 
+/* name_to_handle_at(2): no file handles are handed out here -- a handle names
+ * an inode on the host's own filesystem, which open_by_handle_at (a
+ * CAP_DAC_READ_SEARCH call) would then reach from outside the rootfs. The
+ * answer is the kernel's for a filesystem that does not export handles,
+ * EOPNOTSUPP, given in the kernel's order: the flags first (6.1 knows only
+ * AT_SYMLINK_FOLLOW and AT_EMPTY_PATH), then the name, which must resolve --
+ * ENOENT, ENOTDIR, EACCES and the like come ahead of it -- with the last
+ * component followed only under AT_SYMLINK_FOLLOW. Callers (systemd, the
+ * util-linux mount tools) take EOPNOTSUPP as their cue to fall back. */
+SYSDEF(name_to_handle_at) {
+    (void)a2; (void)a3; (void)a5;
+    unsigned gf = (unsigned)a4;
+    if (gf & ~(G_AT_SYMLINK_FOLLOW | G_AT_EMPTY_PATH))
+        return (u64)(s64)-EINVAL;
+    struct stat st;
+    if (gf & G_AT_EMPTY_PATH) {
+        char gpath[PATH_MAX];
+        long n = copy_str_from_guest(c, gpath, a1, sizeof gpath);
+        if (n == 0) {   /* the descriptor itself (or the cwd, for AT_FDCWD) */
+            if (fstatat((int)(s32)a0, "", &st, AT_EMPTY_PATH) < 0) return host_err();
+            return (u64)(s64)-EOPNOTSUPP;
+        }
+        if (n < 0) return (u64)(s64)n;
+    }
+    PathPin pin;
+    char canon[PATH_MAX];
+    unsigned rf = (gf & G_AT_SYMLINK_FOLLOW) ? 0 : PATH_NOFOLLOW_LAST;
+    int rr = resolve_pin(c, (int)(s32)a0, a1, rf, &pin, canon);
+    if (rr < 0) return (u64)(s64)rr;
+    /* Pinned: the walk followed what was to be followed (newfstatat). */
+    int nf = (pin.pinned || !(gf & G_AT_SYMLINK_FOLLOW)) ? AT_SYMLINK_NOFOLLOW : 0;
+    int r = fstatat(pin.dfd, pin.name, &st, nf);
+    u64 e = r < 0 ? host_err() : (u64)(s64)-EOPNOTSUPP;
+    path_unpin(&pin);
+    return e;
+}
+
 SYSDEF(newfstatat) {
     unsigned gf = (unsigned)a3;
     struct stat st;
@@ -1793,8 +1832,8 @@ static u64 access_faked(struct Machine *m, const PathPin *p, int mode, int eff) 
     int r = mode_access_ok(eff ? cr.euid : cr.ruid,
                            eff ? cr.egid : cr.rgid,
                            cr.groups, cr.ngroups,
-                           remap_uid(m, (u32)st.st_uid),
-                           remap_gid(m, (u32)st.st_gid),
+                           vis_uid(m, (u32)st.st_uid, (u32)st.st_mode),
+                           vis_gid(m, (u32)st.st_gid, (u32)st.st_mode),
                            (u32)st.st_mode, mode);
     if (r < 0) return (u64)(s64)r;
     if (access_pinned(p, mode) == 0) return 0;
@@ -1831,8 +1870,8 @@ static u64 access_synth(CPU *c, const char *pcanon, int nofollow, int mode,
         gid = eff ? getegid() : getgid();
     }
     return (u64)(s64)mode_access_ok(uid, gid, cr.groups, cr.ngroups,
-                                    remap_uid(m, (u32)st.st_uid),
-                                    remap_gid(m, (u32)st.st_gid),
+                                    vis_uid(m, (u32)st.st_uid, (u32)st.st_mode),
+                                    vis_gid(m, (u32)st.st_gid, (u32)st.st_mode),
                                     (u32)st.st_mode, mode);
 }
 
@@ -4742,10 +4781,12 @@ SYSDEF(statx) {
         path_unpin(&pin);
     }
     if (r < 0) return host_err();
-    if (c->m->fake_id) {   /* remap stx_uid (off 20), stx_gid (off 24) */
+    if (c->m->fake_id) {   /* remap stx_uid (off 20), stx_gid (off 24) by
+                            * stx_mode (off 28), as gstat_from_host does */
         u32 u, g;
-        memcpy(&u, buf + 20, 4); memcpy(&g, buf + 24, 4);
-        u = remap_uid(c->m, u); g = remap_gid(c->m, g);
+        u16 md;
+        memcpy(&u, buf + 20, 4); memcpy(&g, buf + 24, 4); memcpy(&md, buf + 28, 2);
+        u = vis_uid(c->m, u, md); g = vis_gid(c->m, g, md);
         memcpy(buf + 20, &u, 4); memcpy(buf + 24, &g, 4);
     }
     return copy_to_guest(c, a4, buf, 256) < 0 ? (u64)(s64)-EFAULT : 0;

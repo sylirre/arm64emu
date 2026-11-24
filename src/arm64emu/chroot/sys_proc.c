@@ -3265,8 +3265,8 @@ static int exec_perm_check(struct Machine *m, const PathPin *p, int fd,
     Cred cr;
     cred_get(m, &cr);
     return mode_exec_ok(cr.euid, cr.egid, cr.groups, cr.ngroups,
-                        remap_uid(m, (u32)st.st_uid),
-                        remap_gid(m, (u32)st.st_gid), st.st_mode);
+                        vis_uid(m, (u32)st.st_uid, (u32)st.st_mode),
+                        vis_gid(m, (u32)st.st_gid, (u32)st.st_mode), st.st_mode);
 }
 
 /* load_script's two scanners, both over the CLOSED range [first, last]: the
@@ -3447,8 +3447,10 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
      * permission check judged -- the image's own descriptor, not its name.
      * "Disregard actual filesystem ownership": the file's guest-visible owner
      * is the remapped owner, so a rootfs binary owned by the host user confers
-     * the fake identity. euid/fsuid (and saved id) take the file owner; the
-     * real uid is unchanged. AT_SECURE then follows from euid != ruid.
+     * the fake identity -- or root, under --setuid-root/--setgid-root, which
+     * show set-id files as root's (machine.h, vis_uid). euid/fsuid (and saved
+     * id) take the file owner; the real uid is unchanged. AT_SECURE then
+     * follows from euid != ruid.
      *
      * Which bits count is bprm_fill_uid's rule, not the mode's letter: under
      * no_new_privs neither does (that is the whole of the flag's promise --
@@ -3470,9 +3472,9 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     u32 new_euid = 0, new_egid = 0;
     if (m->fake_id) {
         if (setid_uid)
-            { raise_uid = 1; new_euid = remap_uid(m, img_st.st_uid); }
+            { raise_uid = 1; new_euid = vis_uid(m, img_st.st_uid, img_st.st_mode); }
         if (setid_gid)
-            { raise_gid = 1; new_egid = remap_gid(m, img_st.st_gid); }
+            { raise_gid = 1; new_egid = vis_gid(m, img_st.st_gid, img_st.st_mode); }
     }
 
     /* Last thing that can still be refused: empty the thread group, so nothing

@@ -451,6 +451,8 @@ struct Machine {
 
     /* Fake identity (-fake-id): proot-style fake uid/gid + credential set. */
     int fake_id;              /* mode enabled */
+    u8 setuid_root;           /* --setuid-root: set-uid files are root's (vis_uid) */
+    u8 setgid_root;           /* --setgid-root: set-gid files are root's group */
     u32 fake_uid, fake_gid;   /* configured identity = stat remap target (fixed) */
     u32 host_uid, host_gid;   /* real invoking IDs, captured at startup */
     Cred cred;                /* mutable process credential set */
@@ -482,7 +484,12 @@ struct Machine {
                                * them -- guest fd IS host fd, so an inherited
                                * one is a live handle onto a host file the
                                * rootfs does not contain) */
-    char abs_tag[16];         /* per-rootfs prefix spliced into guest abstract
+    u8 file_backed;           /* -F/--file-backed: the loader maps the program's
+                               * and the interpreter's segments from their file
+                               * (MAP_PRIVATE, page cache shared) instead of
+                               * copying them, where the host page lets it
+                               * (elf.c) */
+    char abs_tag[16];       /* per-rootfs prefix spliced into guest abstract
                                * AF_UNIX names for isolation (see sys_net.c) */
     u8 abs_tag_len;           /* bytes of abs_tag in use */
 
@@ -544,6 +551,29 @@ static inline u32 remap_uid(const struct Machine *m, u32 host) {
 }
 static inline u32 remap_gid(const struct Machine *m, u32 host) {
     return (m->fake_id && host == m->host_gid) ? m->fake_gid : host;
+}
+
+/* The owner the guest is shown for a file of mode `mode`: remap_uid/gid's,
+ * except that under --setuid-root a set-uid regular file is root's, and under
+ * --setgid-root a set-gid one (S_ISGID with group execute: without it the bit
+ * is the old mandatory-locking mark, not set-gid -- bprm_fill_uid's rule) is
+ * root's group. That is what lets a set-uid-root binary such as su gain root
+ * under a non-root fake identity: every rootfs file belongs to the invoking
+ * user on the host, so its set-uid bit would otherwise confer that user. The
+ * exec raise (sys_proc.c) and every stat and permission judgement use this,
+ * so what the guest reads and what it is granted agree. */
+static inline int vis_setuid(const struct Machine *m, u32 mode) {
+    return m->setuid_root && (mode & 0170000u) == 0100000u && (mode & 04000u);
+}
+static inline int vis_setgid(const struct Machine *m, u32 mode) {
+    return m->setgid_root && (mode & 0170000u) == 0100000u &&
+           (mode & 02010u) == 02010u;
+}
+static inline u32 vis_uid(const struct Machine *m, u32 host, u32 mode) {
+    return vis_setuid(m, mode) ? 0 : remap_uid(m, host);
+}
+static inline u32 vis_gid(const struct Machine *m, u32 host, u32 mode) {
+    return vis_setgid(m, mode) ? 0 : remap_gid(m, host);
 }
 
 /* FNV-1a 32-bit hash. Keys per-rootfs state from the rootfs path: the

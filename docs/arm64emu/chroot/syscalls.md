@@ -21,6 +21,15 @@ with a one-shot stderr warning naming it — invaluable during bring-up.
 **Designed-ENOSYS set.** Some numbers (`rseq`, `clone3`, `openat2`,
 `io_uring_*`, `statmount`, `close_range`, …) return `-ENOSYS` *silently*: libc
 probes them and falls back, so ENOSYS is the correct emulated answer, not a stub.
+So does every number past the advertised kernel's last one (6.1's is
+`set_mempolicy_home_node`, 450): a real 6.1 answers those ENOSYS, and what
+probes them falls back as it must there.
+
+**No file handles.** `name_to_handle_at` answers `EOPNOTSUPP`, the kernel's
+answer for a filesystem that exports none, after the kernel's own checks in its
+order (the flags, then the name): a handle names a host inode, which
+`open_by_handle_at` would reach from outside the rootfs
+(`tests/arm64emu/chroot/fixtures/handleat.c`).
 
 The `--strace` flag prints one line per syscall in a qemu-compatible format; it is
 the primary bring-up instrument (diff against `qemu-aarch64 -strace`). `--strace-full`
@@ -2533,7 +2542,13 @@ fatal signal. One difference remains, and it is the loader's design rather than
 a check: segment content is `pread` into anonymous backing rather than mapped
 from the file, so an image naming content past the end of its file is refused
 here, where a kernel maps the hole, execs successfully and delivers `SIGBUS`
-when the guest touches it.
+when the guest touches it. Under `-F/--file-backed` a segment is mapped
+`MAP_PRIVATE` from the file instead, as the kernel's `elf_map` does
+(`seg_map_file`): the page cache is shared, `/proc/self/maps` names the file
+offsets, and the end of the page the file part ends in is zeroed as `padzero`
+zeroes it. A segment is still copied where it cannot be mapped -- a file offset
+that does not share its address's page offset, a page another segment also
+occupies, a file the host will not map (`tests/arm64emu/chroot/fixtures/filebacked.c`).
 
 ### The stack the new image gets
 
@@ -2731,14 +2746,19 @@ identity. Design (all gated on `m->fake_id`; plain host passthrough when off):
   — but only with group execute beside it (`S_ISGID` alone is the old
   mandatory-locking mark, which `bprm_fill_uid` does not treat as setgid), and
   neither once the process has set `no_new_privs`. `AT_SECURE` follows a real
-  transition (`euid != ruid`) (`tests/arm64emu/chroot/fixtures/setidexec.c`). The raise is applied
+  transition (`euid != ruid`) (`tests/arm64emu/chroot/fixtures/setidexec.c`).
+  Under `--setuid-root` / `--setgid-root` the owner a set-id file is judged and
+  shown by is root (`vis_uid`/`vis_gid` in `machine.h`, applied wherever the
+  remap below is), so its exec raises to 0
+  (`tests/arm64emu/chroot/fixtures/setidroot.c`). The raise is applied
   past the point of no return, where a kernel's `commit_creds` runs: the one
   refusal still ahead of it (`de_thread`) returns to the *old* image, which must
   not go on running with privilege it never exec'd into.
 - **Ownership remap** (proot-style, no per-file database): a file the host
   reports as owned by the **real invoking user** is presented to the guest as
   owned by the **fake identity**; other owners pass through. Applied in
-  `gstat_from_host`, `statx`, and the setuid-exec owner lookup. The same remap
+  `gstat_from_host`, `statx`, the access and exec permission checks, and the
+  setuid-exec owner lookup. The same remap
   covers **`SO_PEERCRED`** (`getsockopt` in `sys_net.c`): the peer `ucred`
   uid/gid the host reports for a Unix socket is remapped to the fake identity so
   peer-uid checks (tmux's server ACL, polkit, …) agree with `getuid()` — and

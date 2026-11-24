@@ -18,6 +18,7 @@ SYSDEF(openat); SYSDEF(close); SYSDEF(read); SYSDEF(write);
 SYSDEF(readv); SYSDEF(writev); SYSDEF(pread64); SYSDEF(pwrite64);
 SYSDEF(preadv); SYSDEF(pwritev); SYSDEF(preadv2); SYSDEF(pwritev2);
 SYSDEF(lseek); SYSDEF(fstat); SYSDEF(newfstatat); SYSDEF(faccessat);
+SYSDEF(name_to_handle_at);
 SYSDEF(readlinkat); SYSDEF(getdents64); SYSDEF(ioctl); SYSDEF(fcntl);
 SYSDEF(dup); SYSDEF(dup3); SYSDEF(pipe2); SYSDEF(getcwd); SYSDEF(chdir);
 SYSDEF(fchdir); SYSDEF(chroot); SYSDEF(mknodat); SYSDEF(mkdirat); SYSDEF(unlinkat); SYSDEF(renameat);
@@ -157,6 +158,7 @@ static const struct {
     { G_NR_copy_file_range, sys_copy_file_range, "copy_file_range" },
     { G_NR_readlinkat, sys_readlinkat, "readlinkat" },
     { G_NR_newfstatat, sys_newfstatat, "newfstatat" },
+    { G_NR_name_to_handle_at, sys_name_to_handle_at, "name_to_handle_at" },
     { G_NR_fstat, sys_fstat, "fstat" },
     { G_NR_fsync, sys_fsync, "fsync" },
     { G_NR_fdatasync, sys_fdatasync, "fdatasync" },
@@ -410,7 +412,7 @@ static const struct { u16 nr; const char *name; } sysname_extra[] = {
     { G_NR_memfd_secret, "memfd_secret" }, { G_NR_mount_setattr, "mount_setattr" },
     { G_NR_move_mount, "move_mount" }, { G_NR_mq_open, "mq_open" },
     { G_NR_mseal, "mseal" },
-    { G_NR_name_to_handle_at, "name_to_handle_at" }, { G_NR_openat2, "openat2" },
+    { G_NR_openat2, "openat2" },
     { G_NR_open_tree, "open_tree" },
     { G_NR_pkey_mprotect, "pkey_mprotect" }, { G_NR_process_madvise, "process_madvise" },
     { G_NR_process_mrelease, "process_mrelease" },
@@ -710,7 +712,11 @@ void syscall_dispatch(CPU *c) {
         g_tls.uaccess = 0;
         as_tlb_block_end();
     } else {
-        int quiet = 0;
+        /* Past the advertised kernel's last syscall (6.1: set_mempolicy_home_node)
+         * the answer is that kernel's own, ENOSYS, and nothing to report: libcs
+         * and runtimes probe the newer calls and fall back, as they must on a
+         * real 6.1 (uname, /proc/version). */
+        int quiet = nr > G_NR_set_mempolicy_home_node;
         for (size_t i = 0; i < sizeof quiet_enosys / sizeof quiet_enosys[0]; i++)
             if (quiet_enosys[i] == nr) { quiet = 1; break; }
         if (!quiet) {

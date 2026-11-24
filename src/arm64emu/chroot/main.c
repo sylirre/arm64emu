@@ -101,11 +101,21 @@ static void help(void) {
                         "TERM and COLORTERM are inherited from the host, PATH "
                         "defaults to "
                         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"
-                        "/sbin:/bin and HOME to /root, and every other host "
-                        "variable is dropped as naming host locations."},
+                        "/sbin:/bin, HOME is left unset, and every other "
+                        "host variable is dropped as naming host locations."},
         {"-0, --argv0 ARG0", "Override argv[0] for the guest program"},
         {"-u, --fake-id[=ID]", "Present a fake user identity. Accepts values "
                         "like uid or uid:gid, default 0:0 (root)."},
+        {"    --setuid-root", "Show set-uid executables as owned by root, so "
+                        "that executing one raises the effective user id to 0 "
+                        "(su, sudo). Implies --fake-id, with the invoking "
+                        "user's id unless -u gives one."},
+        {"    --setgid-root", "The same for set-gid executables and the "
+                        "effective group id."},
+        {"-F, --file-backed", "Load the program and its interpreter by mapping "
+                        "their file pages (shared with the page cache) "
+                        "instead of copying them; a segment that cannot be "
+                        "mapped is copied."},
         {"    --share-abstract-sockets", "Share abstract namespace sockets "
                         "of the host, disable per-rootfs socket isolation."},
         {"    --host-keyring", "Forward keyctl/add_key/request_key to the host "
@@ -568,6 +578,7 @@ int chroot_main(int argc, char **argv)
     int n_extra = 0;
 
     u32 fake_uid = 0, fake_gid = 0;
+    int fake_explicit = 0;   /* -u/--fake-id given, not only implied */
 
     /* Create the process-shared bind table before any --bind registration below
      * and before the first fork, so every guest process maps the same mounts. */
@@ -603,7 +614,10 @@ int chroot_main(int argc, char **argv)
             else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));
             else if (!strcmp(n, "argv0"))  argv0 = long_value("--argv0", val, argv, argc, &i);
             else if (!strcmp(n, "work-dir")) work_dir = long_value("--work-dir", val, argv, argc, &i);
-            else if (!strcmp(n, "fake-id")) set_fake_id(m, val, argv, argc, &i, &fake_uid, &fake_gid);
+            else if (!strcmp(n, "fake-id")) { set_fake_id(m, val, argv, argc, &i, &fake_uid, &fake_gid); fake_explicit = 1; }
+            else if (!strcmp(n, "setuid-root")) { if (val) opt_no_value(arg); m->fake_id = 1; m->setuid_root = 1; }
+            else if (!strcmp(n, "setgid-root")) { if (val) opt_no_value(arg); m->fake_id = 1; m->setgid_root = 1; }
+            else if (!strcmp(n, "file-backed")) { if (val) opt_no_value(arg); m->file_backed = 1; }
             else usage();
         } else {                                       /* short cluster: -abc */
             for (char *p = arg + 1; *p; ) {
@@ -616,7 +630,8 @@ int chroot_main(int argc, char **argv)
                 else if (c == 'E') { push_env(&extra_env, &n_extra, short_value("--env", p, argv, argc, &i)); break; }
                 else if (c == '0') { argv0 = short_value("--argv0", p, argv, argc, &i); break; }
                 else if (c == 'w') { work_dir = short_value("--work-dir", p, argv, argc, &i); break; }
-                else if (c == 'u') { set_fake_id(m, p, argv, argc, &i, &fake_uid, &fake_gid); break; }
+                else if (c == 'u') { set_fake_id(m, p, argv, argc, &i, &fake_uid, &fake_gid); fake_explicit = 1; break; }
+                else if (c == 'F') m->file_backed = 1;
                 else usage();
             }
         }
@@ -635,6 +650,13 @@ int chroot_main(int argc, char **argv)
      * seed the credential set to the configured identity. */
     m->host_uid = getuid();
     m->host_gid = getgid();
+    /* An identity only implied by --setuid-root/--setgid-root is the invoking
+     * one, not 0:0: the flags let set-id binaries raise it without making the
+     * guest root from the start. An explicit -u/--fake-id wins. */
+    if (m->fake_id && !fake_explicit) {
+        fake_uid = m->host_uid;
+        fake_gid = m->host_gid;
+    }
     if (m->fake_id) {
         m->fake_uid = fake_uid;
         m->fake_gid = fake_gid;
@@ -723,8 +745,11 @@ int chroot_main(int argc, char **argv)
     /* Guest environ: a clean environment. Only the host's terminal-appearance
      * variables (TERM, COLORTERM) are inherited; every other host variable
      * (PATH, HOME, LD_*, XDG_*, ...) names host locations, not guest ones, and
-     * is dropped. What the guest gets instead of the dropped PATH and HOME is
-     * a pair of guest-side defaults (guest_default below), not the host's.
+     * is dropped. What the guest gets instead of the dropped PATH is a
+     * guest-side default (guest_default below), not the host's; HOME stays
+     * unset, as it is in a process nothing logged in (a login shell, su -,
+     * or -E sets it), since no home directory can be assumed for whatever
+     * identity the guest runs as.
      * -E/--env entries come first and win: a host var is inherited, and a
      * default supplied, only when no -E entry already sets that key. (Emitting
      * both as duplicates is not enough -- getenv() would return the -E copy but
@@ -736,14 +761,12 @@ int chroot_main(int argc, char **argv)
      * search it themselves rather than going through execvp(3) then fail before
      * they exec anything -- gcc's collect2 looks for `ld` over COMPILER_PATH +
      * $PATH and dies with "cannot find 'ld'", so compiling in a Debian rootfs
-     * needed an explicit -E PATH=... The values are the ones a login would set
-     * for root: login.defs ENV_SUPATH, and root's home -- which is the identity
-     * --fake-id presents, and the only one whose home directory a rootfs can be
-     * assumed to have. */
+     * needed an explicit -E PATH=... The value is the one a login sets for
+     * root, login.defs ENV_SUPATH: a superset of the user one, and nothing in
+     * it is outside the rootfs. */
     static const char *const host_keep[] = { "TERM=", "COLORTERM=" };
     static const char *const guest_default[] = {
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME=/root",
     };
     int n_keep = (int)(sizeof host_keep / sizeof *host_keep);
     int n_def  = (int)(sizeof guest_default / sizeof *guest_default);

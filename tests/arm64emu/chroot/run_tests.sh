@@ -464,13 +464,13 @@ if [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok &&
     skip=$((skip+1)); echo "SKIP sh: proot cannot run the reference rootfs here"
 elif [ -x "$ALPINE/bin/busybox" ] && oracle_proot_ok; then
     # proot hands the guest the HOST environment, and the emulator gives its
-    # guests the fixed default PATH + HOME=/root. On a host whose own PATH is
+    # guests the fixed default PATH and no HOME. On a host whose own PATH is
     # meaningless inside the rootfs (Termux: $PREFIX/bin) every non-builtin
     # then failed 127 on the oracle side only. Pin the guest env to the
     # emulator's defaults through the rootfs's own env(1) so the two sides
     # always agree, whatever the host environment looks like. The emulator
     # side is bounded like every other test (-k: a hang that blocks TERM).
-    GUESTENV="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root"
+    GUESTENV="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     while IFS= read -r cmd; do
         [ -z "$cmd" ] && continue
         out_o=$(oracle_proot -r "$ALPINE" /usr/bin/env -i $GUESTENV /bin/sh -c "$cmd" 2>/dev/null); rc_o=$?
@@ -560,6 +560,37 @@ setgid-nnp euid=1000 egid=1000 secure=0 pers=00360000
 done" --fake-id "$ALPINE" /tmp/ci_setidexec
     rm -f "$ALPINE/tmp/ci_setidexec" "$ALPINE"/tmp/ci_sid*
     fx_rm build/tests/arm64emu/chroot/fixtures/setidexec.bin
+    # --setuid-root / --setgid-root: a set-id file is shown as root's and its
+    # exec raises to 0 (su under a non-root fake identity); without them the
+    # same files are the fake identity's own. Each flag answers for its own
+    # bit, set-gid only with group execute, and an identity only implied by
+    # the flags is the invoking user's (machine.h, vis_uid).
+    "$AGCC" -O1 -static -o build/tests/arm64emu/chroot/fixtures/setidroot.bin tests/arm64emu/chroot/fixtures/setidroot.c 2>/dev/null &&
+        cp build/tests/arm64emu/chroot/fixtures/setidroot.bin "$ALPINE/tmp/ci_setidroot" && {
+        check_fakeid "--setuid-root --setgid-root" "setuid uid=0 gid=1000 euid=0 egid=1000
+setgid uid=1000 gid=0 euid=1000 egid=0
+setgid-no-gx uid=1000 gid=1000 euid=1000 egid=1000
+plain uid=1000 gid=1000 euid=1000 egid=1000
+done" -u 1000:1000 --setuid-root --setgid-root "$ALPINE" /tmp/ci_setidroot
+        check_fakeid "--setuid-root alone" "setuid uid=0 gid=1000 euid=0 egid=1000
+setgid uid=1000 gid=1000 euid=1000 egid=1000
+setgid-no-gx uid=1000 gid=1000 euid=1000 egid=1000
+plain uid=1000 gid=1000 euid=1000 egid=1000
+done" -u 1000:1000 --setuid-root "$ALPINE" /tmp/ci_setidroot
+        check_fakeid "set-id files without the flags" "setuid uid=1000 gid=1000 euid=1000 egid=1000
+setgid uid=1000 gid=1000 euid=1000 egid=1000
+setgid-no-gx uid=1000 gid=1000 euid=1000 egid=1000
+plain uid=1000 gid=1000 euid=1000 egid=1000
+done" -u 1000:1000 "$ALPINE" /tmp/ci_setidroot
+        hu=$(id -u); hg=$(id -g)
+        check_fakeid "implied identity is the invoking user's" "setuid uid=0 gid=$hg euid=0 egid=$hg
+setgid uid=$hu gid=0 euid=$hu egid=0
+setgid-no-gx uid=$hu gid=$hg euid=$hu egid=$hg
+plain uid=$hu gid=$hg euid=$hu egid=$hg
+done" --setuid-root --setgid-root "$ALPINE" /tmp/ci_setidroot
+    }
+    rm -f "$ALPINE/tmp/ci_setidroot" "$ALPINE"/tmp/ci_sr_*
+    fx_rm build/tests/arm64emu/chroot/fixtures/setidroot.bin
     # SCM_CREDENTIALS: the guest sends the identity it knows ({pid, getuid(),
     # getgid()}) and the kernel judges the ids against the sender's REAL ones,
     # so a fake root sending uid 0 was refused EPERM; the peer must read back
@@ -609,6 +640,53 @@ done" $eng --fake-id / build/tests/arm64emu/chroot/fixtures/credrace.bin
         'deluser ci_u 2>/dev/null; adduser -D -u 1234 -g CI -s /bin/sh -H ci_u >/dev/null 2>&1; grep "^ci_u:" /etc/passwd; deluser ci_u 2>/dev/null'
 fi
 
+# ---- -F/--file-backed: the program and its interpreter mapped from their files
+# (self-checking: the copy and the mapping must be indistinguishable but for
+# where the pages come from, which /proc/self/maps then tells like a kernel's).
+# A second run must still see the file's data: the mapping is private. ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    check_fb() {   # check_fb <label> <expected> <args...>
+        local label="$1" expect="$2"; shift 2
+        local got
+        got=$("$EMU" chroot "$@" 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS file-backed: $label"
+        else fail=$((fail+1)); echo "FAIL file-backed: $label (want '$expect' got '$got')"; fi
+    }
+    "$AGCC" -O1 -static -o build/tests/arm64emu/chroot/fixtures/filebacked.bin tests/arm64emu/chroot/fixtures/filebacked.c 2>/dev/null &&
+        cp build/tests/arm64emu/chroot/fixtures/filebacked.bin "$ALPINE/tmp/ci_filebacked" && {
+        check_fb "segments mapped" "data=1 bss=1 tail=1 off=file" -F "$ALPINE" /tmp/ci_filebacked
+        check_fb "private: a second run sees the file" "data=1 bss=1 tail=1 off=file" -F "$ALPINE" /tmp/ci_filebacked
+        check_fb "segments mapped (jit)" "data=1 bss=1 tail=1 off=file" --jit -F "$ALPINE" /tmp/ci_filebacked
+        check_fb "copied by default" "data=1 bss=1 tail=1" "$ALPINE" /tmp/ci_filebacked nooff
+    }
+    rm -f "$ALPINE/tmp/ci_filebacked"; fx_rm build/tests/arm64emu/chroot/fixtures/filebacked.bin
+    # A dynamic program: its interpreter is loaded the same way.
+    check_fb "dynamic program + interpreter" "ok" -F "$ALPINE" /bin/busybox sh -c 'echo ok'
+fi
+
+# ---- name_to_handle_at(2) and the calls past the advertised 6.1 (self-checking:
+# a host kernel hands out a real handle). EOPNOTSUPP after the kernel's own
+# checks, ENOSYS for a newer call -- and no "unimplemented syscall" line on
+# stderr about either (the emulator's other notices, such as the one an
+# inherited seccomp filter earns, may be there). ----
+if [ -x "$ALPINE/bin/busybox" ]; then
+    "$AGCC" -O1 -static -o build/tests/arm64emu/chroot/fixtures/handleat.bin tests/arm64emu/chroot/fixtures/handleat.c 2>/dev/null &&
+        cp build/tests/arm64emu/chroot/fixtures/handleat.bin "$ALPINE/tmp/ci_handleat" && {
+        got=$("$EMU" chroot "$ALPINE" /tmp/ci_handleat 2>build/tests/arm64emu/chroot/fixtures/handleat.err)
+        err=$(cat build/tests/arm64emu/chroot/fixtures/handleat.err)
+        want="root=EOPNOTSUPP
+missing=ENOENT
+badflag=EINVAL
+emptyfd=EBADF
+setxattrat=ENOSYS"
+        case "$err" in *unimplemented*) quiet=0 ;; *) quiet=1 ;; esac
+        if [ "$got" = "$want" ] && [ "$quiet" = 1 ]; then pass=$((pass+1)); echo "PASS handleat: EOPNOTSUPP, quiet ENOSYS past 6.1"
+        else fail=$((fail+1)); echo "FAIL handleat: want '$want' got '$got' stderr '$err'"; fi
+    }
+    rm -f "$ALPINE/tmp/ci_handleat"
+    fx_rm build/tests/arm64emu/chroot/fixtures/handleat.bin build/tests/arm64emu/chroot/fixtures/handleat.err
+fi
+
 # ---- abstract AF_UNIX socket isolation (self-checking; qemu has no rootfs, so
 # it can't model per-rootfs abstract-namespace tagging). By default a guest's
 # abstract name is tagged per rootfs on the host; --share-abstract-sockets
@@ -633,8 +711,8 @@ fi
 
 # ---- guest env inheritance (self-checking; qemu-user inherits the full host
 # env by design, so this cannot be differential). Only TERM/COLORTERM are passed
-# through from the host, PATH and HOME get guest-side defaults, everything else
-# is dropped; -E/--env adds and overrides any of it. ----
+# through from the host, PATH gets a guest-side default, HOME stays unset,
+# everything else is dropped; -E/--env adds and overrides any of it. ----
 if [ -x "$ALPINE/bin/busybox" ]; then
     check_env() {   # check_env <label> <expected> <got>
         if [ "$3" = "$2" ]; then pass=$((pass+1)); echo "PASS env: $1"
@@ -654,35 +732,39 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     # -E adds a variable the host never had.
     check_env "-E sets a fresh var" "bar" \
         "$("$EMU" chroot -E A64CH_FOO=bar "$ALPINE" /bin/busybox sh -c 'echo "${A64CH_FOO:-none}"' 2>/dev/null)"
-    # PATH and HOME are given guest-side defaults. A guest with no PATH at all
-    # is not something a real system ever presents, and programs that search it
+    # PATH is given a guest-side default. A guest with no PATH at all is not
+    # something a real system ever presents, and programs that search it
     # themselves rather than via execvp(3) fail before they exec: gcc's collect2
     # looks for `ld` over COMPILER_PATH + $PATH and dies "cannot find 'ld'".
+    # HOME is not: no home directory can be assumed for the identity the guest
+    # runs as, and a process nothing logged in has none.
     check_env "PATH defaults" "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         "$("$EMU" chroot "$ALPINE" /bin/busybox sh -c 'echo "${PATH:-none}"' 2>/dev/null)"
-    check_env "HOME defaults" "/root" \
+    check_env "HOME unset" "none" \
         "$("$EMU" chroot "$ALPINE" /bin/busybox sh -c 'echo "${HOME:-none}"' 2>/dev/null)"
     # The default is the guest's, not the host's: a host PATH/HOME still must
-    # not reach the guest, it is replaced rather than passed through.
+    # not reach the guest -- PATH is replaced, HOME dropped.
     check_env "host PATH not leaked" "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         "$(PATH=/hostpath "$EMU" chroot "$ALPINE" /bin/busybox sh -c 'echo "$PATH"' 2>/dev/null)"
-    check_env "host HOME not leaked" "/root" \
-        "$(HOME=/hosthome "$EMU" chroot "$ALPINE" /bin/busybox sh -c 'echo "$HOME"' 2>/dev/null)"
+    check_env "host HOME not leaked" "none" \
+        "$(HOME=/hosthome "$EMU" chroot "$ALPINE" /bin/busybox sh -c 'echo "${HOME:-none}"' 2>/dev/null)"
     # -E wins over a default, and can clear one outright.
     check_env "-E overrides default PATH" "/mypath" \
         "$("$EMU" chroot -E PATH=/mypath "$ALPINE" /bin/busybox sh -c 'echo "$PATH"' 2>/dev/null)"
-    check_env "-E overrides default HOME" "/myhome" \
+    check_env "-E sets HOME" "/myhome" \
         "$("$EMU" chroot -E HOME=/myhome "$ALPINE" /bin/busybox sh -c 'echo "$HOME"' 2>/dev/null)"
     check_env "-E can empty a default" "empty" \
         "$("$EMU" chroot -E PATH= "$ALPINE" /bin/busybox sh -c '[ -z "$PATH" ] && echo empty || echo "$PATH"' 2>/dev/null)"
     # No duplicates: a shell importing envp keeps the LAST of a repeated name,
-    # so an override emitted alongside the value it replaces would lose. Done
-    # on HOME, not PATH -- overriding PATH would leave the applets this checks
-    # with unreachable tr/grep (an *unset* PATH still works, since execvp(3)
-    # falls back to confstr(_CS_PATH); a wrong one does not).
-    check_env "no duplicate HOME in envp" "1" \
-        "$("$EMU" chroot -E HOME=/myhome "$ALPINE" /bin/busybox sh -c \
-           'tr "\0" "\n" < /proc/self/environ | grep -c "^HOME="' 2>/dev/null)"
+    # so an override emitted alongside the value it replaces would lose -- an
+    # inherited one (TERM) or a default (PATH, overridden with one that still
+    # reaches the applets this runs: a wrong PATH would not).
+    check_env "no duplicate TERM in envp" "1" \
+        "$(TERM=hostval "$EMU" chroot -E TERM=flagval "$ALPINE" /bin/busybox sh -c \
+           'tr "\0" "\n" < /proc/self/environ | grep -c "^TERM="' 2>/dev/null)"
+    check_env "no duplicate PATH in envp" "1" \
+        "$("$EMU" chroot -E PATH=/usr/bin:/bin "$ALPINE" /bin/busybox sh -c \
+           'tr "\0" "\n" < /proc/self/environ | grep -c "^PATH="' 2>/dev/null)"
 fi
 
 # ---- --bind mounts (self-checking; qemu has no bind-mount concept). Exercises

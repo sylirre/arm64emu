@@ -103,6 +103,7 @@ static const struct { u16 nr; u8 t[6]; u8 rt; } argdefs[] = {
     { G_NR_lseek,     { AT_FD, AT_INT, AT_WHENCE }, 0 },
     { G_NR_fstat,     { AT_FD, AT_STAT }, 0 },
     { G_NR_newfstatat,{ AT_DIRFD, AT_STR, AT_STAT, AT_ATFLAGS }, 0 },
+    { G_NR_name_to_handle_at, { AT_DIRFD, AT_STR, AT_PTR, AT_PTR, AT_ATFLAGS }, 0 },
     { G_NR_statx,     { AT_DIRFD, AT_STR, AT_ATFLAGS, AT_HEX, AT_PTR }, 0 },
     { G_NR_readlinkat,{ AT_DIRFD, AT_STR, AT_BUF_OUT, AT_UINT }, 0 },
     { G_NR_getdents64,{ AT_FD, AT_PTR, AT_UINT }, 0 },
