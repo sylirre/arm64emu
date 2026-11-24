@@ -161,6 +161,7 @@ struct Machine {
     u64 dethread_sigmask;     /* the exec'ing thread's blocked set, which the
                                * new image inherits (execve preserves it) */
     u32 dethread_personality; /* ...and its personality, as the exec left it */
+    u8  dethread_nnp;         /* ...and its no_new_privs */
     u64 dethread_fault_address, dethread_fault_code;
                               /* ...and its last fault's record (thread.h),
                                * which execve keeps */
@@ -348,8 +349,10 @@ struct Machine {
      * necessarily the host task flag: an Android app process already carries
      * it from zygote, and answering PR_GET from the host would tell a guest it
      * is locked down when it never asked (sudo-rs and friends refuse to run).
-     * One-way latch, fork-inherited with the rest of Machine, kept across
-     * execve exactly like the kernel's. */
+     * The flag is a task's (g_tls.no_new_privs, thread.h); this is the main
+     * thread's, what /proc/<pid>/status reports for the process -- set with
+     * it, taken from the forking thread by a fork child and from the exec'ing
+     * one by the image an execve installs. */
     u8 no_new_privs;
 
     /* personality(2) is per thread (g_tls.personality). This is the value a
@@ -427,6 +430,8 @@ struct Machine {
                                * repeats across filesystems, and a match on a
                                * recycled number would aim the refresh's
                                * ftruncate at whatever file opened next. */
+        char name[64];        /* the /proc path it was opened as, which its fd
+                               * link reads back as ("" if it did not fit) */
     } *pf_fds;
     int pf_fds_count, pf_fds_cap;
 
@@ -1225,6 +1230,14 @@ void exec_close_image(int fd);
  * multicall binary made of hardlinks (uutils' coreutils) checks that the last
  * component of /proc/self/exe is the utility it was run as. */
 #define PATH_STOP_AT_L2S   4
+/* PATH_CREATE_NAME: the caller makes the final component the way the kernel's
+ * filename_create does (mkdir, mknod, symlink, link's new name) or replaces it
+ * the way rename's lookup of its target does: that component is never
+ * followed, a trailing slash included, and what a trailing slash says about
+ * it -- EEXIST for a name that is there, ENOENT for one that is not unless
+ * the call is mkdir -- is left to the host, to which the caller hands the
+ * slash on (sys_file.c, pin_host_name). */
+#define PATH_CREATE_NAME   8
 int path_resolve(struct Machine *m, int dirfd, const char *gpath,
                  unsigned flags, char *host_out, char *canon_out);
 
@@ -1433,6 +1446,7 @@ int proc_zone_path(const char *host);
 /* Strip the rootfs prefix from a host path in place (guest view of e.g. a
  * host /proc/.../fd/N readlink); non-rootfs paths pass through unchanged. */
 void path_strip_rootfs(const struct Machine *m, char *path);
+int  path_host_guest(const struct Machine *m, const char *host, char *guest_out);
 
 /* Canonical guest path of an open guest dirfd (readlink /proc/self/fd/N, then
  * bind-reverse / rootfs-strip). Writes to `out` (>= PATH_MAX) and returns 0, or

@@ -481,17 +481,26 @@ static u64 mmap_locked(CPU *c, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
             }
         }
         if (r == 0 && !is_mfd) {
-            /* A NATIVE memfd deserves its kernel name in the synthesized
-             * maps too (regions are otherwise named only for ELF images;
-             * plain files stay nameless, and widening that would shift
-             * recorded /proc outputs). */
-            char lnk[48], tgt[MFD_NAME_MAX + 24];
+            /* The name the kernel's maps line gives the mapping: a NATIVE
+             * memfd's own, and a file's path -- the guest's spelling of it,
+             * as everything here is guest-facing. A file the guest has no
+             * name for (an inherited descriptor onto the host) stays
+             * nameless: its path is the host's. Kept "(deleted)" and all,
+             * as d_path spells an unlinked file. Nameless, a program that
+             * looks itself up there (a JIT finding its own library, a
+             * monitor its image) found anonymous memory. */
+            char lnk[48], tgt[PATH_MAX], gv[PATH_MAX];
             snprintf(lnk, sizeof lnk, "/proc/self/fd/%d", fd);
             ssize_t tn = readlink(lnk, tgt, sizeof tgt - 1);
-            if (tn > 7 && !memcmp(tgt, "/memfd:", 7)) {
+            const char *name = NULL;
+            if (tn > 0) {
                 tgt[tn] = 0;
+                if (tn > 7 && !memcmp(tgt, "/memfd:", 7)) name = tgt;
+                else if (tgt[0] == '/' && path_host_guest(c->m, tgt, gv)) name = gv;
+            }
+            if (name) {
                 Region *reg = (Region *)as_find_region(as, addr);
-                if (reg && !reg->path) reg->path = as_path_dup(tgt);
+                if (reg && !reg->path) reg->path = as_path_dup(name);
             }
         }
         if (r == 0 && is_mfd) {

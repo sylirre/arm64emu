@@ -686,6 +686,12 @@ int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t have, size_t len,
  * callers that ask (EBADF for a read-only descriptor first, as the kernel
  * checks FMODE_WRITE before anything else). */
 int procfs_fd_synth(struct Machine *m, int fd, int *acc);
+/* A synthesized file's own attributes over its backing's in *st (the mode and,
+ * for a file of no process, root's ownership). 1 when fd is one. */
+int procfs_fd_stat(struct Machine *m, int fd, struct stat *st);
+/* The path a synthesized file was opened as, which its fd link names (as
+ * d_path names the kernel's), into `out` (>= PATH_MAX). 1 when there is one. */
+int procfs_fd_name(struct Machine *m, int fd, char *out);
 /* The guest's children's usage (sys_proc.c): RUSAGE_CHILDREN as the guest's
  * own children account for it -- the host's figure less what the emulator's
  * own reaped helpers charged (proctab.c), and the RSS high-water mark tracked

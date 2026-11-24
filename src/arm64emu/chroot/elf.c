@@ -521,6 +521,12 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     size_t strtab = strlen(execfn) + 1;
     for (int i = 0; i < argc; i++) strtab += strlen(argv[i]) + 1;
     for (int i = 0; i < envc; i++) strtab += strlen(envp[i]) + 1;
+    /* The strings end a pointer short of the top: bprm_mm_init starts
+     * bprm->p at vma->vm_end - sizeof(void *), so the stack's last word is
+     * zero and lies above every string. Code that measures the block reads
+     * that word -- a word past the execfn's NUL is still the stack -- and
+     * with execfn ending at the top it read past the mapping. */
+    const u64 top_word = 8;
 
     /* Stack: the argument pages and 128 KB below them, or the guest's
      * RLIMIT_STACK if that is less -- the vma setup_arg_pages leaves -- and
@@ -537,7 +543,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
      * READ_IMPLIES_EXEC, and arm64 clears that at every exec (the
      * interpreter's own PT_GNU_STACK is not consulted). */
     u64 rl = rlim_cur(m, G_RLIMIT_STACK);
-    u64 args = PG_UP((u64)strtab);
+    u64 args = PG_UP((u64)strtab + top_word);
     u64 stack_size = args + STACK_EXPAND;
     if (rl != G_RLIM_INFINITY && (rl & ~(u64)GUEST_PAGE_MASK) < stack_size)
         stack_size = rl & ~(u64)GUEST_PAGE_MASK;
@@ -558,7 +564,7 @@ int load_elf(struct Machine *m, int fd, int interp_fd, const char *canon,
     u64 *envpp = malloc(sizeof(u64) * (size_t)(envc + 1));
     if (!argvp || !envpp) { free(argvp); free(envpp); return -ENOMEM; }
 
-    u64 sp = STACK_TOP - strtab;
+    u64 sp = STACK_TOP - top_word - strtab;
     u64 str = sp;
     /* The argv+envp string block starts here: setup_arg_pages records exactly
      * this address as arg_start. */

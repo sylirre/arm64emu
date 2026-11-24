@@ -2006,7 +2006,7 @@ int nl_maybe_ifreq_ioctl(CPU *c, u32 cmd, u64 arg, u64 *ret)
 
 int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret)
 {
-    uint32_t ifc_len;
+    int32_t ifc_len;   /* signed, as the kernel's: a negative one fits nothing */
     uint64_t bufp;
     struct { char name[IFNAMSIZ]; uint32_t addr; } ent[64];
     int n = 0;
@@ -2054,7 +2054,9 @@ int nl_maybe_siocgifconf(CPU *c, u64 arg, u64 *ret)
         return 1;
     }
 
-    cap = ifc_len / GUEST_IFREQ_SZ;                  /* whole entries that fit */
+    /* Whole entries that fit; a negative length is a length no entry fits
+     * in (dev_ifconf compares it with each entry's size), not an error. */
+    cap = ifc_len > 0 ? (uint32_t) ifc_len / GUEST_IFREQ_SZ : 0;
     produced = 0;
     for (i = 0; i < (uint32_t) n && i < cap; i++) {
         uint8_t e[GUEST_IFREQ_SZ];

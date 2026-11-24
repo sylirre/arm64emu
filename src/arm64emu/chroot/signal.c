@@ -2395,7 +2395,8 @@ int sig_pgrp_session(int pg) {
  * resumes right after the trapped svc/syscall instruction inside the host
  * libc wrapper — it then sets errno normally and the emulator handler above
  * it takes its ordinary ENOSYS fallback path. Any other SIGSYS (a guest
- * kill()) goes through the normal capture queue.
+ * kill(), or a trap a guest queued itself) goes through the normal capture
+ * queue.
  *
  * The net owns the host SIGSYS disposition for the process lifetime:
  * sig_host_update skips SIGSYS so a guest sigaction can never replace it,
@@ -2415,8 +2416,33 @@ void sig_sigsys_expected(int host_nr) {
         __atomic_store_n(&sigsys_warned[host_nr], 1, __ATOMIC_RELAXED);
 }
 
+/* Is this SIGSYS a seccomp trap of one of our own host syscalls? SYS_SECCOMP
+ * alone does not say so: rt_tgsigqueueinfo lets a task queue itself any
+ * si_code, and a guest that queues itself a SIGSYS dressed as a trap (a
+ * seccomp monitor running as the guest tests its handler that way) is sending
+ * a signal to its own disposition, as on the kernel. The kernel's trap names
+ * the trapping call's address in si_call_addr -- KSTK_EIP, the pc after the
+ * syscall instruction, which is exactly where the frame resumes -- and a
+ * queued one names whatever its sender wrote. */
+static int sigsys_is_host_trap(const siginfo_t *si, const void *uctx) {
+    if (si->si_code != SYS_SECCOMP) return 0;
+    const ucontext_t *uc = uctx;
+#if defined(__aarch64__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__arm__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.arm_pc;
+#elif defined(__x86_64__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__i386__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.gregs[REG_EIP];
+#else
+#error "no SIGSYS pc accessor for this host arch"
+#endif
+    return (uintptr_t)si->si_call_addr == pc;
+}
+
 static void sigsys_net(int sig, siginfo_t *si, void *uctx) {
-    if (si->si_code != SYS_SECCOMP) {   /* guest-directed kill(SIGSYS) etc. */
+    if (!sigsys_is_host_trap(si, uctx)) {   /* guest-directed kill(SIGSYS) etc. */
         host_catcher(sig, si, uctx);
         return;
     }

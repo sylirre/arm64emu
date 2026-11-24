@@ -282,7 +282,11 @@ static void put_maps(int fd, struct Machine *m) {
         for (u64 pg = r->start + GUEST_PAGE_SIZE; ; pg += GUEST_PAGE_SIZE) {
             u32 p = pg < end ? as_page_prot(as, pg) : ~0u;
             if (p != prot) {
-                dprintf(fd, "%08llx-%08llx %c%c%c%c %08llx 00:00 0%s%s\n",
+                /* A file mapping names its file by device and inode, as
+                 * show_map_vma does; anonymous memory, and an image the
+                 * loader copied into it, by 00:00 0. */
+                int fid = r->file && r->ino;
+                dprintf(fd, "%08llx-%08llx %c%c%c%c %08llx %02x:%02x %llu%s%s\n",
                         (unsigned long long)run, (unsigned long long)pg,
                         (prot & PTE_R) ? 'r' : '-',
                         (prot & PTE_W) ? 'w' : '-',
@@ -290,6 +294,9 @@ static void put_maps(int fd, struct Machine *m) {
                         r->shared ? 's' : 'p',
                         (unsigned long long)
                             (r->path ? r->file_off + (run - r->start) : 0),
+                        fid ? (unsigned)major((dev_t)r->dev) : 0,
+                        fid ? (unsigned)minor((dev_t)r->dev) : 0,
+                        fid ? (unsigned long long)r->ino : 0ULL,
                         name ? "                   " : "", name ? name : "");
                 run = pg;
                 prot = p;
@@ -1006,6 +1013,10 @@ int procfs_pre_write(CPU *c, int fd, const u8 *head, size_t have, size_t len,
  * clobbering an innocent file. Returns 0, or -ENOMEM when the table could not
  * grow -- the caller then withholds the descriptor, since an untracked
  * written-through file is a silent lie (its writes land in the memfd). */
+/* The canonical path procfs_open is serving, on this thread, for pf_track to
+ * record as the name the descriptor's link reads back as. */
+static __thread const char *pf_canon;
+
 static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self, int acc) {
     struct stat st;
     if (fstat(fd, &st) != 0) return -errno;
@@ -1023,6 +1034,21 @@ static int pf_track(struct Machine *m, int fd, int kind, s32 pid, int self, int 
         t[m->pf_fds_count].pid = pid;
         t[m->pf_fds_count].dev = (u64)st.st_dev;
         t[m->pf_fds_count].ino = (u64)st.st_ino;
+        /* The name d_path gives it: the self links resolved, as the walk
+         * the kernel's open made resolved them. */
+        char *nm = t[m->pf_fds_count].name;
+        size_t nsz = sizeof t->name;
+        int n = -1;
+        if (!pf_canon)
+            n = -1;
+        else if (!strncmp(pf_canon, "/proc/self/", 11))
+            n = snprintf(nm, nsz, "/proc/%d/%s", (int)getpid(), pf_canon + 11);
+        else if (!strncmp(pf_canon, "/proc/thread-self/", 18))
+            n = snprintf(nm, nsz, "/proc/%d/task/%d/%s", (int)getpid(),
+                         (int)g_tls.tid, pf_canon + 18);
+        else
+            n = snprintf(nm, nsz, "%s", pf_canon);
+        if (n < 0 || (size_t)n >= nsz) nm[0] = 0;
         m->pf_fds_count++;
     }
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
@@ -1088,6 +1114,58 @@ static int pf_find_locked(struct Machine *m, int fd) {
         return -1;
     }
     return i;
+}
+
+/* What fstat says of a synthesized file: the kernel's attributes for the file
+ * it is served as, where the backing would answer for itself -- a memfd,
+ * 0777 and the emulator's user, beside a stat of the same name that says
+ * 0444 and root. The modes are fs/proc's own: S_IRUGO for nearly everything,
+ * 0400 for the files only their owner may read (environ, auxv, mountstats,
+ * personality), 0644 for the writable id maps and the overflow sysctls.
+ * proc_create'd files and the sysctls are root's; a process's own files keep
+ * the backing's owner, which is the process's. */
+static mode_t pf_kind_mode(int kind) {
+    switch (kind) {
+    case PF_ENVIRON: case PF_AUXV: case PF_MOUNTSTATS: case PF_PERS:
+        return 0400;
+    case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS: case PF_OVERFLOWID:
+        return 0644;
+    default:
+        return 0444;
+    }
+}
+
+static int pf_kind_global(int kind) {
+    switch (kind) {
+    case PF_LOADAVG: case PF_UPTIME: case PF_VERSION: case PF_STAT:
+    case PF_CPUINFO: case PF_LOCKS: case PF_OVERFLOWID:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int procfs_fd_stat(struct Machine *m, int fd, struct stat *st) {
+    if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
+    int i = pf_find_locked(m, fd);
+    if (i >= 0) {
+        int kind = m->pf_fds[i].kind;
+        st->st_mode = S_IFREG | pf_kind_mode(kind);
+        if (pf_kind_global(kind)) st->st_uid = st->st_gid = 0;
+    }
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    return i >= 0;
+}
+
+int procfs_fd_name(struct Machine *m, int fd, char *out) {
+    if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
+    EMU_LOCK(&pf_lock, EMU_LK_PF);
+    int i = pf_find_locked(m, fd);
+    int ok = i >= 0 && m->pf_fds[i].name[0];
+    if (ok) strcpy(out, m->pf_fds[i].name);
+    EMU_UNLOCK(&pf_lock, EMU_LK_PF);
+    return ok;
 }
 
 int procfs_fd_synth(struct Machine *m, int fd, int *acc) {
@@ -2050,7 +2128,17 @@ static int proc_other_cmdline(const char *canon, s32 *pid) {
 
 /* If canon names a synthesized /proc file, open the guest view: returns 1 and
  * sets *ret to a host fd or -errno; returns 0 to fall through to the host. */
+static int procfs_open_1(CPU *c, const char *canon, int gflags, s64 *ret);
+
 int procfs_open(CPU *c, const char *canon, int gflags, s64 *ret) {
+    const char *outer = pf_canon;   /* procfs_open does not nest, but be safe */
+    pf_canon = canon;
+    int r = procfs_open_1(c, canon, gflags, ret);
+    pf_canon = outer;
+    return r;
+}
+
+static int procfs_open_1(CPU *c, const char *canon, int gflags, s64 *ret) {
     struct Machine *m = c->m;
     int kind;
 

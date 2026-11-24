@@ -721,6 +721,7 @@ int mfd_chmod_hold(struct Machine *m, int fd, u32 mode) {
 /* Splice a held mode into a stat the host answered. Every guest-visible stat
  * of a descriptor goes through here, so fstat and the exec check agree. */
 void mfd_stat_fixup(struct Machine *m, int fd, struct stat *st) {
+    if (fd >= 0 && procfs_fd_stat(m, fd, st)) return;   /* a synthesized file */
     if (!mfd_chmod_blocked() || !S_ISREG(st->st_mode)) return;
     if (fd >= 0 && fd < MFDC_N && (mfdc_cls[fd] == 0 || mfdc_cls[fd] == 1)) return;
     u64 dev, ino;

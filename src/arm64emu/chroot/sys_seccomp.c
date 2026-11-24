@@ -492,7 +492,7 @@ static s64 seccomp_install(CPU *c, u64 flags, u64 prog_va) {
     /* The kernel requires no_new_privs (or CAP_SYS_ADMIN) so a filtered
      * process cannot gain privilege through a setuid exec it can no longer
      * see. Our fake-root is that capability. */
-    if (!m->no_new_privs && !fake_root(m)) return -EACCES;
+    if (!g_tls.no_new_privs && !fake_root(m)) return -EACCES;
 
     struct SeccompProg *p = malloc(sizeof *p + (size_t)len * sizeof(GSockFilter));
     if (!p) return -ENOMEM;

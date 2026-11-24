@@ -1996,7 +1996,12 @@ SYSDEF(readlinkat) {
          * rootfs-contained file carry the rootfs prefix; strip it. */
         if (!strncmp(host, "/proc/", 6)) {
             buf[rn] = 0;
-            if (mfd_link_rewrite(c, host, buf))   /* tier memfd: no host leak */
+            int pfd = proc_own_fd_path(host);
+            if (pfd >= 0 && procfs_fd_name(c->m, pfd, buf)) {
+                /* A synthesized /proc file: its memfd backing is no name the
+                 * guest opened, the file it is served as is. */
+                rn = (ssize_t)strlen(buf);
+            } else if (mfd_link_rewrite(c, host, buf))   /* tier memfd: no host leak */
                 rn = (ssize_t)strlen(buf);
             /* One of our own descriptors reads back as the path it was opened
              * under, when that is remembered and still true: a node on the
@@ -3650,11 +3655,13 @@ static int mnt_operand(CPU *c, u64 va, unsigned rflags, PathPin *pin,
  * current namespace (honoring any existing chroot, so nesting composes) to a
  * canonical namespace-absolute path stored in m->chroot_base; subsequent
  * absolute paths, "..", and absolute symlinks re-root there (path.c). Gated on
- * fake-root, matching the kernel's CAP_SYS_CHROOT. Per POSIX, cwd is NOT changed
+ * fake-root, matching the kernel's CAP_SYS_CHROOT -- in ksys_chroot's order:
+ * the name is looked up first (EFAULT, ENOENT, ENOTDIR), then searched
+ * (EACCES), and only then is the capability asked for, so a caller without it
+ * hears about its path before it hears EPERM. Per POSIX, cwd is NOT changed
  * (the classic footgun: programs do chroot(x); chdir("/")). */
 SYSDEF(chroot) {
     struct Machine *m = c->m;
-    if (!fake_root(m)) return (u64)(s64)-EPERM;
     PathPin pin;
     char canon[PATH_MAX];
     int r = mnt_operand(c, a0, 0, &pin, canon, NULL);
@@ -3662,9 +3669,16 @@ SYSDEF(chroot) {
     struct stat st;
     int sr = fstatat(pin.dfd, pin.name, &st, pin.pinned ? AT_SYMLINK_NOFOLLOW : 0);
     u64 e = sr < 0 ? host_err() : 0;
+    /* path_permission(MAY_EXEC | MAY_CHDIR), which root's DAC override
+     * passes: asked of the host only for a caller that is not root here. */
+    if (sr == 0 && S_ISDIR(st.st_mode) && !fake_root(m) &&
+        faccessat(pin.dfd, pin.name, X_OK, 0) < 0 && errno == EACCES)
+        e = (u64)(s64)-EACCES;
     path_unpin(&pin);
     if (sr < 0) return e;
     if (!S_ISDIR(st.st_mode)) return (u64)(s64)-ENOTDIR;
+    if (e) return e;
+    if (!fake_root(m)) return (u64)(s64)-EPERM;
     croot_set(m, canon);
     return 0;
 }
@@ -3931,9 +3945,31 @@ static u64 ro_create_err(const PathPin *pin) {
                ? (u64)(s64)-EEXIST : (u64)(s64)-EROFS;
 }
 
+/* The name a create (mkdir, mknod, symlink, link's new name) or a rename's
+ * target is handed to the host under: the pin names a bare final component,
+ * and a trailing slash on the guest's spelling is a statement the kernel
+ * acts on there (filename_create: EEXIST for a name that is there, ENOENT
+ * for one that is not unless the call is mkdir; do_renameat2: ENOTDIR for a
+ * source that is no directory), which the slash-less name lost -- the link or
+ * the rename was made. These calls never follow the final component
+ * (PATH_CREATE_NAME), with the slash or without, so the slash is put back and
+ * the host kernel applies the rule in its own order. `buf` is >= PATH_MAX. */
+static const char *pin_host_name(CPU *c, u64 path_va, const PathPin *p, char *buf) {
+    char g[PATH_MAX];
+    long n = copy_str_from_guest(c, g, path_va, sizeof g);
+    if (n <= 0 || g[n - 1] != '/') return p->name;
+    size_t l = strlen(p->name);
+    if (l + 2 > PATH_MAX) return p->name;
+    memcpy(buf, p->name, l);
+    buf[l] = '/';
+    buf[l + 1] = 0;
+    return buf;
+}
+
 SYSDEF(mknodat) {
     PathPin pin;
-    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
+    char hname[PATH_MAX];
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST | PATH_CREATE_NAME, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
     if (host_ro(c->m, pin.host)) { u64 e = ro_create_err(&pin); path_unpin(&pin); return e; }
     /* Pass the guest-supplied dev straight to the raw host syscall: it is
@@ -3943,7 +3979,8 @@ SYSDEF(mknodat) {
      * nodes fail with EPERM, exactly as on a real unprivileged host. */
     /* mknod never follows a final symlink, so the pinned parent is the whole
      * guarantee. */
-    u64 ret = syscall(SYS_mknodat, pin.dfd, pin.name, (unsigned)a2, (unsigned)a3) < 0
+    u64 ret = syscall(SYS_mknodat, pin.dfd, pin_host_name(c, a1, &pin, hname),
+                      (unsigned)a2, (unsigned)a3) < 0
                   ? host_err() : 0;
     path_unpin(&pin);
     return ret;
@@ -3951,10 +3988,12 @@ SYSDEF(mknodat) {
 
 SYSDEF(mkdirat) {
     PathPin pin;
-    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &pin, NULL);
+    char hname[PATH_MAX];
+    int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST | PATH_CREATE_NAME, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
     u64 ret = host_ro(c->m, pin.host) ? ro_create_err(&pin)
-            : mkdirat(pin.dfd, pin.name, (mode_t)a2) < 0 ? host_err() : 0;
+            : mkdirat(pin.dfd, pin_host_name(c, a1, &pin, hname), (mode_t)a2) < 0
+                  ? host_err() : 0;
     path_unpin(&pin);
     return ret;
 }
@@ -4056,7 +4095,7 @@ SYSDEF(renameat) {
     PathPin p1, p2;
     int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &p1, NULL);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST | PATH_CREATE_NAME, &p2, NULL);
     if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
     const char *h1 = p1.host, *h2 = p2.host;
     if (host_ro(c->m, h1) || host_ro(c->m, h2)) {
@@ -4071,7 +4110,9 @@ SYSDEF(renameat) {
         return lret;
     }
 #endif
-    int rr = renameat(p1.dfd, p1.name, p2.dfd, p2.name);   /* follows neither end */
+    char dname[PATH_MAX];
+    int rr = renameat(p1.dfd, p1.name, p2.dfd,             /* follows neither end */
+                      pin_host_name(c, a3, &p2, dname));
     u64 e = rr < 0 ? host_err() : 0;
     path_unpin(&p1); path_unpin(&p2);
 #ifdef L2S_ENABLED
@@ -4085,7 +4126,7 @@ SYSDEF(renameat2) {
     PathPin p1, p2;
     int r = resolve_pin(c, (int)(s32)a0, a1, PATH_NOFOLLOW_LAST, &p1, NULL);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, NULL);
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST | PATH_CREATE_NAME, &p2, NULL);
     if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
     const char *h1 = p1.host, *h2 = p2.host;
     if (host_ro(c->m, h1) || host_ro(c->m, h2)) {
@@ -4100,7 +4141,9 @@ SYSDEF(renameat2) {
         return lret;
     }
 #endif
-    long rr = syscall(SYS_renameat2, p1.dfd, p1.name, p2.dfd, p2.name, (unsigned)a4);
+    char dname[PATH_MAX];
+    long rr = syscall(SYS_renameat2, p1.dfd, p1.name, p2.dfd,
+                      pin_host_name(c, a3, &p2, dname), (unsigned)a4);
     u64 ret = rr < 0 ? host_err() : 0;
     path_unpin(&p1); path_unpin(&p2);
 #ifdef L2S_ENABLED
@@ -4126,11 +4169,13 @@ SYSDEF(symlinkat) {
         if (l2s_hidden(tb ? tb + 1 : target)) return (u64)(s64)-ENOENT;
     }
 #endif
-    int r = resolve_pin(c, (int)(s32)a1, a2, PATH_NOFOLLOW_LAST, &pin, NULL);
+    char hname[PATH_MAX];
+    int r = resolve_pin(c, (int)(s32)a1, a2, PATH_NOFOLLOW_LAST | PATH_CREATE_NAME, &pin, NULL);
     if (r < 0) return (u64)(s64)r;
     /* The link *content* is stored as the guest wrote it. */
     u64 ret = host_ro(c->m, pin.host) ? ro_create_err(&pin)
-            : symlinkat(target, pin.dfd, pin.name) < 0 ? host_err() : 0;
+            : symlinkat(target, pin.dfd, pin_host_name(c, a2, &pin, hname)) < 0
+                  ? host_err() : 0;
     path_unpin(&pin);
     return ret;
 }
@@ -4148,7 +4193,7 @@ SYSDEF(linkat) {
     char canon1[PATH_MAX], canon2[PATH_MAX];
     int r = resolve_pin(c, (int)(s32)a0, a1, rf, &p1, canon1);
     if (r < 0) return (u64)(s64)r;
-    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST, &p2, canon2);
+    r = resolve_pin(c, (int)(s32)a2, a3, PATH_NOFOLLOW_LAST | PATH_CREATE_NAME, &p2, canon2);
     if (r < 0) { path_unpin(&p1); return (u64)(s64)r; }
     const char *h2 = p2.host;
     if (host_ro(c->m, h2)) {                          /* new name on a :ro bind */
@@ -4210,7 +4255,8 @@ SYSDEF(linkat) {
         return lret;
     }
 #endif
-    int lr = linkat(p1.dfd, p1.name, p2.dfd, p2.name, hflags);
+    char hname[PATH_MAX];
+    int lr = linkat(p1.dfd, p1.name, p2.dfd, pin_host_name(c, a3, &p2, hname), hflags);
     if (lr == 0) { path_unpin(&p1); path_unpin(&p2); return 0; }
 #ifdef L2S_ENABLED
     /* Android refuses hardlinks with EXDEV/EPERM/EACCES depending on the path

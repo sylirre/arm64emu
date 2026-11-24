@@ -671,6 +671,22 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt, int *delete
     return 1;
 }
 
+/* A host path's guest spelling, when the guest has one: under a bind or the
+ * rootfs. 1 with `guest_out` (>= PATH_MAX), 0 for a path outside the view. */
+int path_host_guest(const struct Machine *m, const char *host, char *guest_out) {
+    if (bind_of_host(m, host, guest_out) >= 0) return 1;
+    size_t rl = strlen(m->rootfs);
+    if (rl <= 1) {                          /* the host's own root */
+        if (strlen(host) >= PATH_MAX) return 0;
+        strcpy(guest_out, host);
+        return 1;
+    }
+    if (strncmp(host, m->rootfs, rl) || (host[rl] && host[rl] != '/')) return 0;
+    if (strlen(host + rl) >= PATH_MAX) return 0;
+    strcpy(guest_out, host[rl] ? host + rl : "/");
+    return 1;
+}
+
 /* Strip the rootfs prefix from a host path in place, yielding the guest path.
  * Anonymous targets (pipe:[..]) and passthrough paths (/dev, /proc) don't
  * carry the prefix and pass through unchanged. */
@@ -1880,6 +1896,10 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
      * to "file" and every operation went through -- open("file/") succeeded and
      * unlink("file/") deleted the file. */
     int want_dir = path_wants_dir(rest);
+    /* ...and whether it said so with a slash: an O_CREAT open refuses that
+     * with EISDIR before it looks the name up at all (open_last_lookups),
+     * whatever is or is not there; a final "." or ".." is looked up first. */
+    int slash_last = rest[0] && rest[strlen(rest) - 1] == '/';
     int nlinks = 0;
     /* Components below `trusted` came from the starting directory (the cwd,
      * or the dirfd) and are a directory that exists by construction -- the
@@ -1959,7 +1979,8 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
         /* Follow symlinks (last component only if the caller wants it). A
          * trailing slash overrides that: the kernel follows a final symlink
          * regardless, because the slash demands a directory to enter. */
-        if (last && (flags & PATH_NOFOLLOW_LAST) && !want_dir) continue;
+        if (last && (flags & PATH_NOFOLLOW_LAST) &&
+            (!want_dir || (flags & PATH_CREATE_NAME))) continue;
         char tgt[PATH_MAX];
         ssize_t tn;
         r = canon_to_host(m, canon, hostbuf, NULL, NULL);
@@ -2061,8 +2082,9 @@ static int path_walk(struct Machine *m, int dirfd, const char *gpath,
     int r = canon_to_host(m, canon, host_out, NULL, &plain);   /* -bind > /dev,/proc > rootfs */
     if (r < 0) return r;
     if (fast && (!plain || want_dir)) { *fast = 0; return 0; }
-    if (want_dir) {
+    if (want_dir && !((flags & PATH_CREATE_NAME) && slash_last)) {
         struct stat st;
+        if ((flags & PATH_CREATING) && slash_last) return -EISDIR;
         if (stat(host_out, &st) == 0) {
             if (!S_ISDIR(st.st_mode)) return -ENOTDIR;
         } else if (flags & PATH_CREATING) {

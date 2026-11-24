@@ -1933,6 +1933,8 @@ static void sem_fill_stat(struct BResp *r, const struct SemSet *s) {
     r->ctime = s->ctime;
 }
 
+static void sem_reap_set(s32 semid);
+
 /* GETALL/SETALL payload transfer happens in ipc_serve; a 0 return for those
  * means "validated, set exists" and r->size carries nsems. */
 static s32 sem_do_ctl(struct BReq *q, struct BResp *r) {
@@ -1955,8 +1957,11 @@ static s32 sem_do_ctl(struct BReq *q, struct BResp *r) {
         return s->semid;
     }
 
+    /* semctl_setval judges the value before it looks the set up at all. */
+    if (q->arg == G_SETVAL && (q->val < 0 || q->val > G_SEMVMX)) return -ERANGE;
     struct SemSet *s = sem_find(q->id);
     if (!s) return -EINVAL;
+    sem_reap_set(s->semid);
     int rd = ipc_access(s->mode, s->uid, s->cuid, s->gid, s->cgid,
                         q->uid, q->gid, 04);
     int wr = ipc_access(s->mode, s->uid, s->cuid, s->gid, s->cgid,
@@ -1986,19 +1991,23 @@ static s32 sem_do_ctl(struct BReq *q, struct BResp *r) {
     /* G_SETALL never reaches here: ipc_serve handles it inline (payload) */
     }
 
+    /* The kernel's order for the rest: semctl_main asks for read access
+     * before it looks at semnum, semctl_setval looks at semnum first. */
+    int getter = q->arg == G_GETVAL || q->arg == G_GETPID ||
+                 q->arg == G_GETNCNT || q->arg == G_GETZCNT;
+    if (getter && !rd) return -EACCES;
     if (q->semnum < 0 || (u32)q->semnum >= s->nsems) return -EINVAL;
     switch (q->arg) {
     case G_GETVAL:
-        return rd ? (s32)s->val[q->semnum] : -EACCES;
+        return (s32)s->val[q->semnum];
     case G_GETPID:
-        return rd ? s->lpid[q->semnum] : -EACCES;
+        return s->lpid[q->semnum];
     case G_GETNCNT:
-        return rd ? sem_count_waiters(s->semid, (u32)q->semnum, 0) : -EACCES;
+        return sem_count_waiters(s->semid, (u32)q->semnum, 0);
     case G_GETZCNT:
-        return rd ? sem_count_waiters(s->semid, (u32)q->semnum, 1) : -EACCES;
+        return sem_count_waiters(s->semid, (u32)q->semnum, 1);
     case G_SETVAL:
         if (!wr) return -EACCES;
-        if (q->val < 0 || q->val > G_SEMVMX) return -ERANGE;
         s->val[q->semnum] = (u16)q->val;
         s->lpid[q->semnum] = q->pid;
         sem_undo_clear(s->semid, q->semnum);
@@ -2076,6 +2085,42 @@ static s32 msg_do_ctl(struct BReq *q, struct BResp *r) {
 }
 
 /* --- liveness / session-anchor extensions ---------------------------------- */
+
+/* Has the process an undo row was recorded for exited? Its pid gone or
+ * reused, or a zombie: exit_sem runs in do_exit, before the task is a zombie
+ * its parent can reap. */
+static int undo_holder_gone(const struct SemUndo *u) {
+    char path[80], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", u->pid, u->pid);
+    fdwin_enter();   /* a descriptor of our own, briefly (machine.h) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(path, sizeof path, "/proc/%d/stat", u->pid);
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+    }
+    ssize_t n = fd >= 0 ? read(fd, buf, sizeof buf - 1) : -1;
+    if (fd >= 0) close(fd);
+    fdwin_leave();
+    if (n <= 0) return 1;
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    if (!p || p[1] != ' ') return 1;
+    if (p[2] == 'Z' || p[2] == 'X') return 1;
+    return starttime_read(path) != u->start;
+}
+
+/* A set is about to be read or operated on: the undo rows of its holders
+ * that have died since are applied first. The reclaim tick gets to every
+ * one within a second, but a kernel applies them at the exit itself, so a
+ * parent that reaps a SIGKILL'd holder and reads the set straight after
+ * sees the adjustment made -- and must here too. */
+static void sem_reap_set(s32 semid) {
+    for (int i = 0; i < SEM_UNDO_MAX; i++) {
+        struct SemUndo *u = &g_undo[i];
+        if (u->used && u->semid == semid && undo_holder_gone(u))
+            sem_undo_apply(u);
+    }
+}
 
 /* Apply and free every undo row held by `pid` (clean exit via REQ_SEMEXIT, or
  * the reclaim tick after a SIGKILL). */
@@ -2163,6 +2208,7 @@ static int ipc_serve(int cfd, struct BReq *q, int proctab_memfd, int reqfd) {
         if (read_full(cfd, sops, nsops * sizeof *sops) != 0) { free(sops); return 0; }
         struct SemSet *s = sem_find(q->id);
         if (!s) { free(sops); r.ret = -EINVAL; break; }
+        sem_reap_set(s->semid);   /* a holder's death, applied as at its exit */
         /* kernel order: EFBIG (bad sem_num) precedes the EACCES perm check */
         int alter = 0, efbig = 0;
         for (u32 i = 0; i < nsops; i++) {

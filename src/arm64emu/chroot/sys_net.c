@@ -7,10 +7,12 @@
  * sendmsg rewrite it through the rootfs resolver (unix_path_in) and the address
  * the kernel reports back is stripped to its guest view (unix_path_out). A
  * translated path is reached relative to its PINNED parent-directory fd via
- * /proc/self/fd (unix_path_in), which both contains it against a concurrent
- * rename and leaves only the basename to fit the 108 bytes. Abstract
+ * /proc/<pid>/fd (unix_path_in), which both contains it against a concurrent
+ * rename and leaves only the basename to fit the 108 bytes; the name a bind
+ * leaves with the kernel is read back through a record of it (sun_rec). Abstract
  * sockets, which have no filesystem node, are instead isolated per rootfs by a
  * name tag (abs_tag_in/out) unless --share-abstract-sockets is given. */
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stddef.h>
@@ -19,6 +21,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>    /* struct timeval (SO_RCVTIMEO/SO_SNDTIMEO) */
 #include <time.h>       /* clock_gettime (recvmmsg's deadline)               */
 #include <sys/uio.h>
@@ -150,6 +153,188 @@ static void abs_tag_out(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t po
     *sl = (socklen_t)(*sl - T);
 }
 
+/* ---- a bound pathname's name, read back ----
+ *
+ * The kernel keeps sun_path exactly as the bind handed it, and a pathname is
+ * bound through its pinned directory (unix_path_in): "/proc/<pid>/fd/<n>/
+ * <name>". That spelling is what every reader got back -- getsockname of the
+ * socket itself, getpeername and accept of its peers, the source address of
+ * every datagram it sends -- where a kernel answers the name the guest bound.
+ * It is not a rootfs path, so path_strip_rootfs had nothing to strip, and
+ * nothing named the directory any more: the descriptor was closed after the
+ * bind. (A program comparing the readback with what it bound -- a datagram
+ * service replying to its client's address -- is the casualty.)
+ *
+ * So, as chroot-ng does: the descriptor named in the spelling is the binder's
+ * own, kept above every number the guest can hold for as long as the socket
+ * is open in this process, which makes the spelling resolvable by any process
+ * of the user while the binding lasts; and the binder records what the guest
+ * bound. Read back, the record answers first -- by the socket's inode for its
+ * own getsockname, by the spelling for a reader that holds no such socket --
+ * then the spelling is resolved through the binder's descriptor to the
+ * directory's guest name. A stale one, its binder gone, stays as it is: not
+ * the guest's name, but nobody's host path either. The record is per process
+ * (a fork child inherits it with the socket and the descriptor); a binding's
+ * descriptor is given back once its socket is not open here any more, which
+ * every bind looks for (sun_sweep) since close(2) tells us nothing. */
+#define SUN_PATH_LEN 108
+#define SUN_REC_MAX  256
+
+typedef struct {
+    int state;                 /* 0 free, 1 being written, 2 published */
+    int dfd;                   /* the directory, held for the binding; -1 none */
+    dev_t ddev;                /* ...and what it was: the number may have gone */
+    ino_t dino;                /*    to the guest since (a closefrom, an exec) */
+    unsigned long long ino;    /* the bound socket's inode in sockfs */
+    unsigned slen, glen;
+    char stored[SUN_PATH_LEN]; /* what the kernel keeps */
+    char guest[SUN_PATH_LEN];  /* what the guest bound */
+} SunRec;
+
+static SunRec g_sun[SUN_REC_MAX];
+
+static unsigned long long sock_ino(int fd) {
+    struct stat st;
+    return fd >= 0 && fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)
+               ? (unsigned long long)st.st_ino : 0;
+}
+
+/* Close a record's descriptor if it is still the one the record took. */
+static void sun_drop_fd(SunRec *e) {
+    struct stat st;
+    if (e->dfd >= 0 && fstat(e->dfd, &st) == 0 && st.st_dev == e->ddev &&
+        st.st_ino == e->dino)
+        close(e->dfd);
+    e->dfd = -1;
+}
+
+/* Free the records of sockets this process no longer has open. */
+static void sun_sweep(void) {
+    int any = 0;
+    for (int i = 0; i < SUN_REC_MAX && !any; i++)
+        any = __atomic_load_n(&g_sun[i].state, __ATOMIC_ACQUIRE) == 2;
+    if (!any) return;
+    enum { LIVE_MAX = 512 };
+    unsigned long long live[LIVE_MAX];
+    int n = 0, overflow = 0;
+    fdwin_enter();   /* descriptors of our own, briefly (machine.h) */
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) { fdwin_leave(); return; }
+    struct dirent *de;
+    while (!overflow && (de = readdir(d))) {
+        char *end;
+        long fd = strtol(de->d_name, &end, 10);
+        if (*end || fd < 0 || fd == dirfd(d)) continue;
+        unsigned long long ino = sock_ino((int)fd);
+        if (!ino) continue;
+        if (n == LIVE_MAX) overflow = 1;
+        else live[n++] = ino;
+    }
+    closedir(d);
+    fdwin_leave();
+    if (overflow) return;   /* keep everything; the next bind asks again */
+    for (int i = 0; i < SUN_REC_MAX; i++) {
+        SunRec *e = &g_sun[i];
+        int st = 2;
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != 2) continue;
+        int open = 0;
+        for (int k = 0; k < n && !open; k++) open = live[k] == e->ino;
+        if (open || !__atomic_compare_exchange_n(&e->state, &st, 1, 0,
+                                                 __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        sun_drop_fd(e);
+        __atomic_store_n(&e->state, 0, __ATOMIC_RELEASE);
+    }
+}
+
+/* Record what socket `fd` was bound as. `dfd` is the directory the spelling
+ * names, which the record holds from here on (or closes, with no room). */
+static void sun_note(int fd, const char *stored, const char *guest, int dfd) {
+    size_t sl = strlen(stored), gl = strlen(guest);
+    struct stat dst;
+    sun_sweep();
+    if (sl >= SUN_PATH_LEN || gl >= SUN_PATH_LEN || fstat(dfd, &dst) < 0) {
+        fdheld_close(dfd);
+        return;
+    }
+    for (int i = 0; i < SUN_REC_MAX; i++) {
+        SunRec *e = &g_sun[i];
+        int st = 0;
+        if (!__atomic_compare_exchange_n(&e->state, &st, 1, 0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_RELAXED))
+            continue;
+        memcpy(e->stored, stored, sl + 1);
+        memcpy(e->guest, guest, gl + 1);
+        e->slen = (unsigned)sl;
+        e->glen = (unsigned)gl;
+        e->ino = sock_ino(fd);
+        e->ddev = dst.st_dev;
+        e->dino = dst.st_ino;
+        e->dfd = fdheld_forget(dfd);   /* the record's now, a fork child's too */
+        __atomic_store_n(&e->state, 2, __ATOMIC_RELEASE);
+        return;
+    }
+    fdheld_close(dfd);   /* no room: the readback falls back to the spelling */
+}
+
+/* The guest name recorded for `stored`, or NULL. `ino` (0: unknown) is the
+ * socket the answer is the own address of; its own record wins over one
+ * that merely carries the same spelling, and of those the latest. */
+static const char *sun_lookup(unsigned long long ino, const char *stored) {
+    const SunRec *by = NULL;
+    size_t sl = strlen(stored);
+    for (int i = 0; i < SUN_REC_MAX; i++) {
+        const SunRec *e = &g_sun[i];
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) != 2 || e->slen != sl ||
+            memcmp(e->stored, stored, sl))
+            continue;
+        by = e;
+        if (ino && e->ino == ino) break;
+    }
+    return by ? by->guest : NULL;
+}
+
+/* Is `p` the bind spelling, "/proc/<pid>/fd/<n>/<name>"? Then *link is the
+ * length of its "/proc/<pid>/fd/<n>" head. */
+static int sun_pin_form(const char *p, size_t *link) {
+    if (strncmp(p, "/proc/", 6)) return 0;
+    size_t i = 6;
+    if (p[i] < '0' || p[i] > '9') return 0;
+    while (p[i] >= '0' && p[i] <= '9') i++;
+    if (strncmp(p + i, "/fd/", 4)) return 0;
+    i += 4;
+    if (p[i] < '0' || p[i] > '9') return 0;
+    while (p[i] >= '0' && p[i] <= '9') i++;
+    if (p[i] != '/' || !p[i + 1] || strchr(p + i + 1, '/')) return 0;
+    *link = i;
+    return 1;
+}
+
+/* The guest name for a bind spelling read back, into `out` (PATH_MAX): the
+ * record's, else the directory the binder's descriptor names. 0, or -1 to
+ * leave the spelling as it is. */
+static int sun_guest_name(CPU *c, int sockfd, const char *path, size_t link,
+                          char *out) {
+    const char *g = sun_lookup(sock_ino(sockfd), path);
+    if (g) { strcpy(out, g); return 0; }
+    char lk[SUN_PATH_LEN + 1], dir[PATH_MAX];
+    memcpy(lk, path, link);
+    lk[link] = 0;
+    ssize_t n = readlink(lk, dir, sizeof dir - 1);
+    if (n <= 0) return -1;   /* the binder is gone, or holds it no more */
+    dir[n] = 0;
+    if (dir[0] != '/') return -1;
+    path_strip_rootfs(c->m, dir);
+    size_t dl = strlen(dir);
+    if (dl == 1) dl = 0;     /* the guest's root */
+    const char *base = path + link + 1;
+    if (dl + 1 + strlen(base) + 1 > PATH_MAX) return -1;
+    memcpy(out, dir, dl);
+    out[dl] = '/';
+    strcpy(out + dl + 1, base);
+    return 0;
+}
+
 /* AF_UNIX pathname sockets carry a filesystem path in sun_path; route it
  * through the rootfs resolver so bind/connect/sendto reach the guest's socket,
  * not the host's. Abstract sockets are per-rootfs isolated (abs_tag_in);
@@ -165,8 +350,9 @@ static void abs_tag_out(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t po
  * runs the syscall and then closes *dirfd_out. `dirfd_out` is set to -1 unless a
  * fd was opened; passing NULL keeps the plain -ENAMETOOLONG behavior. */
 static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
-                        int follow, int *dirfd_out) {
+                        int follow, int *dirfd_out, char *guest_out) {
     if (dirfd_out) *dirfd_out = -1;
+    if (guest_out) guest_out[0] = 0;
     /* An address too short to hold a family has none to look at (the host
      * refuses it by protocol); the field used to be read regardless, and a
      * guest length of 0 or 1 left it uninitialized. */
@@ -206,22 +392,54 @@ static int unix_path_in(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
      * which is why it was already the shape of the overlong fallback. The
      * caller closes *dirfd_out once the syscall has run. */
     if (!dirfd_out) { path_unpin(&pin); return -ENAMETOOLONG; }
+    int dfd = pin.dfd;
+    if (guest_out) {
+        /* A bind leaves its spelling with the kernel for good: the directory
+         * is named by this process's pid and a descriptor kept above every
+         * number the guest can hold, which the record holds for the binding
+         * (sun_note), so another process can read it back too. */
+        /* Where the guest's limit is the host's own there is no room above
+         * it, and the descriptor goes near its top instead: a number a guest
+         * reaches only with its table all but full. */
+        int cap = fd_nofile_cap(c->m);
+        fdwin_enter();
+        int hfd = fcntl(pin.dfd, F_DUPFD_CLOEXEC, cap);
+        if (hfd < 0 && errno == EINVAL)
+            hfd = fcntl(pin.dfd, F_DUPFD_CLOEXEC, cap - cap / 16 > 3 ? cap - cap / 16 : 3);
+        if (hfd < 0 && errno == EINVAL)
+            hfd = fcntl(pin.dfd, F_DUPFD_CLOEXEC, 3);
+        if (hfd >= 0) fdheld_add(hfd);
+        fdwin_leave();
+        path_unpin(&pin);
+        if (hfd < 0) return -errno;
+        dfd = hfd;
+        memcpy(guest_out, gpath, i + 1);
+    }
     char proc[sizeof un->sun_path];
-    int n = snprintf(proc, sizeof proc, "/proc/self/fd/%d/%s", pin.dfd, pin.base);
-    if (n < 0 || (size_t)n >= sizeof proc) { path_unpin(&pin); return -ENAMETOOLONG; }
+    int n = snprintf(proc, sizeof proc, "/proc/%d/fd/%d/%s", (int)getpid(), dfd,
+                     pin.base);
+    if (n < 0 || (size_t)n >= sizeof proc) {
+        if (guest_out) fdheld_close(dfd);
+        else path_unpin(&pin);
+        return -ENAMETOOLONG;
+    }
     memcpy(un->sun_path, proc, (size_t)n + 1);
     *sl = (socklen_t)(poff + (size_t)n + 1);
-    *dirfd_out = pin.dfd;                      /* handed to the caller to close --
+    *dirfd_out = dfd;                          /* handed to the caller to close --
                                                 * with fdheld_close: it is a held
-                                                * descriptor (machine.h) */
+                                                * descriptor (machine.h) -- or a
+                                                * bind's to sun_note */
     return 0;
 }
 
 /* Reverse of unix_path_in: rewrite a host sun_path the kernel reports back
  * (getsockname/getpeername/accept/recvfrom/recvmsg) to its guest view, so the
- * guest never sees a host path (pathname) or our rootfs tag (abstract). No-op
- * for non-AF_UNIX and unnamed addresses. Rewrites address and length in place. */
-static void unix_path_out(CPU *c, struct sockaddr_storage *ss, socklen_t *sl) {
+ * guest never sees a host path (pathname), our bind spelling (sun_rec) or our
+ * rootfs tag (abstract). `sockfd` is the socket whose own address this is
+ * (getsockname), -1 for a peer's. No-op for non-AF_UNIX and unnamed
+ * addresses. Rewrites address and length in place. */
+static void unix_path_out(CPU *c, struct sockaddr_storage *ss, socklen_t *sl,
+                          int sockfd) {
     /* As on the way in: a length the kernel left at 0 (an unnamed datagram
      * peer) wrote no family, so there is none to read. */
     if ((size_t)*sl < sizeof ss->ss_family) return;
@@ -240,7 +458,14 @@ static void unix_path_out(CPU *c, struct sockaddr_storage *ss, socklen_t *sl) {
     for (; i < maxp && i + 1 < sizeof path && un->sun_path[i]; i++)
         path[i] = un->sun_path[i];
     path[i] = 0;
-    path_strip_rootfs(c->m, path);
+    size_t link;
+    if (sun_pin_form(path, &link)) {
+        char g[PATH_MAX];
+        if (sun_guest_name(c, sockfd, path, link, g) < 0) return;
+        strcpy(path, g);
+    } else {
+        path_strip_rootfs(c->m, path);
+    }
     size_t pl = strlen(path);
     if (pl + 1 > sizeof un->sun_path) return;   /* leave as-is if it won't fit */
     memcpy(un->sun_path, path, pl + 1);
@@ -256,9 +481,15 @@ SYSDEF(bind) {
     socklen_t sl;
     int dfd, r = addr_in(c, a1, (u32)a2, &ss, &sl);
     if (r < 0) return (u64)(s64)r;
-    if ((r = unix_path_in(c, &ss, &sl, 0, &dfd)) < 0) return (u64)(s64)r;
+    char guest[PATH_MAX];
+    if ((r = unix_path_in(c, &ss, &sl, 0, &dfd, guest)) < 0) return (u64)(s64)r;
     u64 ret = bind((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
-    fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
+    if (ret == 0 && dfd >= 0 && guest[0]) {
+        const struct sockaddr_un *un = (const struct sockaddr_un *)&ss;
+        sun_note((int)a0, un->sun_path, guest, dfd);   /* holds the directory */
+    } else {
+        fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
+    }
     return ret;
 }
 
@@ -271,7 +502,7 @@ SYSDEF(connect) {
     socklen_t sl;
     int dfd, r = addr_in(c, a1, (u32)a2, &ss, &sl);
     if (r < 0) return (u64)(s64)r;
-    if ((r = unix_path_in(c, &ss, &sl, 1, &dfd)) < 0) return (u64)(s64)r;
+    if ((r = unix_path_in(c, &ss, &sl, 1, &dfd, NULL)) < 0) return (u64)(s64)r;
     u64 ret = connect((int)a0, (struct sockaddr *)&ss, sl) < 0 ? host_err() : 0;
     fdheld_close(dfd);   /* the pin's parent (unix_path_in) */
     return ret;
@@ -320,11 +551,12 @@ int sock_addr_out(CPU *c, u64 addr_va, u64 len_va, const void *sa,
 }
 
 /* Write back a sockaddr result (accept/getsockname/getpeername/recvfrom),
- * translating an AF_UNIX path to the guest's view on the way out. */
+ * translating an AF_UNIX path to the guest's view on the way out; `sockfd`
+ * is the socket whose own address it is (getsockname), -1 otherwise. */
 static u64 addr_out(CPU *c, u64 addr_va, u64 len_va, struct sockaddr_storage *ss,
-                    socklen_t sl, int addr_optional) {
+                    socklen_t sl, int addr_optional, int sockfd) {
     if (addr_optional && !addr_va) return 0;
-    unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
+    unix_path_out(c, ss, &sl, sockfd);   /* host sun_path -> guest view */
     return (u64)(s64)sock_addr_out(c, addr_va, len_va, ss, sl, addr_optional);
 }
 
@@ -334,7 +566,7 @@ SYSDEF(accept) {
     int fd = accept((int)a0, (struct sockaddr *)&ss, &sl);
     if (fd < 0) return host_err();
     if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
-    u64 e = addr_out(c, a1, a2, &ss, sl, 1);
+    u64 e = addr_out(c, a1, a2, &ss, sl, 1, -1);
     if ((s64)e < 0) { close(fd); return e; }
     return (u64)fd;
 }
@@ -345,7 +577,7 @@ SYSDEF(accept4) {
     int fd = accept4((int)a0, (struct sockaddr *)&ss, &sl, (int)a3);
     if (fd < 0) return host_err();
     if (!fd_within_limit(c, fd)) return (u64)(s64)-EMFILE;
-    u64 e = addr_out(c, a1, a2, &ss, sl, 1);
+    u64 e = addr_out(c, a1, a2, &ss, sl, 1, -1);
     if ((s64)e < 0) { close(fd); return e; }
     return (u64)fd;
 }
@@ -355,7 +587,7 @@ SYSDEF(getsockname) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     if (getsockname((int)a0, (struct sockaddr *)&ss, &sl) < 0) return host_err();
-    return addr_out(c, a1, a2, &ss, sl, 0);
+    return addr_out(c, a1, a2, &ss, sl, 0, (int)a0);
 }
 
 SYSDEF(getpeername) {
@@ -363,7 +595,7 @@ SYSDEF(getpeername) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
     if (getpeername((int)a0, (struct sockaddr *)&ss, &sl) < 0) return host_err();
-    return addr_out(c, a1, a2, &ss, sl, 0);
+    return addr_out(c, a1, a2, &ss, sl, 0, -1);
 }
 
 /* A send the transfer could not cover in full (sys.h: only a vector over a
@@ -394,7 +626,7 @@ SYSDEF(sendto) {
          * its pointer instead of its length. bind/connect already pass it on. */
         int ar = addr_in(c, a4, (u32)a5, &ss, &sl);
         if (ar < 0) return (u64)(s64)ar;
-        int tr = unix_path_in(c, &ss, &sl, 1, &dfd);
+        int tr = unix_path_in(c, &ss, &sl, 1, &dfd, NULL);
         if (tr < 0) return (u64)(s64)tr;
         dp = (struct sockaddr *)&ss;
     }
@@ -486,7 +718,7 @@ SYSDEF(recvfrom) {
      * untruncated length, so clamp to what the buffer actually holds. */
     if (n > 0) nlr_fix_gvec(c, (int)a0, &g, 1, (size_t)n < room ? (size_t)n : room,
                             (int)a3 & MSG_PEEK);
-    u64 ae = addr_out(c, a4, a5, &ss, sl, 1);
+    u64 ae = addr_out(c, a4, a5, &ss, sl, 1, -1);
     if ((s64)ae < 0) return ae;
     return e;
 }
@@ -1381,7 +1613,7 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
      * overflows sun_path), which msg_release closes; it leaves -1 on error. */
     if (for_send && h->msg_name) {
         socklen_t sl = h->msg_namelen;
-        int tr = unix_path_in(c, ss, &sl, 1, &mi->dfd);
+        int tr = unix_path_in(c, ss, &sl, 1, &mi->dfd, NULL);
         if (tr < 0) return tr;
         h->msg_namelen = sl;
     }
@@ -1498,7 +1730,7 @@ static int recvmsg_writeback(CPU *c, int fd, u64 hdr_va, GMsghdr *g,
     }
     if (g->msg_name && h->msg_namelen) {
         socklen_t sl = h->msg_namelen;
-        unix_path_out(c, ss, &sl);   /* host sun_path -> guest view */
+        unix_path_out(c, ss, &sl, -1);   /* host sun_path -> guest view */
         h->msg_namelen = sl;
         /* Write at most the buffer the guest supplied, but report the true
          * length below -- POSIX: "fromlen shall refer to the value before

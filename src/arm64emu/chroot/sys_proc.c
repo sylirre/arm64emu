@@ -790,6 +790,7 @@ typedef struct {
                                * joins it (task_join_group_stop) */
     u32 tagged_addr_ctrl;     /* ...and its tagged-address ABI (inherited) */
     u32 pers;                 /* creator's personality, inherited likewise */
+    u8  nnp;                  /* ...and its no_new_privs */
     u64 fault_address, fault_code;   /* ...and its last fault's record (thread.h):
                                * arch_dup_task_struct copies the creator's */
     /* The creator's call-out counters, not the Machine's current ones: if the
@@ -860,6 +861,7 @@ static void *thread_entry(void *arg) {
     g_tls.fault_address = t->fault_address;
     g_tls.fault_code = t->fault_code;
     g_tls.personality = t->pers;
+    g_tls.no_new_privs = t->nnp;
     g_tls.pers_pub = 0;
     thr_reg_add(tid, t->pers);
     g_tls.sig_altstack_flags = 2 /*SS_DISABLE*/;   /* sas_ss_reset: a CLONE_VM
@@ -1988,6 +1990,7 @@ SYSDEF(clone) {
         t->fault_address = g_tls.fault_address;
         t->fault_code = g_tls.fault_code;
         t->pers = g_tls.personality;
+        t->nnp = g_tls.no_new_privs;
         t->stop_gen = g_tls.stop_gen;
         t->image_gen = g_tls.image_gen;
         /* ptrace thread-follow: a CLONE_THREAD clone is a PTRACE_EVENT_CLONE
@@ -2236,6 +2239,7 @@ SYSDEF(clone) {
          * the child's base, and nothing of it is in the broker (seeded into
          * the slot by the parent, above). */
         m->pers_base = g_tls.personality;
+        m->no_new_privs = g_tls.no_new_privs;   /* ...and its no_new_privs */
         g_tls.pers_pub = 0;
         thr_fork_child();                 /* the thread registry: this thread */
         shm_fork_reattach(m);             /* re-count inherited shm attaches */
@@ -3032,6 +3036,7 @@ static void dethread_join(CPU *c) {
     thr_reg_set_pers(g_tls.tid, m->dethread_personality);
     g_tls.personality = m->dethread_personality;
     pers_host_sticky(g_tls.personality);
+    g_tls.no_new_privs = m->dethread_nnp;   /* ...and its no_new_privs */
     g_tls.image_gen = __atomic_load_n(&m->image_gen, __ATOMIC_ACQUIRE);
     g_tls.stop_gen = __atomic_load_n(&m->stop_gen, __ATOMIC_ACQUIRE);
     __atomic_store_n(&m->dethread_req, 0, __ATOMIC_RELEASE);
@@ -3465,8 +3470,8 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
      * still ahead of us (de_thread) must leave the caller exactly as it was --
      * an execve that returns an error and a raised euid would be a real
      * privilege leak, since the old image goes on running with it. */
-    int setid_uid = !m->no_new_privs && (img_st.st_mode & S_ISUID);
-    int setid_gid = !m->no_new_privs &&
+    int setid_uid = !g_tls.no_new_privs && (img_st.st_mode & S_ISUID);
+    int setid_gid = !g_tls.no_new_privs &&
                     (img_st.st_mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP);
     int raise_uid = 0, raise_gid = 0;
     u32 new_euid = 0, new_egid = 0;
@@ -3511,6 +3516,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
         thr_reg_set_pers(g_tls.tid, np);
         m->pers_base = np;
         m->dethread_personality = np;   /* for the main thread, if it is not us */
+        m->no_new_privs = m->dethread_nnp = g_tls.no_new_privs;   /* likewise */
     }
     robust_list_exit_self(c);   /* exec_mm_release: this thread's robust futexes */
     vfork_child_flush(c);       /* ...and a vfork child's writes to its parent,
@@ -4532,15 +4538,18 @@ SYSDEF(prctl) {
          * so an inherited flag (Android zygote sets one before its seccomp
          * filter) is not reported as the guest's. Kernel argument rules: arg2
          * must be 1, arg3..arg5 zero, never clears. bubblewrap dies on the spot
-         * if this returns an error. */
+         * if this returns an error. The flag is the calling thread's, as the
+         * kernel's task flag is (thread.h), and the main thread's is the
+         * process's for /proc. */
         case PR_SET_NO_NEW_PRIVS:
             if (a1 != 1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
             (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-            c->m->no_new_privs = 1;
+            g_tls.no_new_privs = 1;
+            if (g_tls.tid == (int)getpid()) c->m->no_new_privs = 1;
             return 0;
         case PR_GET_NO_NEW_PRIVS:
             if (a1 || a2 || a3 || a4) return (u64)(s64)-EINVAL;
-            return c->m->no_new_privs;
+            return g_tls.no_new_privs;
         /* The older way into seccomp, and still the one bubblewrap uses.
          * PR_GET_SECCOMP reports the mode -- and, per the kernel, kills a
          * process already in strict mode for asking (prctl is not on strict

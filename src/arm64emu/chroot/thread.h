@@ -117,6 +117,12 @@ typedef struct {
      * clone from its creator and by a fork child from the forking thread,
      * kept across execve less what the exec clears (sys_personality). */
     u32 personality;
+    /* prctl(PR_SET_NO_NEW_PRIVS) as this thread asked for it: a task flag
+     * (PFA_NO_NEW_PRIVS), so a sibling setting it leaves this one as it was.
+     * Inherited by a clone from its creator and by a fork child from the
+     * forking thread, kept across execve; the process's view of it for
+     * /proc is its main thread's (Machine.no_new_privs). */
+    u8  no_new_privs;
     u8  pers_pub;             /* this thread's value is published in the
                                * broker for other processes' /proc views --
                                * it differs from its process's base value

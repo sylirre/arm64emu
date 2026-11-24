@@ -1286,14 +1286,22 @@ isolated namespace's names are that much shorter than the kernel's 107 bytes as
 a result, the same shape of limit the rootfs prefix imposes on pathname sockets
 below. Unnamed/autobind addresses (no name at all) and addresses longer than
 `sun_path` itself (invalid whatever we do, so the kernel's `EINVAL` is the
-better answer) still pass through. When the rootfs prefix pushes the translated
-path past the 108-byte `sun_path`
-limit, `bind`/`connect`/`sendto`/`sendmsg` fall back to opening the parent
-directory and operating relative to it via `/proc/self/fd/<fd>/<basename>`, so
-only the socket basename must fit (the residual limit is a basename ≳90 bytes).
-A socket bound through the fallback reports that `/proc/self/fd` path from
-`getsockname` rather than its guest path (cosmetic; real software reads back the
-bound pathname only rarely).
+better answer) still pass through. A translated path is reached through its
+pinned parent directory, `/proc/<pid>/fd/<fd>/<basename>`, which contains it
+against a concurrent rename and means only the socket basename must fit the
+108-byte `sun_path` (the residual limit is a basename ≳90 bytes).
+
+The kernel keeps `sun_path` exactly as `bind` handed it, so that spelling is
+what every reader of the address gets back -- `getsockname`, a peer's
+`getpeername` and `accept`, a datagram's source address -- where the guest
+expects the name it bound (a datagram service replies to it). So a bind records
+what the guest bound, keyed by the socket's inode and by the spelling, and holds
+the directory descriptor the spelling names -- above the guest's descriptor
+limit where there is room, near its top otherwise -- for as long as the socket
+is open in the process (checked at every bind). The readback answers from the
+record, else from the spelling resolved through the binder's descriptor, which
+any process of the user can read while the binding lasts; a stale one (its
+binder gone) is left as it stands, which is nobody's host path.
 
 **Writing back into the guest is part of the call.** A socket call's results
 land in guest memory through `copy_to_guest`, which can fail — and a failure
@@ -1877,7 +1885,7 @@ then make the consequences the caller depends on true:
   | `TracerPid` | the emulated `ptrace` never host-attaches, so the host task reports no tracer even while a guest `gdb` has it stopped |
   | `Seccomp`, `Seccomp_filters` | a guest filter is evaluated in the dispatcher and never installed on the host, so a filtered guest reads 0 — and where the emulator itself carries a filter the guest never asked for (Android, `make test-arm64emu-chroot-seccomp`), an unfiltered guest reads 2 |
   | `SigPnd`/`ShdPnd`/`SigBlk`/`SigIgn`/`SigCgt` | the capture layer's dispositions and mask, not the guest's |
-  | `NoNewPrivs` | answered from the recorded guest intent, like `PR_GET_NO_NEW_PRIVS`: an inherited host flag (the Android zygote sets one) is not something the guest asked for |
+  | `NoNewPrivs` | answered from the recorded guest intent, like `PR_GET_NO_NEW_PRIVS`: an inherited host flag (the Android zygote sets one) is not something the guest asked for. The flag is a task's, as the kernel's is (a sibling setting it leaves a thread as it was; a new thread or fork child takes its creator's); the process's line shows its main thread's |
   | `Uid`/`Gid`/`Groups` | under `--fake-id`, the real invoking ids, which `ps`/`top` read to name the user |
   | `CapPrm`/`CapEff` | under fake-root, `capget(2)` already answers with a full set, so zeros here contradict the emulator's own syscall |
   | `x86_*` | an arch hook of the host kernel; an aarch64 kernel prints no such line, so passing it through tells the guest what the host CPU is |
@@ -2164,8 +2172,10 @@ crashing guest can never corrupt IPC state.
   on clean exit via `sembroker_exit` in `exit`/`exit_group`/fatal-signal death
   — not `execve` (undo lists survive exec); fork children start clean; threads
   share the pid, giving `CLONE_SYSVSEM` semantics for free. A `SIGKILL`'d
-  holder is caught by the broker's ~1 s liveness-reclaim tick, which also
-  wakes any waiter the applied undo unblocks. `SETVAL`/`SETALL` clear the
+  holder's rows are applied before the set is next read or operated on (its
+  pid gone, reused or a zombie: `exit_sem` runs in `do_exit`, so a parent that
+  reaps it reads the adjustment made), and otherwise by the broker's ~1 s
+  liveness-reclaim tick, which also wakes any waiter the applied undo unblocks. `SETVAL`/`SETALL` clear the
   affected adjustments in every process's list (kernel rule). Adjustments
   accumulate *within* a vector, so two `SEM_UNDO` ops on one semaphore see
   each other and the pair can exceed `SEMAEM` (`ERANGE`); a vector that fails

@@ -79,6 +79,15 @@ int main(void) {
             }
     }
 
+    /* A negative ifc_len is a length no entry fits in, not an error: success,
+     * no entry written, ifc_len 0. Read as unsigned it was a huge buffer. */
+    memset(buf, 0x5a, sizeof buf);
+    ifc.ifc_len = -1;
+    ifc.ifc_buf = buf;
+    int nr = ioctl(s, SIOCGIFCONF, &ifc);
+    printf("conf-neg: rc=%d len=%d untouched=%d\n", nr, ifc.ifc_len,
+           (unsigned char)buf[0] == 0x5a);
+
     close(s);
     return 0;
 }
