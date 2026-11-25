@@ -987,7 +987,10 @@ guest could still *obtain* a writable descriptor, or a writable alias, under a
   and as fake root.
 
 Binds are listed in the
-synthesized `/proc/mounts` and `/proc/mountinfo`. A bind destination is a pure
+synthesized `/proc/mounts` and `/proc/mountinfo`, a space, tab, newline or
+backslash of a mount point (and a `#` of a source too) as the `\040`-style
+escape the kernel's `seq_path` writes — as a newline in a path is in
+`/proc/<pid>/maps`. A bind destination is a pure
 resolution overlay with no physical dirent in the rootfs, so `getdents64`
 (`bind_inject_dents` in `sys_file.c`) splices the mount point into a listing of
 its parent directory (`ls /` shows a `--bind …:/host`). It fires only on the
@@ -1884,7 +1887,8 @@ then make the consequences the caller depends on true:
   | the `Vm`/`Rss` block | it measures the *emulator's* address space — its code, software page tables, JIT cache and malloc, at its own foreign-ISA addresses. Synthesized from the guest's region list (see `docs/arm64emu/chroot/memory.md`), together with all of `statm` and the address fields of `stat`, which are the two files `ps` and `top` actually read. Another guest process's sizes come from what it published in the shared PID registry; only its *resident* set stays the host's, being the one figure no reader can sample inside another address space — and it is bounded by that process's own size, since a resident set larger than the space holding it is something no kernel reports |
   | `TracerPid` | the emulated `ptrace` never host-attaches, so the host task reports no tracer even while a guest `gdb` has it stopped |
   | `Seccomp`, `Seccomp_filters` | a guest filter is evaluated in the dispatcher and never installed on the host, so a filtered guest reads 0 — and where the emulator itself carries a filter the guest never asked for (Android, `make test-arm64emu-chroot-seccomp`), an unfiltered guest reads 2 |
-  | `SigPnd`/`ShdPnd`/`SigBlk`/`SigIgn`/`SigCgt` | the capture layer's dispositions and mask, not the guest's |
+  | `SigPnd`/`ShdPnd`/`SigIgn`/`SigCgt` | the capture layer's dispositions and pending set, not the guest's; rewritten for the reader's own process |
+  | `SigBlk` | the host mask of a task holds out the numbers the emulator reserves (its fault nets, the control-channel kick, the host libc's 32/33 and their carriers), so a task blocking everything read as leaving a dozen signals open, and whoever picks an unblocked signal by it (a debugger's attach) picked a blocked one. Every thread publishes its guest mask in the shared PID registry at each change, a store beside the system call that mirrors it, and the line is exact for any task of any guest process |
   | `NoNewPrivs` | answered from the recorded guest intent, like `PR_GET_NO_NEW_PRIVS`: an inherited host flag (the Android zygote sets one) is not something the guest asked for. The flag is a task's, as the kernel's is (a sibling setting it leaves a thread as it was; a new thread or fork child takes its creator's); the process's line shows its main thread's |
   | `Uid`/`Gid`/`Groups` | under `--fake-id`, the real invoking ids, which `ps`/`top` read to name the user |
   | `CapPrm`/`CapEff` | under fake-root, `capget(2)` already answers with a full set, so zeros here contradict the emulator's own syscall |
@@ -2033,7 +2037,9 @@ then make the consequences the caller depends on true:
   PIDs, and `special_host_path` routes a `/proc/<id>` that is neither a guest
   PID nor a guest thread's tid to ENOENT (`proctab_task_group`, which also keeps
   an interposer's own threads out), so the guest sees only its own process
-  tree — a pid namespace without the namespace. A guest thread's tid used to
+  tree — a pid namespace without the namespace. A number with a leading zero
+  names nothing (`name_to_int`), a process, a thread or a descriptor alike. A
+  guest thread's tid used to
   be hidden like a stranger's: `/proc/<tid>` of any thread that was not a main
   one was ENOENT, where a kernel serves it. The **address-space** files of another guest process
   (`maps`, `smaps`, `smaps_rollup`, `numa_maps`, `pagemap`, `stack`, `mem`,

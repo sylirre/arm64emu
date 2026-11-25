@@ -855,7 +855,7 @@ static void *thread_entry(void *arg) {
     g_tls.stop_gen = t->stop_gen;
     g_tls.image_gen = t->image_gen;
     g_tls.pend_exc.valid = false;
-    g_tls.sigmask = t->sigmask;
+    guest_sigmask_set(t->sigmask);
     g_tls.jc_seen = t->jc_seen;
     g_tls.tagged_addr_ctrl = t->tagged_addr_ctrl;
     g_tls.fault_address = t->fault_address;
@@ -864,6 +864,7 @@ static void *thread_entry(void *arg) {
     g_tls.no_new_privs = t->nnp;
     g_tls.pers_pub = 0;
     thr_reg_add(tid, t->pers);
+    proctab_sigblk_thread(tid);   /* where its blocked set is published */
     g_tls.sig_altstack_flags = 2 /*SS_DISABLE*/;   /* sas_ss_reset: a CLONE_VM
                                                     * child starts with none */
     CPU *c = &t->cpu;
@@ -932,6 +933,7 @@ static void *thread_entry(void *arg) {
     pers_unpublish_self(m);     /* what it published of its personality */
     robust_list_exit_self(c);   /* its robust futexes, before the tid clear */
     as_thread_exit(&m->as);
+    proctab_sigblk_thread_exit(g_tls.tid);
     thr_reg_del(g_tls.tid);
     sig_jc_left();              /* a group stop it had yet to take part in */
     if (g_tls.clear_child_tid) futex_wake_addr(c, g_tls.clear_child_tid);
@@ -3020,7 +3022,7 @@ static void dethread_join(CPU *c) {
     g_tls.saved_sigmask = 0;
     g_tls.have_saved_sigmask = 0;
     g_tls.sc_ret_eintr = 0;
-    g_tls.sigmask = m->dethread_sigmask;
+    guest_sigmask_set(m->dethread_sigmask);
     /* ...and so is its last fault's record (thread.h), which no execve
      * clears: */
     g_tls.fault_address = m->dethread_fault_address;
@@ -3680,8 +3682,17 @@ SYSDEF(execveat) {
     char exec_path[PATH_MAX];
     if (!gpath[0]) {
         if (!(gf & G_AT_EMPTY_PATH)) return (u64)(s64)-ENOENT;
-        if (fcntl((int)(s32)a0, F_GETFD) < 0) return (u64)(s64)-EBADF;
-        snprintf(exec_path, sizeof exec_path, "/proc/self/fd/%d", (int)(s32)a0);
+        /* do_open_execat on the descriptor itself: AT_FDCWD is the working
+         * directory, which is no file to run (EACCES, as for any directory),
+         * and an O_PATH descriptor of a symlink is the link, ELOOP. */
+        if ((s32)a0 == G_AT_FDCWD) {
+            snprintf(exec_path, sizeof exec_path, ".");
+        } else {
+            struct stat st;
+            if (fstat((int)(s32)a0, &st) < 0) return (u64)(s64)-EBADF;
+            if (S_ISLNK(st.st_mode)) return (u64)(s64)-ELOOP;
+            snprintf(exec_path, sizeof exec_path, "/proc/self/fd/%d", (int)(s32)a0);
+        }
     } else {
         PathPin pin;
         char canon[PATH_MAX];
@@ -5110,9 +5121,17 @@ SYSDEF(times) {
  * the calling process itself or one of its *stopped* tracees — the only cross-
  * process guest memory the emulator can reach (guest processes are separate host
  * processes with private COW address spaces; a stopped tracee answers over the
- * ptrace mailbox, see ptrace_vm_block). A running same-uid peer's memory is not
- * reachable and yields -ESRCH. proot/strace use these to read a tracee's
- * argv/paths in bulk instead of word-by-word PTRACE_PEEKDATA. flags must be 0. */
+ * ptrace mailbox, see ptrace_vm_block). Any other live guest process's memory is
+ * out of reach and yields EPERM, as it does on a kernel whose policy keeps it
+ * from us (Yama); ESRCH is for no such process, or one with no memory left (a
+ * zombie), and a caller takes it for exactly that. proot/strace use these to
+ * read a tracee's argv/paths in bulk instead of word-by-word PTRACE_PEEKDATA.
+ * flags must be 0. */
+static int vm_refusal(s32 pid, int e) {
+    return e == ESRCH && pid > 0 && proctab_has_task(pid) && !proctab_zombie(pid)
+               ? EPERM : e;
+}
+
 static u64 do_process_vm(CPU *c, int is_write, u64 pid, u64 liov, u64 liovcnt,
                          u64 riov, u64 riovcnt) {
     /* The two vectors are imported the way process_vm_rw imports them, in that
@@ -5211,7 +5230,7 @@ static u64 do_process_vm(CPU *c, int is_write, u64 pid, u64 liov, u64 liovcnt,
         loff += moved; roff += moved;
     }
     free(lv); free(rv);
-    if (total == 0 && err) return (u64)(s64)-err;
+    if (total == 0 && err) return (u64)(s64)-(is_self ? err : vm_refusal((s32)pid, err));
     return (u64)total;
 }
 

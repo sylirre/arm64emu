@@ -86,6 +86,9 @@ static int put_pidstat(int fd, struct Machine *m, const ProcMem *pm,
                        s32 *tid_out);
 static int put_statm(int fd, struct Machine *m, const ProcMem *pm,
                      const AsMem *mi, const char *canon);
+/* A synthesized file's own attributes, with the stat half at the end. */
+static void synth_attrs(int kind, const char *canon, int link, struct stat *st);
+static int stat_forced_deny(void);
 /* Leaf lock for the /proc/stat busy estimate — the writers run both with
  * and without pf_lock held (open vs refresh path). */
 static pthread_mutex_t est_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -147,6 +150,33 @@ static int mnt_view(struct Machine *m, const char *guest, char *out) {
     return 1;
 }
 
+/* A path as the kernel prints it in a table (mangle_path, seq_escape): every
+ * byte of `set` as a backslash and three octal digits. Returns `s` itself when
+ * it holds none, else a copy in *heap for the caller to free (and `s` again,
+ * a line read wrong, if there is no memory for one). */
+static const char *mangled(const char *s, const char *set, char **heap) {
+    *heap = NULL;
+    size_t n = strlen(s), k = 0;
+    for (const char *p = s; *p; p++) k += strchr(set, *p) != NULL;
+    if (!k) return s;
+    char *o = malloc(n + 3 * k + 1), *d = o;
+    if (!o) return s;
+    for (const char *p = s; *p; p++) {
+        u8 b = (u8)*p;
+        if (!strchr(set, *p)) { *d++ = *p; continue; }
+        *d++ = '\\';
+        *d++ = (char)('0' + (b >> 6));
+        *d++ = (char)('0' + ((b >> 3) & 7));
+        *d++ = (char)('0' + (b & 7));
+    }
+    *d = 0;
+    *heap = o;
+    return o;
+}
+/* What a mount table escapes of a mount point and of a device name. */
+#define MNT_ESC_PATH " \t\n\\"
+#define MNT_ESC_DEV  " \t\n\\#"
+
 /* The guest mount table: the rootfs plus the passthrough zones path.c binds
  * (/proc, /dev/pts, /dev/shm). The devpts and shm rows are omitted under
  * --no-dev, when that passthrough is disabled. Fixed mount IDs; the root's
@@ -195,7 +225,6 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
             char bg[PATH_MAX], bh[PATH_MAX], bv[PATH_MAX]; int bro;
             if (!bind_get(i, bg, bh, &bro)) continue;   /* skip freed/mid-claim */
             if (!mnt_view(m, bg, bv)) continue;
-            strcpy(bg, bv);
             struct stat bst;
             unsigned bmaj = maj, bmin = min;
             if (stat(bh, &bst) == 0) {
@@ -203,9 +232,14 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
                 bmin = minor(bst.st_dev);
             }
             const char *o = bro ? "ro,relatime" : "rw,relatime";
+            char *h1, *h2;
+            const char *dir = mangled(bv, MNT_ESC_PATH, &h1);
+            const char *dev = mangled(bh, MNT_ESC_DEV, &h2);
             dprintf(fd, "%zu 1 %u:%u / %s %s - %s %s %s\n",
-                    np + 2 + (size_t)i, bmaj, bmin, bg, o,
-                    fstype, bh, bro ? "ro" : "rw");
+                    np + 2 + (size_t)i, bmaj, bmin, dir, o,
+                    fstype, dev, bro ? "ro" : "rw");
+            free(h1);
+            free(h2);
         }
     } else if (fmt == MNT_MOUNTSTATS) {
         /* mountstats: a device line per mount (no NFS per-op stats, since these
@@ -221,7 +255,12 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
             char bg[PATH_MAX], bh[PATH_MAX], bv[PATH_MAX];
             if (!bind_get(i, bg, bh, NULL)) continue;
             if (!mnt_view(m, bg, bv)) continue;
-            dprintf(fd, "device %s mounted on %s with fstype %s\n", bh, bv, fstype);
+            char *h1, *h2;
+            const char *dir = mangled(bv, MNT_ESC_PATH, &h1);
+            const char *dev = mangled(bh, MNT_ESC_DEV, &h2);
+            dprintf(fd, "device %s mounted on %s with fstype %s\n", dev, dir, fstype);
+            free(h1);
+            free(h2);
         }
     } else {
         dprintf(fd, "/dev/root / %s rw,relatime 0 0\n", fstype);
@@ -235,8 +274,13 @@ static void put_mounts(int fd, struct Machine *m, int fmt) {
             char bg[PATH_MAX], bh[PATH_MAX], bv[PATH_MAX]; int bro;
             if (!bind_get(i, bg, bh, &bro)) continue;
             if (!mnt_view(m, bg, bv)) continue;
-            dprintf(fd, "%s %s %s %s 0 0\n", bh, bv,
+            char *h1, *h2;
+            const char *dir = mangled(bv, MNT_ESC_PATH, &h1);
+            const char *dev = mangled(bh, MNT_ESC_DEV, &h2);
+            dprintf(fd, "%s %s %s %s 0 0\n", dev, dir,
                     fstype, bro ? "ro,relatime" : "rw,relatime");
+            free(h1);
+            free(h2);
         }
     }
 }
@@ -277,6 +321,9 @@ static void put_maps(int fd, struct Machine *m) {
             else if (r->start < as->stack_top && as->stack_top <= end)
                 name = "[stack]";
         }
+        /* A newline in it is the one byte seq_path escapes here. */
+        char *nheap = NULL;
+        if (name) name = mangled(name, "\n", &nheap);
         u64 run = r->start;
         u32 prot = as_page_prot(as, run);
         for (u64 pg = r->start + GUEST_PAGE_SIZE; ; pg += GUEST_PAGE_SIZE) {
@@ -303,6 +350,7 @@ static void put_maps(int fd, struct Machine *m) {
             }
             if (pg >= end) break;
         }
+        free(nheap);
         i = last;
     }
     as_unlock();
@@ -1116,46 +1164,27 @@ static int pf_find_locked(struct Machine *m, int fd) {
     return i;
 }
 
-/* What fstat says of a synthesized file: the kernel's attributes for the file
- * it is served as, where the backing would answer for itself -- a memfd,
- * 0777 and the emulator's user, beside a stat of the same name that says
- * 0444 and root. The modes are fs/proc's own: S_IRUGO for nearly everything,
- * 0400 for the files only their owner may read (environ, auxv, mountstats,
- * personality), 0644 for the writable id maps and the overflow sysctls.
- * proc_create'd files and the sysctls are root's; a process's own files keep
- * the backing's owner, which is the process's. */
-static mode_t pf_kind_mode(int kind) {
-    switch (kind) {
-    case PF_ENVIRON: case PF_AUXV: case PF_MOUNTSTATS: case PF_PERS:
-        return 0400;
-    case PF_UIDMAP: case PF_GIDMAP: case PF_SETGROUPS: case PF_OVERFLOWID:
-        return 0644;
-    default:
-        return 0444;
-    }
-}
-
-static int pf_kind_global(int kind) {
-    switch (kind) {
-    case PF_LOADAVG: case PF_UPTIME: case PF_VERSION: case PF_STAT:
-    case PF_CPUINFO: case PF_LOCKS: case PF_OVERFLOWID:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
+/* What fstat says of a synthesized file: what a stat of the same name says,
+ * the host's answer or the view's where the host gives none (synth_attrs) --
+ * the backing would answer for itself, a memfd, 0777, unlinked and the
+ * emulator's user's. A name the host no longer has (its process is gone) is
+ * the view's too. */
 int procfs_fd_stat(struct Machine *m, int fd, struct stat *st) {
     if (!m->pf_fds_count) return 0;   /* unlocked fast path; benign race */
     EMU_LOCK(&pf_lock, EMU_LK_PF);
     int i = pf_find_locked(m, fd);
-    if (i >= 0) {
-        int kind = m->pf_fds[i].kind;
-        st->st_mode = S_IFREG | pf_kind_mode(kind);
-        if (pf_kind_global(kind)) st->st_uid = st->st_gid = 0;
-    }
+    int kind = i >= 0 ? m->pf_fds[i].kind : -1;
+    char name[sizeof m->pf_fds->name];
+    if (i >= 0) strcpy(name, m->pf_fds[i].name);
     EMU_UNLOCK(&pf_lock, EMU_LK_PF);
-    return i >= 0;
+    if (i < 0) return 0;
+    int e = errno;
+    struct stat h;
+    if (!name[0] || stat_forced_deny() || stat(name, &h) != 0 || !S_ISREG(h.st_mode))
+        synth_attrs(kind, name[0] ? name : "/proc", 0, &h);
+    *st = h;
+    errno = e;
+    return 1;
 }
 
 int procfs_fd_name(struct Machine *m, int fd, char *out) {
@@ -1271,7 +1300,7 @@ static s32 pers_group_of(s32 t) {
 static s32 pers_num(const char **pp) {
     const char *p = *pp;
     u64 n = 0;
-    if (*p < '0' || *p > '9') return 0;
+    if (*p < '0' || *p > '9' || proc_num_bad(p)) return 0;
     for (; *p >= '0' && *p <= '9'; p++)
         if ((n = n * 10 + (u64)(*p - '0')) > 0x7fffffff) return 0;
     if (*p != '/') return 0;
@@ -1707,20 +1736,16 @@ static char task_state_view(s32 tid, s32 tgid, char host) {
  *              a file the guest reads about itself.
  *
  * `self` says the file describes this Machine, the only place the guest's exact
- * signal state and credentials exist. For another guest process we rewrite what
- * the shared tables can answer -- TracerPid from the ptrace link registry,
- * Seccomp and the Vm sizes from the PID registry -- and leave the host's
- * approximation of the rest standing, the same split every other cross-process
- * /proc file here makes: its blocked set would have to be republished on every
- * sigprocmask and every delivery to be worth reading, and being per-thread it
- * does not belong in a per-process record anyway.
+ * signal dispositions and credentials exist. For another guest process we
+ * rewrite what the shared tables can answer -- TracerPid from the ptrace link
+ * registry, Seccomp, the Vm sizes and SigBlk from the PID registry -- and leave
+ * the host's approximation of the rest standing, the same split every other
+ * cross-process /proc file here makes.
  *
- * That per-thread part also decides which mask the self case reports: the
- * *calling* thread's, since that is the one this emulator process can see. It
- * is exact for /proc/self/status in a single-threaded guest, for thread-self,
- * and for a thread's own task/<tid>; a thread reading a sibling's task dir gets
- * its own instead of the sibling's -- still the guest's mask rather than the
- * capture layer's, which is the choice being made everywhere here.
+ * The blocked set is a thread's own and published per thread (proctab.c,
+ * "blocked sets"), so SigBlk is exact for whichever task the file describes.
+ * The pending set is not published: a thread reading a sibling's task dir gets
+ * its own SigPnd instead of the sibling's.
  *
  * `canon` is the passthrough host path. *tid_out gets the thread this file
  * describes, so a refresh can name it directly whichever spelling was opened.
@@ -1781,8 +1806,10 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
     /* Guest signal state. The kernel's mask spelling puts signal N in bit N-1,
      * which is the guest sigset layout too, so these transfer as they are. */
     u64 blk = 0, ign = 0, cgt = 0, pnd = 0;
+    int blkknown = self && tid == g_tls.tid;
+    if (blkknown) blk = g_tls.sigmask;
+    else if (proctab_sigblk_get(tgid, tid, &blk)) blkknown = 1;
     if (self) {
-        blk = g_tls.sigmask;
         /* Our capture ring is per-thread, so everything queued is private to
          * this thread and the process-wide (shared) pending set is empty. */
         pnd = sig_pending_set();
@@ -1877,6 +1904,10 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
             dprintf(fd, "Threads:\t%d\n", t > 0 ? t : 1);
             goto next_line;
         }
+        if (blkknown && is_key(p, "SigBlk")) {
+            dprintf(fd, "SigBlk:\t%016llx\n", (unsigned long long)blk);
+            goto next_line;
+        }
         if (scknown && is_key(p, "Seccomp")) {
             dprintf(fd, "Seccomp:\t%u\n", scmode);
             goto next_line;
@@ -1907,7 +1938,6 @@ static int put_status(int fd, struct Machine *m, const char *canon, int self,
         if (self) {
             if (is_key(p, "SigPnd")) { dprintf(fd, "SigPnd:\t%016llx\n", (unsigned long long)pnd); goto next_line; }
             if (is_key(p, "ShdPnd")) { dprintf(fd, "ShdPnd:\t%016llx\n", 0ULL); goto next_line; }
-            if (is_key(p, "SigBlk")) { dprintf(fd, "SigBlk:\t%016llx\n", (unsigned long long)blk); goto next_line; }
             if (is_key(p, "SigIgn")) { dprintf(fd, "SigIgn:\t%016llx\n", (unsigned long long)ign); goto next_line; }
             if (is_key(p, "SigCgt")) { dprintf(fd, "SigCgt:\t%016llx\n", (unsigned long long)cgt); goto next_line; }
             if (is_key(p, "NoNewPrivs")) { dprintf(fd, "NoNewPrivs:\t%d\n", m->no_new_privs ? 1 : 0); goto next_line; }
@@ -2565,7 +2595,14 @@ static int synth_stat_fill(CPU *c, const char *canon, int nofollow, struct stat 
     }
 
     /* The kernel's /proc/mounts is a link to self/mounts, and lstat says so. */
-    int link = nofollow && !strcmp(canon, "/proc/mounts");
+    synth_attrs(kind, canon, nofollow && !strcmp(canon, "/proc/mounts"), st);
+    return 1;
+}
+
+/* The attributes of a synthesized file of `kind` named `canon` (`link`: the
+ * symlink of that name) as the kernel's procfs reports them, for a host that
+ * will not say. */
+static void synth_attrs(int kind, const char *canon, int link, struct stat *st) {
     struct stat pd;
     memset(st, 0, sizeof *st);
     st->st_dev = stat("/proc", &pd) == 0 ? pd.st_dev : 0;
@@ -2584,7 +2621,6 @@ static int synth_stat_fill(CPU *c, const char *canon, int nofollow, struct stat 
     static struct timespec born;
     if (!born.tv_sec) clock_gettime(CLOCK_REALTIME, &born);
     st->st_atim = st->st_mtim = st->st_ctim = born;
-    return 1;
 }
 
 static int stat_forced_deny(void) {

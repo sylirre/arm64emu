@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -63,6 +64,17 @@ int main(void) {
     t("private_file", a, 8192, 8192, MV);
     a = mmap(NULL, 8192, PROT_READ, MAP_SHARED, fd, 0);
     t("shared_file", a, 8192, 8192, MV);
+    /* The program's own read-only data: a private file mapping to a kernel,
+     * whichever way the emulator loaded it. Through volatile, the bytes being
+     * constants to the compiler; aligned past any page size. */
+    static const unsigned char blob[3 * 65536] __attribute__((aligned(65536))) = {
+        [0 ... 3 * 65536 - 1] = 0x5a};
+    char *ip = (char *)(uintptr_t)blob + 65536;
+    errno = 0;
+    b = mremap(ip, 65536, 65536, MV);
+    printf("image: %s new=%x old=%x\n", b == MAP_FAILED ? strerror(errno) : "ok",
+           b == MAP_FAILED ? 0 : *(volatile unsigned char *)((char *)b + 100),
+           *(volatile unsigned char *)(ip + 100));
     printf("done\n");
     return 0;
 }

@@ -303,6 +303,9 @@ typedef struct AddrSpace {
     u64 peak_rss;             /* highest resident set yet SAMPLED (VmHWM) --
                                * see as_meminfo, which is where sampling
                                * happens */
+    u64 rss_when, rss_cost;   /* its last sample: when it was taken
+                               * (CLOCK_MONOTONIC, ns), what it cost, */
+    u64 rss_anon, rss_file, rss_shmem;   /* ...and what it found */
     u32 npgtables;            /* live second-level tables (VmPTE) */
     u32 stack_ids;            /* the last Region.stack_id handed out */
     u64 locked_vm;            /* pages, the kernel's mm->locked_vm (VmLck):

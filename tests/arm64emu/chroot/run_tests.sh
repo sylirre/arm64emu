@@ -801,6 +801,10 @@ if [ -x "$ALPINE/bin/busybox" ]; then
     check_bind "ro write blocked"      "blocked"    --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'echo x > /mnt/ro/x 2>/dev/null; test -e /mnt/ro/x && echo created || echo blocked'
     check_bind "ro mkdir blocked"      "blocked"    --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'mkdir /mnt/ro/d 2>/dev/null; test -d /mnt/ro/d && echo created || echo blocked'
     check_bind "mounts row (ro)"       "ro,relatime" --bind "$BSRC:/mnt/ro:ro" "$ALPINE" /bin/busybox sh -c 'awk "\$2==\"/mnt/ro\"{print \$4}" /proc/mounts'
+    # What a kernel's tables escape of a path, they escape: a space ends a field.
+    mkdir -p "$BSRC/s p#c"
+    check_bind "mounts row (escaped)"  '\040p\043c /mnt/a\040b#c' --bind "$BSRC/s p#c:/mnt/a b#c" "$ALPINE" /bin/busybox sh -c 'sed -n "s|^.*/s\(.*c /mnt/.*\) [a-z0-9]* rw,relatime 0 0\$|\1|p" /proc/mounts'
+    check_bind "mountinfo row (escaped)" '/mnt/a\040b#c s\040p\043c' --bind "$BSRC/s p#c:/mnt/a b#c" "$ALPINE" /bin/busybox sh -c 'awk "\$5 ~ /^\\/mnt/ {n=split(\$(NF-1),v,\"/\"); print \$5, v[n]}" /proc/self/mountinfo'
     # Virtual mount point shows up in its parent's listing (getdents synthesis).
     # The point must be a child of a *listable* directory, so bind at /hostdir
     # (child of "/") rather than the /mnt/x above (/mnt is absent in the rootfs).
@@ -1343,6 +1347,29 @@ if [ -n "$AGCC" ]; then
         fx_rm build/tests/arm64emu/chroot/fixtures/status_probe.bin
     else
         skip_build "fixtures/status_probe"
+    fi
+fi
+
+# ---- SigBlk of another task's /proc status is that task's whole guest mask
+# (src/arm64emu/chroot/proctab.c, "blocked sets"). Self-checking: qemu-user answers with
+# the host's line, which holds out the signals the emulator reserves. The
+# block is a kernel's own answer, byte for byte. ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o build/tests/arm64emu/chroot/fixtures/sigblk_other.bin \
+            tests/arm64emu/chroot/fixtures/sigblk_other.c -lpthread 2>/dev/null; then
+        expect=$'child_all=fffffffffffbfeff\nchild_none=0000000000000000\nat_fork=c000000080000010\nafter_exec=c000000080000010\nsuspended=fffffffffffbfcff\nresumed=fffffffffffbfeff\nsibling=fffffffffffbfeff 8000000080000010 main=0000000000000000\nforeign=fffffffffffbfeff 8000000080000010 main=0000000000000000'
+        for e in "" --shared-proc; do
+            # shellcheck disable=SC2086  # no flag is no word
+            got=$(timeout -s KILL 60 "$EMU" chroot $e / build/tests/arm64emu/chroot/fixtures/sigblk_other.bin 2>/dev/null)
+            if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: sigblk_other${e:+ ($e)}"
+            else
+                fail=$((fail+1)); echo "FAIL fixture: sigblk_other${e:+ ($e)}"
+                diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+            fi
+        done
+        fx_rm build/tests/arm64emu/chroot/fixtures/sigblk_other.bin
+    else
+        skip_build "fixtures/sigblk_other"
     fi
 fi
 
@@ -4050,11 +4077,17 @@ check_fixture timers_many $'created 300\nreplaced 150\ntimer 0: code=-2 si_timer
 check_fixture idmapparse $'simple: 9 back=0:1000:1\nno_newline: 8 back=0:1000:1\ntwo_lines: 18 back=0:1000:1,1:1001:1\ntabs: 9 back=0:1000:1\ncr: 10 back=0:1000:1\nleading_space: 11 back=0:1000:1\ntrailing_space: 10 back=0:1000:1\nblank_between: -22\nblank_trailing: -22\nblank_leading: -22\nspace_only_line: -22\njunk: -22\ntwo_fields: -22\none_field: -22\nempty: -22\nnewline_only: -22\nplus: -22\nminus: -22\nhex: -22\nglued: -22\nnul_ends: 23 back=0:1000:1\nnul_after_newline: 11 back=0:1000:1\nwrap_first: 18 back=0:1000:1\nwrap_lower: 15 back=0:1000:1\nwrap_huge: 28 back=5:1000:1\nfirst_minus1: -22\nlower_minus1: -22\ncount_zero: -22\nfirst_wraps: -22\nlower_wraps: -22\nfirst_to_end: 18 back=4294967294:1000:1\nlower_to_end: 15 back=0:4294967294:1\noverlap_upper: -22\noverlap_lower: -22\noverlap_touch: -22\nadjacent: 21 back=0:1000:10,10:1010:10\nduplicate: -22\nextents_340: 3630 back=0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nextents_341: -22\nextents_340_blank: -22\nbytes_4095: 4095 back=0:100000:1,11:100011:1,23:100023:1,35:100035:1,...(298 extents)\nbytes_4096: -22\nbytes_4096_junk: -22\ncut: -14\ncut_page: -22\nsg_deny: 4\nsg_allow: 5\nsg_deny_nl: 5\nsg_allow_nl: 6\nsg_denyx: -22\nsg_allowx: -22\nsg_deny_ws: 7\nsg_allow_ws: 7\nsg_deny_junk: -22\nsg_den: -22\nsg_empty: -22\nsg_8bytes: -22\nsg_Deny: -22\nsg_cut: -14\nsg_cut_8: -22\ngid_map: 9\nallow_after_gid_map: 5\ndeny_after_gid_map: -1\ngid_map_again: -1\ngid_map_again_junk: -1\ngid_map_again_page: -22\ndeny: 4\ndeny_again: 4\nallow_after_deny: -1\nallowx_after_deny: -22\nsetgroups_back: deny\ngid_map_after_deny: 9\nparent_writes_340: 3630\nparent_writes_again: -1\nparent_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\ngrandchild_back: 0:1000:1,1:1001:1,2:1002:1,3:1003:1,...(340 extents)\nchild_status: 0\ndone' \
     "ARM64EMU_PROCTAB_FORCE_FILE=1" "file-registry tier"
 
+# recvmsg into a msg_name with a msg_namelen of 0 (sys_net.c msg_import): the
+# length of the name that had nowhere to go, which the emulator used to report
+# as 0, and a NULL msg_name's left as it was. Self-checking: qemu-user writes
+# the name all the same.
+check_fixture recvname0 $'inet 0: r=1 namelen=16 untouched=1\ninet null: r=1 namelen=16 untouched=-1\ninet 16: r=1 namelen=16 untouched=0\nunix 0: r=1 namelen=19 untouched=1\nunix unnamed 0: r=1 namelen=0 untouched=1\nmmsg 0: r=1 namelen=19'
+
 # mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped
 # afresh -- zeroes behind private anonymous memory, the file again behind a
 # private file mapping, the same pages behind a shared one. Self-checking:
 # qemu fails the call; the private file row needs a 5.13+ host (marker).
-check_fixture dontunmap $'shrink: Invalid argument\ngrow: Invalid argument\nno_maymove: Invalid argument\nanon_written: ok moved=1 new=7 old=0\nanon_untouched: ok moved=1 new=0 old=0\nunrounded: ok moved=1 new=8 old=0\nfixed: ok at_dst=1 new=9 old=0\nshared_memfd: ok moved=1 new=5 old=5\nprivate_memfd_written: ok moved=1 new=6 old=5\nprivate_memfd_clean: ok moved=1 new=5 old=5\nprivate_file: ok moved=1 new=0 old=0\nshared_file: ok moved=1 new=0 old=0\ndone'
+check_fixture dontunmap $'shrink: Invalid argument\ngrow: Invalid argument\nno_maymove: Invalid argument\nanon_written: ok moved=1 new=7 old=0\nanon_untouched: ok moved=1 new=0 old=0\nunrounded: ok moved=1 new=8 old=0\nfixed: ok at_dst=1 new=9 old=0\nshared_memfd: ok moved=1 new=5 old=5\nprivate_memfd_written: ok moved=1 new=6 old=5\nprivate_memfd_clean: ok moved=1 new=5 old=5\nprivate_file: ok moved=1 new=0 old=0\nshared_file: ok moved=1 new=0 old=0\nimage: ok new=5a old=5a\ndone'
 
 # The fs reflink ioctls against the emulator's own objects (sys_file.c
 # reflink_denied): a synthesized /proc view or a tier memfd on either side of

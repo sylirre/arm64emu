@@ -3598,7 +3598,7 @@ void sig_inherit_host_mask(struct Machine *m) {
     k &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)) | (1ULL << 31) | (1ULL << 32));
     k &= ~((1ULL << (g_sig_kicksig - 1)) | (1ULL << (SIG_REMAP32_HOST - 1)) |
            (1ULL << (SIG_REMAP33_HOST - 1)));   /* the host's numbers, not the guest's */
-    g_tls.sigmask = k;
+    guest_sigmask_set(k);
     sig_sync_host_mask(m);
 }
 
@@ -4295,7 +4295,7 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
             m->sigact[SIGSEGV].handler = GSIG_DFL;
             sig_host_update_locked(m, SIGSEGV);
             EMU_UNLOCK(&sigact_lock, EMU_LK_SIGACT);
-            g_tls.sigmask &= ~(1ULL << (SIGSEGV - 1));
+            guest_sigmask_set(g_tls.sigmask & ~(1ULL << (SIGSEGV - 1)));
             sig_sync_host_mask(m);
         }
         sig_deliver_fault(c, SIGSEGV, 0x80 /*SI_KERNEL*/, 0);
@@ -4334,9 +4334,9 @@ static void deliver_to_handler(CPU *c, int sig, const PendSig *info) {
     /* New blocked set while the handler runs -- and the host's with it, or
      * the kernel would go on delivering to a thread whose handler is
      * running with the signal blocked (sig_sync_host_mask). */
-    g_tls.sigmask |= act->mask;
-    if (!(act->flags & G_SA_NODEFER)) g_tls.sigmask |= 1ULL << (sig - 1);
-    g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    u64 hmask = g_tls.sigmask | act->mask;
+    if (!(act->flags & G_SA_NODEFER)) hmask |= 1ULL << (sig - 1);
+    guest_sigmask_set(hmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1))));
     sig_sync_host_mask(m);
     g_tls.sc_ret_eintr = 0;
 }
@@ -4479,7 +4479,7 @@ u64 sig_return(CPU *c) {
     if ((frame & 15) || !frame_access_ok(frame, SIGFRAME_SIZE)) goto bad;
     u64 v;
     if (copy_from_guest(c, &v, frame + UC_SIGMASK, 8) == 0) {
-        g_tls.sigmask = v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        guest_sigmask_set(v & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1))));
         sig_sync_host_mask(c->m);
     } else {
         err = 1;
@@ -4934,7 +4934,7 @@ int sig_on_trampoline(CPU *c, u64 pc) {
  * gone for good. */
 static void sig_saved_mask_back(struct Machine *m) {
     if (!g_tls.have_saved_sigmask) return;
-    g_tls.sigmask = g_tls.saved_sigmask;
+    guest_sigmask_set(g_tls.saved_sigmask);
     g_tls.have_saved_sigmask = 0;
     sig_sync_host_mask(m);
 }

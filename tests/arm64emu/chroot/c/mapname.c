@@ -2,7 +2,7 @@
  * (show_map_vma). The emulator printed plain file mappings as anonymous
  * memory -- no name, 00:00 0 -- so a program looking itself up there (its
  * own library, a mapped database) found nothing; and a long path is printed
- * whole. Paths are compared, never printed: the directory differs per run. */
+ * whole, a newline in it escaped. Paths are compared, never printed: the directory differs per run. */
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
@@ -49,6 +49,27 @@ int main(void) {
     fputs("x", f);
     fclose(f);
     check("short", path);
+    /* A newline in it is printed as \\012 (seq_path), not as the end of the
+     * line. */
+    char nl[3000];
+    snprintf(nl, sizeof nl, "%s/a\nb", dir);
+    f = fopen(nl, "w");
+    fputs("z", f);
+    fclose(f);
+    int fd = open(nl, O_RDONLY);
+    char *np = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    FILE *mf = fopen("/proc/self/maps", "r");
+    static char line[16384];
+    int esc = 0, bad = 0;
+    while (fgets(line, sizeof line, mf)) {
+        if (strstr(line, "/a\\012b\n")) esc++;
+        if (strcspn(line, "-") > 16) bad++;
+    }
+    fclose(mf);
+    printf("newline: escaped=%d broken=%d\n", esc, bad);
+    munmap(np, 4096);
+    unlink(nl);
     /* A path past a page of text. */
     char deep[3000];
     snprintf(deep, sizeof deep, "%s", dir);

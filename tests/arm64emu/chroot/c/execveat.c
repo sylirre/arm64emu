@@ -59,7 +59,18 @@ int main(int argc, char **argv) {
     errno = 0;
     r = xat(AT_FDCWD, "/tmp/arm64emu_exat_link", av, ev, 0);
     printf("link_follow rc=%ld err=%d\n", r, errno);
+    /* AT_EMPTY_PATH runs the descriptor itself (do_open_execat): an O_PATH
+     * one of a symlink is the link, ELOOP; AT_FDCWD is the working directory,
+     * which is no file to run, EACCES. */
+    int lfd = open("/tmp/arm64emu_exat_link", O_PATH | O_NOFOLLOW);
+    errno = 0;
+    r = xat(lfd, "", av, ev, AT_EMPTY_PATH);
+    printf("opath_link rc=%ld err=%d\n", r, errno);
+    close(lfd);
     unlink("/tmp/arm64emu_exat_link");
+    errno = 0;
+    r = xat(AT_FDCWD, "", av, ev, AT_EMPTY_PATH);
+    printf("emptypath_cwd rc=%ld err=%d\n", r, errno);
 
     if (getauxval(AT_BASE) != 0) {   /* dynamically linked: see header */
         printf("dyn: skip exec chain\n");

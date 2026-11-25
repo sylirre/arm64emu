@@ -89,6 +89,31 @@ int main(void) {
     if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st)) return fail("child exit");
     if (WEXITSTATUS(st) != 77) return fail("tracee did not observe poked content");
 
+    /* ---- a process that is not our tracee: its memory may be refused
+     * (EPERM), but ESRCH says there is no such process, or none with a memory
+     * (a zombie), and a caller takes it for that. ---- */
+    int pfd[2];
+    if (pipe(pfd)) return fail("pipe");
+    pid = fork();
+    if (pid == 0) {
+        char ch;
+        close(pfd[1]);
+        _exit(read(pfd[0], &ch, 1) == 0 ? 0 : 1);
+    }
+    close(pfd[0]);
+    struct iovec nl = { rb, 4 }, nr = { marker, 4 };
+    errno = 0;
+    ssize_t n = process_vm_readv(pid, &nl, 1, &nr, 1, 0);
+    if (n != 4 && !(n == -1 && errno == EPERM)) return fail("a live peer");
+    close(pfd[1]);
+    siginfo_t si;
+    if (waitid(P_PID, (id_t)pid, &si, WEXITED | WNOWAIT)) return fail("waitid");
+    if (process_vm_readv(pid, &nl, 1, &nr, 1, 0) != -1 || errno != ESRCH)
+        return fail("a zombie");
+    waitpid(pid, &st, 0);
+    if (process_vm_readv(pid, &nl, 1, &nr, 1, 0) != -1 || errno != ESRCH)
+        return fail("a reaped pid");
+
     printf("OK\n");
     return 0;
 }

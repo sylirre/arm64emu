@@ -4727,10 +4727,15 @@ static void statx_from_stat(u8 *buf, const struct stat *st) {
     v32 = (u32)minor(st->st_dev);        memcpy(buf + 140, &v32, 4);
 }
 
-/* mfd_stat_fixup for the statx buffer: stx_mode is a u16 at offset 28. */
+/* mfd_stat_fixup for the statx buffer: a synthesized /proc file whole, else
+ * stx_mode, a u16 at offset 28. */
 static void mfd_statx_fixup(struct Machine *m, int fd, u8 *buf) {
-    if (fd < 0 || !mfd_chmod_blocked()) return;
     struct stat st;
+    if (fd >= 0 && procfs_fd_stat(m, fd, &st)) {
+        statx_from_stat(buf, &st);
+        return;
+    }
+    if (fd < 0 || !mfd_chmod_blocked()) return;
     memset(&st, 0, sizeof st);
     u16 v16;
     memcpy(&v16, buf + 28, 2);
@@ -4861,7 +4866,7 @@ SYSDEF(statx) {
 static int pwait_mask_enter(CPU *c, u64 gmask) {
     g_tls.saved_sigmask = g_tls.sigmask;
     g_tls.have_saved_sigmask = 1;
-    g_tls.sigmask = gmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    guest_sigmask_set(gmask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1))));
     sig_sync_host_mask(c->m);
     /* The kernel tests for a pending signal before it sleeps. Without this, one
      * that arrived while the caller had it blocked -- already sitting in the
@@ -4900,7 +4905,7 @@ static void pwait_host_mask(sigset_t *ss, u64 gmask) {
 static void pwait_mask_leave(CPU *c) {
     if (sig_pending_deliverable(c->m)) return;   /* a handler is about to run */
     int e = errno;                               /* callers still owe host_err() */
-    g_tls.sigmask = g_tls.saved_sigmask;
+    guest_sigmask_set(g_tls.saved_sigmask);
     g_tls.have_saved_sigmask = 0;
     sig_sync_host_mask(c->m);
     errno = e;

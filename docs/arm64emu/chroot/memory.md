@@ -651,7 +651,11 @@ host mapping exactly what the guest asked — and only a host kernel of 5.13 or
 later does that for a file mapping, only on whole host pages. Where the host
 refuses, so does this, with the `EINVAL` a kernel before 5.13 answers: a fresh
 private mapping of the file for the range left behind would need its
-descriptor, which nothing keeps (guest fd == host fd). The guest used to be told
+descriptor, which nothing keeps (guest fd == host fd). The image the loader
+copied stands for the private file mapping a kernel exec makes: its read-only
+pages are copied and stay where they were too, the file's bytes at both ends
+(V8 moves its builtins out of its own text and checks), and its writable ones
+get that `EINVAL`. The guest used to be told
 `EINVAL` for the flag itself, as a kernel before 5.7 was.
 `tests/arm64emu/chroot/fixtures/dontunmap.c` (qemu passes the call to its host with its own
 address bookkeeping and fails it) carries `NEEDS-HOST-SYSCALL:
@@ -810,7 +814,12 @@ The resident set is sampled with `mincore(2)` over the host backing, since that
 backing **is** the guest's memory and what the guest has touched is the host
 kernel's business — nothing here is told about a fault. `VmHWM` is therefore a
 high-water mark over the samples actually taken: a guest watching its own
-footprint reads repeatedly and misses nothing between its own reads. A host
+footprint reads repeatedly and misses nothing between its own reads. A sample
+costs a `mincore` or more per region, where a kernel reads counters: in a guest
+of thousands of threads it ran to tens of milliseconds, and a program reading
+each thread's `status` (an exec taking its siblings down) paid that per thread.
+A sample that took a millisecond or more stands for ten times what it cost; one
+that took less is never reused. A host
 that cannot answer `mincore` — a sandbox or a seccomp policy between the
 emulator and the kernel — falls back to the host file's own figures, bounded
 as below; `ARM64EMU_MINCORE_FORCE_FAIL=1` selects that tier anywhere, and the suite

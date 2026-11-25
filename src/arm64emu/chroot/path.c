@@ -379,6 +379,13 @@ int proc_zone_path(const char *host) {
     return !strncmp(host, "/proc", 5) && (host[5] == 0 || host[5] == '/');
 }
 
+/* procfs reads a numbered entry's name with name_to_int(), which refuses a
+ * leading zero: /proc/0123 and /proc/self/fd/05 do not exist, whatever process
+ * 123 and descriptor 5 are. `p` is at the first digit. */
+int proc_num_bad(const char *p) {
+    return p[0] == '0' && p[1] >= '0' && p[1] <= '9';
+}
+
 /* Tail after the "this process" spellings of a /proc path: /proc/self/,
  * /proc/<own-pid>/, /proc/thread-self/, /proc/<tid>/ of one of our own
  * threads, and the task/<tid>/ sub-path of any of them for one of our own
@@ -413,7 +420,7 @@ const char *proc_self_tail(const char *canon) {
             u64 id = 0;
             for (; *p >= '0' && *p <= '9'; p++)
                 if ((id = id * 10 + (u64)(*p - '0')) > 0x7fffffff) return NULL;
-            if (p == rest || *p != '/' || !id ||
+            if (p == rest || *p != '/' || !id || proc_num_bad(rest) ||
                 syscall(SYS_tgkill, (pid_t)getpid(), (pid_t)id, 0) != 0 ||
                 proc_task_is_foreign((s32)id))
                 return NULL;
@@ -449,7 +456,7 @@ const char *proc_self_tail(const char *canon) {
 const char *proc_other_tail(const char *canon, s32 *pid) {
     if (strncmp(canon, "/proc/", 6)) return NULL;
     const char *p = canon + 6;
-    if (*p < '0' || *p > '9') return NULL;
+    if (*p < '0' || *p > '9' || proc_num_bad(p)) return NULL;
     u64 n = 0;
     for (; *p >= '0' && *p <= '9'; p++) {
         n = n * 10 + (u64)(*p - '0');
@@ -490,7 +497,7 @@ int proc_own_fd_path(const char *host) {
     const char *tail = proc_self_tail(host);
     if (!tail || strncmp(tail, "fd/", 3)) return -1;
     const char *p = tail + 3;
-    if (*p < '0' || *p > '9') return -1;
+    if (*p < '0' || *p > '9' || proc_num_bad(p)) return -1;
     long fd = 0;
     for (; *p >= '0' && *p <= '9'; p++) {
         fd = fd * 10 + (*p - '0');
@@ -775,7 +782,8 @@ static int special_host_path(struct Machine *m, const char *canon, char *host_ou
                 pid = pid * 10 + (*p - '0');
                 if (pid > 0x7fffffff) { numeric = 0; break; }
             }
-            if (numeric && pid != (long)getpid() && !proctab_has_task((s32)pid))
+            if (numeric && (proc_num_bad(canon + 6) ||
+                            (pid != (long)getpid() && !proctab_has_task((s32)pid))))
                 return 0;
         }
         strcpy(host_out, canon);   /* host /proc passthrough */

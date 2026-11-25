@@ -47,7 +47,9 @@ typedef struct {
      * threads block/restore concurrently -- musl wraps every raise() and
      * pthread_exit() in block-all/restore, so a thread could exit with its
      * own raise()d signal still deferred by a sibling's block. */
-    u64 sigmask;
+    u64 sigmask;              /* written by guest_sigmask_set alone */
+    u64 *sigmask_pub;         /* where other processes read it, for this
+                               * thread's /proc status (proctab.c), or NULL */
     u64 saved_sigmask;        /* rt_sigsuspend: mask to record in the frame */
     int have_saved_sigmask;
     /* Copies of the Machine's call-out counters (machine.h). stop_gen is
@@ -136,5 +138,13 @@ typedef struct {
 } ThreadState;
 
 extern __thread ThreadState g_tls;
+
+/* Every change of the calling thread's blocked set, published where another
+ * task's read of /proc/<pid>/status finds it (proctab.c, "blocked sets"). The
+ * host's own mask follows by sig_sync_host_mask, the caller's to call. */
+static inline void guest_sigmask_set(u64 v) {
+    g_tls.sigmask = v;
+    if (g_tls.sigmask_pub) __atomic_store_n(g_tls.sigmask_pub, v, __ATOMIC_RELAXED);
+}
 
 #endif /* A64_THREAD_H */

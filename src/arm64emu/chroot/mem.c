@@ -539,6 +539,7 @@ static void as_fields_init(AddrSpace *as) {
     as->start_stack = 0;
     as->arg_start = as->arg_end = as->env_start = as->env_end = 0;
     as->peak = as->peak_rss = 0;
+    as->rss_when = as->rss_cost = 0;
     as->npgtables = 0;
     as->stack_ids = 0;
     as->locked_vm = 0;
@@ -1892,11 +1893,20 @@ int guest_remap_dup_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
  *   kernel of 5.13 or later does it for a file mapping, only on whole host
  *   pages. Where the host refuses, so does this, with the EINVAL a kernel
  *   before 5.13 answers: a fresh private mapping of the file for the old range
- *   would need its descriptor, which nothing keeps (guest fd == host fd).
+ *   would need its descriptor, which nothing keeps (guest fd == host fd);
+ * - an image the loader copied, standing for the private file mapping a kernel
+ *   exec makes: copied, and the old backing left as it is, which is the file's
+ *   bytes while nobody could write them. Pages that are writable now have the
+ *   file's bytes nowhere, and get that same EINVAL. (V8 moves its builtins out
+ *   of its own text this way and checks both ends.)
  *
  * The guest used to be told EINVAL for the flag itself, as a kernel before
  * 5.7 was. */
 static void host_zero_backing(u8 *p, size_t len);
+/* Anonymous memory holding a copy of a file's bytes: the loader's image. */
+static int image_copy(const Region *r) {
+    return r->path && !r->hostmap && !r->shared;
+}
 int guest_remap_dontunmap_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
     if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
     if ((addr | len | dst) & GUEST_PAGE_MASK || !len) return -EINVAL;
@@ -1918,6 +1928,9 @@ int guest_remap_dontunmap_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
                 ((hi - pos) & (u64)(g_host_pagesz - 1)))
                 return -EINVAL;          /* not whole host pages (>4 KB host) */
         }
+        if (image_copy(src))
+            for (u64 pg = pos; pg < hi; pg += GUEST_PAGE_SIZE)
+                if (as_page_prot(as, pg) & PTE_W) return -EINVAL;
         pos = hi;
     }
     pos = addr;
@@ -1947,7 +1960,7 @@ int guest_remap_dontunmap_impl(AddrSpace *as, u64 addr, u64 len, u64 dst) {
             u8 *host = host_alloc(slen, PROT_READ | PROT_WRITE);
             if (!host) { free(n.path); return -ENOMEM; }
             memcpy(host, shost, (size_t)slen);
-            host_zero_backing(shost, (size_t)slen);
+            if (!image_copy(src)) host_zero_backing(shost, (size_t)slen);
             n.host = host;
             n.hmap = hmap_new(host, (size_t)slen);
             n.mfdcnt = 0;
@@ -2414,12 +2427,27 @@ static u64 region_resident(const Region *r, int *ok) {
  * pages are faulted by the host, under the emulator, without the emulator
  * being told. A guest watching its own footprint reads repeatedly and so
  * misses nothing between its own reads; one that reads once has no earlier
- * sample to have missed. */
+ * sample to have missed.
+ *
+ * A sample costs a mincore call or more per region, where a kernel reads
+ * counters: in a guest of thousands of threads, whose every stack is regions,
+ * it runs to tens of milliseconds, and a program that reads the status of each
+ * of its threads (an exec taking its siblings down) paid that per thread --
+ * minutes. One that cost RSS_COSTLY_NS or more stands for RSS_REUSE times what
+ * it cost, so sampling takes a bounded share of the reader's time; a guest
+ * small enough to be sampled faster is sampled at every read. */
+#define RSS_COSTLY_NS 1000000ULL
+#define RSS_REUSE     10
 void as_meminfo(AddrSpace *as, AsMem *out) {
     memset(out, 0, sizeof *out);
     out->rss_ok = 1;
     if (!g_host_pagesz) g_host_pagesz = sysconf(_SC_PAGESIZE);
     as_lock();
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    u64 now = (u64)t0.tv_sec * 1000000000ULL + (u64)t0.tv_nsec;
+    int reuse = as->rss_cost >= RSS_COSTLY_NS &&
+                now - as->rss_when < RSS_REUSE * as->rss_cost;
     for (int i = 0; i < as->nregions; i++) {
         const Region *r = &as->regions[i];
         u64 len = r->end - r->start;
@@ -2428,7 +2456,7 @@ void as_meminfo(AddrSpace *as, AsMem *out) {
         if (stk) out->stack += len;
         else if ((r->prot & PTE_W) && !r->shared) out->data += len;
         if (!stk && (r->prot & PTE_X) && !(r->prot & PTE_W)) out->exec += len;
-        if (out->rss_ok) {
+        if (out->rss_ok && !reuse) {
             u64 res = region_resident(r, &out->rss_ok);
             if (r->anon_shm)   out->rss_shmem += res;
             else if (r->file)  out->rss_file  += res;
@@ -2436,6 +2464,27 @@ void as_meminfo(AddrSpace *as, AsMem *out) {
         }
     }
     if (!out->rss_ok) out->rss_anon = out->rss_file = out->rss_shmem = 0;
+    if (reuse) {
+        out->rss_anon = as->rss_anon;
+        out->rss_file = as->rss_file;
+        out->rss_shmem = as->rss_shmem;
+        /* What was unmapped since is resident nowhere: the sum is never more
+         * than what is mapped (the clamp region_resident makes per region). */
+        u64 room = out->size;
+        if (out->rss_anon > room) out->rss_anon = room;
+        room -= out->rss_anon;
+        if (out->rss_file > room) out->rss_file = room;
+        room -= out->rss_file;
+        if (out->rss_shmem > room) out->rss_shmem = room;
+    } else if (out->rss_ok) {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        as->rss_when = (u64)t1.tv_sec * 1000000000ULL + (u64)t1.tv_nsec;
+        as->rss_cost = as->rss_when - now;
+        as->rss_anon = out->rss_anon;
+        as->rss_file = out->rss_file;
+        as->rss_shmem = out->rss_shmem;
+    }
     if (out->size > as->peak) as->peak = out->size;
     out->peak = as->peak;
     u64 rss = out->rss_anon + out->rss_file + out->rss_shmem;

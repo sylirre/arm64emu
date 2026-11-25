@@ -71,13 +71,13 @@ SYSDEF(rt_sigprocmask) {
         u64 set;
         if (copy_from_guest(c, &set, a1, 8) < 0) return (u64)(s64)-EFAULT;
         switch (how) {
-            case 0: g_tls.sigmask |= set; break;       /* SIG_BLOCK */
-            case 1: g_tls.sigmask &= ~set; break;      /* SIG_UNBLOCK */
-            case 2: g_tls.sigmask = set; break;        /* SIG_SETMASK */
+            case 0: set = old | set; break;        /* SIG_BLOCK */
+            case 1: set = old & ~set; break;       /* SIG_UNBLOCK */
+            case 2: break;                         /* SIG_SETMASK */
             default: return (u64)(s64)-EINVAL;
         }
         /* SIGKILL/SIGSTOP cannot be blocked */
-        g_tls.sigmask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+        guest_sigmask_set(set & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1))));
         sig_sync_host_mask(c->m);   /* propagate the new block state to the host */
     }
     if (a2 && copy_to_guest(c, a2, &old, 8) < 0) return (u64)(s64)-EFAULT;
@@ -114,7 +114,7 @@ SYSDEF(rt_sigsuspend) {
      * handler runs under the temporary mask). */
     g_tls.saved_sigmask = g_tls.sigmask;
     g_tls.have_saved_sigmask = 1;
-    g_tls.sigmask = set;
+    guest_sigmask_set(set);
     sig_sync_host_mask(c->m);
     /* Sleep until the capture queue holds a deliverable signal. The guest's
      * temporary mask is the host thread's now, so the kernel's own
@@ -146,7 +146,7 @@ SYSDEF(rt_sigsuspend) {
          * early beats a thread group that cannot be dismantled. Callers of this
          * syscall loop on it by construction -- it has no other return. */
         if (guest_stop_pending(c->m)) {
-            g_tls.sigmask = g_tls.saved_sigmask;
+            guest_sigmask_set(g_tls.saved_sigmask);
             g_tls.have_saved_sigmask = 0;
             sig_sync_host_mask(c->m);
             return (u64)(s64)-EINTR;

@@ -1711,8 +1711,11 @@ requests about itself**, the same way it already mediates every other syscall:
   is how strace/proot pull a tracee's argv and paths. The remote must be the
   caller itself or one of its stopped tracees — the only cross-process guest
   memory the mailbox can reach, since guest processes are separate host
-  processes with private copy-on-write address spaces; any other target is
-  `-ESRCH`. A partial transfer stops at the first unmapped remote page and
+  processes with private copy-on-write address spaces; any other live guest
+  process is `-EPERM`, what a kernel whose policy keeps its memory from us says,
+  and `-ESRCH` is for no such process or a zombie — a caller takes it for that
+  (a monitor that reads `ESRCH` as "exited, no memory" showed a live process
+  with an empty command line). A partial transfer stops at the first unmapped remote page and
   returns the byte count, matching the kernel.
 - The two iovecs are imported **in `process_vm_rw`'s order, and not the same
   way**, which is observable. The local one reaches `import_iovec`'s `unsigned

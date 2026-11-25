@@ -1460,7 +1460,8 @@ static int msg_import(CPU *c, int fd, u64 va, GMsghdr *g, struct msghdr *h,
      * a guest naming a negative length had 128 bytes read out of msg_name and
      * sent, or a source address written back into a buffer it never offered. */
     if (g->msg_name && (s32)g->msg_namelen < 0) return -EINVAL;
-    if (g->msg_name && g->msg_namelen) {
+    /* A receive with room for none of the name still hears its length. */
+    if (g->msg_name && (g->msg_namelen || !for_send)) {
         if (for_send) {
             u32 nl = g->msg_namelen > sizeof *ss ? sizeof *ss : g->msg_namelen;
             memset(ss, 0, sizeof *ss);   /* as addr_in: defined past the length */
@@ -1754,7 +1755,7 @@ static int recvmsg_writeback(CPU *c, int fd, u64 hdr_va, GMsghdr *g,
     } else {
         g->msg_controllen = h->msg_controllen;
     }
-    g->msg_namelen = h->msg_namelen;
+    if (g->msg_name) g->msg_namelen = h->msg_namelen;   /* else left alone */
     g->msg_flags = h->msg_flags;
     return copy_to_guest(c, hdr_va, g, sizeof *g) < 0 ? -EFAULT : 0;
 }

@@ -1406,6 +1406,7 @@ int path_proc_magic(struct Machine *m, const char *canon, char *tgt, int *delete
 /* Does this per-task /proc tail name an address-space file (maps, smaps, mem,
  * pagemap, map_files/..., ...)? Their host answers describe the emulator, so
  * none of them may pass through -- for another guest process or for this one. */
+int proc_num_bad(const char *p);    /* a number procfs does not take: a leading 0 */
 int proc_addrspace_leaf(const char *tail);
 /* Tail after a "this process" /proc spelling (self, own pid, thread-self, our
  * own task/<tid>), or NULL. */
@@ -1789,6 +1790,13 @@ void proctab_fork_child(void);
 void proctab_seccomp_set(u8 mode, u32 nfilters);
 void proctab_seccomp_seed(int slot, u8 mode, u32 nfilters); /* pre-fork */
 int  proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters);
+
+/* A task's blocked set for other tasks' /proc views (proctab.c, "blocked
+ * sets"): a thread's place, taken as it starts and given back as it ends;
+ * what one publishes goes through guest_sigmask_set (thread.h). */
+void proctab_sigblk_thread(s32 tid);
+void proctab_sigblk_thread_exit(s32 tid);
+int  proctab_sigblk_get(s32 tgid, s32 tid, u64 *mask);   /* 1 = known */
 
 /* personality(2) for other processes' /proc (proctab.c, REQ_PERS): the main
  * thread's value and the base every other thread holds, in the registry; a

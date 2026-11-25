@@ -159,6 +159,12 @@ struct ProcEnt {
      * published the slot under it yet -- a signal the child sends at once
      * is still known for a guest's. Cleared with the reservation. */
     s32 kid;
+    /* The blocked set of the owner's main thread, for another task's read of
+     * its /proc status ("blocked sets", below); SIGBLK_UNKNOWN until someone
+     * who knows it says. Seeded into a fork child's reservation (the forking
+     * thread's, which is the child's), then the main thread's to write at
+     * every change (guest_sigmask_set). */
+    u64 sigblk __attribute__((aligned(8)));
     /* What the owner's SIGCHLD disposition spares it (signal.c,
      * sig_chldact_bits): a stop or continue notice is not sent to a parent
      * or tracer that ignores SIGCHLD or set SA_NOCLDSTOP
@@ -273,12 +279,42 @@ struct ProcGrave {
                                         * stops here (slots_used) */
 };
 static struct ProcGrave *g_grave;
-#define PROCTAB_SIZE (sizeof(struct ProcEnt) * PROCTAB_MAX + sizeof(struct ProcGrave))
+
+/* Blocked sets. SigBlk of /proc/<pid>/status is the one line of a task's
+ * signal state other tasks act on -- a debugger or a supervisor choosing a
+ * signal the task has not blocked -- and the host's line is not it: the
+ * emulator's own host numbers (its fault nets, the control-channel kick, the
+ * host libc's 32/33 and the carriers standing in for them) are held out of
+ * every host mask (signal.c, sig_set_to_host), so the host shows a task that
+ * blocks everything as leaving a dozen signals open. A main thread's set is
+ * in its process's entry; every other thread's is here, in a table of the
+ * same mapping right past the graves, found by tid: the slot tid %
+ * SIGBLK_SLOTS or one of the SIGBLK_PROBE - 1 after it. A thread takes a slot
+ * as it starts and gives it back as it ends; one left by a process that died
+ * with its threads is taken over once its task is gone. A thread that found
+ * no slot shows the host's line, as everything did. Publishing a change is
+ * one store (guest_sigmask_set), beside a system call that mirrors it. */
+#define SIGBLK_SLOTS 8192
+#define SIGBLK_PROBE 16
+struct SigBlk {
+    s32 tid;                 /* 0 = free, -1 = being filled; published last */
+    s32 tgid;                /* its process: a tid alone comes round again */
+    u64 mask __attribute__((aligned(8)));
+};
+static struct SigBlk *g_sigblk;
+/* No guest mask: SIGKILL and SIGSTOP are never in one. */
+#define SIGBLK_UNKNOWN (~0ULL)
+
+#define PROCTAB_SIZE (sizeof(struct ProcEnt) * PROCTAB_MAX + sizeof(struct ProcGrave) + \
+                      sizeof(struct SigBlk) * SIGBLK_SLOTS)
+_Static_assert(sizeof(struct ProcEnt) % 8 == 0 && sizeof(struct ProcGrave) % 8 == 0,
+               "the blocked sets are 8-byte atomics");
 
 static void tab_adopt(void *p) {
     g_tab = p;
     g_tab_n = PROCTAB_MAX;
     g_grave = (struct ProcGrave *)(g_tab + PROCTAB_MAX);
+    g_sigblk = (struct SigBlk *)(void *)(g_grave + 1);
 }
 
 /* How many slots a scan has to look at: all ever used. */
@@ -408,8 +444,9 @@ static int proctab_open_shared(const char *rootfs_key, size_t size) {
      * owner's slot, kept until it is reaped; v13 the owner's real uid, and
      * the reaped ones past the slots; v14 its SIGCHLD disposition; v15
      * the real parent's view of its job control, and the slots ever used;
-     * v16 the signal of its host stop.) */
-    snprintf(path, sizeof path, "%s/arm64emu-proctab.v16.%u.%08x",
+     * v16 the signal of its host stop; v17 its blocked set, and the other
+     * threads' past the graves.) */
+    snprintf(path, sizeof path, "%s/arm64emu-proctab.v17.%u.%08x",
              dir, (unsigned)getuid(), fnv1a32(rootfs_key));
     /* The name is fixed by design -- every invocation of this rootfs has to
      * find the same file -- and shared_dir's candidates (/dev/shm, /tmp) are
@@ -475,9 +512,9 @@ static socklen_t broker_addr(struct sockaddr_un *a, u32 key_hash, u64 session) {
     a->sun_family = AF_UNIX;
     /* a->sun_path[0] stays NUL (abstract); the name follows from index 1. */
     int n = session
-        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v16.%u.s%016llx",
+        ? snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v17.%u.s%016llx",
                    (unsigned)getuid(), (unsigned long long)session)
-        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v16.%u.%08x",
+        : snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "a64ipc.v17.%u.%08x",
                    (unsigned)getuid(), key_hash);
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
 }
@@ -2783,6 +2820,7 @@ int proctab_reserve(void) {
         __atomic_store_n(&e->ruid, own_ruid(), __ATOMIC_RELEASE);
         __atomic_store_n(&e->kid, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&e->chldact, sig_chldact_bits(), __ATOMIC_RELEASE);
+        __atomic_store_n(&e->sigblk, g_tls.sigmask, __ATOMIC_RELEASE);
         __atomic_store_n(&e->exited, 0, __ATOMIC_RELAXED);
         /* A previous owner SIGKILL'd mid-write may have left the seqlock odd,
          * which would invert its parity for the whole life of the new entry. */
@@ -2819,6 +2857,9 @@ void proctab_release(int slot) {
 void proctab_slot_adopt(int slot) {
     g_own_slot = slot;
     g_mem_ent = NULL;
+    /* Our blocked set is ours to publish from here, in our slot -- the
+     * thread's inherited place is its parent's. */
+    g_tls.sigmask_pub = g_tab && slot >= 0 && slot < g_tab_n ? &g_tab[slot].sigblk : NULL;
     if (g_tab && slot >= 0 && slot < g_tab_n &&
         __atomic_load_n(&g_tab[slot].pid, __ATOMIC_ACQUIRE) == PT_RESERVED)
         __atomic_store_n(&g_tab[slot].kid, (s32)getpid(), __ATOMIC_RELEASE);
@@ -2926,6 +2967,7 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
     if (claimed || (!reserved && e->start != start)) {
         carry_clear(e);
         jc_clear(e);
+        __atomic_store_n(&e->sigblk, SIGBLK_UNKNOWN, __ATOMIC_RELAXED);
         __atomic_store_n(&e->userns, 0, __ATOMIC_RELAXED);
         e->sg_deny = e->uid_claim = e->gid_claim = 0;
         __atomic_store_n(&e->uid_n, 0, __ATOMIC_RELAXED);
@@ -2970,6 +3012,9 @@ void proctab_register_at(int rsv, s32 pid, const char *cmd, u32 len,
         __atomic_store_n(&e->pers_npub, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&e->pers_main, g_tls.personality, __ATOMIC_RELEASE);
         __atomic_store_n(&e->pers_base, g_tls.personality, __ATOMIC_RELEASE);
+        /* The image runs on the main thread, which is this one. */
+        g_tls.sigmask_pub = &e->sigblk;
+        guest_sigmask_set(g_tls.sigmask);
     }
     /* A slot below this one that still names the pid is a previous process's
      * -- one that died without a word (SIGKILL), or whose zombie someone who
@@ -3805,6 +3850,72 @@ int proctab_seccomp_get(s32 pid, u8 *mode, u32 *nfilters) {
     if (mode) *mode = (u8)(w >> 16);
     if (nfilters) *nfilters = w & 0xffff;
     return 1;
+}
+
+/* A thread starts: a slot of its own for its blocked set, before clone(2)
+ * returns its tid to anyone (proctab.c, "blocked sets"). */
+void proctab_sigblk_thread(s32 tid) {
+    g_tls.sigmask_pub = NULL;
+    if (!g_sigblk || tid <= 0) return;
+    s32 tgid = (s32)getpid();
+    /* A slot that still names this tid is a dead thread's: taken first, or a
+     * reader would find it before ours. */
+    struct SigBlk *e = NULL;
+    for (int pass = 0; pass < 3 && !e; pass++)
+        for (int i = 0; i < SIGBLK_PROBE; i++) {
+            struct SigBlk *s = &g_sigblk[(u32)(tid + i) % SIGBLK_SLOTS];
+            s32 t = __atomic_load_n(&s->tid, __ATOMIC_ACQUIRE);
+            if (t < 0) continue;
+            if (pass == 0 ? t != tid : pass == 1 ? t != 0 :
+                (t == 0 || syscall(SYS_tgkill, __atomic_load_n(&s->tgid, __ATOMIC_RELAXED),
+                                   t, 0) == 0 || errno != ESRCH))
+                continue;
+            if (__atomic_compare_exchange_n(&s->tid, &t, -1, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                e = s;
+                break;
+            }
+        }
+    if (!e) return;   /* a full neighbourhood: the host's line */
+    __atomic_store_n(&e->tgid, tgid, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->mask, g_tls.sigmask, __ATOMIC_RELAXED);
+    __atomic_store_n(&e->tid, tid, __ATOMIC_RELEASE);
+    g_tls.sigmask_pub = &e->mask;
+}
+
+/* ...and ends. Never the main thread's, whose place is its process's entry. */
+void proctab_sigblk_thread_exit(s32 tid) {
+    g_tls.sigmask_pub = NULL;
+    if (!g_sigblk || tid <= 0) return;
+    for (int i = 0; i < SIGBLK_PROBE; i++) {
+        struct SigBlk *s = &g_sigblk[(u32)(tid + i) % SIGBLK_SLOTS];
+        s32 t = tid;
+        if (__atomic_load_n(&s->tgid, __ATOMIC_RELAXED) == (s32)getpid() &&
+            __atomic_compare_exchange_n(&s->tid, &t, 0, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return;
+    }
+}
+
+/* Task `tid` of process `tgid`'s blocked set, 1 when it is published. */
+int proctab_sigblk_get(s32 tgid, s32 tid, u64 *mask) {
+    if (!g_tab || tgid <= 0 || tid <= 0) return 0;
+    if (tid == tgid) {
+        struct ProcEnt *e = resolve_entry(tgid);
+        if (!e) return 0;
+        *mask = __atomic_load_n(&e->sigblk, __ATOMIC_ACQUIRE);
+        return *mask != SIGBLK_UNKNOWN;
+    }
+    if (!g_sigblk) return 0;
+    for (int i = 0; i < SIGBLK_PROBE; i++) {
+        struct SigBlk *s = &g_sigblk[(u32)(tid + i) % SIGBLK_SLOTS];
+        if (__atomic_load_n(&s->tid, __ATOMIC_ACQUIRE) != tid ||
+            __atomic_load_n(&s->tgid, __ATOMIC_RELAXED) != tgid)
+            continue;
+        *mask = __atomic_load_n(&s->mask, __ATOMIC_RELAXED);
+        if (__atomic_load_n(&s->tid, __ATOMIC_ACQUIRE) == tid) return 1;
+    }
+    return 0;
 }
 
 /* Publish this process's non-guest host tasks, so that another process can

@@ -1,6 +1,7 @@
 /* A synthesized /proc file through its descriptor: fstat gives the file's own
  * attributes (S_IRUGO, 0400 for environ and auxv, root's for a file of no
- * process), and its fd link names the file, as d_path does -- not the
+ * process, one link, the inode a stat of the name has; statx likewise, and
+ * through an O_PATH descriptor), and its fd link names the file, as d_path does -- not the
  * anonymous memory the emulator serves it from (0777, /memfd:...). Not
  * cmdline: qemu-user, the oracle on a foreign host, serves that one from a
  * memfd of its own and has the same two defects. */
@@ -39,6 +40,22 @@ int main(void) {
                by_fd.st_mode == by_name.st_mode,
                by_fd.st_uid == by_name.st_uid && by_fd.st_gid == by_name.st_gid,
                !strcmp(tgt, want));
+        struct stat by_path;
+        int pfd = open(files[i], O_PATH);
+        int ps = pfd >= 0 ? fstat(pfd, &by_path) : -1;
+        struct statx sx, px;
+        memset(&sx, 0, sizeof sx);
+        memset(&px, 0, sizeof px);
+        int xs = statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &sx);
+        int xp = statx(pfd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &px);
+        printf("  nlink=%d same_ino=%d same_dev=%d size=%d opath=%d same_ino=%d nlink=%d\n",
+               (int)by_fd.st_nlink, by_fd.st_ino == by_name.st_ino,
+               by_fd.st_dev == by_name.st_dev, (int)by_fd.st_size, ps,
+               by_path.st_ino == by_name.st_ino, (int)by_path.st_nlink);
+        printf("  statx=%d same_ino=%d nlink=%d mode=%o opath=%d same_ino=%d nlink=%d mode=%o\n",
+               xs, sx.stx_ino == by_name.st_ino, (int)sx.stx_nlink, sx.stx_mode,
+               xp, px.stx_ino == by_name.st_ino, (int)px.stx_nlink, px.stx_mode);
+        if (pfd >= 0) close(pfd);
         close(fd);
     }
     return 0;
