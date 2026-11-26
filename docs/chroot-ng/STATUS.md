@@ -5295,8 +5295,68 @@ kernel 3.18 (Galaxy S7).
     the process's (as before; the clonethr row is a named skip). Bionic's
     per-thread mappings made inside pthread_create are not recorded for
     the exec sweep (a fork child's stale g_thread_list would then point
-    into swept memory): the device round. CLONE_VM without CLONE_THREAD
-    (a process sharing the address space) answers EINVAL.
+    into swept memory): the device round (M119). CLONE_VM without
+    CLONE_THREAD (a process sharing the address space) answers EINVAL.
+
+- [x] **M119 — the thread model on a device: bionic**
+  - Step 2.5's device round, on the Zenfone 10 (Android 15, 5.15): the
+    Bionic build from Termux clang links and runs -- its own
+    __stack_chk_guard under -mstack-protector-guard=global, the handler
+    entry's switch onto Bionic's shadow call stack, PR_PAC_RESET_KEYS
+    answered; the filter admits seven ranges of host code there (281 of
+    405 instructions). Its first suite hung row after row: every one that
+    joined a thread that had exited. After this: 951 passed, 0 failed, 25
+    skipped (Android's refusals, Termux's toolchain), on the device.
+  - clear_child_tid. The kernel keeps one a thread, and bionic's
+    pthread_exit sets none for a detached thread (ours are) before it ends
+    it, which took the guest's CLONE_CHILD_CLEARTID with it: a join of an
+    exited thread waited for ever (m7's capset and view races, m6's signal
+    against a blocking call, m3's elfbad through bionic's crash handler,
+    which waits so for its pseudothread). musl's would have been worse:
+    the kernel's clear at a thread's exit is what releases the lock of its
+    thread list. So on every libc but glibc the guest's is the monitor's
+    to keep -- CLONE_CHILD_CLEARTID's, then set_tid_address's, trapped now
+    -- and to clear, with the kernel's FUTEX_WAKE, as the thread unwinds,
+    before its libc ends it. glibc's stays the kernel's, as does the
+    leader's everywhere.
+  - What the host's libc made for a thread of ours. bionic carves its
+    thread record from the top of the stack we give it and maps the rest:
+    the TLS (a guard page either side), a shadow call stack in a guard
+    region of 16 MiB, an alternate signal stack. A fork child's one
+    thread, made by a thread of ours, goes on as the process on them, and
+    the exec sweep gave them back: its next pthread_create died of
+    SIGSEGV. Each thread now marks an address inside each -- its thread
+    pointer, x18, the alternate stack bionic set -- and the sweep keeps
+    the mapping a mark lies in and the ones abutting it, the guards
+    (a victim is held until the walk has seen what follows it). And
+    bionic's fork child keeps every thread's record on its list of
+    threads, where its next pthread_create links the new one in: the
+    other threads' stacks are kept in a bionic fork child for good, not
+    given back (a SIGSEGV too, at the first thread of a threaded
+    program's fork child's exec).
+  - thr_start no longer asks for set_robust_list where Android refuses it.
+  - Test fixes the round found: m5's tree and m8 entrystate's outside
+    directory moved out of the binds (Termux's $TMPDIR is inside the bound
+    $PREFIX); entrystate built without gcc's loop-distribution flag where
+    the compiler is clang, and its chroot-ng rows no longer gated on a
+    kernel reference that Android's filter kills at its rseq; clonethr's
+    robust-mutex leg left out on bionic, which has no robust mutexes;
+    elfbad's "no segment" nulls every PT_LOAD (lld links four, and the
+    program it made still had two); m14's listings read the guest's stdout
+    alone (a dynamic bionic guest's linker warns on stderr, where an app
+    cannot read /linkerconfig to bind it), and its full-buffer leg lists a
+    directory of its own one bind below the root, which on Termux has the
+    host's three binds besides -- four overlay records and a kernel one are
+    more than its 128-byte read holds, the bound inject_dents documents;
+    and execthr counts the memory a generation can reach, not the PROT_NONE
+    gaps a bionic guest's linker leaves of a random size (tens of MiB
+    either way between two generations, where the reachable memory moved
+    by the same 20 kB on every run). The last two with the owner's leave.
+  - Tests: m8 forkthr -- threads after an exec from a thread that is not
+    the main one, after the exec of a threaded program's fork child, and
+    after the exec of a fork child a thread that is not the main one made
+    (the second died without the kept stacks, the third without the
+    marks).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

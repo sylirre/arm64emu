@@ -294,7 +294,15 @@ frame of an exit made after unmapping the thread's own stack (musl's
 and answers with the guest's own. A plain fork is the libc's `fork()`, the
 tid words then the guest's call's. The handler's entry switches to the host
 context of the thread it lands on -- the pthread's TCB and shadow call stack --
-found by tid.
+found by tid. What the libc made for such a thread is the host's, and an
+exec's sweep leaves it while the thread lives (a fork child's one thread goes
+on as the process): glibc and musl carve their thread record and TLS from
+the stack we give them, while bionic carves only the record there and maps
+the rest (its TLS, a shadow call stack, an alternate stack), so each thread
+marks an address inside each of those -- its thread pointer, x18, the
+alternate stack bionic set -- and the sweep keeps the mapping a mark lies in
+with the guards that abut it. bionic's fork child keeps every thread's record
+on its list of threads, so it keeps the other threads' stacks too.
 
 **The filter is the whole of the interception.** When it cannot be installed
 there is nothing left that intercepts, and the invocation — a rootfs, binds,

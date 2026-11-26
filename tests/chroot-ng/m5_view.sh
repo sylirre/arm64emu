@@ -5,7 +5,9 @@
 # planted on the host side.
 echo "== M5: the guest's view: paths and binds =="
 
-V=$(mktemp -d)
+# Outside every bind: a host-only file must be one no guest path reaches, and
+# Termux's $TMPDIR is inside $PREFIX, which is bound.
+V=$(cng_outside_binds "$(mktemp -d)")
 mkdir -p "$V/root/bin2" "$V/root/etc" "$V/root/a/b" "$V/root/a/etc" "$V/root/a/dat" \
     "$V/root/dev" "$V/root/sub" "$V/root/home/u/foo" "$V/root/datextra" "$V/root/dat" \
     "$V/root/usr/bin" "$V/root/usr/lib" "$V/root/usr/inner" "$V/root/lib" \

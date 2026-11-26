@@ -308,6 +308,11 @@ fi
 # meant the guest never saw it at all -- decided by the guest libc's readdir
 # buffer, which is 2 KiB in musl and 32 KiB in glibc. Read the same directory
 # to the end at three buffer sizes: the set of names must not depend on it.
+# The directory is one below the root, with the one bind of its own: the root
+# has the host's binds too where the guest needs them (Termux: /system, /apex,
+# /vendor), and four overlay records and a kernel one are more than the
+# smallest buffer here holds -- a first read carries what fits, and the rest
+# is the bound inject_dents documents, not this row's subject.
 M14S=$(mktemp -d)
 M14SB=$(mktemp -d)
 M14W=$(mktemp -d)
@@ -316,11 +321,14 @@ if ! guest_xlate_ready "overlay entries in a full read buffer" ||
     :
 else
     cp "$M14S/getdents" "$M14W/getdents"
+    mkdir -p "$M14S/sub"
     i=0
-    while [ $i -lt 60 ]; do : >"$M14S/file_with_a_longish_name_$i"; i=$((i + 1)); done
+    while [ $i -lt 60 ]; do : >"$M14S/sub/file_with_a_longish_name_$i"; i=$((i + 1)); done
+    # The listing is the guest's stdout: a dynamic bionic guest's linker warns
+    # on stderr, where an app cannot read /linkerconfig to bind it.
     m14_names() { # bufsz
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-        run $CHROOTNG_GUEST_BINDS -b "$M14SB":/zzbind "$M14S" /getdents / "$1" 2>&1 |
+        run $CHROOTNG_GUEST_BINDS -b "$M14SB":/sub/zzbind "$M14S" /getdents /sub "$1" 2>/dev/null |
             head -1 | tr ' ' '\n' | sort | tr '\n' ' '
     }
     m14_count() { echo "$1" | tr ' ' '\n' | grep -c .; }
@@ -353,7 +361,7 @@ else
     mkdir -p "$M14W/dev"
     for bufsz in 32 64 128 184 200 256 376 400 408 512 65536; do
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-        m14w=$(run_t 30 $CHROOTNG_GUEST_BINDS "$M14W" /getdents /dev $bufsz 2>&1 |
+        m14w=$(run_t 30 $CHROOTNG_GUEST_BINDS "$M14W" /getdents /dev $bufsz 2>/dev/null |
             head -1 | sed 's/^dents://')
         check "m14 a $bufsz-byte getdents64 of /dev repeats no entry" "" \
             "$(echo "$m14w" | tr ' ' '\n' | grep -v '^$' | sort | uniq -d |
@@ -365,7 +373,7 @@ else
     # once one kernel record fits alongside the whole set, nothing is dropped.
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
     check_contains "m14 a buffer that holds the whole overlay lists all of it" \
-        " stderr " "$(run_t 30 $CHROOTNG_GUEST_BINDS "$M14W" /getdents /dev 65536 2>&1 | head -1) "
+        " stderr " "$(run_t 30 $CHROOTNG_GUEST_BINDS "$M14W" /getdents /dev 65536 2>/dev/null | head -1) "
 fi
 rm -rf "$M14S" "$M14SB" "$M14W"
 

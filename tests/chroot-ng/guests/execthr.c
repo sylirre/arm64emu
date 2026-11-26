@@ -4,6 +4,10 @@
  * the first had; chroot-ng's keeps the address space, and has to give back
  * every thread it ended -- the guest's own stacks, and its own for each: the
  * pthread's stack and alternate stack, the scratch stack (monitor/thread.c).
+ * What is counted is the memory that can be reached, every mapping but a
+ * PROT_NONE one: a bionic guest's linker leaves gaps of that kind around the
+ * libraries it loads, of a random size each time, tens of MiB between one
+ * generation and the next; what a leak would leave is all read-write.
  *
  *   execthr           the first generation
  *   execthr N KB      (internal) generation N; KB the first's mapped kB */
@@ -11,17 +15,19 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define GENS 6
 
 static unsigned long mapped_kb(void) {
     FILE *f = fopen("/proc/self/maps", "r");
-    char line[512];
+    char line[512], perm[8];
     unsigned long kb = 0;
     while (f && fgets(line, sizeof line, f)) {
         unsigned long lo, hi;
-        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2)
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perm) == 3 &&
+            strncmp(perm, "---", 3) != 0)
             kb += (hi - lo) >> 10;
     }
     if (f)

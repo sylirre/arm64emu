@@ -97,7 +97,8 @@ int main(int argc, char **argv) {
     BAD("wrong machine", eh->e_machine = 62);
     BAD("a relocatable", eh->e_type = ET_REL);
     BAD("cut in the header", n = 40);
-    BAD("no segment", l0->p_type = PT_NULL; l1->p_type = PT_NULL);
+    BAD("no segment", /* every one: lld links four, ld.bfd two or more */
+        for (Elf64_Phdr *l; (l = ph_of(b, PT_LOAD, 0));) l->p_type = PT_NULL);
     BAD("file part past the memory part", l1->p_memsz = l1->p_filesz / 2);
     BAD("file part past the end", l1->p_filesz = l1->p_memsz = len * 64);
     BAD("a segment that wraps", l1->p_vaddr = 0xffffffffffff0000ull; l1->p_memsz = 0x20000);

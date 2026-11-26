@@ -4414,8 +4414,9 @@ void cng_clone_convert(struct cng_uregs *ur) {
                         ~(unsigned long)(CNG_CLONE_VM | CNG_CLONE_VFORK));
     /* A plain fork -- the exit signal SIGCHLD and at most the tid words -- is
      * the host libc's fork(), so that its state is right in the child: one
-     * thread, the forking one, its locks reset, its lists of our other
-     * threads (pthreads of its own, thread.c) emptied. The tid words are
+     * thread, the forking one, its locks reset, and our other threads
+     * (pthreads of its own) known to it as its fork child knows them
+     * (thread.c, cng_thread_fork_child). The tid words are
      * then the guest's call's, as the kernel would have them: the parent's
      * at PARENT_SETTID, the child's at CHILD_SETTID, and clear_child_tid
      * CHILD_CLEARTID's or none, where the libc's fork set its own. Anything
@@ -6722,6 +6723,11 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
             cng_thread_exit();
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
+
+    /* set_tid_address: the guest's clear_child_tid, which for a thread of
+     * ours may be ours to keep, not the kernel's (thread.c). */
+    case __NR_set_tid_address:
+        return cng_thread_tid_address((unsigned long)a0);
 
     /* rt_sigprocmask from guest context (the handler answers it from
      * uc_sigmask before it dispatches): apply the mask but never block SIGSYS. */

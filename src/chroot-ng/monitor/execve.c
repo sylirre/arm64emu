@@ -1353,10 +1353,19 @@ void cng_exec_reap(void) {
  * walking it again would be walking forever. */
 #define SWEEP_MAX 256 /* victims per pass: 4 KiB of the scratch stack */
 
+/* The host's libc's memory for a thread of ours is not the program's either
+ * (thread.c: bionic's thread mapping, shadow call stack and alternate stack),
+ * and the thread marks an address inside each. The mapping a mark lies in is
+ * kept, and so are the two either side of it when they abut, which is what
+ * the libc's guard pages do: the libc unmaps all of it in one call when the
+ * thread ends, and a guard given back meanwhile could be the next program's
+ * by then. So a victim is held until the walk has seen what follows it. */
 struct sweep_ctx {
     unsigned long sp;
     struct exec_range hit[SWEEP_MAX];
     int n;
+    struct exec_range held; /* the last victim, until the next is seen */
+    unsigned long mark_hi;  /* the end of a mapping kept for a mark, or 0 */
 };
 
 /* The kernel's own pseudo-mappings, which are not memory we mapped and not
@@ -1383,6 +1392,19 @@ static int sweep_kernel_vma(const char *p) {
 static int sweep_seen(unsigned long lo, unsigned long hi, const char *path,
                       void *ctx) {
     struct sweep_ctx *s = ctx;
+    int mark = cng_thread_host_mark(lo, hi);
+    if (s->held.len) {
+        if (!mark || s->held.lo + s->held.len != lo) {
+            if (s->n == SWEEP_MAX)
+                return 1; /* full: unmap these and walk again */
+            s->hit[s->n++] = s->held;
+        }
+        s->held.len = 0; /* taken, or the guard below a mark */
+    }
+    int above = s->mark_hi == lo;
+    s->mark_hi = mark ? hi : 0;
+    if (mark || above)
+        return 0; /* a mark's mapping, or the guard above one */
     if (s->sp >= lo && s->sp < hi)
         return 0; /* the stack this call is standing on */
     if (sweep_kernel_vma(path))
@@ -1393,9 +1415,7 @@ static int sweep_seen(unsigned long lo, unsigned long hi, const char *path,
     for (int i = 0; i < EXEC_GEN_MAX; i++)
         if (range_overlap(&r, &g_gen_live[i]) || range_overlap(&r, &g_gen_dead[i]))
             return 0; /* the incoming generation, or one the reap still owes */
-    if (s->n == SWEEP_MAX)
-        return 1; /* full: unmap these and walk again */
-    s->hit[s->n++] = r;
+    s->held = r;
     return 0;
 }
 
@@ -1411,8 +1431,14 @@ static void exec_sweep(void) {
     unsigned long bytes = 0;
     for (;;) {
         s.n = 0;
+        s.held.len = 0;
+        s.mark_hi = 0;
         if (cng_maps_walk(sweep_seen, &s) < 0)
             break; /* no maps: nothing is known, so nothing is unmapped */
+        /* The last victim, which nothing followed; with the table full, the
+         * next pass has it. */
+        if (s.held.len && s.n < SWEEP_MAX)
+            s.hit[s.n++] = s.held;
         passes++;
         int gone = 0;
         for (int i = 0; i < s.n; i++) {
@@ -1499,7 +1525,7 @@ void cng_exec_generation(const struct cng_loaded *prog,
  * All best-effort: a kernel without POSIX timers has no such file. */
 static void cng_exec_reset(void) {
     cng_timers_exec_reset();
-    CNG_SYS(__NR_set_tid_address, 0, 0, 0, 0, 0, 0);
+    cng_thread_tid_address(0);
     /* Android blocks set_robust_list (measured: SIGSYS from the zygote filter on
      * Android 13), and a syscall we know is refused is not one to issue — the
      * trap would be answered by the gate-net, i.e. by the nested SIGSYS delivery

@@ -256,8 +256,11 @@ void cng_rseq_drop_host(void);
  * pointer -- the tid, or -errno; whether this thread's exit unwinds to its
  * start routine (a guest thread of ours that is not the leader), and the
  * unwind; the fork child's fix-up; the stacks of threads that are gone, given
- * back; the main thread's host context, from main(); and sigaltstack for a
- * guest thread of ours (1 when answered, with the result in *ret). */
+ * back; the main thread's host context, from main(); sigaltstack for a
+ * guest thread of ours (1 when answered, with the result in *ret); and
+ * whether [lo, hi) holds a mark of memory the host's libc made for a thread
+ * of ours (thread.c has which), for the exec's sweep to keep; and
+ * set_tid_address, whose address may be ours to keep (thread.c). */
 struct cng_ucontext;
 struct cng_uregs;
 long cng_thread_clone(const struct cng_uregs *ur, const void *fp,
@@ -271,6 +274,8 @@ long cng_host_fork(void);
 void cng_thread_warmup(void);
 int cng_thread_altstack(struct cng_ucontext *uc, const void *uss, void *uoss,
                         long *ret);
+int cng_thread_host_mark(unsigned long lo, unsigned long hi);
+long cng_thread_tid_address(unsigned long addr);
 /* This thread's scratch slot, given up for good: the thread is leaving
  * through no frame of ours (sigsys.c). */
 void cng_scratch_gone(void);

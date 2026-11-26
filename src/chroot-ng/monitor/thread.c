@@ -17,7 +17,7 @@
  *  - the new thread registers its host context here (its TCB, its stack),
  *    gives back what its libc gave it that a kernel's new thread does not
  *    have -- an rseq area, a robust list, a clear_child_tid -- and takes the
- *    call's own: CLONE_CHILD_CLEARTID's address for set_tid_address,
+ *    call's own: CLONE_CHILD_CLEARTID's address for clear_child_tid,
  *    CLONE_PARENT_SETTID's and CLONE_CHILD_SETTID's writes, a private fs or
  *    descriptor table without CLONE_FS or CLONE_FILES;
  *  - it reports its tid to the parent, which returns it as the call's result,
@@ -27,9 +27,17 @@
  *    alternate signal stack of ours (see below), with CLONE_SETTLS's thread
  *    pointer -- or the parent's -- in the register.
  *
- * The guest's robust list and clear_child_tid are the kernel's from there on,
- * as the guest sets them: they are not trapped, so the kernel processes them
- * when the thread dies, however it dies.
+ * The guest's robust list is the kernel's from there on, as the guest sets
+ * it: it is not trapped, so the kernel processes it when the thread dies,
+ * however it dies. So is its clear_child_tid where the host's libc leaves the
+ * kernel's to it -- glibc's does, and the kernel's clear then comes where a
+ * kernel's does, after the robust list. The kernel keeps one a thread, and
+ * the other libcs want it for themselves: bionic's pthread_exit sets none
+ * for a detached thread (ours are) before it ends it, and musl's names the
+ * lock of its thread list, which the kernel's clear at the exit releases.
+ * There the guest's is kept here -- CLONE_CHILD_CLEARTID's, then whatever
+ * set_tid_address (trapped) asks for -- and cleared, with the kernel's wake,
+ * as the thread leaves, before its libc ends it.
  *
  * A thread that exits (a trapped exit, or a sibling's exec killing it) does
  * not leave by the svc: it unwinds to the start routine, which returns, and
@@ -46,7 +54,25 @@
  * frame, and musl's __unmapself and bionic's thread teardown make that exit
  * on a stack they have just unmapped. So a guest thread of ours always has a
  * kernel alternate stack: the guest's own while it has one, ours otherwise
- * (sigsys.c, sigsys_altstack, which answers the guest with what it set). */
+ * (sigsys.c, sigsys_altstack, which answers the guest with what it set).
+ *
+ * What the libc made for a thread of ours is the host's, not the guest's,
+ * and an exec's sweep has to leave it (execve.c, exec_sweep) while the
+ * thread lives -- a fork child's one thread, made by a thread of ours, goes
+ * on as the process. glibc and musl make nothing: their thread record and
+ * TLS are carved from the stack we give them. bionic carves its record
+ * there too, and maps the rest: the TLS (since Android 10, guard pages
+ * either side), a shadow call stack in a guard region of 16 MiB, and an
+ * alternate signal stack, all made before the start routine and unmapped by
+ * its pthread_exit. So each thread carries a mark inside each, an address in
+ * no mapping of the guest's -- its thread pointer, its x18, the alternate
+ * stack bionic set -- for the sweep to keep the mapping each lies in and the
+ * guards either side of it.
+ *
+ * And a fork child of bionic's keeps every thread's record on its list of
+ * threads, where its next pthread_create links the new one in: the other
+ * threads' stacks stay mapped in the child for good. glibc's and musl's fork
+ * child forget the other threads, and those stacks are given back. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -60,6 +86,12 @@
 #include "cng/syscall.h"
 #include "cng/uapi.h"
 #include "cng/ucontext.h"
+
+#ifdef __GLIBC__
+#define THR_CTID_KERNEL 1 /* the guest's clear_child_tid is the kernel's */
+#else
+#define THR_CTID_KERNEL 0 /* ...or ours (see the top) */
+#endif
 
 #define THR_N      1024
 #define THR_STACK  (256UL * 1024) /* the pthread's: its TCB, the start routine */
@@ -84,6 +116,11 @@ struct cng_thr {
     struct cng_ctx back; /* where an exit unwinds to */
     cng_stack_t gss;     /* the guest's alternate stack, as it set it */
     int pthread;         /* a guest thread of ours, which unwinds to exit */
+    unsigned long ctid;  /* the guest's clear_child_tid, kept here where it is
+                            not the kernel's (THR_CTID_KERNEL) */
+    unsigned long host[3]; /* inside what its libc mapped for it: the TLS,
+                              the shadow call stack, the alternate stack (the
+                              top); 0: none, or inside `map` */
 };
 static struct cng_thr g_thr[THR_N];
 
@@ -139,8 +176,27 @@ static struct cng_thr *thr_claim(long tid) {
     return 0;
 }
 
+static int thr_in_map(const struct cng_thr *t, unsigned long a) {
+    return a - t->map < t->maplen;
+}
+
+int cng_thread_host_mark(unsigned long lo, unsigned long hi) {
+    for (int i = 0; i < THR_N; i++) {
+        if (__atomic_load_n(&g_thr[i].tid, __ATOMIC_ACQUIRE) <= 0)
+            continue;
+        for (int k = 0; k < 3; k++) {
+            unsigned long a = g_thr[i].host[k];
+            if (a && a >= lo && a < hi)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 static void thr_free(struct cng_thr *t) {
     t->h.tp = t->h.x18 = t->map = t->maplen = t->alt = 0;
+    t->host[0] = t->host[1] = t->host[2] = 0;
+    t->ctid = 0;
     t->pthread = 0;
     __atomic_store_n(&t->tid, -1, __ATOMIC_RELEASE);
 }
@@ -261,6 +317,19 @@ static void *thr_start(void *arg) {
                      : "=r"(t->h.tp), "=r"(t->h.x18));
     t->map = s->map;
     t->maplen = s->maplen;
+    /* The marks (see the top): a kernel's new thread has no alternate stack,
+     * so one here is the libc's; x18 is the shadow call stack's only where
+     * the libc keeps one there. */
+    cng_stack_t hss;
+    unsigned long m[3] = {t->h.tp, 0, 0};
+#ifdef __BIONIC__
+    m[1] = t->h.x18;
+#endif
+    if (CNG_SYS(__NR_sigaltstack, 0, (long)&hss, 0, 0, 0, 0) == 0 &&
+        !(hss.ss_flags & CNG_SS_DISABLE) && hss.ss_size)
+        m[2] = (unsigned long)hss.ss_sp + hss.ss_size - 1;
+    for (int k = 0; k < 3; k++)
+        t->host[k] = m[k] && !thr_in_map(t, m[k]) ? m[k] : 0;
     t->alt = s->map + cng_page_size;
     t->gss.ss_sp = 0;
     t->gss.ss_flags = CNG_SS_DISABLE;
@@ -273,6 +342,11 @@ static void *thr_start(void *arg) {
         cng_scratch_release(me);
         struct cng_thr *u = thr_find(me);
         if (u) {
+            if (u->ctid) { /* the kernel's mm_release, for the guest's */
+                u32 z = 0;
+                if (cng_user_copyout((void *)u->ctid, &z, sizeof z) == 0)
+                    CNG_SYS(__NR_futex, u->ctid, 1 /* FUTEX_WAKE */, 1, 0, 0, 0);
+            }
             thr_bury(me, u->map, u->maplen);
             thr_free(u);
         }
@@ -280,14 +354,20 @@ static void *thr_start(void *arg) {
     }
 
     /* What its libc set up that a kernel's new thread has none of. The
-     * robust list and clear_child_tid are given to the kernel as the call
-     * asked: none, and CLONE_CHILD_CLEARTID's address. */
+     * robust list is given to the kernel as the call asked, none (where the
+     * host has the call at all: Android refuses it), and clear_child_tid is
+     * CLONE_CHILD_CLEARTID's address -- the kernel's, or ours (see the top). */
     unsigned long flags = s->flags;
     struct cng_uregs r = s->r;
+    unsigned long ctid = (flags & CNG_CLONE_CHILD_CLEARTID) ? r.x[4] : 0;
     cng_rseq_drop_host();
-    CNG_SYS(__NR_set_robust_list, 0, 24, 0, 0, 0, 0);
-    CNG_SYS(__NR_set_tid_address,
-            (flags & CNG_CLONE_CHILD_CLEARTID) ? r.x[4] : 0, 0, 0, 0, 0, 0);
+    if (!cng_blocked[__NR_set_robust_list])
+        CNG_SYS(__NR_set_robust_list, 0, 24, 0, 0, 0, 0);
+#if THR_CTID_KERNEL
+    CNG_SYS(__NR_set_tid_address, ctid, 0, 0, 0, 0, 0);
+#else
+    t->ctid = ctid;
+#endif
     long e = 0;
     if (!(flags & CNG_CLONE_FS))
         e = CNG_SYS(__NR_unshare, CNG_CLONE_FS, 0, 0, 0, 0, 0);
@@ -426,7 +506,8 @@ void cng_thread_exit(void) {
  * this one's: keyed by its new tid, and the fallback for anything else. The
  * other threads' stacks are copies the child has no thread for, buried
  * under the parent's tids, which no thread of the child's answers to; the
- * parent's own buried ones likewise. */
+ * parent's own buried ones likewise -- but for bionic's, whose list of
+ * threads still holds their records, on those stacks (see the top). */
 void cng_thread_fork_child(void) {
     long tid = sys_gettid();
     unsigned long tp, x18;
@@ -439,10 +520,15 @@ void cng_thread_fork_child(void) {
             continue;
         if (g_thr[i].h.tp == tp && !have) {
             keep = g_thr[i];
+            keep.ctid = 0; /* the leader's is the kernel's (dispatch.c) */
             have = 1;
-        } else if (g_thr[i].map) {
-            thr_bury(g_thr[i].tid, g_thr[i].map, g_thr[i].maplen);
+            continue;
         }
+#ifdef __BIONIC__
+        continue; /* kept, and ours for good: still own-mapped */
+#endif
+        if (g_thr[i].map)
+            thr_bury(g_thr[i].tid, g_thr[i].map, g_thr[i].maplen);
     }
     for (int i = 0; i < THR_N; i++)
         g_thr[i].tid = 0;
@@ -524,6 +610,24 @@ int cng_thread_altstack(struct cng_ucontext *uc, const void *uss, void *uoss,
     return 1;
 }
 
+/* set_tid_address (dispatch.c): kept for a thread of ours where the
+ * guest's clear_child_tid is not the kernel's (see the top), the kernel's
+ * call otherwise -- the leader's, any thread's under glibc. The caller's tid
+ * either way. */
+long cng_thread_tid_address(unsigned long addr) {
+#if !THR_CTID_KERNEL
+    long tid = sys_gettid();
+    if (tid != sys_getpid()) {
+        struct cng_thr *t = thr_find(tid);
+        if (t && t->pthread) {
+            t->ctid = addr;
+            return tid;
+        }
+    }
+#endif
+    return CNG_SYS(__NR_set_tid_address, addr, 0, 0, 0, 0, 0);
+}
+
 /* The libc's fork(), from the SIGSYS handler (dispatch.c, cng_clone_convert):
  * the child's pid, 0 in the child, or -errno. The handler interrupted the
  * guest, never the libc, so no lock of the libc's is this thread's. */
@@ -536,8 +640,11 @@ long cng_host_fork(void) {
  * handlers), done before the guest runs rather than at its first thread, where
  * it would land on the guest's dispositions for a moment: a thread that does
  * nothing, joined. The entry's reset of the dispositions then takes the two
- * handlers back to the default (execve.c, cng_entry_reset). */
+ * handlers back to the default (execve.c, cng_entry_reset). Bionic has none
+ * to do. */
+#ifdef __GLIBC__
 static void *thr_noop(void *a) { return a; }
+#endif
 
 void cng_thread_warmup(void) {
     thr_alt_probe();

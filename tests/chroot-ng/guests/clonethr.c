@@ -13,7 +13,8 @@
  *     CLONE_FILES, a close of the child's is its own;
  *   - the parent's signal mask, inherited, and no alternate signal stack;
  *   - x0 = 0 in the child and the stack it was given;
- *   - a robust mutex whose owner thread exits holding it: EOWNERDEAD. */
+ *   - a robust mutex whose owner thread exits holding it: EOWNERDEAD (not
+ *     on bionic, which has none). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -100,6 +101,7 @@ static int close_child(void *arg) {
     return 0;
 }
 
+#ifndef __BIONIC__
 static pthread_mutex_t rm;
 static int robust_child(void *arg) {
     (void)arg;
@@ -107,6 +109,7 @@ static int robust_child(void *arg) {
     set_done();
     return 0; /* exits holding it */
 }
+#endif
 
 #define BASE (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | \
               CLONE_SYSVSEM)
@@ -205,6 +208,7 @@ int main(void) {
            raw_clone(CLONE_SIGHAND | SIGCHLD, stk(), 0, 0, 0, probe, 0) == -EINVAL
                ? "EINVAL" : "other");
 
+#ifndef __BIONIC__
     /* A robust mutex left held by a thread that exited. */
     pthread_mutexattr_t ma;
     pthread_mutexattr_init(&ma);
@@ -216,5 +220,6 @@ int main(void) {
     int e = pthread_mutex_lock(&rm);
     printf("a robust mutex its owner thread exited holding: %s\n",
            e == EOWNERDEAD ? "EOWNERDEAD" : strerror(e));
+#endif
     return 0;
 }

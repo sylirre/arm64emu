@@ -474,7 +474,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
      * when faking, plus the conditional entries below). */
-    int nr[NPATH + NIPC + NID + NROFD + 15];
+    int nr[NPATH + NIPC + NID + NROFD + 16];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -552,11 +552,14 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
      * and a thread is made a pthread of the host's (thread.c) -- whose own
      * clone, from the host's code, the admission above lets through. exit,
      * which a guest thread of ours makes by leaving through its start
-     * routine; and sigaltstack, since such a thread's kernel alternate stack
-     * is ours while the guest has none. */
+     * routine; sigaltstack, since such a thread's kernel alternate stack
+     * is ours while the guest has none; and set_tid_address, since its
+     * clear_child_tid may be ours to keep where the host's libc has the
+     * kernel's. */
     nr[nsys++] = __NR_clone;
     nr[nsys++] = __NR_exit;
     nr[nsys++] = __NR_sigaltstack;
+    nr[nsys++] = __NR_set_tid_address;
 
     if (cap < CNG_SECCOMP_MAX_INSNS)
         return -1;
