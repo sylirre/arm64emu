@@ -164,14 +164,6 @@ static int scratch_fd(void) {
     return -1;
 }
 
-/* Test aid: the inode of this process's staging descriptor, created if there is
- * none yet, or 0 where none can be had. Nothing in the monitor asks. It exists
- * so a test can assert the one property that identity carries — that a forked
- * child does not go on staging through its parent's descriptor. */
-unsigned long cng_uaccess_scratch_ino(void) {
-    return scratch_fd() >= 0 ? g_id.ino : 0;
-}
-
 /* Did a probe of `n` bytes come back saying the range is inaccessible? A fault
  * at the very first byte is -EFAULT; one partway in stops the copy and reports
  * the bytes that made it. Any other error is about the memfd, not the guest's

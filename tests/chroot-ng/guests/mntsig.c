@@ -1,12 +1,12 @@
 /* A mount table opened from a signal handler that interrupted the opening of
- * another (M11 regression, -R).
+ * another (M11 regression).
  *
  * The mount tables are emitted from a snapshot of the view held in one static
- * buffer, taken one reader at a time by thread id. On the -R tier the
- * dispatcher runs on the guest's own signal mask, so a handler delivered while
- * the thread was emitting a table — on the way out of any syscall the emission
- * makes — that opened a mount table itself waited for the snapshot its own
- * thread held, forever.
+ * buffer, taken one reader at a time by thread id. Where a dispatch runs on the
+ * guest's own signal mask (a bounced call), a handler delivered while the thread
+ * was emitting a table — on the way out of any syscall the emission makes —
+ * that opened a mount table itself waited for the snapshot its own thread held,
+ * forever.
  *
  * A loop opens and reads /proc/self/mountinfo, and before each read arms a
  * one-shot timer whose handler reads it too. The delay is swept across the

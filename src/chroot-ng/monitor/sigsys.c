@@ -12,7 +12,6 @@
 #include "cng/monitor.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
-#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -94,9 +93,7 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
  * context, on the guest's own mask, with the guest's handlers delivered
  * where they belong; the svc after it traps (cng_bounce_svc_end), and the
  * handler puts the registers back from the record and resumes the guest
- * after its own svc with the wait's result. Two traps per masked wait. The
- * -R trampoline tier reaches these from ordinary context and needs none of
- * this: dispatch.c strips the copy and re-issues in place.
+ * after its own svc with the wait's result. Two traps per masked wait.
  *
  * The masked waits were the first calls bounced, and not the last: every
  * trapped call that can block has the same problem in the handler, with the
@@ -110,9 +107,8 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
  * cng_bounce_wait like a wait, its own registers in place (BOUNCE_RAW). One
  * that has paths or socket addresses to translate runs the dispatcher itself
  * from guest context (BOUNCE_DISP): sigreturn resumes at cng_bounce_dispatch,
- * which calls into it with the record as the register file, as the -R
- * trampoline calls into it with its own, and the completion trap puts the
- * registers back from the record, result and all. Either way the call blocks
+ * which calls into it with the record as the register file, and the
+ * completion trap puts the registers back from the record, result and all. Either way the call blocks
  * on the guest's own mask, and a signal ends or restarts it by the kernel's
  * own rules. */
 struct cng_bounce {
@@ -600,7 +596,7 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
     long nr = (long)r[8];
 
     /* The completion of a bounce (see bounce_start and bounce_call): not a
-     * syscall of the guest's, and its site is ours — never one to rewrite.
+     * syscall of the guest's, and its site is ours.
      * What is owed is the exit stop of the syscall that was bounced, whose
      * entry stop was reported when it trapped (it was recorded then, since a
      * guest handler that ran over the bounced call reported stops of its own
@@ -615,25 +611,6 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
             cng_pt_syscall_exit(ur);
             cng_pt_step_report(ur);
         }
-        return;
-    }
-
-    /* This trap is also the only proof that exists about the word behind it:
-     * the CPU fetched and executed it as `svc #0`. The AoT rewriter has to
-     * decide that by reading bytes, and it is exactly the sites it could not
-     * reach — a natively mapped library, a JIT's output, an object whose
-     * headers named no code — that arrive here. Patch it, so the site costs
-     * this trap once. (`rt_sigreturn` is the site that must never become a
-     * trampoline call; the filter does not trap it, and if it ever did, this
-     * is where that would stop being true.)
-     *
-     * A site that is a branch now is also the way to make this very call:
-     * resumed at the site, the thread runs it through the trampoline, from
-     * its own context and on its own mask, as every later call from there
-     * will be. Made here instead, the first call from each site ran with every
-     * signal blocked — the one that blocks, for as long as it blocked. */
-    if (nr != __NR_rt_sigreturn && cng_rewrite_site(ca - 4)) {
-        uc->uc_mcontext.pc = ca - 4;
         return;
     }
 
@@ -837,9 +814,10 @@ static int cng_scratch_slot(long tid) {
             /* Ours, but the stack is published after the TID, so a re-entry
              * landing between the two would be handed a slot with no stack and
              * switch SP to 0 — an unblockable SIGSEGV. The window is one mmap
-             * wide and reachable on the -R tier, where a guest signal can be
-             * delivered on the way out of that very syscall and reach a
-             * rewritten `svc` from the handler. Run in place until it closes. */
+             * wide and reachable from a dispatch bounced to guest context,
+             * where a guest signal can be delivered on the way out of that
+             * very syscall and its handler make a call that traps. Run in
+             * place until it closes. */
             return __atomic_load_n(&cng_scr[i].hi, __ATOMIC_ACQUIRE) ? (int)i
                                                                      : -1;
         if (t == 0 && cng_claim_slot(&cng_scr[i].tid, 0, tid))
@@ -930,16 +908,6 @@ int cng_sig_all_blocked(long tid) {
     return 0;
 }
 
-/* Testing: the allocator, for a TID the caller names rather than its own, with
- * the slot's stack top so a caller can tell a mapped slot from a claimed one.
- * There is no other way to fill the table — it takes hundreds of threads. */
-int cng_scratch_slot_for(long tid, unsigned long *hi_out) {
-    int i = cng_scratch_slot(tid);
-    if (hi_out)
-        *hi_out = i >= 0 ? cng_scr[i].hi : 0;
-    return i;
-}
-
 /* Runs on the scratch stack, and the first thing it does is take the guest's
  * alt-stack out of the picture for the duration.
  *
@@ -963,8 +931,6 @@ int cng_scratch_slot_for(long tid, unsigned long *hi_out) {
  * The check is free: uc_stack is what the kernel saved in the frame, so a guest
  * with no alt-stack registered — most of them — costs nothing, and one that has
  * registered it is exactly the guest at risk. */
-int cng_g_sigsys_nest = 0;
-unsigned long cng_g_sigsys_frame[2];
 int cng_g_traps_live;
 
 static void sigsys_on_scratch(void *ucv, void *si) {
@@ -973,34 +939,7 @@ static void sigsys_on_scratch(void *ucv, void *si) {
         cng_stack_t off = {0, CNG_SS_DISABLE, 0};
         CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
     }
-    /* Test aid: reach the nested state from a host with no ambient filter, by
-     * raising a real SIGSYS from right here — on the scratch stack, with the
-     * outer frame wherever the kernel put it. */
-    if (cng_g_sigsys_nest) {
-        cng_g_sigsys_nest = 0;
-        cng_g_sigsys_frame[0] = (unsigned long)uc;
-        cng_sigsys_fabricate();
-    }
     cng_sigsys_body(uc, si);
-}
-
-/* Queue a SIGSYS at this thread that the handler takes for a seccomp trap of
- * the gate's own svc: si_code SYS_SECCOMP (which the kernel lets a task send
- * itself) and a call address inside the gate, so the body's gate-net answers
- * it with -ENOSYS in x0 and dispatches nothing. A tgkill'd SIGSYS will not do:
- * that is a guest-directed signal now, delivered to the guest's disposition
- * before the handler ever switches stacks, and what the nesttest has to reach
- * is the stack switch. */
-void cng_sigsys_fabricate(void) {
-    cng_siginfo_t si;
-    memset(&si, 0, sizeof si);
-    si.si_signo = CNG_SIGSYS;
-    si.si_code = CNG_SYS_SECCOMP;
-    si._u._sigsys.call_addr = (void *)__cng_gate_start;
-    si._u._sigsys.syscall = -1; /* no real number: nothing is marked blocked */
-    si._u._sigsys.arch = 0xC00000B7u; /* AUDIT_ARCH_AARCH64 */
-    CNG_SYS(__NR_rt_tgsigqueueinfo, sys_getpid(), sys_gettid(), CNG_SIGSYS, &si,
-            0, 0);
 }
 
 /* A stack for a call that cannot have this thread's slot: the table is full of
@@ -1260,8 +1199,6 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     long tid = sys_gettid();
     int i = cng_scratch_slot(tid);
     if (i < 0 || cng_scr[i].busy) {
-        if (cng_g_sigsys_frame[0]) /* the test above: this is the nested one */
-            cng_g_sigsys_frame[1] = (unsigned long)ucv;
         unsigned long base = scr_temp();
         if (!base) {
             if (fn == sigsys_on_scratch)
@@ -1293,26 +1230,26 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
 /* Run `fn(arg)` on a stack of ours; 0 only when none could be had at all and the
  * caller has to run it where it stands.
  *
- * The SIGSYS handler is not the only way into the path dispatcher. The -R
- * trampoline tier reaches the very same code from an ordinary call, on whatever
- * stack the rewritten `svc` site happened to be executing on — which is the
- * stack the handler above refuses to use, for reasons that do not change with
- * the tier: `cng_dispatch`'s own frame is ~24 KiB and a translated openat runs
- * ~66 KiB deep, against musl's 128 KiB thread stacks, Go's ~8 KiB goroutine
- * stacks, and whatever size a guest hands sigaltstack.
+ * The SIGSYS handler is not the only way into the path dispatcher. A call
+ * bounced to guest context (cng_dispatch_bounced) reaches the very same code
+ * from an ordinary call, on the guest's own stack — which is the stack the
+ * handler above refuses to use, for reasons that do not change with the route:
+ * `cng_dispatch`'s own frame is ~24 KiB and a translated openat runs ~66 KiB
+ * deep, against musl's 128 KiB thread stacks, Go's ~8 KiB goroutine stacks,
+ * and whatever size a guest hands sigaltstack.
  *
  * Nesting is detected by the same busy flag the handler uses, and for the same
  * reason an SP range test will not do it: the re-entry need not be on the
  * scratch stack. A guest that registers a sigaltstack takes its own signals on
  * that alt-stack, and one delivered while we are mid-dispatch — the kernel
- * delivers it on the way out of a syscall we issued ourselves — reaches a
- * rewritten `svc` from there. SP is then the guest's alt-stack, nowhere near
+ * delivers it on the way out of a syscall we issued ourselves — makes a call
+ * that traps from there. SP is then the guest's alt-stack, nowhere near
  * the scratch stack an outer invocation is still using, and switching onto it
  * again overwrites those frames. The SP test is kept alongside for the direct
  * re-entry it does catch. Either way the nested call gets a stack of its own
  * rather than the guest's, which is the one thing the guest's cannot survive. */
 static int cng_run_scratch_on(int i, unsigned long sp, void (*fn)(void *),
-                              void *arg);
+                              void *arg, struct cng_gframe *f);
 
 int cng_run_scratch(void (*fn)(void *), void *arg) {
     return cng_run_scratch_in(fn, arg, 0);
@@ -1327,7 +1264,7 @@ int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f) {
         f->prev = cng_scr[i].gf;
         cng_scr[i].gf = f;
     }
-    int ran = cng_run_scratch_on(i, sp, fn, arg);
+    int ran = cng_run_scratch_on(i, sp, fn, arg, f);
     if (f && i >= 0)
         cng_scr[i].gf = f->prev;
     return ran;
@@ -1347,13 +1284,34 @@ struct cng_gframe *cng_gframe_cur(void) {
     return 0;
 }
 
+/* A bounced dispatch makes its blocking call on the guest's own stack (the
+ * gframe's gsp, reissue_svc in dispatch.c), and it has to be made below every
+ * frame live there: a guest handler delivered while the call waits gets its
+ * signal frame below that sp, and the frames between the bounce record and
+ * here -- the dispatch's own, entered from the record -- are still to be
+ * returned through. The call used to be made at the record, above them, and
+ * survived only because the kernel writes just the parts of a signal frame it
+ * uses, leaving the rest of the 4 KiB __reserved area as it was; a frame
+ * written whole (an SVE register file, an emulator's) took the return
+ * addresses with it. The sp here, just before the switch, is the lowest
+ * address in use: cng_run_on_stack pushes nothing on this stack. */
+static inline __attribute__((always_inline)) void
+scratch_gsp(struct cng_gframe *f) {
+    if (f && f->gsp) {
+        unsigned long sp;
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        f->gsp = sp & ~15UL;
+    }
+}
+
 /* The switch itself, for a slot already looked up (`i`, -1 for none) from a
  * caller standing at `sp`. */
 static int cng_run_scratch_on(int i, unsigned long sp, void (*fn)(void *),
-                              void *arg) {
+                              void *arg, struct cng_gframe *f) {
     if (i >= 0 && !cng_scr[i].busy &&
         !(sp >= cng_scr[i].lo && sp < cng_scr[i].hi)) {
         cng_scr[i].busy = 1;
+        scratch_gsp(f);
         cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, arg, 0);
         cng_scr[i].busy = 0;
         return 1;
@@ -1361,23 +1319,23 @@ static int cng_run_scratch_on(int i, unsigned long sp, void (*fn)(void *),
     /* No slot, or an outer dispatch is on it. Running in place is what the
      * guest's own alt-stack cannot survive, so take a stack for this call.
      *
-     * `fn` need not come back: the -R tier's emulated execve enters the new
-     * program from inside it (cng_scratch_leave), and then this mapping is
-     * never given back. That is 256 KiB against an exec that already keeps the
-     * whole of the previous program's address space, on a path reached only by
-     * an exec from inside a nested dispatch. */
+     * `fn` need not come back: an exit made from a guest-context dispatch
+     * ends the thread from inside it (cng_scratch_leave), and then this
+     * mapping is never given back -- 256 KiB, on a path reached only by an
+     * exit from inside a nested dispatch. */
     unsigned long base = scr_temp();
     if (!base)
         return 0;
+    scratch_gsp(f);
     cng_run_on_stack((void *)(base + CNG_SCR_SZ), (void *)fn, arg, 0);
     scr_temp_free(base);
     return 1;
 }
 
 /* Give the stack back for a call that will not return through cng_run_scratch:
- * the -R tier's emulated execve enters the new program directly. Left set, the
- * flag would send every later SIGSYS on this thread back onto the guest's own
- * stack — the thing this all exists to avoid. */
+ * an exit made from a guest-context dispatch ends the thread there. Left set,
+ * the flag would send every later SIGSYS on this thread back onto the guest's
+ * own stack — the thing this all exists to avoid. */
 void cng_scratch_leave(void) {
     int i = cng_scratch_slot(sys_gettid());
     if (i >= 0)
@@ -1395,8 +1353,9 @@ void cng_scratch_leave(void) {
  * real semop either. A signal that is pending only because *we* blocked it, and
  * whose default action is to be discarded, is likewise not an interruption.
  *
- * The -R trampoline tier has no signal frame; there the live mask is already the
- * guest's, so it is read straight from the kernel (`uc` is then NULL). A caller
+ * A dispatch from guest context has no signal frame; there the live mask is
+ * already the guest's, so it is read straight from the kernel (`uc` is then
+ * NULL). A caller
  * that already holds the frame passes it; cng_sig_deliverable() below finds it.
  * The answer is the signal, the lowest such, which get_signal takes first (0:
  * none). */
@@ -1496,13 +1455,6 @@ int cng_sig_kick_waiting(void) { return cng_sig_kick_pending(scr_cur_uc()); }
 /* The same question for the frame this thread is in, found by its tid: for a
  * caller that is not handed one. */
 int cng_sig_deliverable(void) { return cng_sig_deliverable_in(scr_cur_uc()); }
-
-/* Testing: the SIGSYS handler on its own — no filter, no blocked-syscall probe,
- * no ptrace plumbing. Enough for a fabricated SIGSYS to reach the real handler
- * and be delivered where the kernel would really put it. */
-int cng_sigsys_install_only(void) {
-    return cng_sig_install(CNG_SIGSYS, sigsys_handler);
-}
 
 int cng_install_monitor(struct cng_fs *fs) {
     cng_g_fs = fs;

@@ -23,47 +23,36 @@ tty_check() {
     _knob=$3
     _want=$4
     _why=${5:-}
-    for _tier in -R plain; do
-        if [ "$_tier" = plain ]; then
-            if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-                skip "$_desc, seccomp tier: the filter is inert here"
-                continue
-            fi
-            _opt=""
-        else
-            _opt="-R"
+    for _deny in 0 1; do
+        _label="$_desc"
+        [ "$_deny" = 1 ] && _label="$_desc, the host's refusal forced"
+        if [ "$_deny" = 0 ] && [ -n "$_why" ]; then
+            skip "$_label: $_why"
+            continue
         fi
-        for _deny in 0 1; do
-            _label="$_desc ($_tier)"
-            [ "$_deny" = 1 ] && _label="$_desc, the host's refusal forced ($_tier)"
-            if [ "$_deny" = 0 ] && [ -n "$_why" ]; then
-                skip "$_label: $_why"
-                continue
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        _got=$(
+            if [ "$_deny" = 1 ]; then
+                for _k in $_knob; do
+                    export "$_k=1"
+                done
             fi
-            # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
-            _got=$(
-                if [ "$_deny" = 1 ]; then
-                    for _k in $_knob; do
-                        export "$_k=1"
-                    done
-                fi
-                run_t 60 $_opt $CHROOTNG_GUEST_BINDS "$TTY_DIR" "/$_guest" 2>/dev/null
-            )
-            case "$_got" in
-            SKIP:*)
-                skip "$_label: ${_got#SKIP: }"
-                continue
-                ;;
-            esac
-            if [ "$_got" = "$_want" ]; then
-                pass=$((pass + 1))
-                echo "  ok   $_label"
-            else
-                fail=$((fail + 1))
-                echo "  FAIL $_label"
-                printf '%s\n' "$_got" | sed 's/^/    /'
-            fi
-        done
+            run_t 60 $CHROOTNG_GUEST_BINDS "$TTY_DIR" "/$_guest" 2>/dev/null
+        )
+        case "$_got" in
+        SKIP:*)
+            skip "$_label: ${_got#SKIP: }"
+            continue
+            ;;
+        esac
+        if [ "$_got" = "$_want" ]; then
+            pass=$((pass + 1))
+            echo "  ok   $_label"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL $_label"
+            printf '%s\n' "$_got" | sed 's/^/    /'
+        fi
     done
 }
 

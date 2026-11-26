@@ -5,7 +5,7 @@
  * asked whether it is running under a monitor without needing the monitor to
  * intercept anything. Which matters, because on a host where the seccomp tier
  * is inert (qemu-user applies no guest filter) nothing else about an installed
- * monitor is visible from inside the guest unless -R is also in play.
+ * monitor is visible from inside the guest.
  *
  * Prints the line verbatim: "NoNewPrivs:\t0" or "NoNewPrivs:\t1", or "absent"
  * where /proc has no such field to report.

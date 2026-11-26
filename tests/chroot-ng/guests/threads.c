@@ -1,16 +1,11 @@
-/* Threads under the trampoline tier (M8).
+/* Threads (M8).
  *
- * A thread is made with clone(CLONE_VM|CLONE_THREAD|...), and -R rewrites the
- * `svc` that issues it like any other. That site cannot be handled the way the
- * others are: the child comes back from the call with SP pointing at the stack
- * the guest just allocated for it, where none of the trampoline's frames exist.
- * The dispatcher used to take it and strip CLONE_VM — which with CLONE_THREAD
- * is exactly what the kernel answers EINVAL to — so pthread_create did not work
- * under -R at all.
+ * A thread is made with clone(CLONE_VM|CLONE_THREAD|...), and the child comes
+ * back from the call with SP pointing at the stack the guest just allocated for
+ * it.
  *
- * Each thread then does real work through the tier it was created on: an open
- * of a guest path (which is a rewritten site, translated on a stack of the
- * thread's own) and a getpid/gettid pair, so a thread that came up with a
+ * Each thread then does real work: an open of a guest path (translated on a
+ * stack of the thread's own) and a getpid/gettid pair, so a thread that came up with a
  * damaged register file or no scratch stack shows as a wrong count rather than
  * as a hang. Prints one summary line, byte-comparable against a plain run.
  */

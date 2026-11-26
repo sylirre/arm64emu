@@ -110,7 +110,7 @@ struct cng_procsnap {
  * one view. Set by the option parser before cng_procfs_init runs. */
 extern int cng_g_shared_proc;
 
-/* Which backing cng_procreg_init ended up with (for tests and -t proctest). */
+/* Which backing cng_procreg_init ended up with. */
 #define CNG_PROCREG_B_NONE   0 /* no registry: /proc degrades to passthrough */
 #define CNG_PROCREG_B_ANON   1 /* per-invocation anonymous mapping */
 #define CNG_PROCREG_B_FILE   2 /* --shared-proc named-file fallback */

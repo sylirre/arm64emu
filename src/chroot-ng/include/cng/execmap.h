@@ -12,8 +12,8 @@
  * mapping request is the only place the failure is visible.
  *
  * So the refusal is caught and answered the same way the loader answers it:
- * anonymous RW pages, the file's bytes pread into them, `svc` sites rewritten
- * where -R asked for it, then mprotect to the protection the guest wanted.
+ * anonymous RW pages, the file's bytes pread into them, then mprotect to the
+ * protection the guest wanted.
  * Only MAP_PRIVATE can be served this way (a copy cannot carry MAP_SHARED's
  * visibility), and only where the kernel actually refused — an exec-permitted
  * mount keeps its real file mapping, its page-cache sharing and its identity

@@ -121,9 +121,8 @@ struct cng_bresp {
 
 /* Per-invocation nonce keying the rendezvous when --shared-proc is off. Seeded
  * once in the root process (cng_broker_seed_session, from cng_run) and
- * fork-inherited, so one launch's whole process tree shares one namespace. A
- * caller that never runs cng_run (the -t self-tests) gets a lazy seed on first
- * use. */
+ * fork-inherited, so one launch's whole process tree shares one namespace. One
+ * not seeded by then gets a lazy seed on first use. */
 void cng_broker_seed_session(void);
 
 /* One request/response round-trip against this process's namespace daemon,
@@ -176,14 +175,6 @@ u64 cng_broker_hash(const void *p, unsigned long n);
  * waiter is answered long after its request was served — so the registry drives
  * its own connection rather than returning a reply for broker.c to send. These
  * are the same four primitives the request/response path uses. */
-
-/* The abstract rendezvous name this process's IPC calls use: per-rootfs under
- * --shared-proc, else per-invocation. Returns the sockaddr length. */
-unsigned cng_broker_self_addr(struct cng_sockaddr_un *a);
-
-/* Testing (-t shmtest): reach the daemon of `rootfs` presenting `key` as the
- * rootfs; 0 if answered, -1 if hung up on. */
-int cng_broker_test_hello(const char *rootfs, const char *key);
 
 /* cng_broker_recv: the peer closed with nothing sent at all. Distinguished from
  * a plain -1 because it is the one failure a caller may safely retry — the peer

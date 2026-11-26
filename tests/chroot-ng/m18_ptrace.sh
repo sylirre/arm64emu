@@ -8,81 +8,9 @@
 # needs an emulator, and on an AArch64 host the same binary run without
 # chroot-ng is a same-architecture oracle for free.
 #
-# The guest has to be one whose syscalls chroot-ng actually intercepts. On a
-# device that is every guest (the seccomp tier traps them); under qemu-user,
-# where no filter is live, it means a static guest under -R.
+# The guest has to be one whose syscalls chroot-ng actually intercepts: every
+# guest, which the seccomp tier traps, in a view with something in it.
 echo "== M18: ptrace =="
-
-# The single-step next-PC decoder, checked directly: it is pure logic, it runs
-# on every host, and a branch it misreads is the one failure mode with no
-# safety net (the breakpoint lands where the tracee never goes).
-ptout=$(run_t 60 -t ptracetest 2>&1)
-check "single-step decoder + the SIGSYS tier's stop path" 0 $?
-check_contains "pointer-auth branches are refused, not guessed" \
-    "braaz is refused, not guessed: OK" "$ptout"
-# The tier that runs on a device: no guest filter is applied under qemu-user, so
-# every live-guest leg below goes through the -R trampoline instead. This drives
-# cng_sigsys_body directly — real fork, real registry and mailbox, synthesized
-# trap — so the wrapper that only devices execute is covered here too.
-check_contains "SIGSYS tier: a tracee stops cooperatively" \
-    "sigsys tier: cooperative stop -> OK" "$ptout"
-check_contains "SIGSYS tier: syscall-entry stop" \
-    "sigsys tier: syscall-entry stop -> OK" "$ptout"
-check_contains "SIGSYS tier: the tracer reads the trapped register file" \
-    "sigsys tier: regs at the entry stop -> OK" "$ptout"
-check_contains "SIGSYS tier: syscall-exit stop carries the result" \
-    "sigsys tier: syscall-exit stop -> OK" "$ptout"
-# A PTRACE_ATTACH whose kick reaches a new process on the way out of its fork,
-# before the converted clone's child-side hooks have run. Those hooks wiped the
-# attach the kick had just recorded, so the tracee never stopped again: the
-# rare "usr1 odd: killed 9" of the waitnowait scenario below, made certain.
-check_contains "an attach kick ahead of the fork's child hooks: attach stop" \
-    "fork kick: attach stop -> OK" "$ptout"
-check_contains "...and the tracee's next signal still stops" \
-    "fork kick: the next signal stops -> OK" "$ptout"
-check_contains "...and its exit reaches the tracer" \
-    "fork kick: tracee exited clean -> OK" "$ptout"
-# The -R tier's waits: the kernel's own for a process that cannot be owed an
-# emulated stop, where every one used to poll the registry in 50 ms slices.
-# What has to hold is the hand-over — a kick taken between the wait's look at
-# the registry and its svc, or one cutting the svc short, ends the wait so it
-# looks again; a child's PTRACE_TRACEME does that to a parent asleep in it.
-check_contains "-R native wait: a kick on the wait's frame ends it" \
-    "native wait: a kick's frame -> OK" "$ptout"
-check_contains "-R native wait: a kick before its svc is not slept through" \
-    "native wait: a kick before the svc -> OK" "$ptout"
-check_contains "-R native wait: a child's TRACEME hands it to the registry" \
-    "native wait: a child's TRACEME ends it -> OK" "$ptout"
-check_contains "...which then reports the child's stop" \
-    "native wait: the registry has its stop -> OK" "$ptout"
-check_contains "...and its exit" \
-    "native wait: tracee exited clean -> OK" "$ptout"
-check_contains "-R native wait: a tracer's fork waits natively again" \
-    "native wait: a tracer's fork is none -> OK" "$ptout"
-# The pointer-auth mask gdb asks for whenever AT_HWCAP says PACA, and is fatal
-# about ("unable to fetch pauth registers"). Measured rather than asked for, so
-# what is asserted is the shape the kernel's own answer always has.
-case "$ptout" in
-*"pauth mask"*) check_contains "pauth mask has the kernel's shape" \
-    "pauth mask 0x" "$ptout"
-    check_contains "...and is accepted" "-> OK" \
-        "$(echo "$ptout" | grep 'pauth mask')" ;;
-*) check_contains "no pauth here: the regset is refused as the kernel does" \
-    "no pauth, refused -> OK" "$ptout" ;;
-esac
-
-# The two filters a ptrace role stacks on a task, simulated: they are only
-# installed once a guest traces, and no guest filter runs under qemu-user, so
-# this is the only check they get on a cross host.
-out=$(run -t bpftest 2>&1)
-check_contains "a tracee traps on every syscall" "traceall: read traps -> OK" "$out"
-check_contains "...except rt_sigreturn" \
-    "traceall: rt_sigreturn stays native -> OK" "$out"
-check_contains "...and thread creation" \
-    "traceall: thread clone stays native -> OK" "$out"
-check_contains "a tracer traps only on wait and signal-sending" \
-    "tracer: wait4 traps -> OK" "$out"
-check_contains "...and nothing else" "tracer: read stays native -> OK" "$out"
 
 PT_DIR=$(mktemp -d)
 PT_GUEST="$PT_DIR/pt_guest"
@@ -91,7 +19,7 @@ PT_ORACLE="$PT_DIR/pt_oracle"
 # The oracle: on a host that runs AArch64 binaries directly, the guest build
 # itself (no chroot-ng in the way); otherwise a host-native build.
 pt_oracle_build() {
-    if [ -z "$CHROOTNG_QEMU" ]; then
+    if [ -z "$CHROOTNG_EMU" ]; then
         PT_ORACLE=$PT_GUEST
         return 0
     fi
@@ -108,10 +36,10 @@ pt_oracle_build() {
 # One scenario, both ways. Each side is given its own binary's path after the
 # scenario name (the exec scenarios re-exec themselves).
 #
-# The guest side runs under -R unless PT_TIER says otherwise; the SIGSYS tier
-# needs a view with something in it (an identity view installs no monitor),
-# which an identity bind of the scratch directory is.
-PT_TIER=-R
+# The guest side runs on the SIGSYS tier, which needs a view with something in
+# it (an identity view installs no monitor): an identity bind of the scratch
+# directory is one.
+PT_TIER="-b $PT_DIR:$PT_DIR"
 PT_TIER_NAME=
 
 # pt_case SCENARIO [LACKING WHY] — LACKING is the line the kernel side prints
@@ -120,7 +48,7 @@ PT_TIER_NAME=
 # advertises, not as the one underneath, so the leg is skipped, saying WHY.
 pt_case() {
     _sc=$1
-    _oracle_out=$(cd "$PT_DIR" && timeout 60 "./$(basename "$PT_ORACLE")" \
+    _oracle_out=$(cd "$PT_DIR" && timeout -s KILL 60 "./$(basename "$PT_ORACLE")" \
         "$_sc" "./$(basename "$PT_ORACLE")" 2>/dev/null)
     if [ -n "${2:-}" ]; then
         case "$_oracle_out" in
@@ -143,10 +71,7 @@ pt_case() {
     fi
 }
 
-if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "${CHROOTNG_GUESTLD:-}" != "-static-pie" ] &&
-    [ "${CHROOTNG_GUESTLD:-}" != "-static" ]; then
-    skip "ptrace: the guest links dynamically and no filter is live, so the tracee's syscalls are not intercepted here"
-elif ! guest_cc_report "$PT_GUEST" tests/chroot-ng/guests/pt_probe.c; then
+if ! guest_cc_report "$PT_GUEST" tests/chroot-ng/guests/pt_probe.c; then
     :
 elif ! pt_oracle_build; then
     skip "ptrace: no host compiler for the differential oracle"
@@ -196,7 +121,7 @@ else
     # and written, and the length rules GETREGSET applies to every regset.
     # crashpad reads it from every thread of a crashed process, and every
     # attach stop answered EINVAL: the stop had not kept the signal frame the
-    # registers were in, and a trampoline stop had none to keep. The frame's
+    # registers were in, and a stop without one had none to keep. The frame's
     # FPSIMD record was also read as if it were the ptrace layout, so even a
     # stop that had one returned the registers shifted and lost a write.
     pt_case fpregs
@@ -204,7 +129,7 @@ else
     # a write of it ignored on a CPU without SME. The emulation gave one word,
     # so a two-word read was cut short and a write of 16 bytes refused. The
     # regset is AArch64's: an x86-64 kernel has none to compare with.
-    if [ -z "$CHROOTNG_QEMU" ]; then
+    if [ -z "$CHROOTNG_EMU" ]; then
         pt_case tls "tls get 16: iov_len 8" \
             "the host kernel predates the two-word NT_ARM_TLS (5.19), so it is no reference"
     else
@@ -216,7 +141,7 @@ else
     # one at a time; a death by signal with its PTRACE_EVENT_EXIT; a signal
     # the tracer substitutes delivered by its own disposition with no second
     # stop, a substituted SIGSTOP making a group stop. A call made from guest
-    # context (-R, and a bounced one) was stopped in the middle of, ahead of
+    # context (a bounced one) was stopped in the middle of, ahead of
     # its exit stop; the second of two signals nested over the first; the
     # exit event was skipped; a substitute was raised anew -- stopped for
     # again, and a SIGSTOP stopped the process for real.
@@ -239,9 +164,14 @@ else
     # read cut short by a signal -- ERESTARTSYS at its exit stop, the signal's
     # stop at the svc with x0 as the read was made, the restart that read.
     # Both are AArch64's: an x86-64 kernel shows neither.
-    if [ -z "$CHROOTNG_QEMU" ]; then
+    if [ -z "$CHROOTNG_EMU" ]; then
         pt_case scnum
-        pt_case restart
+        # The restart is made with x0 as the tracer left it at the entry stop,
+        # since e057b9477232 (orig_x0 kept in step with it, in every stable
+        # kernel) -- the answer the emulation gives; a kernel before it
+        # restarts the read as it was made.
+        pt_case restart "signal stop: pc at the svc, x0 own" \
+            "the host kernel predates e057b9477232 (orig_x0 follows a tracer's x0), so it is no reference"
     else
         skip "ptrace scnum, restart: NT_ARM_SYSTEM_CALL and arm64's restart are AArch64's, and the oracle here is an x86-64 kernel"
     fi
@@ -314,17 +244,11 @@ else
     # mirrors. Both leave a guest waiting on children the kernel was supposed to
     # have discarded.
     pt_case sigchld
-    # The SA_NOCLDWAIT half is split off because qemu-user cannot host it:
-    # measured, with no chroot-ng in the picture, a plain qemu-aarch64 run of a
-    # bare SA_NOCLDWAIT program reaps the child by wait() where the host kernel
-    # answers ECHILD. qemu installs its own handler for every caught signal with
-    # sa_flags = SA_SIGINFO and nothing else, so the flag never reaches the host
-    # kernel and neither side of the comparison would mean anything.
-    if [ -z "$CHROOTNG_QEMU" ]; then
-        pt_case sigchldw
-    else
-        skip "ptrace sigchld SA_NOCLDWAIT: qemu-user drops the flag before the kernel sees it"
-    fi
+    # The SA_NOCLDWAIT half, split off when qemu-user ran the suite: it
+    # installs its own handler for every caught signal with SA_SIGINFO alone,
+    # so the flag never reached the host kernel. arm64emu, the runner on a
+    # foreign host now, carries it.
+    pt_case sigchldw
     # waitid names the states it will accept and the kernel honours each one
     # separately. The emulation gated its whole registry on WSTOPPED, so a wait
     # asking only for stops could be handed an exit, and one asking only for
@@ -355,83 +279,24 @@ else
     # TRACEVFORKDONE; it was reported for every vfork.
     pt_case options
 
-    # ...and every scenario again on the SIGSYS tier, which is the one a device
-    # runs without -R: a trapped call is made from the handler there, a call
-    # that can block is bounced to guest context, and the frames a stop reads
-    # are the kernel's. The legs above run under -R, so without these that tier
-    # had only the synthesized traps of -t ptracetest. Without a live filter
-    # nothing traps and the legs would be native.
-    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
-        PT_TIER="-b $PT_DIR:$PT_DIR"
-        PT_TIER_NAME=" (SIGSYS tier)"
-        for _sc in basic sysstop cancel poke signal deliver fork exec \
-            execstart patharg exitstop break step step2 attach fpregs blocked \
-            blockedmask blockspin threadafter forkafter spinafter attachmany \
-            sigact sigchld sigchldw waitid waitnowait options sigafter \
-            sigdeath sigpair subst execsys execsys0 forksys waitrestart \
-            jobctl; do
-            pt_case "$_sc"
-        done
-        if [ -z "$CHROOTNG_QEMU" ]; then
-            pt_case scnum
-            pt_case restart
-        fi
-        pt_case sysinfo "syscall_info unsupported" \
-            "the host kernel predates PTRACE_GET_SYSCALL_INFO (5.3), so it is no reference"
-        if [ -z "$CHROOTNG_QEMU" ]; then
-            pt_case tls "tls get 16: iov_len 8" \
-                "the host kernel predates the two-word NT_ARM_TLS (5.19), so it is no reference"
-        fi
-        pt_case vmrw "vmrw wrapcnt EINVAL" \
-            "the host kernel refuses an iovec count it does not narrow first (pre-import_iovec), so it is no reference"
-        PT_TIER=-R
-        PT_TIER_NAME=
-    else
-        skip "ptrace on the SIGSYS tier: the seccomp filter is inert here"
-    fi
-
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's
     # own string rather than the translated host path.
     mkdir -p "$PT_DIR/rootfs"
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 90 -R $CHROOTNG_GUEST_BINDS -b "$PT_DIR:$PT_DIR" "$PT_DIR/rootfs" \
+    out=$(run_t 90 $CHROOTNG_GUEST_BINDS -b "$PT_DIR:$PT_DIR" "$PT_DIR/rootfs" \
         "$PT_GUEST" patharg 2>/dev/null)
     check_contains "no host path reaches the trace under a rootfs" \
         "openat path /cng-probe-path" "$out"
-
-    # --no-ptrace refuses instead of emulating, and says so the way the kernel
-    # does when it refuses: EPERM, which every tracer reports rather than
-    # misinterpreting.
-    out=$(run_t 60 --no-ptrace -R / "$PT_GUEST" basic 2>&1)
-    check_contains "--no-ptrace refuses the guest tracer" "bad first stop" "$out"
-
-    # ...and without -R, which is the case the option was inert in: the monitor
-    # was installed only when there was a path to translate, so over an identity
-    # rootfs with nothing else asked for, --no-ptrace set its flag and no trap
-    # ever consulted it. The guest's ptrace went to the host kernel and worked.
-    # Only a live seccomp tier can show that: without one and without -R nothing
-    # is intercepted at all, which is what the following leg asks instead.
-    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
-        out=$(run_t 60 --no-ptrace / "$PT_GUEST" basic 2>&1)
-        check_contains "--no-ptrace refuses over the SIGSYS tier too" \
-            "bad first stop" "$out"
-    else
-        skip "m18 --no-ptrace without -R: the seccomp tier is inert here"
-    fi
 fi
 
 # Which options are worth installing a monitor for, over a rootfs that needs no
 # translation at all. An option that turns an emulation of ours OFF is already
 # honoured by there being no monitor; one whose whole effect is a trap of ours is
-# not — --no-ptrace has a ptrace to refuse, and --shared-proc has to publish each
-# forked guest process into the shared registry, which hangs off the trapped
-# clone. On a live host the monitor shows through PR_SET_NO_NEW_PRIVS, which
-# installing it sets and /proc/self/status reports. On a host whose seccomp tier
-# is inert the filter cannot go in at all, and an option that needs one is then
-# a refusal to enter the guest -- which is the same fact, told the only way an
-# inert host can tell it (it used to run the guest anyway, with the option
-# silently inert, behind a warning). A kernel before 4.10 has no NoNewPrivs line
+# not — --shared-proc has to publish each forked guest process into the shared
+# registry, which hangs off the trapped clone. The monitor shows through
+# PR_SET_NO_NEW_PRIVS, which installing it sets and /proc/self/status reports.
+# A kernel before 4.10 has no NoNewPrivs line
 # in /proc/self/status to show the bit through (Android 8's 3.18), and the
 # guest's own prctl is answered by the monitor, so there is no reading the bit
 # there at all.
@@ -446,24 +311,9 @@ else
     out=$(run_t 60 --no-proc / "$PT_DIR/nnprivs" 2>/dev/null)
     check_contains "...nor does an option that only turns an emulation off" \
         "nnp=0" "$out"
-    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ]; then
-        out=$(run_t 60 --no-ptrace / "$PT_DIR/nnprivs" 2>/dev/null)
-        check_contains "--no-ptrace installs one: it has a ptrace to refuse" \
-            "nnp=1" "$out"
-        out=$(run_t 60 --shared-proc / "$PT_DIR/nnprivs" 2>/dev/null)
-        check_contains "--shared-proc installs one: forks must reach the registry" \
-            "nnp=1" "$out"
-    else
-        out=$(run_t 60 --no-ptrace / "$PT_DIR/nnprivs" 2>&1); rc=$?
-        check "--no-ptrace wants one: with none to be had, the guest is not entered" 1 $rc
-        check_contains "...and the refusal says so" \
-            "cannot install the seccomp monitor" "$out"
-        check_absent "...before the guest could run with ptrace unrefused" \
-            "nnp=" "$out"
-        out=$(run_t 60 --shared-proc / "$PT_DIR/nnprivs" 2>&1); rc=$?
-        check "--shared-proc wants one: with none to be had, the guest is not entered" 1 $rc
-        check_absent "...before the guest could fork unpublished" "nnp=" "$out"
-    fi
+    out=$(run_t 60 --shared-proc / "$PT_DIR/nnprivs" 2>/dev/null)
+    check_contains "--shared-proc installs one: forks must reach the registry" \
+        "nnp=1" "$out"
 fi
 
 rm -rf "$PT_DIR"

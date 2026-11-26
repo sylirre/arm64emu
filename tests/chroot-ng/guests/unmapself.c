@@ -7,15 +7,13 @@
  *     bionic _exit_with_stack_teardown: mov w8,#215; svc 0; mov x0,#0;
  *                                       mov w8,#93; svc 0
  *
- * bionic writes the number into w8, as every Android from 8 to 15 has it;
- * written here with x8, this passed while the rewriter recognised only that,
- * and rewrote the real thing.
+ * bionic writes the number into w8, as every Android from 8 to 15 has it, and
+ * a monitor that recognises the sequence has to know both spellings.
  *
  * Every detached thread of a musl or bionic program ends this way (the JVM's
- * all are, being created detached). The -R rewriter replaces each `svc` with a
- * branch to a trampoline, which builds its frame on the caller's stack and reads
- * every register back from it: after the munmap that stack is gone, and the
- * thread died of a SEGV on the way out — which takes the whole process with it.
+ * all are, being created detached). A monitor that needs the caller's stack at
+ * the exit — a trap whose signal frame goes there, say — finds it gone, and the
+ * thread dies of a SEGV on the way out, which takes the whole process with it.
  *
  * The sequence is written out here as it stands in libc, and run on a stack the
  * guest mapped for the purpose, so what is asked is the thread's exit and not

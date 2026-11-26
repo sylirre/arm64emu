@@ -54,7 +54,7 @@ else
     if [ -z "$base" ]; then
         skip "rtnetlink legs: the unemulated guest produced no output at all"
     else
-        em=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/netif 2>/dev/null)
+        em=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/netif 2>/dev/null)
 
         # --- 1. the emulation's own properties, assertable on any host ------
         check_contains "m16 getifaddrs works under the emulation" \
@@ -158,14 +158,14 @@ else
 
             # Without forcing, rtnetlink works here, so the emulation must stay
             # out of the way entirely rather than shadowing a working kernel.
-            pt=$(m16run -R "$R" /bin/netif 2>/dev/null)
+            pt=$(m16run "$R" /bin/netif 2>/dev/null)
             if [ "$pt" = "$base" ]; then
                 pass=$((pass + 1)); echo "  ok   m16 passthrough is unchanged"
             else
                 fail=$((fail + 1)); echo "  FAIL m16 passthrough is unchanged"
                 echo "    got: $pt"
             fi
-            dbg=$(CHROOTNG_DEBUG=1 m16run -R "$R" /bin/netif 2>&1 \
+            dbg=$(CHROOTNG_DEBUG=1 m16run "$R" /bin/netif 2>&1 \
                 >/dev/null | grep -c 'netlink: emulating')
             check "m16 the emulation does not engage where rtnetlink works" \
                 0 "$dbg"
@@ -175,8 +175,8 @@ else
             # rescued, and still was.
             printf '  (this kernel refuses the raw path: %s)\n' \
                 "$(printf %s "$base" | tr '\n' ' ')"
-            pt=$(m16run -R "$R" /bin/netif 2>/dev/null)
-            dbg=$(CHROOTNG_DEBUG=1 m16run -R "$R" /bin/netif 2>&1 \
+            pt=$(m16run "$R" /bin/netif 2>/dev/null)
+            dbg=$(CHROOTNG_DEBUG=1 m16run "$R" /bin/netif 2>&1 \
                 >/dev/null | grep -c 'netlink: emulating')
             if [ "$dbg" -gt 0 ]; then
                 pass=$((pass + 1))
@@ -212,7 +212,7 @@ else
         #    listing.
         if guest_cc "$M16D/nldone" tests/chroot-ng/guests/nldone.c; then
             cp "$M16D/nldone" "$R/bin/nldone"
-            kem=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nldone \
+            kem=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nldone \
                 2>/dev/null)
             check_contains "m16 the dump satisfies iproute2's contract" \
                 "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
@@ -232,7 +232,7 @@ else
                 # The on-device acceptance bar, and literally what makes `ip
                 # addr` print anything there: unforced, over whatever the kernel
                 # does allow, the contract still has to hold.
-                knf=$(m16run -R "$R" /bin/nldone 2>/dev/null)
+                knf=$(m16run "$R" /bin/nldone 2>/dev/null)
                 check_contains "m16 unforced: the dump contract holds on a refusing kernel" \
                     "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
                     "$knf"
@@ -242,12 +242,12 @@ else
             # RTM_GETLINK must be synthesized from the address dump plus
             # ioctls, not degraded to an empty dump that `ip addr` renders as
             # total silence. CHROOTNG_NETLINK_DENY_GETLINK simulates that split.
-            kdg=$(CHROOTNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/nldone \
+            kdg=$(CHROOTNG_NETLINK_DENY_GETLINK=1 m16run "$R" /bin/nldone \
                 2>/dev/null)
             check_contains "m16 a refused RTM_GETLINK is synthesized" \
                 "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
                 "$kdg"
-            edg=$(CHROOTNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/netif \
+            edg=$(CHROOTNG_NETLINK_DENY_GETLINK=1 m16run "$R" /bin/netif \
                 2>/dev/null)
             check_contains "m16 getifaddrs works over a synthesized link dump" \
                 "getifaddrs: ok" "$edg"
@@ -256,7 +256,7 @@ else
             # With no relay at all the guest still gets a well-formed dump
             # presenting loopback — the oracle's exact degradation when even
             # getifaddrs fails, and what bubblewrap/glibc want to see.
-            knr=$(CHROOTNG_NETLINK_NO_RELAY=1 m16run -R "$R" /bin/nldone \
+            knr=$(CHROOTNG_NETLINK_NO_RELAY=1 m16run "$R" /bin/nldone \
                 2>/dev/null)
             check_contains "m16 a relay-less dump presents loopback only" \
                 "nldone: done=1 done_len_ok=1 links>0=1 named>0=1 skipped=0" \
@@ -264,7 +264,7 @@ else
             # ...and the ioctl view degrades with it, to the same one interface.
             # Without that, `ifconfig` would still be listing the host's real
             # network while `ip addr` showed loopback alone.
-            enr=$(CHROOTNG_NETLINK_NO_RELAY=1 m16run -R "$R" /bin/netif 2>/dev/null)
+            enr=$(CHROOTNG_NETLINK_NO_RELAY=1 m16run "$R" /bin/netif 2>/dev/null)
             check_contains "m16 a relay-less SIOCGIFCONF presents loopback only" \
                 "ifcount: 1" "$enr"
             check_contains "m16 that loopback carries 127.0.0.1" \
@@ -277,7 +277,7 @@ else
             # one interface line and one inet line, under the Android split.
             M16_ALPINE="${M16_ALPINE:-$CHROOTNG_ALPINE}"
             if [ -n "$M16_ALPINE" ] && [ -x "$M16_ALPINE/bin/busybox" ]; then
-                bb=$(CHROOTNG_NETLINK_DENY_GETLINK=1 run_t 60 -R \
+                bb=$(CHROOTNG_NETLINK_DENY_GETLINK=1 run_t 60 \
                     "$M16_ALPINE" /bin/busybox ip addr 2>/dev/null)
                 check_contains "m16 busybox ip addr lists loopback" \
                     ": lo: <LOOPBACK,UP" "$bb"
@@ -311,7 +311,7 @@ else
         # Forced: the refusal Android returns, turned into the one the tools
         # survive. EPROTONOSUPPORT is 93 -- what netlink_create itself returns
         # for a protocol nobody registered, i.e. a kernel built without audit.
-        ad=$(CHROOTNG_NETLINK_DENY_AUDIT=1 m16run -R "$R" /bin/auditsock 2>/dev/null)
+        ad=$(CHROOTNG_NETLINK_DENY_AUDIT=1 m16run "$R" /bin/auditsock 2>/dev/null)
         check_contains "m16c a refused audit socket reads as 'no audit in this kernel'" \
             "audit: open=0 errno=93 survives=1" "$ad"
         # ...and it is that narrow: no other socket is touched by the answer.
@@ -322,7 +322,7 @@ else
             # This kernel grants the socket (audit built in, no policy in the
             # way). Then there is no refusal to rephrase and the guest must see
             # exactly what it would have seen unemulated.
-            apt=$(m16run -R "$R" /bin/auditsock 2>/dev/null | grep '^audit:')
+            apt=$(m16run "$R" /bin/auditsock 2>/dev/null | grep '^audit:')
             if [ "$apt" = "$abase" ]; then
                 pass=$((pass + 1))
                 echo "  ok   m16c a granted audit socket is passed through untouched"
@@ -338,7 +338,7 @@ else
             # asked -- the on-device acceptance bar, and the whole reason
             # `useradd` aborts there today.
             printf '  (this kernel refuses the audit socket: %s)\n' "$abase"
-            apt=$(m16run -R "$R" /bin/auditsock 2>/dev/null)
+            apt=$(m16run "$R" /bin/auditsock 2>/dev/null)
             check_contains "m16c unforced: the refusal is rephrased where the kernel refuses it" \
                 "audit: open=0 errno=93 survives=1" "$apt"
         fi
@@ -356,7 +356,7 @@ else
     # debug log names every socket it stands in for, and all 36 must be there.
     if guest_cc "$M16D/nlmany" tests/chroot-ng/guests/nlmany.c -pthread; then
         cp "$M16D/nlmany" "$R/bin/nlmany"
-        many=$(CHROOTNG_DEBUG=1 CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlmany 2>"$M16D/nlmany.err")
+        many=$(CHROOTNG_DEBUG=1 CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlmany 2>"$M16D/nlmany.err")
         check_contains "m16 twelve emulated sockets at once, reopened, and from four threads" \
             "many: opened=12 dumps=12 reopened=12 redumps=12 threaded=1" "$many"
         check "m16 ...and every one of the 36 was the emulation's" \
@@ -383,7 +383,7 @@ else
     # every socket the emulation stands in for.
     if guest_cc "$M16D/nlchurn" tests/chroot-ng/guests/nlchurn.c -pthread; then
         cp "$M16D/nlchurn" "$R/bin/nlchurn"
-        st=$(CHROOTNG_DEBUG=1 CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlchurn \
+        st=$(CHROOTNG_DEBUG=1 CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlchurn \
             2>"$M16D/nlchurn.err")
         check_contains "m16 sockets opened and closed by eight threads stay emulated" \
             "nlchurn: sockets=3600 bad=0" "$st"
@@ -405,7 +405,7 @@ else
     # own; the legs stand for what they check.)
     if guest_cc "$M16D/nlstale" tests/chroot-ng/guests/nlstale.c; then
         cp "$M16D/nlstale" "$R/bin/nlstale"
-        st=$(CHROOTNG_DEBUG=1 CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlstale \
+        st=$(CHROOTNG_DEBUG=1 CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlstale \
             2>"$M16D/nlstale.err")
         check_contains "m16 a close-all loop costs the guest none of its own files" \
             "closeall: dump=1 files=16 reclaim=-1/88 kept=16 redump=1" "$st"
@@ -434,7 +434,7 @@ else
     # build leaves its one relay behind every round, and more when it races.
     if guest_cc "$M16D/nlrace" tests/chroot-ng/guests/nlrace.c -pthread; then
         cp "$M16D/nlrace" "$R/bin/nlrace"
-        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlrace 2>/dev/null)
+        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlrace 2>/dev/null)
         check_contains "m16 concurrent relays leave no relay socket behind" \
             "nlrace: rounds=60 left=0 leaked=0" "$st"
     else
@@ -467,7 +467,7 @@ recvmsg -1: r=-1 e=22 then=1
 recvmmsg: r=2 namelen=12 family=16 pid=0 namelen0=12 b=aa'
     if guest_cc "$M16D/nladdr" tests/chroot-ng/guests/nladdr.c; then
         cp "$M16D/nladdr" "$R/bin/nladdr"
-        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nladdr 2>/dev/null)
+        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nladdr 2>/dev/null)
         if [ "$st" = "$nladdr_want" ]; then
             pass=$((pass + 1))
             echo "  ok   m16 an emulated socket hands its address back as the kernel does"
@@ -512,7 +512,7 @@ badiov: r=-1 e=14 then=1
 recvmmsg: r=1 len=32 second=1 flags=0x20 controllen=0'
     if guest_cc "$M16D/nlhdr" tests/chroot-ng/guests/nlhdr.c; then
         cp "$M16D/nlhdr" "$R/bin/nlhdr"
-        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlhdr 2>/dev/null)
+        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlhdr 2>/dev/null)
         if [ "$st" = "$nlhdr_want" ]; then
             pass=$((pass + 1))
             echo "  ok   m16 an emulated recvmsg writes its header as the kernel does"
@@ -548,19 +548,9 @@ writev: route=24 oif=1
 sendmmsg: sent=1 route=24 oif=1'
     if guest_cc "$M16D/nlrw" tests/chroot-ng/guests/nlrw.c; then
         cp "$M16D/nlrw" "$R/bin/nlrw"
-        for _tier in -R plain; do
-            if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-                skip "m16 netlink requests by write(2), seccomp tier: the filter is inert here"
-                continue
-            fi
-            _opt=""
-            [ "$_tier" = -R ] && _opt=-R
-            # shellcheck disable=SC2086  # $_opt is a flag or deliberately empty
-            st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run $_opt "$R" /bin/nlrw \
-                2>/dev/null)
-            check "m16 requests by write(2), poll(2), writev(2), sendmmsg(2) are served ($_tier)" \
-                "$nlrw_want" "$st"
-        done
+        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlrw 2>/dev/null)
+        check "m16 requests by write(2), poll(2), writev(2), sendmmsg(2) are served" \
+            "$nlrw_want" "$st"
         if [ "$m16_raw" = 1 ]; then
             kst=$(emu_t 60 "$M16D/nlrw" 2>/dev/null)
             check "m16 ...and the kernel here answers the same" "$nlrw_want" "$kst"
@@ -586,10 +576,10 @@ getroute: objects=1 errors=0 acks=0 dones=0 more=0
 dump ack: objects>0=1 errors=0 acks=0 dones=1 more=0'
     if guest_cc "$M16D/nlack" tests/chroot-ng/guests/nlack.c; then
         cp "$M16D/nlack" "$R/bin/nlack"
-        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlack 2>/dev/null)
+        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlack 2>/dev/null)
         check "m16 a get that asks for an ACK gets one after its answer, a dump none" \
             "$nlack_want" "$st"
-        st=$(CHROOTNG_NETLINK_DENY_GETLINK=1 m16run -R "$R" /bin/nlack 2>/dev/null)
+        st=$(CHROOTNG_NETLINK_DENY_GETLINK=1 m16run "$R" /bin/nlack 2>/dev/null)
         check "m16 ...and so does a synthesized one" "$nlack_want" "$st"
         # A request the emulation does not model (bubblewrap's RTM_NEWADDR of
         # 127.0.0.1 on lo) is acked as a success, with the same ACK a get gets.
@@ -597,7 +587,7 @@ dump ack: objects>0=1 errors=0 acks=0 dones=1 more=0'
         # host. A kernel is no reference here: it answers an unprivileged
         # caller EPERM (Android's policy refuses the send, EACCES), and root
         # finds the address already there.
-        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/nlack unmodelled \
+        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/nlack unmodelled \
             2>/dev/null)
         check "m16 a request it does not model is acked as a current kernel acks" \
             'newaddr ack: objects=0 errors=0 acks=1 dones=0 more=0 ack=0 flags=0x100 len=36 echo=20/32/0x605/6' \
@@ -624,7 +614,7 @@ dump ack: objects>0=1 errors=0 acks=0 dones=1 more=0'
 
     # The interface-query band is all cng_nl_ioctl answers for. Every other
     # request used to be taken for an ifreq as well wherever the dispatcher saw
-    # it (all of them under -R, and every request at a patched site), so a NULL
+    # it (all of them for a tracee, which traps everything), so a NULL
     # argument, or one at the end of a mapping, was EFAULT where the host
     # answers: once anything had asked for the interface list, TIOCSCTTY,
     # FIONCLEX and FIONREAD stopped working on Android. The text is a kernel's.
@@ -634,7 +624,7 @@ fionclex=0 cloexec=0
 fionread_edge=0 n=3'
     if guest_cc "$M16D/ioctlband" tests/chroot-ng/guests/ioctlband.c; then
         cp "$M16D/ioctlband" "$R/bin/ioctlband"
-        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run -R "$R" /bin/ioctlband 2>/dev/null)
+        st=$(CHROOTNG_NETLINK_FORCE_BLOCK=1 m16run "$R" /bin/ioctlband 2>/dev/null)
         if [ "$st" = "$ioctlband_want" ]; then
             pass=$((pass + 1))
             echo "  ok   m16 an ioctl beside the interface band is the host's, whatever its argument"

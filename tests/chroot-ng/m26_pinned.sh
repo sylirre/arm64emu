@@ -14,24 +14,6 @@ echo "== M26: pinned resolution =="
 m26run() { run_t 120 $CHROOTNG_GUEST_BINDS "$@"; }
 M26D=$(mktemp -d)
 
-# The pin asked directly (-t pintest), on a tree under a rootfs of its own:
-# the forms no guest can be made to produce to order — a spelling the
-# readback does not agree with (the descriptor walk decides), the race held
-# still (a link where the walk saw a directory, on the way and at the leaf),
-# the trailing slash, what is left unpinned, and the kernel's order of
-# refusals for a name whose directory cannot be pinned.
-PTR=$(mktemp -d)
-out=$(run_t 60 -t pintest -r "$PTR" 2>&1); rc=$?
-check "m26 pintest overall" 0 "$rc"
-for _leg in "plain: rc=0 names_dir=1" "respelled: rc=0 names_dir=1" \
-    "trailing slash: dir leaf=0 file leaf=-20" \
-    "link in the way: dir=-40 leaf=-40" \
-    "unpinned and missing: missing=-2 notdir=-20" \
-    "errno order: badflags=-22 missing=-2 unlink_badflags=-22 present=0"; do
-    check_contains "m26 pin $_leg" "pintest $_leg -> OK" "$out"
-done
-rm -rf "$PTR"
-
 if ! guest_xlate_ready "pinned-resolution legs"; then
     :
 else
@@ -55,7 +37,7 @@ else
         ln -s HOST "$H/lnk"
         : > "$H/victim"
         head -c 100 /dev/zero > "$H/big"
-        out=$(m26run -R "$R" /bin/pathrace "$H" 4 2>/dev/null)
+        out=$(m26run "$R" /bin/pathrace "$H" 4 2>/dev/null)
         check_contains "m26 the race never reaches the host: no family answers for it" \
             " host=0 " "$out"
         check_absent "m26 ...and the run exercised the families at all" \
@@ -86,11 +68,11 @@ else
     if guest_cc "$M26D/uxreply" tests/chroot-ng/guests/uxreply.c; then
         R=$(mktemp -d); mkdir -p "$R/bin" "$R/run"
         cp "$M26D/uxreply" "$R/bin/uxreply"
-        m26run -R "$R" /bin/uxreply server /run/srv.sock >"$M26D/srv.out" \
+        m26run "$R" /bin/uxreply server /run/srv.sock >"$M26D/srv.out" \
             2>/dev/null &
         m26bg=$!
         sleep 2
-        cl=$(m26run -R "$R" /bin/uxreply client /run/srv.sock /run/cli.sock \
+        cl=$(m26run "$R" /bin/uxreply client /run/srv.sock /run/cli.sock \
             2>/dev/null)
         wait $m26bg 2>/dev/null
         sv=$(cat "$M26D/srv.out")

@@ -5068,12 +5068,91 @@ kernel 3.18 (Galaxy S7).
     dev host (qemu-aarch64, -R), none failing. The devices went offline
     before a re-run.
 
+- [x] **M112 — one tier, one runner: -R, --probe, -t, -L and --no-ptrace go**
+  - The first step of merging chroot-ng into arm64emu as `arm64emu chroot
+    --native` (docs/arm64emu, the native-tier plan). The seccomp/SIGSYS tier
+    is the only interception now: `-R`'s svc rewriting (tramp.S, rewrite.c,
+    the pools and the lazy patch through /proc/self/mem) measured slower
+    than the trap for every untranslated call on a device (~800 ns against
+    ~350 ns for getppid), and was the one tier that wrote the guest's text.
+    `--probe`, the `-t` self-tests (debug.c), `-L` and `--no-ptrace` went
+    with it. A monitor that cannot be installed is a refusal to run, always.
+  - The x86 runner is arm64emu's chroot mode (`--jit --keep-fds
+    --shared-proc`, the environment forwarded with `-E`): it applies a
+    guest's filter, RET_TRAP and SIGSYS included, so the SIGSYS tier is live
+    on the dev host for the first time. Its first run found arm64emu's
+    fidelity gaps (fixed there: 3075a9d4) and one latent bug here: a call
+    bounced to guest context made its blocking svc at the bounce record,
+    above the dispatch's own frames, so a guest handler's signal frame
+    landed on their return addresses; the kernel writes only the parts of a
+    frame it uses, which is all that kept it alive on hardware. The svc is
+    made below every live frame now (scratch_gsp).
+  - M8's rows that were not about the rewriting are asked of the trap tier
+    now (m8_context.sh): threads, vfork-style clones, interrupted waits, an
+    ET_EXEC exec chain, calls on small stacks, a thread that frees its own
+    stack. Gone with the tier: the trampoline's register and gap checks, the
+    lazy patcher's (lazystale.c, belowsp.c).
+  - What the self-tests drove is asked by guests where it can be: the
+    designed-ENOSYS set (denied.c), the prctl view (prctlview.c), the kernel
+    identity (unameview.c), overlay entries under full read buffers
+    (getdents.c), an execmap copy past EOF (pasteof.c); the path view --
+    the rootfs, binds, symlinks, chroot, the /dev zone, fd links, xattr and
+    inotify containment, faccessat's forms -- by viewpath.c and the :ro
+    binds by robind.c (m5_view.sh, whose every robind leg a 6.8 kernel's own
+    read-only bind mount passes); exectest's exec variants by execvar.c and
+    the malformed headers elfspan and elfinterp built by elfbad.c. Dropped
+    without a guest yet: the fake-id and l2s engine drivers (much of both
+    covered by M7/M9/M10/M28's guests), the /proc, SysV shm/sem/msg and
+    fault drivers, the BPF shape (bpftest), ptrace's step decoder and
+    native-wait kicks, the stack-switch and nested-SIGSYS drivers (the
+    context switch is rewritten next), imgtest (the image's fixed address
+    goes in the hosted build), and openat2's pre-reissue legs.
+  - The new guests found two bugs here. A link of a followed fd link
+    (`linkat("/proc/self/fd/N", AT_SYMLINK_FOLLOW)`, the O_TMPFILE publish
+    idiom that needs no capability) linked the procfs symlink itself:
+    EXDEV. And a `#!` file was read before its mode was judged, so a script
+    of mode 0644 ran; it is EACCES, as the program at the end of a chain is.
+
+- [x] **M113 — exe, cwd and root asked about as links, and a thread's own directory**
+  - A /proc/<pid>/{exe,cwd,root} the guest named was its target whatever
+    the call: lstat of /proc/self/exe described the program's file (`ls -l
+    /proc/self/` showed no links), O_NOFOLLOW opened it, and an unlink
+    of /proc/self/exe removed the program. Not followed -- the final
+    component of a NOFOLLOW lookup -- they are procfs's own symlinks now, to
+    describe or refuse (proc_view_link), as an fd link already was. A
+    readlinkat with an empty name, through an O_PATH|O_NOFOLLOW descriptor
+    of one, reads back the target the view gives (rl_canon), not the host's.
+  - /proc/<pid>/task/<tid>/ spells a thread's directory, which holds its
+    process's links, fd table, address space and mounts, and the walk always
+    arrives at it for /proc/thread-self. None of it was recognised: a
+    readlink of task/<tid>/exe and task/<tid>/cwd read back chroot-ng's binary
+    and the rootfs's host path, a stat of /proc/thread-self/exe was ENOENT,
+    and task/<tid>/{maps,mounts,mountinfo,cmdline,environ,auxv} were the
+    host's files. The prefix takes the task part (proc_pid_prefix), and the
+    synthesis serves a thread's files as its process's (task_kind).
+  - proclink.c (M7, differential) and the thread-directory rows of M11.
+
+- [x] **M114 — orig_x0 follows a tracer's x0 at the entry stop**
+  - e057b9477232 ("arm64: syscall: Ensure saved x0 is kept in-sync with
+    tracer updates", Cc stable, a CVE) makes a tracer's register write at a
+    call's entry stop, or its RET_TRACE stop, the call's orig_x0 as well,
+    for a call that is made: seccomp, audit and GET_SYSCALL_INFO see it, and
+    a restart after a signal is made with it. The VM rebooted into Ubuntu's
+    6.8.0-151, which has it, and M18's restart row diverged: the signal's
+    stop showed, and the restart made, the read as the guest made it where
+    the kernel has the tracer's. The entry stop's register writes keep
+    orig_x0 and the published first argument in step now (pt_orig_x0_sync);
+    arm64emu's emulated ptrace does the same. On a kernel without the fix
+    the row has no reference and says so.
+  - pt_probe's restart scenario waited for ever on a restart that blocks on
+    the tracer's descriptor; it feeds that descriptor a byte after a second.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
 - `make` builds (cross on x86_64, native on AArch64/Termux); `make run-chroot-ng
-  ARGS="..."` runs the result, under qemu-aarch64 only where the host needs it.
-- `make test-chroot-ng` runs `tests/chroot-ng/run.sh`. It runs on x86_64 (cross + qemu), on native
+  CHROOTNG_ARGS="..."` runs the result, under arm64emu only where the host needs it.
+- `make test-chroot-ng` runs `tests/chroot-ng/run.sh`. It runs on x86_64 (cross + arm64emu), on native
   AArch64 Linux, and under Termux; `tests/chroot-ng/lib.sh` resolves every host
   difference (emulator, guest toolchain and link mode, which translation tier is
   live, rootfs images) and the milestone scripts assert against what it found.
@@ -5085,10 +5164,7 @@ kernel 3.18 (Galaxy S7).
   diff against, so the assertions are that the emulation engages *unforced* and
   turns each refusal into a working dump — which is the on-device acceptance bar
   and the one thing a devbox cannot check.
-- qemu-user does NOT emulate guest seccomp filters faithfully → M5's mechanism
-  needs simulated-SIGSYS unit tests + real-hardware validation. Loader (M3/M4)
-  and path logic are fully qemu-testable. On an AArch64 host the harness detects
-  the live filter (`CHROOTNG_SECCOMP_LIVE`) and flips the legs that depend on it —
-  M8's no-`-R` control, for instance, expects chroot-ng to refuse to enter the
-  guest under qemu (no filter and no `-R` means nothing intercepts; see M42)
-  and a seccomp-translated open on a real kernel.
+- qemu-user does NOT apply guest seccomp filters, and since M112 chroot-ng
+  cannot run under it at all: the x86 runner is arm64emu's chroot mode, which
+  does. The harness checks the tier is live (`CHROOTNG_SECCOMP_LIVE`) and
+  stops where it is not.

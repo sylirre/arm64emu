@@ -14,7 +14,9 @@
  * kernel's answer, which is the oracle), and a page of this program's
  * read-only data as it was loaded. The last must say what the second says —
  * moved with its bytes kept, or EINVAL from a 5.7-5.12 kernel that moves no
- * file mapping this way. A kernel (or qemu-user) with no DONTUNMAP at all
+ * file mapping this way. The bytes are put back through /proc/self/mem, so a
+ * row before them says whether this host opens it ("mem r=<errno>"): where it
+ * does not, EINVAL is the answer too. A kernel (or qemu-user) with no DONTUNMAP at all
  * answers the first row EINVAL, and nothing else is asked.
  */
 #define _GNU_SOURCE
@@ -74,6 +76,11 @@ static int row(const char *tag, void *p) {
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     pg = sysconf(_SC_PAGESIZE);
+
+    int m = open("/proc/self/mem", O_RDWR);
+    printf("mem r=%d\n", m < 0 ? errno : 0);
+    if (m >= 0)
+        close(m);
 
     char *a = mmap(NULL, pg, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

@@ -50,8 +50,8 @@ int cng_hits_monitor(unsigned long addr, unsigned long len);
 /* Take the floor. Called once, from cng_run, immediately before the first guest
  * program is loaded — not merely before it runs, or the floor claims that
  * program's image and stack and goes on claiming those addresses after they are
- * given back. A `-t` self-test driver does not call it, so the reclaim stays
- * disarmed there, which is the safe direction. */
+ * given back. Until it is called the reclaim stays disarmed, which is the safe
+ * direction. */
 void cng_own_floor(void);
 
 /* Is the answer trustworthy enough to unmap on? Zero until the floor is taken,

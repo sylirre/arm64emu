@@ -42,7 +42,7 @@ else
     # SELinux refuses an app process even stat() on /dev/full — so the
     # precondition is checked the same way the injection checks it rather than
     # assumed.
-    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run "$M14_ALPINE" /bin/busybox sh -c \
         'ls /dev | tr "\n" " "' 2>/dev/null)
     for want in null zero full random urandom tty ptmx console pts shm fd \
                 stdin stdout stderr; do
@@ -83,15 +83,15 @@ else
     # from the injected one below.
     M14P=$(mktemp -d); cp -a "$M14_ALPINE/." "$M14P"
     : > "$M14P/dev/null"; : > "$M14P/dev/m14-physical"
-    got=$(run -R "$M14P" /bin/busybox sh -c \
+    got=$(run "$M14P" /bin/busybox sh -c \
         'ls /dev | grep -c "^null$"' 2>/dev/null)
     check "m14 a physically-present node is not duplicated" 1 "$got"
 
     # The nodes are usable, not just listed.
-    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run "$M14_ALPINE" /bin/busybox sh -c \
         'echo written-to-null > /dev/null && echo ok' 2>/dev/null)
     check_contains "m14 /dev/null is writable" "ok" "$got"
-    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run "$M14_ALPINE" /bin/busybox sh -c \
         'dd if=/dev/zero bs=4 count=1 2>/dev/null | wc -c' 2>/dev/null)
     check_contains "m14 /dev/zero reads" "4" "$got"
 
@@ -107,7 +107,7 @@ else
         break
     done
     if [ -n "$m14_dev" ]; then
-        got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+        got=$(run "$M14_ALPINE" /bin/busybox sh -c \
             "[ -e /dev/$m14_dev ] && echo reachable || echo contained" \
             2>/dev/null)
         check_contains \
@@ -120,7 +120,7 @@ else
     # --no-dev turns the whole zone off: /dev is the rootfs directory only, so
     # the guest's listing of it is the host's listing of the same directory —
     # the planted entries and nothing else.
-    got=$(run -R --no-dev "$M14P" /bin/busybox sh -c \
+    got=$(run --no-dev "$M14P" /bin/busybox sh -c \
         'ls /dev | tr "\n" " "' 2>/dev/null)
     check "m14 --no-dev lists only the rootfs /dev" \
         "$(LC_ALL=C ls "$M14P/dev" | tr '\n' ' ')" "$got"
@@ -136,12 +136,12 @@ else
     # guest has, and /dev/fd/N already resolved under --no-proc. The directory
     # itself did not — it fell through to the /proc zone and vanished with it,
     # taking its listing entry along (busybox lstats each name it prints).
-    got=$(run -R --no-proc "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run --no-proc "$M14_ALPINE" /bin/busybox sh -c \
         '[ -d /dev/fd ] && echo have-dir; [ -e /dev/fd/1 ] && echo have-n' \
         2>/dev/null)
     check_contains "m14 --no-proc keeps /dev/fd a directory" "have-dir" "$got"
     check_contains "m14 --no-proc keeps /dev/fd/N" "have-n" "$got"
-    got=$(run -R --no-proc "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run --no-proc "$M14_ALPINE" /bin/busybox sh -c \
         'ls /dev | grep -c "^fd$"' 2>/dev/null)
     check "m14 --no-proc still lists fd" 1 "$got"
 
@@ -149,25 +149,25 @@ else
     # it was reachable by name but invisible to anything that enumerates first
     # (shell globbing, find, a package manager's tree walk).
     M14B=$(mktemp -d); printf x > "$M14B/marker"
-    got=$(run -R -b "$M14B":/hostdir "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run -b "$M14B":/hostdir "$M14_ALPINE" /bin/busybox sh -c \
         'ls / | grep -c "^hostdir$"' 2>/dev/null)
     check "m14 a bind mount point appears in its parent's listing" 1 "$got"
     # d_type comes from an lstat of the bind source, so `find -type d` agrees
     # with what an open of the same name gets.
-    got=$(run -R -b "$M14B":/hostdir "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run -b "$M14B":/hostdir "$M14_ALPINE" /bin/busybox sh -c \
         'find / -maxdepth 1 -name hostdir -type d | wc -l' 2>/dev/null)
     check "m14 the spliced entry carries a real d_type" 1 "$got"
-    got=$(run -R -b "$M14B":/hostdir "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run -b "$M14B":/hostdir "$M14_ALPINE" /bin/busybox sh -c \
         'cat /hostdir/marker' 2>/dev/null)
     check_contains "m14 the spliced mount point is usable" "x" "$got"
     rm -rf "$M14B"
 
     # The synthesized mount table gains the zone rows.
-    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run "$M14_ALPINE" /bin/busybox sh -c \
         'grep -c -e " /dev devtmpfs " -e " /dev/pts devpts " -e " /dev/shm tmpfs " /proc/mounts' \
         2>/dev/null)
     check "m14 the mount table lists the /dev zone" 3 "$got"
-    got=$(run -R --no-dev "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run --no-dev "$M14_ALPINE" /bin/busybox sh -c \
         'grep -c " /dev devtmpfs " /proc/mounts' 2>/dev/null)
     check "m14 --no-dev drops the /dev mount rows" 0 "$got"
 
@@ -178,7 +178,7 @@ else
     # shm_open and sem_open are an open() under /dev/shm and nothing else) was
     # told tmpfs and then given ENOENT. Whatever the table claims, a create
     # under it must work.
-    got=$(run -R "$M14_ALPINE" /bin/busybox sh -c \
+    got=$(run "$M14_ALPINE" /bin/busybox sh -c \
         'grep -q " /dev/shm tmpfs " /proc/mounts || { echo norow; exit 0; }
          echo SHM-PAYLOAD > /dev/shm/m14obj || { echo nocreate; exit 0; }
          cat /dev/shm/m14obj; ls /dev/shm | grep -c "^m14obj$"
@@ -191,7 +191,7 @@ else
     # it too: the guest's objects land in a per-uid directory under $TMPDIR and
     # nowhere near the host's own /dev/shm.
     M14T=$(mktemp -d)
-    got=$(TMPDIR="$M14T" CHROOTNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" \
+    got=$(TMPDIR="$M14T" CHROOTNG_DEVSHM_FORCE_TMP=1 run "$M14_ALPINE" \
         /bin/busybox sh -c \
         'echo STANDIN-PAYLOAD > /dev/shm/m14standin && cat /dev/shm/m14standin
          grep -q " /dev/shm tmpfs " /proc/mounts && echo row-kept' 2>/dev/null)
@@ -234,7 +234,7 @@ else
     m14_squat() { # desc, TMPDIR to use, dir the object must not reach
         M14X=$(mktemp -d)
         got=$(TMPDIR="$2" XDG_RUNTIME_DIR="$M14X" CHROOTNG_DEVSHM_FORCE_TMP=1 \
-            run -R "$M14_ALPINE" /bin/busybox sh -c \
+            run "$M14_ALPINE" /bin/busybox sh -c \
             'echo SQUAT > /dev/shm/m14squat && cat /dev/shm/m14squat' \
             2>/dev/null)
         if [ "$got" = "SQUAT" ] && [ ! -e "$3/m14squat" ] &&
@@ -275,7 +275,7 @@ else
         M14T=$(mktemp -d)
         chmod "$1" "$M14T"
         got=$(TMPDIR="$M14T" XDG_RUNTIME_DIR= CHROOTNG_TMP_ENV_ONLY=1 \
-            CHROOTNG_DEVSHM_FORCE_TMP=1 run -R "$M14_ALPINE" /bin/busybox sh -c \
+            CHROOTNG_DEVSHM_FORCE_TMP=1 run "$M14_ALPINE" /bin/busybox sh -c \
             '[ -e /dev/shm ] && echo has-shm || echo no-shm' 2>&1)
     }
     m14_tmpdir 0771
@@ -310,24 +310,30 @@ fi
 # to the end at three buffer sizes: the set of names must not depend on it.
 M14S=$(mktemp -d)
 M14SB=$(mktemp -d)
-i=0
-while [ $i -lt 60 ]; do : >"$M14S/file_with_a_longish_name_$i"; i=$((i + 1)); done
-m14_names() { # bufsz
-    run -t dtest -r "$M14S" -b "$M14SB":/zzbind dents / "$1" 2>&1 |
-        head -1 | tr ' ' '\n' | sort | tr '\n' ' '
-}
-m14_count() { echo "$1" | tr ' ' '\n' | grep -c .; }
-m14_big=$(m14_names 65536)
-m14_bign=$(m14_count "$m14_big")
-check_contains "m14 an overlay entry is listed with a large read buffer" \
-    " zzbind " "$m14_big"
-for bufsz in 256 128; do
-    m14_got=$(m14_names $bufsz)
-    check_contains "m14 ...and with a $bufsz-byte one" " zzbind " "$m14_got"
-    check "m14 ...listing the same names either way ($bufsz)" "$m14_bign" \
-        "$(m14_count "$m14_got")"
-done
-rm -rf "$M14S" "$M14SB"
+M14W=$(mktemp -d)
+if ! guest_xlate_ready "overlay entries in a full read buffer" ||
+    ! guest_cc_report "$M14S/getdents" tests/chroot-ng/guests/getdents.c; then
+    :
+else
+    cp "$M14S/getdents" "$M14W/getdents"
+    i=0
+    while [ $i -lt 60 ]; do : >"$M14S/file_with_a_longish_name_$i"; i=$((i + 1)); done
+    m14_names() { # bufsz
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        run $CHROOTNG_GUEST_BINDS -b "$M14SB":/zzbind "$M14S" /getdents / "$1" 2>&1 |
+            head -1 | tr ' ' '\n' | sort | tr '\n' ' '
+    }
+    m14_count() { echo "$1" | tr ' ' '\n' | grep -c .; }
+    m14_big=$(m14_names 65536)
+    m14_bign=$(m14_count "$m14_big")
+    check_contains "m14 an overlay entry is listed with a large read buffer" \
+        " zzbind " "$m14_big"
+    for bufsz in 256 128; do
+        m14_got=$(m14_names $bufsz)
+        check_contains "m14 ...and with a $bufsz-byte one" " zzbind " "$m14_got"
+        check "m14 ...listing the same names either way ($bufsz)" "$m14_bign" \
+            "$(m14_count "$m14_got")"
+    done
 
 # ...and the room the injection leaves has to admit at least one of the kernel's
 # own records. put_dent stops only when the *next* record does not fit, so what
@@ -344,22 +350,24 @@ rm -rf "$M14S" "$M14SB"
 # The /dev whitelist is 14 entries totalling 384 bytes, so the sizes below
 # bracket it: below it, across each cumulative record boundary, exactly at the
 # first size that fits everything, and well above.
-M14W=$(mktemp -d)
-mkdir -p "$M14W/dev"
-for bufsz in 32 64 128 184 200 256 376 400 408 512 65536; do
-    m14w=$(run_t 30 -t dtest -r "$M14W" dents /dev $bufsz 2>&1 | head -1 |
-        sed 's/^dents://')
-    check "m14 a $bufsz-byte getdents64 of /dev repeats no entry" "" \
-        "$(echo "$m14w" | tr ' ' '\n' | grep -v '^$' | sort | uniq -d |
-            tr '\n' ' ')"
-    check_contains "m14 ...and still reaches the directory's own entries ($bufsz)" \
-        " .. " "$m14w "
-done
-# The buffer is what bounds how many overlay records a first read can carry;
-# once one kernel record fits alongside the whole set, nothing is dropped.
-check_contains "m14 a buffer that holds the whole overlay lists all of it" \
-    " stderr " "$(run_t 30 -t dtest -r "$M14W" dents /dev 65536 2>&1 | head -1) "
-rm -rf "$M14W"
+    mkdir -p "$M14W/dev"
+    for bufsz in 32 64 128 184 200 256 376 400 408 512 65536; do
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        m14w=$(run_t 30 $CHROOTNG_GUEST_BINDS "$M14W" /getdents /dev $bufsz 2>&1 |
+            head -1 | sed 's/^dents://')
+        check "m14 a $bufsz-byte getdents64 of /dev repeats no entry" "" \
+            "$(echo "$m14w" | tr ' ' '\n' | grep -v '^$' | sort | uniq -d |
+                tr '\n' ' ')"
+        check_contains "m14 ...and still reaches the directory's own entries ($bufsz)" \
+            " .. " "$m14w "
+    done
+    # The buffer is what bounds how many overlay records a first read can carry;
+    # once one kernel record fits alongside the whole set, nothing is dropped.
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    check_contains "m14 a buffer that holds the whole overlay lists all of it" \
+        " stderr " "$(run_t 30 $CHROOTNG_GUEST_BINDS "$M14W" /getdents /dev 65536 2>&1 | head -1) "
+fi
+rm -rf "$M14S" "$M14SB" "$M14W"
 
 M14D=$(mktemp -d)
 M14DB=$(mktemp -d)
@@ -369,7 +377,7 @@ if ! guest_xlate_ready "dirfd-relative overlay legs"; then
     :
 elif guest_cc_report "$M14D/atoverlay" tests/chroot-ng/guests/atoverlay.c; then
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    out=$(run -R $CHROOTNG_GUEST_BINDS -b "$M14DB":/hostdir "$M14D" /atoverlay \
+    out=$(run $CHROOTNG_GUEST_BINDS -b "$M14DB":/hostdir "$M14D" /atoverlay \
         2>/dev/null)
     check_contains "m14 openat(dirfd(/dev), \"zero\") resolves" "dev-openat=ok" \
         "$out"
@@ -395,7 +403,7 @@ echo LEAK >"$M14N/dev/null/x"
 if [ -z "$M14_ALPINE" ] || [ ! -x "$M14_ALPINE/bin/busybox" ]; then
     skip "m14 a name under a device node: no alpine rootfs"
 else
-    out=$(run -R -b "$M14_ALPINE/bin":/bin -b "$M14_ALPINE/lib":/lib \
+    out=$(run -b "$M14_ALPINE/bin":/bin -b "$M14_ALPINE/lib":/lib \
         -b "$M14_ALPINE/usr":/usr "$M14N" /bin/busybox cat /dev/null/x 2>&1)
     check_absent "m14 a rootfs file under /dev/null is not reachable" "LEAK" \
         "$out"

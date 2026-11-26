@@ -3,9 +3,9 @@
 #
 # On an AArch64 host the interpreter is simply on the system paths, and with the
 # rootfs at "/" the loader resolves it directly. On a cross host it lives under
-# the toolchain sysroot instead, so chroot-ng is pointed at it with -L and ld.so
-# with LD_LIBRARY_PATH (M5 is what redirects ld.so's opens into a real guest
-# rootfs through the SIGSYS translator).
+# the toolchain sysroot instead, so the sysroot's directories are bound at the
+# paths the binary names (cng_dyn_binds), and ld.so is pointed at them with
+# LD_LIBRARY_PATH.
 echo "== M4: ul_exec loader (dynamic) =="
 
 GDIR=build/tests/chroot-ng
@@ -42,8 +42,9 @@ else
     # stack the loader built, and that environment is not inherited from the host
     # (M17-16) — so the host's copy of either variable would never arrive.
     if [ -n "$M4_SYSROOT" ]; then
-        out=$(run -L "$M4_SYSROOT" -E CHROOTNG_TEST=dyn \
-            -E LD_LIBRARY_PATH="$M4_SYSROOT/lib" \
+        cng_dyn_binds
+        # shellcheck disable=SC2086  # $GUEST_DYN_BINDS is a deliberately split arg list
+        out=$(run $GUEST_DYN_BINDS -E CHROOTNG_TEST=dyn -E LD_LIBRARY_PATH=/lib \
             / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
     else
         out=$(run -E CHROOTNG_TEST=dyn / "$GDIR/hello_dyn" XX YY 2>&1); rc=$?
@@ -52,15 +53,4 @@ else
     check_contains "ld.so bootstrapped main (argc)" "guest: argc=3" "$out"
     check_contains "dynamic argv forwarded" "guest: argv1=XX" "$out"
     check_contains "dynamic env forwarded" "guest: CHROOTNG_TEST=dyn" "$out"
-
-    # -L is a prefix the interpreter's own name is joined onto, and the join
-    # truncated at PATH_MAX. A cut path is a different path — one that may
-    # exist, and would then have been loaded as the interpreter — so the join
-    # refuses rather than shortening. Before, the shortened name reached the
-    # loader and the failure was reported about a path nobody typed.
-    m4_long="/$(printf '%4090s' '' | tr ' ' 'a')"
-    out=$(run -L "$m4_long" / "$GDIR/hello_dyn" 2>&1); rc=$?
-    check "an over-long --lib-prefix is refused" 1 $rc
-    check_contains "...as a length, not as a failure to load something else" \
-        "interpreter path is too long" "$out"
 fi

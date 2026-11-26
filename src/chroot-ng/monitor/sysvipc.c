@@ -90,8 +90,8 @@ static long ipc_wait_rpc(struct cng_breq *q, const void *payload, u64 plen,
             break;
         }
         /* Either the slice elapsed, or the wait was interrupted by an actual
-         * delivery. The latter only happens on the -R trampoline tier, which
-         * runs with the guest's own mask — and there the delivery IS the
+         * delivery. The latter only happens from guest context (a bounced
+         * dispatch), on the guest's own mask — and there the delivery IS the
          * interruption, since the handler has already run by the time ppoll
          * returns and the signal is no longer pending to be found. Under the
          * SIGSYS handler nothing can be delivered, so the slice is what makes

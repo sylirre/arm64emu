@@ -84,28 +84,19 @@ if guest_xlate_ready "fake-root DAC differential" &&
     # then the l2s emulation's, whose first link writes the source's
     # directory too. Elsewhere the host's own link is made and -l never
     # steps in, so the forced run below is what exercises that lend there.
-    for _run in -R plain l2s; do
+    for _run in plain l2s; do
         _label="fake root ($_run) is let through as root is"
-        if [ "$_run" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-            skip "$_label: the filter is inert here"
-            continue
-        fi
         _r=$(mktemp -d)
         cp "$DRD/dacroot" "$_r/"
         case $_run in
-        -R)
-            # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
-            got=$(run_t 120 -R -l -u 0:0 $CHROOTNG_GUEST_BINDS "$_r" /dacroot / \
-                2>/dev/null)
-            ;;
         plain)
-            # shellcheck disable=SC2086
+            # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
             got=$(run_t 120 -l -u 0:0 $CHROOTNG_GUEST_BINDS "$_r" /dacroot / \
                 2>/dev/null)
             ;;
         l2s)
             # shellcheck disable=SC2086
-            got=$(CHROOTNG_L2S_FORCE=1 run_t 120 -R -l -u 0:0 $CHROOTNG_GUEST_BINDS "$_r" \
+            got=$(CHROOTNG_L2S_FORCE=1 run_t 120 -l -u 0:0 $CHROOTNG_GUEST_BINDS "$_r" \
                 /dacroot / 2>/dev/null)
             ;;
         esac
@@ -133,34 +124,25 @@ M28_ALPINE="${M28_ALPINE:-$CHROOTNG_ALPINE}"
 if [ -z "$M28_ALPINE" ] || [ ! -x "$M28_ALPINE/bin/busybox" ]; then
     skip "tar into read-only directories: no alpine rootfs"
 else
-    for _tier in -R plain; do
-        _label="tar under fake root ($_tier)"
-        if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-            skip "$_label: the filter is inert here"
-            continue
-        fi
-        _t=$(mktemp -d)
-        mkdir -p "$_t/src/top/ro/sub" "$_t/x" "$_t/a"
-        echo a >"$_t/src/top/ro/a"
-        echo b >"$_t/src/top/ro/sub/b"
-        chmod 0555 "$_t/src/top/ro/sub" "$_t/src/top/ro"
-        _opt=""
-        [ "$_tier" = -R ] && _opt=-R
-        # shellcheck disable=SC2086  # $_opt is empty or one flag
-        out=$(run_t 60 $_opt -u 0:0 -b "$_t/src:/src" -b "$_t/x:/x" \
-            -b "$_t/a:/a" "$M28_ALPINE" /bin/sh -c \
-            'cd /src && tar cf /a/t.tar top && cd /x && tar xf /a/t.tar;
-             echo "tar=$?"; cat top/ro/a top/ro/sub/b | tr "\n" " "; echo;
-             stat -c "%a" top/ro top/ro/sub | tr "\n" " "; echo;
-             rm -r top; echo "rm=$?"' 2>&1)
-        check_contains "$_label extracts into a directory made 0500" "tar=0" \
-            "$out"
-        check_contains "$_label: ...every file in it" "a b " "$out"
-        check_contains "$_label: ...with the modes the archive holds" \
-            "555 555 " "$out"
-        check_contains "$_label: ...and rm -r empties them again" "rm=0" \
-            "$out"
-        chmod -R u+rwx "$_t"
-        rm -rf "$_t"
-    done
+    _label="tar under fake root"
+    _t=$(mktemp -d)
+    mkdir -p "$_t/src/top/ro/sub" "$_t/x" "$_t/a"
+    echo a >"$_t/src/top/ro/a"
+    echo b >"$_t/src/top/ro/sub/b"
+    chmod 0555 "$_t/src/top/ro/sub" "$_t/src/top/ro"
+    out=$(run_t 60 -u 0:0 -b "$_t/src:/src" -b "$_t/x:/x" \
+        -b "$_t/a:/a" "$M28_ALPINE" /bin/sh -c \
+        'cd /src && tar cf /a/t.tar top && cd /x && tar xf /a/t.tar;
+         echo "tar=$?"; cat top/ro/a top/ro/sub/b | tr "\n" " "; echo;
+         stat -c "%a" top/ro top/ro/sub | tr "\n" " "; echo;
+         rm -r top; echo "rm=$?"' 2>&1)
+    check_contains "$_label extracts into a directory made 0500" "tar=0" \
+        "$out"
+    check_contains "$_label: ...every file in it" "a b " "$out"
+    check_contains "$_label: ...with the modes the archive holds" \
+        "555 555 " "$out"
+    check_contains "$_label: ...and rm -r empties them again" "rm=0" \
+        "$out"
+    chmod -R u+rwx "$_t"
+    rm -rf "$_t"
 fi

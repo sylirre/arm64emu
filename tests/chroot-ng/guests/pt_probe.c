@@ -24,6 +24,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
@@ -1306,10 +1307,8 @@ static const char *ptres(long r) {
 /* A vfork-style clone whose child exits at once, both halves in asm: the
  * child shares the parent's stack on a real kernel until it leaves, so it
  * must not touch it — a C call through the libc wrapper is not that, and at
- * -O2 corrupted the suspended parent. Not vfork(3) either: glibc's passes the
- * current sp as the child stack, which the -R tier's clone path hands to the
- * real clone and so kills the converted child (a separate defect). Returns in
- * the parent once the child is gone. */
+ * -O2 corrupted the suspended parent. Returns in the parent once the child is
+ * gone. */
 static void vfork_child_exits(void) {
 #if defined(__aarch64__)
     register long x0 __asm__("x0");
@@ -1456,7 +1455,7 @@ static int sc_options(void) {
  * syscall stop. crashpad attaches to every thread of a crashed process and
  * reads this from each; it got EINVAL from every one, because an attach stop
  * did not keep the signal frame the registers were in, and a stop with no
- * frame at all (the trampoline tier's) had nowhere else to look.
+ * frame at all had nowhere else to look.
  *
  * One register carries a marker across the tracee's blocking read: set before
  * the syscall, read back by the tracer at each stop, overwritten by it, and
@@ -2135,7 +2134,7 @@ static void after_fork(void) {
  * space, after the call's exit stop: a tgkill of its own thread, and a write
  * to a pipe nobody reads (SIGPIPE). The kill(SIGSTOP) before them is the mark
  * PTRACE_SYSCALL starts from, with nothing in between. A dispatch running
- * from guest context (-R, a bounced call) took the stop in the middle of the
+ * from guest context (a bounced call) took the stop in the middle of the
  * call, ahead of its exit stop. */
 static int sc_sigafter(void) {
     int pp[2];
@@ -2419,13 +2418,14 @@ static void rs_case(const char *name, int flags) {
     /* Delivered to the handler, or suppressed where there is none. */
     ptrace(PTRACE_CONT, pid, 0, (void *)(long)(flags >= 0 ? SIGUSR1 : 0));
     long out[5] = {0};
-    if (read(rep[0], out, sizeof out) != (ssize_t)sizeof out) {
-        /* A restart with the tracer's descriptor blocks: end it. */
-        if (write(b[1], "B", 1) != 1)
-            return;
-        if (read(rep[0], out, sizeof out) != (ssize_t)sizeof out)
-            return;
-    }
+    /* A restart made with the tracer's descriptor blocks on it -- what a
+     * kernel that keeps orig_x0 in step with a tracer's x0 does (e057b9477232)
+     * -- so it is fed a byte after a second, rather than waited for. */
+    struct pollfd pf = {rep[0], POLLIN, 0};
+    if (poll(&pf, 1, 1000) != 1 && write(b[1], "B", 1) != 1)
+        return;
+    if (read(rep[0], out, sizeof out) != (ssize_t)sizeof out)
+        return;
     wait_for(pid, &st);
     show(st);
     printf("read: %ld '%c'\n", out[0], out[1] ? (char)out[1] : '-');

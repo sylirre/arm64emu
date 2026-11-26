@@ -4,7 +4,6 @@
  * Android. Command-line front end.
  *
  *   chroot-ng [options] <rootfs> <program> [args...]   (normal use)
- *   chroot-ng --probe [path...]                         (capability probe)
  *   chroot-ng --help | --version
  *
  * The full option / environment reference lives in help() below (reachable via
@@ -22,7 +21,6 @@
 #include "cng/path.h"
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
-#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -34,107 +32,11 @@
 #endif
 
 
-/* --- the run + probe + self-test entry points (own translation units) ----- */
-int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
+/* --- the run entry point (run.c) --------------------------------------- */
+int cng_run(const char *rootfs, const char *workdir,
             const char *const *bind_g, const char *const *bind_h,
             const int *bind_ro, int nb, char *const *env_set, int ne,
             int gargc, char **gargv, char **envp, unsigned long *auxv);
-int cng_cmd_probe(int argc, char **argv, char **envp, unsigned long *auxv);
-
-int cng_cmd_xlate(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_sigtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_jmptest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_faketest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_rwtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_ptracetest(int argc, char **argv, char **envp,
-                       unsigned long *auxv);
-int cng_cmd_nettest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_blocktest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_loadtwice(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_exectest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_cloexectest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_stackswtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_nesttest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_sigsystest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_argvtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_stackguardtest(int argc, char **argv, char **envp,
-                           unsigned long *auxv);
-int cng_cmd_execmaptest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_elfspan(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_elfinterp(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_imgtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_o2test(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_sharedtest(int argc, char **argv, char **envp,
-                       unsigned long *auxv);
-int cng_cmd_clonetest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_clonestktest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_proctest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_bpftest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_shmtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_tabtest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_lazytest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_pintest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_ipctest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_faulttest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_prctltest(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_selfproc(int argc, char **argv, char **envp, unsigned long *auxv);
-int cng_cmd_rttest(int argc, char **argv, char **envp, unsigned long *auxv);
-
-/* Internal self-tests, exposed via `-t/--test NAME`. Hidden from --help; the
- * argument that would be a <rootfs> can never begin with '-', so there is no
- * ambiguity with the normal form. Each callee treats argv[0] as its own name
- * and parses its arguments from argv[1], exactly as when it was a subcommand. */
-struct test_entry {
-    const char *name;
-    int (*fn)(int, char **, char **, unsigned long *);
-};
-static const struct test_entry g_tests[] = {
-    {"xlate", cng_cmd_xlate},           {"dtest", cng_cmd_dtest},
-    {"sigtest", cng_cmd_sigtest},       {"jmptest", cng_cmd_jmptest},
-    {"faketest", cng_cmd_faketest},     {"rwtest", cng_cmd_rwtest},
-    {"ptracetest", cng_cmd_ptracetest},
-    {"nettest", cng_cmd_nettest},       {"blocktest", cng_cmd_blocktest},
-    {"loadtwice", cng_cmd_loadtwice},   {"l2stest", cng_cmd_l2stest},
-    {"exectest", cng_cmd_exectest},     {"cloexectest", cng_cmd_cloexectest},
-    {"stackswtest", cng_cmd_stackswtest}, {"argvtest", cng_cmd_argvtest},
-    {"stackguardtest", cng_cmd_stackguardtest},
-    {"execmaptest", cng_cmd_execmaptest},
-    {"nesttest", cng_cmd_nesttest},     {"sigsystest", cng_cmd_sigsystest},
-    {"elfspan", cng_cmd_elfspan},
-    {"elfinterp", cng_cmd_elfinterp},
-    {"imgtest", cng_cmd_imgtest},
-    {"o2test", cng_cmd_o2test},
-    {"sharedtest", cng_cmd_sharedtest},
-    {"clonetest", cng_cmd_clonetest},
-    {"clonestktest", cng_cmd_clonestktest},
-    {"proctest", cng_cmd_proctest},   {"bpftest", cng_cmd_bpftest},
-    {"shmtest", cng_cmd_shmtest},       {"ipctest", cng_cmd_ipctest},
-    {"faulttest", cng_cmd_faulttest},
-    {"prctltest", cng_cmd_prctltest}, {"selfproc", cng_cmd_selfproc},
-    {"tabtest", cng_cmd_tabtest},     {"lazytest", cng_cmd_lazytest},
-    {"pintest", cng_cmd_pintest},     {"rttest", cng_cmd_rttest},
-};
-
-static int dispatch_test(const char *name, int argc, char **argv, char **envp,
-                         unsigned long *auxv) {
-    for (unsigned k = 0; k < sizeof g_tests / sizeof *g_tests; k++)
-        if (!strcmp(name, g_tests[k].name)) {
-            /* What the ambient (Android) filter refuses, measured the way the
-             * real monitor measures it at install. A driver runs the
-             * dispatcher directly and nothing here catches a SIGSYS, so a
-             * re-issue of a refused number does not come back as an errno, it
-             * kills the run (openat2, faccessat2 and the rest of the set on
-             * Android) — and which drivers reach such a re-issue changes with
-             * every path the dispatcher learns to pin or probe. Measuring once
-             * here, ahead of all of them, means a new driver cannot forget. */
-            cng_probe_blocked();
-            return g_tests[k].fn(argc, argv, envp, auxv);
-        }
-    cng_dprintf(2, "chroot-ng: unknown test '%s'\n", name);
-    return 2;
-}
 
 /* --- freestanding output primitives for the help renderer ----------------- */
 
@@ -157,7 +59,6 @@ static void out_pad(int fd, int n) {
 static void usage(int fd) {
     out_str(fd,
         "usage: chroot-ng [options] <rootfs> <program> [args...]\n"
-        "       chroot-ng --probe [path...]\n"
         "try 'chroot-ng --help' for details\n");
 }
 
@@ -423,16 +324,6 @@ static void help(char **envp) {
                       "installed by proot-distro) are read and kept the way "
                       "proot keeps them. Off by default: without it the host's "
                       "refusal is reported to the guest unchanged."},
-        {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
-                      "trampolines: ahead of time where an object's section "
-                      "headers say its code is, and on its first trap for a "
-                      "site that pass could not reach. Faster than trapping "
-                      "every syscall, and also provides path translation where "
-                      "the seccomp monitor is unavailable (e.g. under "
-                      "qemu-user): without -R, a monitor that cannot be "
-                      "installed is a refusal to run, since nothing else would "
-                      "intercept; with it the run goes ahead, and only the svc "
-                      "sites the rewriter reached are intercepted."},
         {"-F, --file-backed", "Force file-backed segment mapping. Auto-selected "
                       "when anonymous executable memory is denied (Android "
                       "no-new-privs / execmem); this forces it unconditionally."},
@@ -470,13 +361,6 @@ static void help(char **envp) {
                       "and stat where the host denies them. With this flag the "
                       "guest sees only whatever /proc its rootfs (or an "
                       "explicit -b) provides."},
-        {"    --no-ptrace", "Refuse guest ptrace(2) with EPERM instead of "
-                      "emulating it. By default a guest tracer (strace, gdb, "
-                      "proot) works: chroot-ng emulates the whole stop protocol "
-                      "in-process, since the host kernel's ptrace would show a "
-                      "tracer our own re-issued syscalls and host paths. The "
-                      "machinery costs nothing until something actually traces, "
-                      "but a traced task then stops on every syscall."},
         {"    --shared-proc", "Share the guest process view between independent "
                       "chroot-ng invocations of the same rootfs, so ps/top in "
                       "one session see the guest processes of another. The "
@@ -487,15 +371,6 @@ static void help(char **envp) {
                       "hides the others' processes. The same daemon serves the "
                       "System V shared-memory namespace, so this widens that "
                       "from per-invocation to per-rootfs as well."},
-        {"-L, --lib-prefix DIR", "Resolve the ELF interpreter under DIR instead "
-                      "of through the rootfs/bind map (test aid). On real "
-                      "hardware the interpreter and libraries resolve through "
-                      "the rootfs + monitor."},
-        {"-t, --test NAME", "Run a built-in self-test (development). All "
-                      "remaining arguments are passed to the test."},
-        {"    --probe",   "Report kernel / seccomp / execmem / noexec "
-                      "capabilities and exit. Optional trailing paths are "
-                      "checked for the noexec mount flag (default '/' and '.')."},
         {"-h, --help",    "Show this help and exit."},
         {"-v, --version", "Show version and exit."},
         {"    --",        "Stop option parsing."},
@@ -601,19 +476,17 @@ static void help(char **envp) {
                       "other way to be exercised."},
     };
     static const char *const examples[] = {
-        "chroot-ng --probe",
         "chroot-ng -u ./rootfs /bin/sh",
         "chroot-ng --fake-id 1000:1000 --setuid-root --setgid-root ./rootfs /bin/su -",
         "chroot-ng -u -E HOME=/root -E PATH=/usr/bin:/bin ./rootfs /bin/sh -l",
         "chroot-ng -u -w /root ./rootfs /bin/sh",
         "chroot-ng -u -l ./rootfs /sbin/apk add busybox",
-        "chroot-ng -R -b /data/local/tmp:/tmp ./rootfs /bin/busybox sh",
+        "chroot-ng -b /data/local/tmp:/tmp ./rootfs /bin/busybox sh",
         "chroot-ng / /usr/bin/uname -a",
     };
 
     help_section(fd, "USAGE");
-    help_wrap(fd, "chroot-ng [options] <rootfs> <program> [args...]\n\n"
-                  "chroot-ng --probe [path...]", w, 2, 0);
+    help_wrap(fd, "chroot-ng [options] <rootfs> <program> [args...]", w, 2, 0);
 
     help_section(fd, "DESCRIPTION");
     help_wrap(fd,
@@ -625,9 +498,7 @@ static void help(char **envp) {
         "'noexec' mounts.\n\n"
         "It works for glibc / musl (dynamic and static) and Go / Rust binaries "
         "without version pinning, where LD_PRELOAD tricks fail and proot's "
-        "per-syscall ptrace overhead hurts.\n\n"
-        "Run --probe on any target device FIRST: the whole in-process design "
-        "depends on the SELinux execmem permission being granted.",
+        "per-syscall ptrace overhead hurts.",
     w, 2, 0);
 
     help_section(fd, "ARGUMENTS");
@@ -840,7 +711,6 @@ static int add_env(char *spec, char **env_set, int *ne) {
 
 int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     const char *rootfs = 0;
-    const char *libprefix = 0;
     const char *workdir = 0;   /* -w/--work-dir: initial guest cwd */
     const char *bind_g[CNG_MAX_BINDS];
     const char *bind_h[CNG_MAX_BINDS];
@@ -849,11 +719,10 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     char *env_set[CNG_MAX_ENV];   /* -E entries; every one points into argv */
     int ne = 0;
 
-    /* GNU-style options: single-letter short (-R), --word long. Value-taking
+    /* GNU-style options: single-letter short (-F), --word long. Value-taking
      * options accept "-b VAL"/"-bVAL" and "--bind VAL"/"--bind=VAL"; no-arg
-     * shorts bundle ("-RF"). Parsing stops at the first non-option, at "--", or
-     * at <rootfs>, so guest args are never consumed as options. The mode flags
-     * --probe and -t hand the rest of argv to the probe / self-test verbatim. */
+     * shorts bundle ("-lF"). Parsing stops at the first non-option, at "--", or
+     * at <rootfs>, so guest args are never consumed as options. */
     int i = 1;
     for (; i < argc; i++) {
         char *arg = argv[i];
@@ -872,10 +741,6 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                 if (val) return err_noval(arg);
                 version();
                 return 0;
-            } else if (!strcmp(n, "probe")) {
-                if (val) return err_noval(arg);
-                argv[i] = (char *)"probe";             /* callee's argv[0] */
-                return cng_cmd_probe(argc - i, argv + i, envp, auxv);
             } else if (!strcmp(n, "fake-id")) {
                 cng_g_fake_id = 1;   /* default 0:0 unless a spec follows */
                 cng_g_fake_id_explicit = 1;
@@ -897,18 +762,12 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else if (!strcmp(n, "link2symlink")) {
                 if (val) return err_noval(arg);
                 cng_g_l2s = 1;
-            } else if (!strcmp(n, "rewrite")) {
-                if (val) return err_noval(arg);
-                cng_g_rewrite = 1;
             } else if (!strcmp(n, "file-backed")) {
                 if (val) return err_noval(arg);
                 cng_g_loader_file = 1;
             } else if (!strcmp(n, "no-proc")) {
                 if (val) return err_noval(arg);
                 cng_g_no_proc = 1;
-            } else if (!strcmp(n, "no-ptrace")) {
-                if (val) return err_noval(arg);
-                cng_g_no_ptrace = 1;
             } else if (!strcmp(n, "no-dev")) {
                 if (val) return err_noval(arg);
                 cng_g_no_dev = 1;
@@ -938,24 +797,10 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     if (i + 1 >= argc) return err_needarg("--work-dir");
                     workdir = argv[++i];
                 }
-            } else if (!strcmp(n, "lib-prefix")) {
-                if (val) libprefix = val;
-                else {
-                    if (i + 1 >= argc) return err_needarg("--lib-prefix");
-                    libprefix = argv[++i];
-                }
-            } else if (!strcmp(n, "test")) {
-                char *name; int k;
-                if (val) { argv[i] = val; k = i; name = val; }   /* --test=NAME */
-                else {
-                    if (i + 1 >= argc) return err_needarg("--test");
-                    k = i + 1; name = argv[k];                   /* --test NAME */
-                }
-                return dispatch_test(name, argc - k, argv + k, envp, auxv);
             } else {
                 return err_unknown(arg);
             }
-        } else {                                       /* short cluster: -RFb... */
+        } else {                                       /* short cluster: -lFb... */
             for (char *p = arg + 1; *p; ) {
                 char c = *p++;
                 if (c == 'h') { help(envp); return 0; }
@@ -974,7 +819,6 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     break;   /* -u takes the rest of the cluster / next token */
                 }
                 else if (c == 'l') { cng_g_l2s = 1; }
-                else if (c == 'R') { cng_g_rewrite = 1; }
                 else if (c == 'F') { cng_g_loader_file = 1; }
                 else if (c == 'b') {
                     char *spec = *p ? p : (i + 1 < argc ? argv[++i] : 0);
@@ -991,17 +835,6 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
                     if (!v) return err_needarg("-w");
                     workdir = v;
                     break;
-                } else if (c == 'L') {
-                    char *v = *p ? p : (i + 1 < argc ? argv[++i] : 0);
-                    if (!v) return err_needarg("-L");
-                    libprefix = v;
-                    break;
-                } else if (c == 't') {
-                    char *name; int k;
-                    if (*p) { name = p; argv[i] = name; k = i; }  /* -tNAME */
-                    else if (i + 1 < argc) { k = i + 1; name = argv[k]; }  /* -t NAME */
-                    else return err_needarg("-t");
-                    return dispatch_test(name, argc - k, argv + k, envp, auxv);
                 } else {
                     return err_unknown_short(c);
                 }
@@ -1027,6 +860,6 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
     char **gargv = argv + i + 1;
     int gargc = argc - i - 1;
 
-    return cng_run(rootfs, libprefix, workdir, bind_g, bind_h, bind_ro, nb,
+    return cng_run(rootfs, workdir, bind_g, bind_h, bind_ro, nb,
                    env_set, ne, gargc, gargv, envp, auxv);
 }

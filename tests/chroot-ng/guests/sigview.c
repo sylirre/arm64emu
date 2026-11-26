@@ -109,7 +109,16 @@ int main(int argc, char **argv) {
        syscall(SYS_rt_tgsigqueueinfo, a, a, SIGURG, &si));
     si.si_code = SI_USER;
     rc("sigqueue-hidden-forged", syscall(SYS_rt_sigqueueinfo, a, SIGURG, &si));
-    rc("kill-parent", kill(getppid(), 0));
+    /* The parent is outside the view: a pid it cannot reach, or -- under a
+     * runner that shows an out-of-session parent as a pid namespace does --
+     * no pid at all, which kill(0) would read as the caller's own group. */
+    pid_t pp = getppid();
+    if (pp == 0) {
+        errno = ESRCH;
+        rc("kill-parent", -1);
+    } else {
+        rc("kill-parent", kill(pp, 0));
+    }
     rc("kill-hidden-group-0", kill(-b, 0));
     rc("kill-hidden-group", kill(-b, SIGURG));
     rc("kill-intmin", kill(INT_MIN, 0));

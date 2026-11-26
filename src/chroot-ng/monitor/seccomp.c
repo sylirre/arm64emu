@@ -156,7 +156,8 @@ static const int ipc_syscalls[] = {
  *
  * Answered with SECCOMP_RET_ERRNO, so the kernel refuses them itself — no
  * signal, no handler, and it holds even where nested SIGSYS delivery does not.
- * cng_denied_syscall() covers the -R trampoline tier, which has no filter. */
+ * cng_denied_syscall() covers a tracee's trap-everything filter, which traps
+ * them instead. */
 static const int enosys_syscalls[] = {
     __NR_io_uring_setup,
     __NR_io_uring_enter,
@@ -255,11 +256,10 @@ static const int enosys_syscalls[] = {
 };
 #define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
 
-/* The same set as a bitset, for the -R tier: there every rewritten site calls
- * into the dispatcher and asks this before anything else, so a walk of the
- * list above was paid on every syscall of the process. Built from the list on
- * first use rather than at some init point, because the self-tests reach the
- * dispatcher without the monitor installed. Two threads may build it at once;
+/* The same set as a bitset, for the dispatcher: a tracee's trap-everything
+ * filter sends it every syscall of the task, and it asks this before anything
+ * else, so a walk of the list above was paid on every one of them. Built from
+ * the list on first use. Two threads may build it at once;
  * each stores the same complete words, then releases the flag, so a reader
  * that sees the flag sees every bit. */
 #define DENIED_WORDS 8 /* 512 numbers: the table ends at 469 (cng/unistd.h) */
@@ -831,8 +831,7 @@ static int install_filter(const struct sock_filter *f, int n) {
  *  - rt_sigreturn, which must execute with sp still pointing at the kernel's
  *    signal frame. We can only "execute" a trapped syscall by re-issuing it
  *    from the gate, where sp is the handler's — so trapping it would restore a
- *    garbage context. It carries nothing a tracer needs, and the -R rewriter
- *    skips its site for the same reason;
+ *    garbage context. It carries nothing a tracer needs;
  *  - a thread-creating clone (CLONE_VM without CLONE_VFORK). A re-issued clone
  *    returns into the handler on the new thread's stack, with no frame to
  *    sigreturn through; the base filter lets threads run natively for exactly

@@ -1,9 +1,9 @@
 /* A link and an unlink of a hardlinked file from a signal handler that
- * interrupted another (M10 regression, -R -l).
+ * interrupted another (M10 regression, -l).
  *
  * Every change of a group's count is made under the store lock, an flock on a
  * file of the emulation's own, held across the several syscalls the change
- * takes. On the -R tier the dispatcher runs on the guest's own signal mask, so
+ * takes. Where a dispatch runs on the guest's own signal mask (a bounced call),
  * a handler delivered while the thread held the lock — on the way out of any
  * of those syscalls — that linked or unlinked a name itself opened the lock
  * file again and waited for the lock its own thread held: forever, since an

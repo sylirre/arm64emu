@@ -1,9 +1,7 @@
 # M12: System V shared memory (sourced by tests/chroot-ng/run.sh).
 #
-# Three layers. First the dispatcher-level self-test (-t shmtest), which needs
-# no seccomp and so runs anywhere, over both backing tiers (memfd, and the
-# file-backed fallback forced with CHROOTNG_SHM_FORCE_FILE=1). Then a differential
-# leg: the same guest binaries run once under chroot-ng's emulation and once with
+# Two layers. First a differential leg: the same guest binaries run once under
+# chroot-ng's emulation and once with
 # no emulation at all, where they get the host kernel's REAL SysV shm — stdout
 # must match byte for byte, which is the strongest statement available that the
 # emulation is indistinguishable. Finally the namespace scope, which
@@ -14,97 +12,6 @@
 # timestamps — since those legitimately differ between the host's global
 # namespace and ours. See tests/chroot-ng/guests/shm_sysv.c.
 echo "== M12: System V shared memory =="
-
-# --- dispatcher self-test ---------------------------------------------------
-out=$(run -t shmtest 2>&1); rc=$?
-check "shmtest overall" 0 "$rc"
-check_contains "create, attach, and IPC_STAT agree" \
-    "shmtest create+attach+stat -> OK" "$out"
-check_contains "a fork child shares the memory; nattch drops when it dies" \
-    "shmtest fork share=1 nattch-after-exit=1 -> OK" "$out"
-check_contains "attach-address rules (unaligned, SHM_RND, occupied, SHM_REMAP)" \
-    "shmtest attach-addr unaligned/rnd/occupied/remap -> OK" "$out"
-# SHM_REMAP is MAP_FIXED, and chroot-ng shares the guest's address space: an
-# attach aimed at the monitor's own image would replace the code performing it.
-check_contains "a SHM_REMAP attach onto chroot-ng's own image is refused" \
-    "shmtest remap over our own image refused=1 intact=1 -> OK" "$out"
-# The memfd tier leaves nothing on disk at all; the leg below asserts the other
-# direction, where a file does appear.
-check_contains "the memfd tier leaves no file in the shared directory" \
-    "shmtest backing files forced=0 found=0 malformed=0 -> OK" "$out"
-check_contains "a read-only attach sees the same memory" \
-    "shmtest rdonly attach -> OK" "$out"
-check_contains "detach then IPC_RMID kills the id" \
-    "shmtest detach+rmid -> OK" "$out"
-check_contains "keyed lookup, IPC_EXCL and ENOENT" \
-    "shmtest keyed lookup -> OK" "$out"
-check_contains "the ipcs enumeration path (SHM_INFO, SHM_STAT, IPC_INFO)" \
-    "shmtest shm_info+shm_stat+ipc_info -> OK" "$out"
-check_contains "SHM_INFO/IPC_INFO succeed before any segment exists" \
-    "shmtest empty-namespace shm_info+ipc_info -> OK" "$out"
-check_contains "a truncated broker reply leaves no descriptor behind" \
-    "shmtest short reply leaks no fd -> OK" "$out"
-# The other direction, and the one the daemon actually reads on: an fd a peer
-# attaches to a *request* is installed by the kernel whether or not the receiver
-# asked for one, because the control buffer goes on the recvmsg regardless.
-check_contains "a fd attached to a request is not left installed" \
-    "shmtest an unwanted fd is not left installed -> OK" "$out"
-# A peer that closed with nothing sent is the one broker failure a caller may
-# retry: it neither answered nor half-answered, and the daemon's state died with
-# it. A timeout and a truncated reply must not be confused with it — there the
-# request may already have been served.
-check_contains "the retryable broker failure is told from the others" \
-    "shmtest gone/short/timeout told apart: 111 -> OK" "$out"
-# ...and the retry itself: the daemon listens across its whole idle-exit
-# teardown, so a connect landing there succeeds and only the reply never comes.
-# Callers turned that into a fabricated ENOSPC/EIDRM instead of trying again.
-check_contains "a daemon on its way out does not fail the caller's request" \
-    "shmtest a daemon on its way out is retried past: OK" "$out"
-# The rendezvous is an abstract name anyone on the machine can compute, so the
-# daemon has to take the caller's identity from the kernel rather than from the
-# request — and refuse a peer the kernel will not identify at all.
-check_contains "a request cannot name a process other than its sender" \
-    "shmtest a forged caller pid is not believed -> OK" "$out"
-check_contains "an unidentifiable peer is refused by both ends" \
-    "shmtest an unidentifiable peer is refused client=-28 daemon=-28 -> OK" "$out"
-# ...and the name is a hash of the rootfs path, which two rootfs could share:
-# the daemon is started for one path and told the client's on every
-# connection, and hangs up on any other.
-check_contains "a client presenting another rootfs is not answered" \
-    "shmtest a client of another rootfs is not answered own=0 other=-1 own_again=0 -> OK" "$out"
-check_contains "IPC_SET writes the permission triad back" \
-    "shmtest ipc_set -> OK" "$out"
-check_contains "execve detaches every attachment" \
-    "shmtest execve detach-all -> OK" "$out"
-check_contains "bad ids, zero size and a stray address are refused" \
-    "shmtest error cases -> OK" "$out"
-# Termux's X servers attach a guest client's segment through libandroid-shmem:
-# the id's high half names a socket of ours, which hands the backing over. Its
-# size probe is ashmem's ioctl, so on Termux the backing has to be ashmem.
-check_contains "a libandroid-shmem client attaches a guest segment" \
-    "shmtest a libandroid-shmem client attaches a guest segment shape=1 keys=1 shared=1 uncounted=1 removed=1 gone=1 unknown=1 -> OK" "$out"
-if [ "$CHROOTNG_TERMUX" = 1 ]; then m12_ashmem=1; else m12_ashmem=0; fi
-check_contains "segments are ashmem where /dev/ashmem opens ($m12_ashmem here)" \
-    "shmtest segment backing is ashmem where /dev/ashmem opens: ashmem=$m12_ashmem -> OK" "$out"
-
-# The file-backed tier: what the broker falls back to where memfd_create is
-# unavailable (pre-3.17 kernel, or a seccomp filter blocking it).
-out=$(CHROOTNG_SHM_FORCE_FILE=1 run -t shmtest 2>&1); rc=$?
-check "shmtest over the file-backed backing tier" 0 "$rc"
-check_contains "file-backed segments still share across a fork" \
-    "shmtest fork share=1 nattch-after-exit=1 -> OK" "$out"
-check_contains "file-backed segments still reach a libandroid-shmem client" \
-    "shmtest a libandroid-shmem client attaches a guest segment shape=1 keys=1 shared=1 uncounted=1 removed=1 gone=1 unknown=1 -> OK" "$out"
-check_contains "a forced file tier takes precedence over ashmem" \
-    "shmtest segment backing is ashmem where /dev/ashmem opens: ashmem=0 -> OK" "$out"
-# That file lands in /dev/shm or /tmp, where every user on the machine may
-# create names — and it used to be named after the shmid, so anyone could
-# predict it, leave a symlink on it and have O_TRUNC destroy what it pointed at,
-# or leave a file on it and read the guest's shared memory back out. Nothing
-# outside the daemon needs to find it by name (attachers are handed the
-# descriptor), so it now carries only random bits and is created O_EXCL.
-check_contains "the backing file's name is unguessable and exclusively created" \
-    "shmtest backing files forced=1 found=1 malformed=0 -> OK" "$out"
 
 # --- differential against the host kernel's real SysV shm -------------------
 # The reference side is the same binary run with no emulation at all, so it needs
@@ -129,7 +36,7 @@ elif ! guest_cc_report "$SG/brokerchld" tests/chroot-ng/guests/brokerchld.c; the
     :
 else
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    bc_out=$(run_t 60 $CHROOTNG_GUEST_BINDS -R "$SG" /brokerchld 2>/dev/null)
+    bc_out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$SG" /brokerchld 2>/dev/null)
     # The control: this run can see a SIGCHLD and reap a child at all.
     check_contains "m12 a guest's own child is still its own" \
         "own: chld=1 reaped=1 status=3" "$bc_out"
@@ -168,7 +75,7 @@ posix: after-unlink gone
 posix: done"
     M12T=$(mktemp -d)
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
-    m12_got=$(TMPDIR="$M12T" CHROOTNG_DEVSHM_FORCE_TMP=1 run_t 60 $CHROOTNG_GUEST_BINDS -R \
+    m12_got=$(TMPDIR="$M12T" CHROOTNG_DEVSHM_FORCE_TMP=1 run_t 60 $CHROOTNG_GUEST_BINDS \
         "$SG" /shm_posix 2>/dev/null); m12_rc=$?
     check "m12 a POSIX shm round trip on the /dev/shm stand-in exits 0" 0 "$m12_rc"
     if [ "$m12_got" = "$m12_want" ]; then
@@ -202,8 +109,7 @@ fi
 # and refuses, so every MIT-SHM client in the guest (mpv --vo=x11, GTK, cairo)
 # got BadAccess. The oracle is the consumer itself: a host program linked
 # against Termux's libandroid-shmem attaches what the guest made, reads it, and
-# writes back. Termux only, where that library is; -t shmtest speaks the
-# protocol itself everywhere else.
+# writes back. Termux only, where that library is.
 if [ "$CHROOTNG_TERMUX" != 1 ]; then
     skip "m12 libandroid-shmem attach: not a Termux host"
 elif ! guest_xlate_ready "libandroid-shmem attach"; then
@@ -217,7 +123,7 @@ else
     AD=$SG/ashv
     mkdir -p "$AD"
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
-    run_t 60 $CHROOTNG_GUEST_BINDS -R "$SG" /shm_ashv /ashv >"$AD/guest.out" 2>&1 &
+    run_t 60 $CHROOTNG_GUEST_BINDS "$SG" /shm_ashv /ashv >"$AD/guest.out" 2>&1 &
     AJ=$!
     _n=0
     until [ -s "$AD/id" ] || [ $_n -ge 300 ]; do
@@ -264,7 +170,7 @@ if [ "$m12_ready" = 1 ]; then
     shm_diff() {
         out_k=$(emu_t 60 "$SG/$2" 2>/dev/null); rc_k=$?
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
-        out_e=$(run_t 60 $CHROOTNG_GUEST_BINDS -R "$SG" "/$2" 2>/dev/null); rc_e=$?
+        out_e=$(run_t 60 $CHROOTNG_GUEST_BINDS "$SG" "/$2" 2>/dev/null); rc_e=$?
         if [ "$out_k" = "$out_e" ] && [ "$rc_k" = "$rc_e" ]; then
             pass=$((pass + 1)); printf '  ok   %s\n' "$1"
         else
@@ -295,7 +201,7 @@ if [ "$m12_ready" = 1 ]; then
             skip "m12 $2: the guest program does not build here"
             return
         fi
-        if [ -n "$CHROOTNG_QEMU" ]; then
+        if [ -n "$CHROOTNG_EMU" ]; then
             _oracle=
             for _c in ${HOSTCC:-} cc gcc clang; do
                 have "$_c" || continue
@@ -316,7 +222,7 @@ if [ "$m12_ready" = 1 ]; then
             _k=$("$_oracle" 2>/dev/null)
         fi
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
-        _e=$(run_t "$4" $CHROOTNG_GUEST_BINDS -R "$SG" "/$2" 2>/dev/null)
+        _e=$(run_t "$4" $CHROOTNG_GUEST_BINDS "$SG" "/$2" 2>/dev/null)
         if [ "$_k" = "$_e" ]; then
             pass=$((pass + 1))
             printf '  ok   %s\n' "$1"
@@ -357,12 +263,12 @@ if [ "$m12_ready" = 1 ]; then
     # ...and again over the file-backed tier, which must be indistinguishable
     # from the memfd one (only the broker's backing differs).
     out_k=$m12_kbase
-    out_e=$(CHROOTNG_SHM_FORCE_FILE=1 m12run -R "$SG" /shm_sysv 2>/dev/null)
+    out_e=$(CHROOTNG_SHM_FORCE_FILE=1 m12run "$SG" /shm_sysv 2>/dev/null)
     check_contains "m12 file-backed shm_sysv still matches" "$out_k" "$out_e"
 
     # The guest's calls really are being emulated, not passed to the host: the
     # dispatcher traces every one under CHROOTNG_DEBUG.
-    n=$(CHROOTNG_DEBUG=1 m12run -R "$SG" /shm_sysv 2>&1 | grep -c 'sysv-shm')
+    n=$(CHROOTNG_DEBUG=1 m12run "$SG" /shm_sysv 2>&1 | grep -c 'sysv-shm')
     if [ "$n" -ge 8 ]; then
         pass=$((pass + 1)); printf '  ok   %s\n' "m12 the guest's shm syscalls reach the emulation ($n)"
     else
@@ -373,19 +279,19 @@ if [ "$m12_ready" = 1 ]; then
     # Default: one namespace per invocation, so a keyed segment does not leak
     # from one launch to the next (two containers do not share IPC).
     K=51ab0001
-    m12run -R "$SG" /shm_key $K create first-invocation >/dev/null 2>&1
-    out=$(m12run -R "$SG" /shm_key $K find 2>/dev/null)
+    m12run "$SG" /shm_key $K create first-invocation >/dev/null 2>&1
+    out=$(m12run "$SG" /shm_key $K find 2>/dev/null)
     check_contains "m12 a keyed segment does not leak between invocations" \
         "found=0" "$out"
 
     # --shared-proc widens the namespace to the rootfs, the same way it widens
     # the guest process view.
     K=51ab0002
-    m12run --shared-proc -R "$SG" /shm_key $K create shared-invocation >/dev/null 2>&1
-    out=$(m12run --shared-proc -R "$SG" /shm_key $K find 2>/dev/null)
+    m12run --shared-proc "$SG" /shm_key $K create shared-invocation >/dev/null 2>&1
+    out=$(m12run --shared-proc "$SG" /shm_key $K find 2>/dev/null)
     check_contains "m12 --shared-proc shares segments between invocations" \
         "found=1 text=shared-invocation" "$out"
-    m12run --shared-proc -R "$SG" /shm_key $K rmid >/dev/null 2>&1
+    m12run --shared-proc "$SG" /shm_key $K rmid >/dev/null 2>&1
 fi
 rm -rf "$SG"
 
@@ -396,7 +302,7 @@ rm -rf "$SG"
 M12_ALPINE="${M12_ALPINE:-$CHROOTNG_ALPINE}"
 if [ -n "$M12_ALPINE" ] && [ -x "$M12_ALPINE/bin/busybox" ]; then
     SR=$(mktemp -d); cp -a "$M12_ALPINE/." "$SR"
-    out=$(run -R "$SR" /bin/sh -c 'ipcs -m; echo rc=$?' 2>/dev/null)
+    out=$(run "$SR" /bin/sh -c 'ipcs -m; echo rc=$?' 2>/dev/null)
     check_contains "m12 ipcs -m runs in a guest shell" "rc=0" "$out"
     rm -rf "$SR"
 else

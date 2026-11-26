@@ -4,9 +4,10 @@
 # resolved here rather than inside the milestone scripts:
 #
 #   Linux x86_64      cross-built binary; chroot-ng and every AArch64 guest run
-#                     under qemu-aarch64.  qemu-user does not apply a guest's
-#                     seccomp filter, so the SIGSYS tier is INERT there and the
-#                     -R (svc-rewriting) tier is what carries translation.
+#                     under this repository's arm64emu, in its chroot mode with
+#                     the host's own tree as the rootfs. That mode emulates a
+#                     guest's seccomp filter, RET_TRAP and SIGSYS included, so
+#                     the SIGSYS tier is LIVE there as on real hardware.
 #   Linux aarch64     native: no emulator, and the seccomp/SIGSYS tier is LIVE.
 #   Termux (Android)  native as well, but the guest toolchain is bionic clang:
 #                     -static-pie may not link, so compiled guests can be
@@ -21,6 +22,7 @@
 #   CHROOTNG_GUEST_BINDS          -b args a dynamic guest needs inside a fresh rootfs
 #   GUEST_LD_DESC        human name of the link mode in use
 #   CHROOTNG_SECCOMP_LIVE     1 when the in-process monitor really traps syscalls
+#                        (the suite stops where it does not)
 #   CHROOTNG_EXECMEM          1 when anon RW->RX memory is permitted
 #   CHROOTNG_GUEST_XLATE      1 when a compiled guest's own path syscalls get
 #                        translated here (see guest_xlate_ready)
@@ -29,9 +31,9 @@
 #   skip MSG             uniform, counted "  skip <msg>" reporting
 #   elf_type / elf_machine / elf_has_interp   ELF facts without file(1)
 #
-# Overridable from the environment: CHROOTNG_BIN, CHROOTNG_QEMU (set empty to force direct
+# Overridable from the environment: CHROOTNG_BIN, CHROOTNG_EMU (set empty to force direct
 # execution), CHROOTNG_GUESTCC, CHROOTNG_GUESTLD, CHROOTNG_GUEST_BINDS, CHROOTNG_ROOTFS_DIR, CHROOTNG_ROOTFS_FETCH,
-# CHROOTNG_ALPINE, CHROOTNG_DEBIAN, CHROOTNG_ORACLE, CHROOTNG_SYSROOT. See tests/chroot-ng/README.md.
+# CHROOTNG_ALPINE, CHROOTNG_DEBIAN, CHROOTNG_ORACLE, CHROOTNG_SYSROOT. See docs/chroot-ng/testing.md.
 
 pass=${pass:-0}
 fail=${fail:-0}
@@ -54,25 +56,62 @@ skip() {
 }
 
 # ---- running AArch64 programs ---------------------------------------------
-# On an AArch64 host $CHROOTNG_QEMU is empty and everything runs directly; elsewhere the
-# emulator prefixes the command line. Kept as functions rather than a variable
-# so an empty $CHROOTNG_QEMU never becomes an empty argv[0].
+# On an AArch64 host $CHROOTNG_EMU is empty and everything runs directly;
+# elsewhere it is an arm64emu, and the program runs in its chroot mode with the
+# host's tree as the rootfs, the way a binfmt handler would run it:
+#
+#   - the JIT, which keeps a suite of a few thousand runs affordable;
+#   - --keep-fds, since a row may hand the program descriptors above 2 (a
+#     socket to import, a pipe to report on), and chroot mode closes them;
+#   - --shared-proc, so every run sees the others' processes as one host's
+#     processes see each other: chroot mode otherwise hides whatever is not
+#     of its own session, and rows start helpers (signal holders, a second
+#     invocation sharing a registry) as runs of their own;
+#   - the shell's working directory, which chroot mode would otherwise
+#     replace with /;
+#   - the whole environment, which chroot mode builds fresh. chroot-ng's knobs
+#     and the variables a row sets for a guest arrive through it, so every
+#     exported variable is forwarded with -E, the TERM and PATH chroot mode
+#     would choose for itself included.
+#
+# Kept as functions rather than a variable so an empty $CHROOTNG_EMU never
+# becomes an empty argv[0].
 
-emu() {
-    if [ -n "$CHROOTNG_QEMU" ]; then "$CHROOTNG_QEMU" "$@"; else "$@"; fi
-}
-
-# emu_t SECS CMD... — as emu, but bounded: a test that blocks (a netlink dump
-# that never terminates, a socket that never accepts) should fail one check
-# rather than wedge the suite.
+# emu_t SECS CMD... — run an AArch64 program, bounded by SECS seconds when SECS
+# is not empty: a test that blocks (a netlink dump that never terminates, a
+# socket that never accepts) should fail one check rather than wedge the suite.
 emu_t() {
-    _t=$1
+    _emu_t=$1
     shift
-    if [ -z "$TIMEOUT" ]; then emu "$@"
-    elif [ -n "$CHROOTNG_QEMU" ]; then "$TIMEOUT" "$_t" "$CHROOTNG_QEMU" "$@"
-    else "$TIMEOUT" "$_t" "$@"
+    if [ -n "$CHROOTNG_EMU" ]; then
+        # Forwarded in the order the names come, after the command, then the
+        # command rotated back behind them: positional parameters are the one
+        # array a POSIX shell has. A name the shell cannot spell is not one a
+        # row set, and is left behind.
+        _emu_n=$#
+        for _emu_v in $(awk 'BEGIN { for (k in ENVIRON) if (k ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print k }'); do
+            eval "set -- \"\$@\" -E \"$_emu_v=\${$_emu_v-}\""
+        done
+        set -- "$@" /
+        while [ "$_emu_n" -gt 0 ]; do
+            set -- "$@" "$1"
+            shift
+            _emu_n=$((_emu_n - 1))
+        done
+        set -- "$CHROOTNG_EMU" chroot --jit --keep-fds --shared-proc -w "$PWD" "$@"
+    fi
+    # KILL, not TERM: at the deadline it goes to the whole process group. A
+    # guest that has every signal blocked (a ptrace row's tracee) outlives a
+    # TERM that ended its parent, and holds the row's output pipe open: the
+    # substitution reading it never ends, nor does the suite.
+    if [ -n "$_emu_t" ] && [ -n "$TIMEOUT" ]; then
+        "$TIMEOUT" -s KILL "$_emu_t" "$@"
+    else
+        "$@"
     fi
 }
+
+emu() { emu_t "" "$@"; }
 
 # kref CMD... — run a host-built reference, the stand-in for "what the kernel
 # answers" in a differential. Termux preloads libtermux-exec into every process,
@@ -140,20 +179,20 @@ cng_detect_host() {
     */com.termux/*) CHROOTNG_TERMUX=1 ;;
     esac
 
-    # CHROOTNG_QEMU: an explicit setting always wins, INCLUDING an empty one — that is how
-    # to force direct execution on a cross host that runs AArch64 binaries some
-    # other way (a binfmt_misc handler), or to override the auto-picked build.
+    # CHROOTNG_EMU: an explicit setting always wins, INCLUDING an empty one —
+    # that is how to force direct execution on a cross host that runs AArch64
+    # binaries some other way (a binfmt_misc handler). Otherwise a foreign host
+    # takes the arm64emu this repository builds (`make test-chroot-ng` builds
+    # it), by an absolute name, since rows change directory.
     CHROOTNG_EMU_MISSING=0
-    if [ "${CHROOTNG_QEMU+x}" != x ]; then
-        CHROOTNG_QEMU=
+    if [ "${CHROOTNG_EMU+x}" != x ]; then
+        CHROOTNG_EMU=
         if [ "$CHROOTNG_NATIVE" = 0 ]; then
-            for _q in qemu-aarch64-static qemu-aarch64; do
-                if have "$_q"; then
-                    CHROOTNG_QEMU=$_q
-                    break
-                fi
-            done
-            [ -n "$CHROOTNG_QEMU" ] || CHROOTNG_EMU_MISSING=1
+            if [ -x "$PWD/build/arm64emu" ]; then
+                CHROOTNG_EMU=$PWD/build/arm64emu
+            else
+                CHROOTNG_EMU_MISSING=1
+            fi
         fi
     fi
 
@@ -309,18 +348,14 @@ cng_outside_binds() {
 # noexec .so path only exists for a guest whose OWN ld.so maps libraries). On a
 # cross host the AArch64 interpreter and libc are under the toolchain sysroot
 # rather than at the host's own /lib, so they are exposed at the guest paths the
-# binary names instead of at their host ones. Sets GUEST_DYN_BINDS, and beside
-# it GUEST_DYN_L — the `-L` that names the same sysroot to the loader, which is
-# empty on a native host and must be, or the interpreter the binary asks for is
-# looked up under a prefix that is not there.
+# binary names instead of at their host ones -- the interpreter the loader
+# resolves through the guest view among them. Sets GUEST_DYN_BINDS.
 cng_dyn_binds() {
     GUEST_DYN_BINDS=
-    GUEST_DYN_L=
     if [ "$CHROOTNG_NATIVE" = 1 ]; then _sr=${CHROOTNG_SYSROOT-}; else
         _sr=${CHROOTNG_SYSROOT-/usr/aarch64-linux-gnu}
     fi
     if [ -n "$_sr" ]; then
-        GUEST_DYN_L="-L $_sr"
         for _d in lib lib64 usr/lib usr/lib64; do
             [ -d "$_sr/$_d" ] || continue
             GUEST_DYN_BINDS="$GUEST_DYN_BINDS -b $_sr/$_d:/$_d"
@@ -356,7 +391,7 @@ guest_xlate_ready() {
         return 1
     fi
     if [ "$CHROOTNG_GUEST_XLATE" = 0 ]; then
-        skip "$1: seccomp inert here and the guest links dynamically, so neither tier reaches libc's svc sites"
+        skip "$1: the seccomp tier is inert here"
         return 1
     fi
     return 0
@@ -380,21 +415,33 @@ guest_cc_report() {
 }
 
 # ---- chroot-ng capabilities on THIS host ----------------------------------
-# Which tier is live changes what the suite may assert: with the filter inert
-# (qemu-user) an untranslated run is the expected outcome, and on a real AArch64
-# kernel the very same run must come back translated. Ask the binary rather than
-# inferring it from uname.
+# The seccomp filter is chroot-ng's whole interception: a host that does not
+# apply a guest's filter (qemu-user) cannot run it at all, so whether the tier
+# is live is checked, not assumed -- a compiled guest's open of a file that is
+# only in a scratch rootfs has to find it there. CHROOTNG_SECCOMP_LIVE is that
+# answer (the suite stops on a 0: run.sh), unknown and taken as live where no
+# guest can be built to ask. CHROOTNG_EXECMEM is whether the host lets anonymous
+# memory become executable, asked of the host with no chroot-ng in the way
+# (guests/execmem.c): the loader's anonymous strategy needs it.
 
 cng_probe_caps() {
-    CHROOTNG_SECCOMP_LIVE=0
+    CHROOTNG_SECCOMP_LIVE=1
     CHROOTNG_EXECMEM=0
-    CHROOTNG_PROBE_OUT=$(run --probe / 2>&1)
-    case "$CHROOTNG_PROBE_OUT" in
-    *"filter RET_ERRNO    WORKS"*) CHROOTNG_SECCOMP_LIVE=1 ;;
-    esac
-    case "$CHROOTNG_PROBE_OUT" in
-    *"RESULT    OK"*) CHROOTNG_EXECMEM=1 ;;
-    esac
+    _pr=$CHROOTNG_TMP/probe
+    mkdir -p "$_pr/root/etc" "$_pr/root/bin"
+    if guest_cc "$_pr/root/bin/readfile" tests/chroot-ng/guests/readfile.c; then
+        printf 'cng-live\n' >"$_pr/root/etc/greeting"
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        case "$(run_t 60 $CHROOTNG_GUEST_BINDS "$_pr/root" /bin/readfile 2>/dev/null)" in
+        cng-live) ;;
+        *) CHROOTNG_SECCOMP_LIVE=0 ;;
+        esac
+    fi
+    if guest_cc "$_pr/execmem" tests/chroot-ng/guests/execmem.c; then
+        emu_t 30 "$_pr/execmem" >/dev/null 2>&1
+        [ $? = 7 ] && CHROOTNG_EXECMEM=1
+    fi
+    rm -rf "$_pr"
 }
 
 # ---- guest rootfs images + the differential oracle ------------------------
@@ -619,15 +666,9 @@ cng_platform_init() {
     cng_probe_caps
     cng_detect_images
 
-    # Will a compiled guest's OWN path syscalls really be translated? The seccomp
-    # tier catches every guest; where it is inert (qemu-user) only -R rewriting is
-    # left, and that reaches the svc sites in the objects the loader maps — not
-    # the libc.so a dynamic guest's ld.so maps afterwards. So the legs that assert
-    # translation from inside a compiled guest need one of the two.
-    CHROOTNG_GUEST_XLATE=0
-    if [ "$CHROOTNG_SECCOMP_LIVE" = 1 ] || [ "$GUEST_STATIC" = 1 ]; then
-        CHROOTNG_GUEST_XLATE=1
-    fi
+    # A compiled guest's own path syscalls are translated wherever the tier
+    # is live, which the suite requires (run.sh).
+    CHROOTNG_GUEST_XLATE=$CHROOTNG_SECCOMP_LIVE
 }
 
 cng_platform_banner() {
@@ -635,10 +676,9 @@ cng_platform_banner() {
     printf '  host          %s%s\n' "$HOST_ARCH" \
         "$([ "$CHROOTNG_TERMUX" = 1 ] && echo ' (Termux/Android)')"
     printf '  exec          %s\n' \
-        "$([ -n "$CHROOTNG_QEMU" ] && echo "$CHROOTNG_QEMU" || echo 'native (no emulator)')"
+        "$([ -n "$CHROOTNG_EMU" ] && echo "$CHROOTNG_EMU chroot" || echo 'native (no emulator)')"
     printf '  seccomp tier  %s\n' \
-        "$([ "$CHROOTNG_SECCOMP_LIVE" = 1 ] && echo 'live' ||
-            echo 'inert (-R rewriting carries translation)')"
+        "$([ "$CHROOTNG_SECCOMP_LIVE" = 1 ] && echo 'live' || echo 'INERT')"
     printf '  execmem       %s\n' \
         "$([ "$CHROOTNG_EXECMEM" = 1 ] && echo 'permitted' || echo 'DENIED')"
     printf '  guest cc      %s\n' \

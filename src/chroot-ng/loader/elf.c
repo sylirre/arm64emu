@@ -12,7 +12,6 @@
 #include "cng/monitor.h"
 #include "cng/ownmap.h"
 #include "cng/pin.h"
-#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -61,19 +60,18 @@ void cng_loader_check_execmem(void) {
 /* Strategy A — anonymous: reserve the span RW, pread segment contents, then
  * mprotect each to its final perms. Defeats a true noexec mount but needs
  * execmem (anon PROT_EXEC). Returns CNG_LOAD_EEXEC if mprotect(RX) is denied so
- * the caller can retry file-backed. Supports M8 svc rewriting. */
+ * the caller can retry file-backed. */
 static int map_anon(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
                     int is_dyn, unsigned long lo, unsigned long span,
                     unsigned long base_hint, unsigned long *bias_out,
                     unsigned long *maplen_out) {
-    unsigned long pool_extra = cng_g_rewrite ? CNG_TRAMP_POOL : 0;
-    *maplen_out = span + pool_extra;
+    *maplen_out = span;
     int mflags = CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS;
     void *want = is_dyn ? (void *)base_hint : (void *)lo;
     if (!is_dyn)
         mflags |= CNG_MAP_FIXED;
-    void *seg = sys_mmap(want, span + pool_extra, CNG_PROT_READ | CNG_PROT_WRITE,
-                         mflags, -1, 0);
+    void *seg = sys_mmap(want, span, CNG_PROT_READ | CNG_PROT_WRITE, mflags, -1,
+                         0);
     if (seg == CNG_MAP_FAILED || cng_is_err((long)seg))
         return CNG_LOAD_EMAP;
     unsigned long bias = is_dyn ? ((unsigned long)seg - lo) : 0;
@@ -83,35 +81,8 @@ static int map_anon(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
             continue;
         if (read_exact(fd, (void *)(bias + ph[i].p_vaddr), ph[i].p_filesz,
                        (long)ph[i].p_offset) != (long)ph[i].p_filesz) {
-            sys_munmap(seg, span + pool_extra);
+            sys_munmap(seg, span);
             return CNG_LOAD_EIO;
-        }
-    }
-
-    if (cng_g_rewrite) {
-        /* Where this object says its instructions are. An empty map is not a
-         * refusal to rewrite — cng_rewrite_seg then falls back to scanning the
-         * whole segment behind the syscall-context filter. */
-        struct cng_code_ranges cr;
-        cng_code_ranges(fd, &cr);
-        unsigned long pool = (unsigned long)seg + span, used = 0;
-        int sites = 0;
-        for (int i = 0; i < eh->e_phnum; i++)
-            if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_X))
-                sites += cng_rewrite_seg(bias + ph[i].p_vaddr,
-                                         bias + ph[i].p_vaddr + ph[i].p_filesz,
-                                         ph[i].p_offset, &cr, pool,
-                                         CNG_TRAMP_POOL, &used);
-        /* `ranges=0` says the object carried no code map and the scan ran
-         * behind the syscall-context filter instead — worth telling apart when
-         * a site count comes out lower than expected. */
-        if (cng_g_debug)
-            cng_dprintf(2, "[cng] load: rewrote %d svc site(s), ranges=%d\n",
-                        sites, cr.n);
-        if (used) {
-            sys_mprotect((void *)pool, cng_page_up(used),
-                         CNG_PROT_READ | CNG_PROT_EXEC);
-            cng_flush_icache((void *)pool, (void *)(pool + used));
         }
     }
 
@@ -170,7 +141,7 @@ static int map_anon(int fd, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
             continue;
         long mr = sys_mprotect((void *)ps, pe - ps, prot);
         if (mr < 0) {
-            sys_munmap(seg, span + pool_extra);
+            sys_munmap(seg, span);
             if (mr == -EACCES && (prot & CNG_PROT_EXEC))
                 return CNG_LOAD_EEXEC; /* execmem denied */
             cng_dprintf(2, "chroot-ng: load: mprotect(%lx len=%lu prot=%d)"
@@ -397,10 +368,7 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
          * The sum wrapping is one way; the other is a sum within a page of the
          * top, which does not wrap but rounds up to 0 (cng_page_end). That one
          * used to be caught only as `e < s`, which a segment starting in the
-         * first page never is — s was 0 as well, the span came out 0, and
-         * under -R the trampoline pool on top of it made the reservation a
-         * mapping that succeeded, a pool's size long, into which the
-         * segment's whole file part was then read. */
+         * first page never is — s was 0 as well, and the span came out 0. */
         unsigned long e;
         if (cng_page_end(ph[i].p_vaddr, ph[i].p_memsz, &e) != 0)
             return CNG_LOAD_EFORMAT;
@@ -412,16 +380,7 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
     }
     if (nload == 0)
         return CNG_LOAD_EFORMAT;
-    /* The same question one step out from the per-segment wrap above. What gets
-     * reserved is the span, plus — under -R — a trampoline pool on top of it
-     * (map_anon), and that sum is a mapping length: a span within a pool's
-     * distance of the top of the address space wraps it, and the mmap then
-     * succeeds at some small length while every pread and every trampoline
-     * write goes outside. Checked against the pool unconditionally, since
-     * whether -R is on is not a property of the header, and a span nothing can
-     * map describes nothing either way. */
-    if (hi - lo > ~0UL - CNG_TRAMP_POOL)
-        return CNG_LOAD_EFORMAT;
+
     /* An ET_EXEC image goes down MAP_FIXED at its link-time vaddr, and the
      * monitor shares this address space: a span reaching 0x1000000000 would
      * map the guest over chroot-ng's own text and data, which is how the
@@ -438,10 +397,8 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
      * (execve.c) knows to leave every one of them alone, but that sweep runs
      * after the map pass, and the map pass had already put the guest over
      * them. cng_hits_monitor asks about all of it — over the whole of what
-     * map_anon reserves, which under -R is the span plus the trampoline pool
-     * on top of it, MAP_FIXED alike. */
-    if (eh->e_type == ET_EXEC &&
-        cng_hits_monitor(lo, (hi - lo) + (cng_g_rewrite ? CNG_TRAMP_POOL : 0)))
+     * either strategy reserves, MAP_FIXED alike. */
+    if (eh->e_type == ET_EXEC && cng_hits_monitor(lo, hi - lo))
         return CNG_LOAD_ECLOBBER;
 
     plan->lo = lo;
@@ -534,8 +491,7 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
      * again at the last moment before the MAP_FIXED, where a stale yes would
      * replace the monitor and a refusal is at worst a fatal exec — which is
      * still a process that dies saying why. */
-    if (!plan->is_dyn &&
-        cng_hits_monitor(lo, span + (cng_g_rewrite ? CNG_TRAMP_POOL : 0)))
+    if (!plan->is_dyn && cng_hits_monitor(lo, span))
         return CNG_LOAD_ECLOBBER;
     int anon = !cng_g_loader_file;
     int rc = anon ? map_anon(plan->fd, eh, ph, plan->is_dyn, lo, span,
@@ -596,18 +552,6 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
     }
     out->is_dyn = plan->is_dyn;
     return CNG_LOAD_OK;
-}
-
-/* ---- both passes, for the callers that have nothing to validate against
- * (the initial program, and the debug ops) ------------------------------- */
-
-int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out) {
-    struct cng_elf_plan plan;
-    int rc = cng_elf_plan_fd(fd, &plan, out);
-    if (rc == CNG_LOAD_OK)
-        rc = cng_elf_map(&plan, base_hint, out);
-    cng_elf_plan_release(&plan);
-    return rc;
 }
 
 int cng_load_elf(const char *path, unsigned long base_hint,

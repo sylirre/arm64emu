@@ -51,15 +51,6 @@ What that does and does not buy:
   made from its own copy of the kernel's record (the control data of a
   `recvmsg` is received into a buffer of the monitor's), so nothing a thread
   writes into the guest's own buffers changes which descriptor is closed.
-  The `-R` tier's lazy patch — a site rewritten on its first trap — has the
-  same shape over the guest's text. The page gains write for the store and
-  gets back the protection `/proc/self/maps` gave it at that patch, so a
-  sibling thread that reprotects or remaps that very page in the few syscalls
-  between that read and the restore can have its change overwritten, or the
-  branch land in what it mapped there. What the monitor does own is that no
-  such race can fault it: the word is read and the branch written through
-  `/proc/self/mem`, and a page that went away is an `EIO` there, not a
-  `SIGSEGV` in a handler that has every signal masked.
 
 One rule follows for the implementation: chroot-ng must never be the instrument.
 Wherever a **guest-chosen address** reaches a `MAP_FIXED` of ours — an `ET_EXEC`
@@ -245,7 +236,6 @@ nothing is left, leaving no file and no socket name.
 | Tier | Mechanism | Min kernel | Notes |
 |------|-----------|-----------|-------|
 | primary | seccomp `RET_TRAP` → in-process `SIGSYS` | 3.5 | one signal per path syscall, no second process; handler translates into its own buffer and re-issues via the gate |
-| perf    | AoT rewrite of `svc #0` sites in our own pages → trampoline | any | AArch64-clean because we own the (anon, RW→RX) pages; optimization on top of the SIGSYS floor |
 | upgrade | seccomp `RET_USER_NOTIF` → supervisor | 5.0 | out-of-process, sheds SIGSYS/execve/clobber fragility where available |
 | fallback| ptrace + seccomp `RET_TRACE` | 3.5 (3.4 plain) | correctness backstop; cannot defeat true `noexec` |
 
@@ -263,10 +253,9 @@ returns into a stub in the gate that makes the call from the guest's own
 context, the guest's call itself or the whole dispatch, and a second trap puts
 the registers back (`sigsys.c`, the bounce).
 
-**The mmap hook is the choke point** for both `noexec`-defeat and rewriting of
-dynamically-loaded code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from
-the `noexec` rootfs (which fails natively), we intercept it, read+map the file
-into anon RW→RX, and rewrite its `svc` sites before flipping to RX
+**The mmap hook is the choke point** for `noexec`-defeat of dynamically-loaded
+code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from the `noexec` rootfs
+(which fails natively), we intercept it and read+map the file into anon RW→RX
 (`src/chroot-ng/monitor/execmap.c`). The filter tests the arguments rather than the
 syscall — `PROT_EXEC` set, `MAP_ANONYMOUS` clear — so every anonymous
 allocation a guest makes stays untrapped and only a library's text mapping
@@ -275,25 +264,13 @@ exec-permitted mount keeps its real file mapping, its page-cache sharing and
 its identity in `/proc/self/maps`; only `MAP_PRIVATE` can be served this way,
 since a copy cannot carry `MAP_SHARED`'s visibility.
 
-**Rewriting needs no seccomp** (a rewritten site is a plain `b` to a trampoline
-that calls the dispatcher directly). The trampoline saves the guest's registers
-in a frame on the guest's stack, `CNG_TRAMP_GAP` bytes below its `sp` rather
-than right under it: a kernel's `svc` touches no memory of the caller's, and Go
-keeps a new thread's m, g and function just below its `sp` through the thread's
-first syscall. So the rewriting tier is not only the speed
-path — it is also a *seccomp-free interception mechanism*, extending translation
-to kernels below the 3.5 seccomp-BPF floor (e.g. 3.4) and to environments where
-seccomp is unavailable. Its limit is coverage: it only catches statically
-locatable `svc` sites in objects we load (not JIT/self-modifying code, and not
-`.so`s until the mmap hook lands), whereas the SIGSYS floor catches every raw
-syscall. The two compose: rewrite what we can find, trap the rest.
-
-That composition is also the whole of what a run may fall back to. When the
-filter cannot be installed and `-R` is on, chroot-ng enters the guest behind a
-warning that names what stays untranslated; when `-R` is off there is nothing
-left that intercepts, and the invocation — a rootfs, binds, `-u`, `-l`,
-`--no-ptrace`, `--shared-proc` — cannot be delivered at all, so `cng_run`
-refuses to enter the guest rather than run it against the host's own paths.
+**The filter is the whole of the interception.** When it cannot be installed
+there is nothing left that intercepts, and the invocation — a rootfs, binds,
+`-u`, `-l`, `--shared-proc` — cannot be delivered at all, so `cng_run` refuses
+to enter the guest rather than run it against the host's own paths. (An `svc`
+rewriting tier, `-R`, once extended translation to hosts with no filter and
+patched sites to trampolines; it was dropped as slower than the trap for an
+untranslated call and as the one tier that wrote the guest's text.)
 
 ### Coexisting with Android's own seccomp filter
 
@@ -319,9 +296,7 @@ Two layers handle this:
   `--fake-id`; else, for a setter the probe below found refused, from the real
   ids and capabilities by the kernel's own rules — 0 for a call that changes
   nothing, EPERM or EINVAL as the kernel would say (M84). Nothing is re-issued,
-  so this does not depend on nested signal delivery. (The M8
-  trampoline path passes `trapped=0`, where an unhandled syscall is an ordinary
-  one to run, not a blocked one.)
+  so this does not depend on nested signal delivery.
 - **Block-list probe (for re-issued path syscalls).** Some syscalls we *do*
   re-issue (translated path syscalls) are also Android-blocked — notably
   `fchownat` and `mknodat`. At monitor install we measure the ambient filter:
@@ -412,8 +387,8 @@ traced child, when it is not the tracer, is told of the group stop and of the
 and a report in the child's link that the parent's wait collects for
 `WUNTRACED` or `WCONTINUED`, since the kernel's own wait never sees a stop the
 child did not make in the kernel. That reaches a parent whose waits come to
-chroot-ng — a tracer's, a tracee's, any `-R` one; an untraced parent's wait in
-the `SIGSYS` tier goes to the kernel and does not see it. `SIGCONT` itself is
+chroot-ng — a tracer's, a tracee's; an untraced parent's wait goes to the
+kernel and does not see it. `SIGCONT` itself is
 sent as well, to be stopped for and delivered like any other signal. A wait the
 `SIGSYS` handler polls for a tracer or a tracee is cut short by a signal the
 guest takes delivery of the way `do_wait` is, with `ERESTARTSYS`: made again
@@ -424,12 +399,14 @@ in progress — x8's low 32 bits, as the tracer left it at the entry stop — at
 the call's own stops (entry, exit, the events it reports), and -1 at every
 other, where what a tracer writes lasts until the kernel is entered again: the
 next trap, or a frame other than the one the last such stop left, which the
-guest ran on to. `orig_x0`, x0 as the trap found it before the entry stop, is
-kept with the call, and a restart is made from it.
+guest ran on to. `orig_x0`, x0 as the trap found it -- or as the tracer leaves
+it at the entry stop, for a call that is made (e057b9477232, in every stable
+kernel) -- is kept with the call: `PTRACE_GET_SYSCALL_INFO` reports it, and a
+restart is made from it.
 
 A signal of the guest's also lands wherever the thread is. In guest code it is
 stopped for there, the kernel's place. In a call the dispatcher makes from
-guest context (an `-R` trampoline's, a bounced one) it is not: the kernel stops
+guest context (a bounced one) it is not: the kernel stops
 for a signal on the way back to user space, after the call's exit stop. So the
 handler holds it back — pending again with its own siginfo, blocked by the
 frame's mask — and the end of the dispatch lets it go at a point of ours
@@ -441,16 +418,16 @@ a read), and the signal's stop finds the call at its `svc` with `orig_x0`, to
 be made again after it, or turned into `EINTR` by a handler without
 `SA_RESTART`. One pending as that call is about to be made is let go just
 before it (`cng_pt_unhold`), and the call is made after it. The bounce stubs
-and the trampolines are put back in place, as for a kick. A stop signal a call
+are put back in place, as for a kick. A stop signal a call
 sends its own thread is taken once the call is over, the same way.
 
 A running task is reached by a kick signal of ours, and the kick lands wherever
 the thread is — which, for a thread blocked in a call made on its behalf, is
-inside chroot-ng: a bounce stub, an `-R` trampoline, or the dispatcher itself.
+inside chroot-ng: a bounce stub, or the dispatcher itself.
 The stop has to show what the kernel shows there, the thread's own registers
 with the call's arguments in place and `pc` at its syscall instruction, and the
 call has to be made again when it ends, with whatever the tracer left in the
-registers. The stubs and the trampolines hold the guest's registers in a
+registers. The stubs hold the guest's registers in a
 record, so the kick's frame is put back to the guest's state, as if the call
 were not yet made or already over. The dispatcher's frames cannot be stepped
 out of: its stop reports the guest's registers from the dispatch's own record,
@@ -498,9 +475,7 @@ handler asks the kernel with a call only the filter in question traps.
   guest handler ran only after the call returned, and a ptrace attach, whose
   kick is masked with the rest, hung its tracer → every trapped call that can
   block is bounced into guest context the same way, where the kernel's own
-  rules interrupt and restart it. Under `-R` the first trap from a site is sent
-  back to the site once the rewrite has made it a branch, so it too runs
-  through the trampoline.
+  rules interrupt and restart it.
 - The guest (notably Go) can clobber the `SIGSYS` handler or block the signal →
   virtualize `rt_sigaction`/`rt_sigprocmask`/`seccomp`/`prctl`. A guest filter is
   layered on top of ours by the kernel and governs the syscalls the handler
@@ -518,11 +493,11 @@ handler asks the kernel with a call only the filter in question traps.
 
 ## Build & test
 
-Cross-compiled with `aarch64-linux-gnu-gcc`, exercised under `qemu-aarch64`.
-Caveat: qemu-user does **not** faithfully run guest-installed seccomp filters,
-so the SIGSYS mechanism is validated with simulated-SIGSYS unit tests plus real
-AArch64-kernel integration; the loader and path logic are fully testable under
-qemu.
+Cross-compiled with `aarch64-linux-gnu-gcc`. On an x86_64 host it runs under
+arm64emu's chroot mode, which applies a guest's seccomp filter (`RET_TRAP`,
+`SIGSYS`) as the kernel does — qemu-user does not, and cannot run it at all —
+and natively on AArch64; every test is a guest's, through the filter
+(docs/chroot-ng/testing.md).
 
 The binary is freestanding (`-nostdlib`, own `_start`, own syscall gate) so it
 never depends on libc and the SIGSYS handler has no re-entrancy hazards. Its

@@ -1,11 +1,7 @@
-/* A blocking wait and the signals that arrive during it (M8, -R).
+/* A blocking wait and the signals that arrive during it (M8).
  *
- * The -R tier used to make every wait4/waitid out of 50 ms polls of the ptrace
- * registry, whether or not anything was traced. Besides costing a shell 51 ms
- * per fork and waitpid, that loop swallowed the interruption: a handler that
- * ran during one of its sleeps did not end the wait, which the kernel's does
- * unless the handler asked for SA_RESTART. Now an untraced -R wait is the
- * kernel's own, and this checks it answers as the kernel does:
+ * An untraced wait is the kernel's own, and this checks it answers as the
+ * kernel does:
  *
  *   - no SA_RESTART: waitpid and waitid fail with EINTR, the handler having run;
  *   - SA_RESTART: the wait carries on through the signals and returns the child;

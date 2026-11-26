@@ -2,9 +2,8 @@
  *
  * The path dispatcher is deep — cng_dispatch's frame alone is ~24 KiB and an
  * openat translation chain runs to ~66 KiB — so the SIGSYS tier switches to a
- * dedicated 256 KiB scratch stack before entering it. The -R trampoline tier
- * calls the same dispatcher from an ordinary context, on whatever stack the
- * rewritten `svc` site happened to be running on.
+ * dedicated 256 KiB scratch stack before entering it. Only the kernel's signal
+ * frame goes on the guest's.
  *
  * Guests do run syscalls on small stacks: musl gives a thread 128 KiB, Go gives
  * a goroutine ~8 KiB, and anything with a sigaltstack runs handlers on one.

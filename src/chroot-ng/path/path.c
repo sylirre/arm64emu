@@ -398,9 +398,8 @@ static int fd_names(int fd, const char *path) {
  * virtual cwd stayed where it was and the script resolved under it — ENOENT.
  *
  * Resolved by opening the path and reading back the kernel's own name for it.
- * Anything that does not resolve (a nonexistent path — diagnosed by the caller
- * — or the synthetic roots the self-tests use, which have no host inode) is
- * kept verbatim, exactly as before.
+ * Anything that does not resolve (a nonexistent path — diagnosed by the
+ * caller) is kept verbatim, exactly as before.
  *
  * The open is O_PATH, which refers to a file of any kind without opening it.
  * O_RDONLY|O_DIRECTORY was two restrictions the reverse map cannot afford: a
@@ -454,15 +453,15 @@ static int canon_host_root(char *dst, size_t dstsz, const char *src) {
  * second writer may since have started on the buffer it read — the work is
  * redone. Readers never wait; a writer waits only for another writer.
  *
- * The writer runs with every signal blocked. On the -R tier the dispatcher
- * runs on the guest's own mask, and a guest handler delivered inside the copy
+ * The writer runs with every signal blocked. From guest context (a bounced
+ * dispatch) it runs on the guest's own mask, and a guest handler delivered inside the copy
  * that itself called chdir would take the lock its own thread holds. The lock
  * is by tid, and one whose holder is gone — a fork child inherits it from the
  * thread that held it in the parent — is taken over.
  *
  * A struct that is not one of the two buffers is private: the initial view
- * cng_run builds before anything else runs, a self-test's own. Those are read
- * and written in place, as before, and cng_fs_publish makes one the view. */
+ * cng_run builds before anything else runs. It is read and written in place,
+ * as before, and cng_fs_publish makes it the view. */
 struct cng_fs *cng_g_fs = 0;
 
 static struct cng_fs g_fs_view[2];

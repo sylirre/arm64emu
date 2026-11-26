@@ -45,7 +45,7 @@ cng_syscall6_on:
     ret
     .size cng_syscall6_on, . - cng_syscall6_on
 
-/* The kickable wait (ptrace.c, cng_pt_wait_native): an -R guest's blocking
+/* The kickable wait (ptrace.c, cng_pt_wait_native): a guest-context blocking
  * wait4 or waitid, made as the guest issued it — unless a ptrace kick has been
  * taken since the caller read *kicks as `seen`.
  *
@@ -149,8 +149,8 @@ cng_bounce_svc_end:
  * (sigsys.c, BOUNCE_DISP): one with a path or a socket address to translate,
  * where it is not the guest's own svc that blocks but the one the dispatcher
  * makes. The handler resumes the thread here with sp at the record; the C side
- * runs the dispatch on the record as its register file, the way the -R
- * trampoline runs it on its own, and the completion is the trap above. Past
+ * runs the dispatch on the record as its register file, and the completion
+ * is the trap above. Past
  * the gate's end, which this has no svc to be inside of. */
     .global cng_bounce_dispatch
     .type cng_bounce_dispatch, %function

@@ -46,10 +46,9 @@ static const int probe_set[] = {
     /* And this one, which the same reset issues to drop the old program's
      * rseq registration — only ever with the parameters of a registration
      * that went through, so a host that refuses rseq is never asked to
-     * unregister; but the -t drivers record a registration through the
-     * dispatcher with no handler behind them, and reissue() must know. (The
-     * probe's arguments, -1 for an area and 0 for a length, are refused
-     * EINVAL before anything is registered.) */
+     * unregister; and reissue() must know a refusal of its own. (The probe's
+     * arguments, -1 for an area and 0 for a length, are refused EINVAL before
+     * anything is registered.) */
     __NR_rseq,
     __NR_fchmodat2,
     /* The 6.13/6.17 dirfd forms of the xattr and file-attribute calls. A kernel

@@ -2,11 +2,9 @@
 # tested from changes, on a GitHub-hosted Linux AArch64 runner.
 #
 # Why AArch64 and not the usual x86_64 box: the binary is an AArch64 program and
-# so is every guest the suite builds. On x86_64 both would run under qemu-user,
-# which does not apply a guest's seccomp filter, so the in-process SIGSYS tier
-# -- the one a device actually uses -- would be inert and only -R svc-rewriting
-# would be exercised (see docs/chroot-ng/testing.md). Native AArch64 makes it
-# live.
+# so is every guest the suite builds. On x86_64 both run under arm64emu's chroot
+# mode, which applies a guest's seccomp filter as the kernel does; native
+# AArch64 is the real kernel, the one a device runs (docs/chroot-ng/testing.md).
 #
 # tests/chroot-ng/lib.sh resolves everything host-dependent (no emulator,
 # native gcc as the guest toolchain, static-PIE guests) and prints what it found
@@ -86,12 +84,6 @@ jobs:
 
       - name: Build
         run: make -j"$(nproc)" chroot-ng
-
-      # The capability probe on the runner's kernel. Its exit status is 1 when a
-      # hard prerequisite of the in-process design fails, so a runner image that
-      # regresses shows up here by name rather than as a wall of test failures.
-      - name: Probe host capabilities
-        run: make probe-chroot-ng
 
       - name: Test
         run: make test-chroot-ng

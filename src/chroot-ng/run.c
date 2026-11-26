@@ -5,9 +5,6 @@
  * main.c; the parameters below arrive already resolved.
  *
  *   rootfs     guest rootfs (host path); "/" means identity (no translation)
- *   libprefix  resolve the ELF interpreter under this dir (test aid; NULL on
- *              real hardware, where the interpreter and libraries resolve
- *              through the rootfs/bind map + the monitor)
  *   workdir    -w/--work-dir: the guest's initial cwd, a guest path (NULL for
  *              the default; see set_workdir)
  *   bind_g/h/ro  nb bind mounts: guest path bind_g[i] is backed by host path
@@ -18,13 +15,12 @@
  *              whole environment (see build_guest_env)
  *   gargv/gargc  the guest program (gargv[0]) and its arguments
  *
- * The credential/rewrite/loader flags (cng_g_fake_id, cng_g_rewrite,
- * cng_g_loader_file) are set by the option parser before this is called.
+ * The credential and loader flags (cng_g_fake_id, cng_g_loader_file) are set
+ * by the option parser before this is called.
  *
  * gargv[0] is a guest path resolved through the rootfs/bind map. The monitor
- * traps the guest's own path syscalls and translates them (see monitor.h).
- * Under qemu-user the seccomp filter is inert, so translation is only exercised
- * on a real AArch64 kernel (and via the `-t dtest` self-test).
+ * traps the guest's own path syscalls and translates them (see monitor.h); it
+ * needs a kernel that applies the guest's seccomp filter (qemu-user does not).
  */
 #include "cng/broker.h"
 #include "cng/execmap.h"
@@ -38,7 +34,6 @@
 #include "cng/procfs.h"
 #include "cng/procreg.h" /* cng_g_shared_proc */
 #include "cng/ptrace.h"
-#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/tty.h"
@@ -75,19 +70,6 @@ static const char *load_err(int rc) {
     default:
         return "unknown error";
     }
-}
-
-/* Join `a` and `b` into `dst`. Returns dst, or 0 when the result did not fit:
- * cng_strlcpy truncates, and a cut path is a different path — the one caller
- * hands the result straight to the loader, which would then open whatever the
- * shortened name happens to be, or report "cannot open" about a name nobody
- * asked for. Same rule as everywhere else a path is assembled here (see
- * normalize_root and cng_fs_abscanon in path.c). */
-static char *join2(char *dst, size_t size, const char *a, const char *b) {
-    size_t n = cng_strlcpy(dst, a, size);
-    if (n >= size || cng_strlcpy(dst + n, b, size - n) >= size - n)
-        return 0;
-    return dst;
 }
 
 /* Assemble the guest environment into `out` (CNG_MAX_ENV + 3 slots) and
@@ -208,7 +190,7 @@ static int env_switch_on(const char *e, const char *name) {
            e[n + 1] != '0';
 }
 
-int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
+int cng_run(const char *rootfs, const char *workdir,
             const char *const *bind_g, const char *const *bind_h,
             const int *bind_ro, int nb, char *const *env_set, int ne,
             int gargc, char **gargv, char **envp, unsigned long *auxv) {
@@ -327,10 +309,8 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
                         bind_h[j], bind_g[j]);
             return 2;
         }
-    /* The dispatcher (used by both the SIGSYS handler and M8 trampolines) needs
-     * the fs view even if the seccomp monitor never installs (e.g. -R only) —
-     * and so does cng_resolve, which -w/--work-dir and the program lookup below
-     * both go through. */
+    /* The dispatcher needs the fs view, and so does cng_resolve, which
+     * -w/--work-dir and the program lookup below both go through. */
     cng_g_fs = &g_fs;
 
     /* Initial guest cwd. With a real rootfs, default to "/" (never leak the host
@@ -339,9 +319,9 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * the guest cwd.
      *
      * The chdir's failure is the whole answer, as it is for --work-dir: a
-     * relative name the monitor never sees — anything untrapped, and under
-     * -R every site the rewriter did not reach — resolves against the real
-     * cwd, and one left at the launch directory while the guest is told it
+     * relative name the monitor never sees — anything untrapped — resolves
+     * against the real cwd, and one left at the launch directory while the
+     * guest is told it
      * is at "/" resolves those names outside the guest view entirely. It
      * used to be ignored, so a rootfs that was not there, or not enterable,
      * ran the guest (from a bind, say) with its containment fallback
@@ -458,15 +438,7 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     if (prog.has_interp) {
         char ipath[CNG_PATH_MAX];
         const char *ip;
-        if (libprefix) {
-            ip = join2(ipath, sizeof ipath, libprefix, prog.interp);
-            if (!ip) {
-                cng_dprintf(2,
-                            "chroot-ng: interpreter path is too long: %s + %s\n",
-                            libprefix, prog.interp);
-                return 1;
-            }
-        } else if (cng_resolve(prog.interp, 1, ipath, sizeof ipath) == 0)
+        if (cng_resolve(prog.interp, 1, ipath, sizeof ipath) == 0)
             ip = ipath;
         else
             ip = prog.interp;
@@ -511,11 +483,8 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
     /* Install the monitor last, after all of our own path syscalls are done.
      * Only when it has something to do: an identity view needs no translation.
      *
-     * Two options need a trap of ours whatever the view is, and were inert
-     * without this. --no-ptrace has to *refuse* ptrace(2), which takes the trap
-     * that would otherwise emulate it — left out, the guest's ptrace went
-     * straight to the host kernel and worked, which is the opposite of what was
-     * asked for. --shared-proc has to publish this invocation's processes into
+     * One option needs a trap of ours whatever the view is, and was inert
+     * without this: --shared-proc has to publish this invocation's processes into
      * the shared registry as they fork, and that hook hangs off the trapped
      * clone; without it a --shared-proc invocation over `/` published its root
      * process and nothing else, so another invocation's `ps` saw one process
@@ -525,50 +494,29 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
      * each turns an emulation of ours off, and with no monitor installed there
      * is none to turn off, so they are already honored by not being here. */
     int want_xlate = (strcmp(rootfs, "/") != 0) || nb > 0 || cng_g_fake_id ||
-                     cng_g_rewrite || cng_g_l2s || cng_g_no_ptrace ||
-                     cng_g_shared_proc;
+                     cng_g_l2s || cng_g_shared_proc;
     if (want_xlate) {
         int mrc = cng_install_monitor(cng_g_fs);
         /* A monitor that could not be installed is not a warning to print on
          * the way into the guest. Without one, nothing intercepts: a rootfs
          * that is not `/` runs against the host's own paths, -u reports the
-         * real identity, -l makes no hardlink, --no-ptrace refuses nothing and
-         * --shared-proc publishes nothing — every one of them the thing the
+         * real identity, -l makes no hardlink and --shared-proc publishes
+         * nothing — every one of them the thing the
          * invocation asked for, and none of them delivered. That used to go
          * ahead behind one line on stderr, which a launcher script never
          * reads, and the guest wrote where the host keeps its files. It stops
-         * here instead, with the errno: EINVAL is qemu-user or a kernel
-         * before 3.5, EACCES a policy that forbids the filter (the probe says
-         * which).
-         *
-         * -R is the exception, and a deliberate one: a rewritten svc site
-         * calls the dispatcher directly and needs no filter, which is what
-         * makes it the interception tier for hosts that have none
-         * (docs/chroot-ng/DESIGN.md). What it cannot reach — the svc sites in a library
-         * the guest's own ld.so maps from a mount that grants PROT_EXEC, and
-         * code no object carries — goes to the host untranslated, and the
-         * warning says exactly that, so a run that goes on does so knowing. */
-        if (mrc < 0 && !cng_g_rewrite) {
+         * here instead, with the errno: EINVAL is a kernel before 3.5,
+         * EACCES a policy that forbids the filter. */
+        if (mrc < 0) {
             cng_dprintf(2,
                         "chroot-ng: cannot install the seccomp monitor (errno %d)"
                         " and nothing else would intercept the guest's syscalls:"
                         " not entering it\n"
-                        "           (seccomp is inert under qemu-user and needs a"
-                        " kernel >= 3.5 that permits the filter; -R carries"
-                        " translation without it, for the svc sites it can"
-                        " reach)\n",
+                        "           (it needs a kernel >= 3.5 that permits the"
+                        " filter)\n",
                         -mrc);
             return 1;
         }
-        if (mrc < 0)
-            cng_dprintf(2,
-                        "chroot-ng: warning: could not install the seccomp"
-                        " monitor (errno %d); only the svc sites -R rewrote are"
-                        " intercepted\n"
-                        "           (code in a library the guest's ld.so maps"
-                        " from an exec-permitted mount, and any code no object"
-                        " carries, reaches the host untranslated)\n",
-                        -mrc);
 
         /* A host with no /dev/shm whose temp directories all failed the
          * stand-in's checks (cng_dev_shm_init) leaves the guest without one,

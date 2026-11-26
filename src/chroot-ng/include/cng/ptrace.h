@@ -145,17 +145,13 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
                                        * uncollected after a while */
 #define CNG_PT_KICK_ARM    0x50544121 /* "PTA!" — install the tracer filter here */
 
-/* --no-ptrace: refuse guest ptrace outright (-EPERM) and keep the registry
- * unmapped. The machinery is otherwise inert until a guest actually traces. */
-extern int cng_g_no_ptrace;
-
 /* 1 once the SIGSYS handler is installed. The stacked filters below are gated
  * on it — trapping with nothing to catch the signal kills the task. */
 extern int cng_g_sigsys_ready;
 
 /* Map the shared registry. Called once from cng_run before the monitor is
  * installed and before the guest can fork. Failure is not fatal: ptrace then
- * answers -EPERM, as if the session had --no-ptrace. */
+ * answers -EPERM. */
 void cng_pt_init(void);
 
 /* Is the calling task a tracee (stops must be reported)? A plain global read
@@ -163,7 +159,8 @@ void cng_pt_init(void);
 int cng_pt_active(void);
 
 /* Is the calling task armed for syscall stops (last resume was PTRACE_SYSCALL)?
- * The SIGSYS/trampoline paths test this before doing anything ptrace-related. */
+ * The SIGSYS and guest-context paths test this before doing anything
+ * ptrace-related. */
 int cng_pt_syscall_armed(void);
 
 /* ---- tracee-side stop reports ---- */
@@ -296,8 +293,8 @@ void cng_pt_service_kick(struct cng_ucontext *uc);
 void cng_pt_kick(s32 tgid, s32 tid, int magic);
 
 /* Record the register frame this entry into monitor code is running on, and
- * the signal frame it came from when there is one (an -R trampoline has none,
- * and its stops read and write the FP/SIMD registers live). Every entry point
+ * the signal frame it came from when there is one (a dispatch from guest
+ * context has none, and its stops read and write the FP/SIMD registers live). Every entry point
  * that can reach a stop sets it; the wait and exit paths read it back for the
  * guest's signal mask and for the registers of an exit stop. Both are no-ops,
  * and both read back NULL, until something in the process takes on a ptrace
@@ -323,21 +320,17 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
 long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
                    const struct cng_ucontext *uc);
 
-/* The -R tier's wait4/waitid (`nr`, guest arguments a0..a4) for a process that
+/* A guest-context wait4/waitid (`nr`, guest arguments a0..a4) for a process that
  * cannot be owed an emulated stop — it has never been a tracer and nothing
  * names it as one: made by the kernel as the guest issued it, on the guest's
- * own mask, so it returns the moment a child does. The wait above, which has
- * to poll the registry, cost every -R wait up to its 50 ms slice — a shell's
- * every fork and waitpid. Returns 1 with the result in *out, or 0 for the
- * caller to use the wait above: a tracer, the kick blocked, or a kick that
- * made this process a tracer while it slept (cng_pt_kick_taken). Only for the
- * trampoline tier: from the SIGSYS handler every signal is masked. */
+ * own mask, so it returns the moment a child does; the wait above has to poll
+ * the registry, up to its 50 ms slice. Returns 1 with the result in *out, or 0
+ * for the caller to use the wait above: a tracer, the kick blocked, or a kick
+ * that made this process a tracer while it slept (cng_pt_kick_taken). Only
+ * from guest context (a bounced dispatch): from the SIGSYS handler every
+ * signal is masked. */
 int cng_pt_wait_native(long nr, long a0, long a1, long a2, long a3, long a4,
                        long *out);
-/* Test aid: when set, run in a blocking native wait after its look at the
- * registry and before its svc, which is where a kick has to be caught by the
- * compare rather than by the svc's EINTR (-t ptracetest). */
-extern void (*cng_g_wait_native_probe)(void);
 
 /* The kick handler's report of a kick of ours (`magic`) it took, with the
  * frame it interrupted: what ends a native wait, see cng_wait_unless. */

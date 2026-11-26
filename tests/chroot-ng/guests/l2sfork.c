@@ -1,4 +1,4 @@
-/* A fork by another thread while one links (M10 regression, -R -l).
+/* A fork by another thread while one links (M10 regression, -l).
  *
  * Every change of a group's count is made under the store lock, an flock on a
  * file of the emulation's own, which belongs to the open file and not to the

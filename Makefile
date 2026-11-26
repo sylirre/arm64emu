@@ -318,15 +318,15 @@ endif
 # Non-empty when CHROOTNG_CC produces AArch64 code.
 CHROOTNG_OK := $(filter aarch64% arm64%,$(shell $(CHROOTNG_CC) -dumpmachine 2>/dev/null))
 
-# How to run an AArch64 binary here. On an AArch64 host (native Linux or Termux)
-# that is "directly", so CHROOTNG_QEMU stays EMPTY and `$(CHROOTNG_QEMU) BIN` is
-# just BIN; elsewhere whichever qemu-user build is installed.
-# tests/chroot-ng/lib.sh does the same detection for the suite.
+# How to run chroot-ng here. On an AArch64 host (native Linux or Termux) that is
+# "directly", so CHROOTNG_RUN stays EMPTY; elsewhere it runs under arm64emu's
+# chroot mode with the host's tree as the rootfs, which applies a guest's
+# seccomp filter as a kernel does (qemu-user does not, and chroot-ng runs
+# nothing untranslated). tests/chroot-ng/lib.sh does the same for the suite.
 ifeq ($(filter aarch64 arm64,$(HOSTARCH)),)
-CHROOTNG_QEMU ?= $(shell command -v qemu-aarch64-static 2>/dev/null \
-                   || command -v qemu-aarch64 2>/dev/null || echo qemu-aarch64-static)
+CHROOTNG_RUN ?= $(BUILD)/arm64emu chroot --jit --keep-fds -w $(CURDIR) /
 else
-CHROOTNG_QEMU ?=
+CHROOTNG_RUN ?=
 endif
 
 # Is the compiler clang (Termux/NDK) rather than gcc? Some flags are gcc-only.
@@ -356,19 +356,15 @@ endif
 # LL/SC form works on every ARMv8. Probed, since not every compiler has it.
 CHROOTNG_INLINEATOMICS := $(shell $(CHROOTNG_CC) -mno-outline-atomics -E -x c /dev/null \
                             >/dev/null 2>&1 && echo -mno-outline-atomics)
-# -mgeneral-regs-only: no floating point or SIMD anywhere in the monitor. This
-# is not a size or a purity argument: on the -R tier the trampoline calls
-# straight into this C code on the guest's own register file, and the kernel
-# preserves the FP registers across a syscall, so anything we spend there is
-# taken from the guest. gcc does spend it — `cnt v0.8b` for a popcount, and
-# `fmov d1, x0` as a cheap spill slot for a pointer — which cost a guest
-# d0/d1/d16 across an openat (measured; see the sentinels in cng_rwtest_fn).
-# Saving all 32 q registers per rewritten syscall would cost 512 bytes of stack
-# traffic on the hot path and still leave the live registers wrong at a ptrace
-# stop, where a stop with no signal frame reads and writes them as the guest's
-# (NT_PRFPREG, src/chroot-ng/monitor/ptrace.c); not generating the instructions
-# in the first place costs nothing and is enforced at build time. Deliberately
-# not probed: silently dropping it would put the clobber back.
+# -mgeneral-regs-only: no floating point or SIMD anywhere in the monitor. A
+# dispatch made from guest context (a bounced call, sigsys.c BOUNCE_DISP) runs
+# on the guest's own register file with no signal frame holding the FP half of
+# it, and the kernel preserves those registers across a syscall, so anything we
+# spend there is taken from the guest -- and a ptrace stop there reads and
+# writes the live registers as the guest's (NT_PRFPREG, monitor/ptrace.c). gcc
+# does spend it: `cnt v0.8b` for a popcount, `fmov d1, x0` as a cheap spill
+# slot for a pointer. Deliberately not probed: silently dropping it would put
+# the clobber back.
 
 # Link chroot-ng far above the guest ET_EXEC range via an explicit linker
 # script (src/chroot-ng/chroot-ng.ld). A non-PIE guest (notably gcc's cc1)
@@ -678,27 +674,22 @@ test-arm64emu-chroot-pack:
 
 # ---- chroot-ng ----
 
-.PHONY: test-chroot-ng probe-chroot-ng run-chroot-ng
+.PHONY: test-chroot-ng run-chroot-ng
 
-# The suite runs chroot-ng natively on an AArch64 host and under qemu-aarch64
-# elsewhere. Its differential legs (M10/M17/M19) take arm64emu's chroot mode,
-# built here, as their oracle, so that is built first.
+# The suite runs chroot-ng natively on an AArch64 host and under arm64emu's
+# chroot mode elsewhere; its differential legs (M10/M17/M19) take arm64emu's
+# chroot mode as their oracle too, so that is built first.
 ifneq ($(CHROOTNG_OK),)
 test-chroot-ng:
 	@$(MAKE) --no-print-directory $(BUILD)/chroot-ng $(BUILD)/arm64emu
 	@sh tests/chroot-ng/run.sh
 
-# The capability probe (a real AArch64 kernel is needed for the seccomp line,
-# so on a cross host under qemu that line always reads "inert").
-probe-chroot-ng: $(BUILD)/chroot-ng
-	$(CHROOTNG_QEMU) $(BUILD)/chroot-ng --probe
-
-# Run the tool itself, natively or under qemu:
+# Run the tool itself, natively or under arm64emu:
 # `make run-chroot-ng CHROOTNG_ARGS="--version"`.
-run-chroot-ng: $(BUILD)/chroot-ng
-	$(CHROOTNG_QEMU) $(BUILD)/chroot-ng $(CHROOTNG_ARGS)
+run-chroot-ng: $(BUILD)/chroot-ng $(if $(CHROOTNG_RUN),$(BUILD)/arm64emu)
+	$(CHROOTNG_RUN) $(BUILD)/chroot-ng $(CHROOTNG_ARGS)
 else
-test-chroot-ng probe-chroot-ng run-chroot-ng:
+test-chroot-ng run-chroot-ng:
 	@echo "SKIP $@: no AArch64 C compiler (install $(CHROOTNG_CROSS)gcc, or set CHROOTNG_CC)"
 endif
 
@@ -742,7 +733,6 @@ help:
 	@echo '  test-arm64emu-chroot-pack  record a replayable test pack'
 	@echo '  test-arm64emu-chroot-env  provision the test rootfs'
 	@echo '  test-chroot-ng           chroot-ng suite'
-	@echo '  probe-chroot-ng          host capability probe'
 	@echo '  run-chroot-ng            run it with CHROOTNG_ARGS'
 	@echo 'Housekeeping:'
 	@echo '  clean                    remove build/ but the test cache'

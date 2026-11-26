@@ -14,44 +14,6 @@
 # walked by the resolver rather than by the kernel.
 echo "== M25: descriptors and the guest view =="
 
-# The driver, which runs without the startup sanitization: what a guest holding
-# a descriptor on an outside directory may do with it (nothing that resolves a
-# name), and that a copy arriving over a socket or from pidfd_getfd is closed.
-# The file beside it keeps the kernel's own answers and survives both imports.
-FVR=$(mktemp -d); FVO=$(mktemp -d)
-printf 'HOST-LEAK' > "$FVO/file"
-out=$(run -t dtest -r "$FVR" outside "$FVO" "$FVO/file" 2>&1); rc=$?
-check "an outside directory descriptor resolves nothing" 0 "$rc"
-for _leg in dir-walk dir-dotdot dir-stat-walk dir-fchdir dir-magic \
-    dir-magic-below; do
-    check_contains "outside dir: $_leg is EACCES" \
-        "outside $_leg: rc=-13 -> OK" "$out"
-done
-check_contains "outside dir: a copy received over a socket is closed" \
-    "outside dir-scm: rc=-9 -> OK" "$out"
-case "$out" in
-*"outside pidfd: unavailable"*)
-    skip "pidfd_getfd import: no pidfd_open or pidfd_getfd here" ;;
-*)
-    check_contains "outside dir: pidfd_getfd's copy is closed and the call is EPERM" \
-        "outside dir-pidfd_getfd: rc=-1 -> OK" "$out"
-    check_contains "outside file: pidfd_getfd imports it" \
-        "outside file-pidfd_getfd: rc=" "$out"
-    check_absent "outside file: pidfd_getfd import not refused" \
-        "outside file-pidfd_getfd: rc=-" "$out" ;;
-esac
-check_contains "outside file: a name below it is the kernel's ENOTDIR" \
-    "outside file-walk: rc=-20 -> OK" "$out"
-check_contains "outside file: its magic link reopens it" \
-    "outside file-magic: rc=" "$out"
-check_absent "outside file: the reopen is not refused" \
-    "outside file-magic: rc=-" "$out"
-check_contains "outside file: a copy received over a socket is kept" \
-    "outside file-scm: rc=" "$out"
-check_absent "outside file: the socket copy is not closed" \
-    "outside file-scm: rc=-" "$out"
-rm -rf "$FVR" "$FVO"
-
 # End to end: a guest with the launcher's leaks in its table (fd 7 a host
 # directory, fd 8 a host file, both outside the rootfs), and every route a
 # relative name used to take out of the view. The rootfs supplies the marker
@@ -70,7 +32,7 @@ if ! guest_xlate_ready "descriptor legs"; then
     :
 elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$FVR" /fdescape 7<"$FVO" 8<"$FVO/file" 2>&1)
+    out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$FVR" /fdescape 7<"$FVO" 8<"$FVO/file" 2>&1)
     check_contains "a leaked directory fd is closed before the guest runs" \
         "inherited-dirfd=Bad file descriptor" "$out"
     check_contains "a leaked file fd stays, for the I/O it carries" \
@@ -79,7 +41,7 @@ elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
     # by /dev/null rather than left closed: a program is entitled to find 0,
     # 1 and 2 open, and its next open must not land on one of them.
     # shellcheck disable=SC2086
-    out0=$(run_t 60 -R $CHROOTNG_GUEST_BINDS "$FVR" /fdescape <"$FVO" 2>&1)
+    out0=$(run_t 60 $CHROOTNG_GUEST_BINDS "$FVR" /fdescape <"$FVO" 2>&1)
     check_contains "stdin on an outside directory becomes /dev/null" \
         "stdin=/dev/null" "$out0"
     for _leg in proc-dotdot procself-dotdot devpts-dotdot; do
@@ -118,7 +80,7 @@ elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
         python3 -c 'import socket; socket.send_fds' 2>/dev/null; then
         rm -f "$FVR/sock"
         # shellcheck disable=SC2086
-        run_t 60 -R $CHROOTNG_GUEST_BINDS "$FVR" /fdimport /sock >"$FVO/import.out" \
+        run_t 60 $CHROOTNG_GUEST_BINDS "$FVR" /fdimport /sock >"$FVO/import.out" \
             2>/dev/null &
         _bg=$!
         _n=0
@@ -152,15 +114,22 @@ elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
     # exist, and a pidfd reaches everything a pidfd reaches. ESRCH now, which
     # is what /proc/<pid> answers -- where a guest process stays reachable.
     # Where the host has no process_vm_readv or pidfd_open to reach a guest
-    # process with (qemu-user implements neither for every guest; an old
-    # kernel has no pidfd_open) the allowed leg says so and sits out; the
-    # hidden one is answered before the kernel is asked, and is ESRCH either
-    # way.
+    # process with (arm64emu reaches the memory of the caller and of its
+    # stopped tracees alone, EPERM for any other; an old kernel has no
+    # pidfd_open) the allowed leg says so and sits out; the hidden one is
+    # answered before the kernel is asked, and is ESRCH either way.
     check_contains "process_vm_readv on a hidden process is ESRCH" \
         "pvm-read-hidden=No such process" "$out"
     case "$out" in
     *"pvm-read-guest=Function not implemented"*)
         skip "process_vm_readv on a guest process: no process_vm_readv here" ;;
+    *"pvm-read-guest=Operation not permitted"*)
+        if [ -n "$CHROOTNG_EMU" ]; then
+            skip "process_vm_readv on a guest process: arm64emu reaches no running process's memory but the caller's"
+        else
+            check_contains "process_vm_readv on a guest process is allowed" \
+                "pvm-read-guest=ok" "$out"
+        fi ;;
     *)
         check_contains "process_vm_readv on a guest process is allowed" \
             "pvm-read-guest=ok" "$out" ;;
@@ -239,24 +208,16 @@ sv_stop() {
 if guest_xlate_ready "signals to hidden processes" &&
     guest_cc_report "$SVD/sigholder" tests/chroot-ng/guests/sigholder.c &&
     guest_cc_report "$SVD/sigview" tests/chroot-ng/guests/sigview.c -pthread; then
-    for _tier in -R plain; do
-        if [ "$_tier" = plain ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-            skip "signals to hidden processes, seccomp tier: the filter is inert here"
-            continue
-        fi
-        _opt=""
-        [ "$_tier" = -R ] && _opt=-R
-        sv_start
-        if [ -z "$SVA" ] || [ -z "$SVB" ]; then
-            check "signals to hidden processes ($_tier): the holders start" \
-                started "a=$SVA b=$SVB"
-            sv_stop
-            continue
-        fi
-        # shellcheck disable=SC2086  # $_opt and $CHROOTNG_GUEST_BINDS are split on purpose
-        _got=$(run $_opt $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" 2>/dev/null)
+    sv_start
+    if [ -z "$SVA" ] || [ -z "$SVB" ]; then
+        check "signals to hidden processes: the holders start" \
+            started "a=$SVA b=$SVB"
         sv_stop
-        _label="a signal reaches no process the view hides, alone or by group ($_tier)"
+    else
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        _got=$(run $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" 2>/dev/null)
+        sv_stop
+        _label="a signal reaches no process the view hides, alone or by group"
         if [ "$(printf '%s\n' "$_got" | sed 1d)" = "$SV_WANT" ]; then
             pass=$((pass + 1))
             echo "  ok   $_label"
@@ -265,21 +226,21 @@ if guest_xlate_ready "signals to hidden processes" &&
             echo "  FAIL $_label"
             printf '%s\n' "$_got" | sed 's/^/    /' | head -30
         fi
-        check "the hidden process in the guest's group got nothing ($_tier)" \
+        check "the hidden process in the guest's group got nothing" \
             "urg=0" "$(grep '^urg=' "$SVD/a")"
-        check "the hidden group got nothing ($_tier)" \
+        check "the hidden group got nothing" \
             "urg=0" "$(grep '^urg=' "$SVD/b")"
         case "$_got" in
         "holder-shares-group=1"*) ;;
-        *) skip "kill(0) past a hidden member ($_tier): the shell put the guest in a group of its own" ;;
+        *) skip "kill(0) past a hidden member: the shell put the guest in a group of its own" ;;
         esac
-    done
+    fi
     # The control: with --no-proc nothing is hidden, and the same calls reach
     # both holders -- so the zeros above are the view's doing. kill(-1) is
     # left out of it, since there it would reach every process of the user.
     sv_start
     # shellcheck disable=SC2086
-    _got=$(run -R --no-proc $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
+    _got=$(run --no-proc $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
     sv_stop
     check_contains "--no-proc: a host process is signalled as on the host" \
         "kill-hidden=0" "$_got"
@@ -293,7 +254,7 @@ if guest_xlate_ready "signals to hidden processes" &&
     # native rather than refuse every pid but the caller's.
     sv_start
     # shellcheck disable=SC2086
-    _got=$(CHROOTNG_PROCREG_NONE=1 run -R $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
+    _got=$(CHROOTNG_PROCREG_NONE=1 run $CHROOTNG_GUEST_BINDS "$SVD" /sigview "$SVA" "$SVB" control 2>/dev/null)
     sv_stop
     check_contains "no registry: a guest still signals its own child" \
         "kill-child=0" "$_got"

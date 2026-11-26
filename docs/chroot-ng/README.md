@@ -24,32 +24,34 @@ mounts. See [docs/chroot-ng/DESIGN.md](DESIGN.md) for the full rationale and
 
 ## Build
 
-On an x86_64 host: an `aarch64-linux-gnu` cross toolchain plus `qemu-aarch64`
-for running what it builds. On an AArch64 host (native Linux, or Termux with
-`clang`): just the native compiler — no emulator is involved.
+On an x86_64 host: an `aarch64-linux-gnu` cross toolchain, and
+[arm64emu](../arm64emu/README.md) (built from the same tree) for running what it
+builds: its chroot mode applies a guest's seccomp filter as a kernel does, which
+qemu-user does not. On an AArch64 host (native Linux, or Termux with `clang`):
+just the native compiler — no emulator is involved.
 
 ```sh
 make chroot-ng                                # -> build/chroot-ng
-make run-chroot-ng CHROOTNG_ARGS="--version"  # run it (under qemu only where the host needs one)
+make run-chroot-ng CHROOTNG_ARGS="--version"  # run it (under arm64emu where the host needs one)
 make test-chroot-ng                           # run the test harness
 ```
 
 A plain `make` builds chroot-ng only where it finds an AArch64 compiler (and
-says so when it does not). Override the compiler/emulator if needed:
+says so when it does not). Override the compiler if needed:
 
 ```sh
-make CHROOTNG_CC=aarch64-linux-gnu-gcc-12 CHROOTNG_QEMU=qemu-aarch64 chroot-ng
+make CHROOTNG_CC=aarch64-linux-gnu-gcc-12 chroot-ng
 ```
 
 `make test-chroot-ng` also builds [arm64emu](../arm64emu/README.md), whose
-chroot mode is the oracle the differential `--link2symlink` legs compare
-against.
+chroot mode runs the suite on a foreign host and is the oracle the
+differential `--link2symlink` legs compare against.
 
 The test harness runs on all three hosts and adapts to each: it picks the
-emulator (or none), finds an AArch64 guest toolchain and the link mode that
-works there, and asks the binary which translation tier is actually live —
-the seccomp/SIGSYS tier only exists on a real AArch64 kernel, so on a cross
-host `-R` svc-rewriting is what carries translation. Legs that a host cannot
+runner (arm64emu, or none), finds an AArch64 guest toolchain and the link mode
+that works there, and checks that a guest's path syscalls really are
+translated — a host that does not apply a guest's seccomp filter cannot run
+chroot-ng, and the suite stops there with the reason. Legs that a host cannot
 support (no guest toolchain, no rootfs image, no SysV shm to diff against) are
 reported as `skip` and counted separately from passes. See
 [docs/chroot-ng/testing.md](testing.md) for the environment knobs.
@@ -58,7 +60,6 @@ reported as `skip` and counted separately from passes. See
 
 ```
 chroot-ng [options] <rootfs> <program> [args...]   # run a guest program
-chroot-ng --probe [path...]                        # report caps, then exit
 chroot-ng --help                                   # full option reference
 ```
 
@@ -71,12 +72,11 @@ path DST, read-only with `:ro`), `-E/--env VAR=VAL` (set a guest environment
 variable — see below), `-w/--work-dir DIR` (start the guest in
 DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`;
 it also reads and keeps the hardlinks of a rootfs installed by `proot-distro`),
-`-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
+`-F/--file-backed` (map the guest's images from their files), `--no-proc` (turn off the `/proc`
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
 independent invocations of the same rootfs, for both the process view and the
-System V IPC namespace), `--no-ptrace` (refuse guest `ptrace(2)` instead of
-emulating it).
+System V IPC namespace).
 
 `/proc` is visible to the guest without a bind, and describes the guest rather
 than chroot-ng: host processes are hidden from it (by path and from listings,
@@ -208,13 +208,12 @@ follows forks but not new threads. One known gap is still open: a `poll`,
 `select`, `nanosleep` or timed futex that a task is sleeping in when a tracer
 attaches returns `EINTR`, where the kernel would let it finish. And a traced
 child's stop and continue reach its parent's `waitpid(WUNTRACED/WCONTINUED)`
-only when the parent's waits pass through chroot-ng — a tracer's, a tracee's,
-any under `-R` — so an untraced parent on the seccomp tier does not see them.
+only when the parent's waits pass through chroot-ng — a tracer's, a tracee's —
+so an untraced parent does not see them.
 Single-step is
 emulated with breakpoints, since arming the hardware kind needs the kernel's
 own ptrace. A traced task stops on *every* syscall, which is slow by
-construction; a guest that never traces pays nothing at all, and `--no-ptrace`
-turns the whole thing off.
+construction; a guest that never traces pays nothing at all.
 
 **The environment** is built, not inherited. A host variable describes the host
 rather than the rootfs — `PATH`, `HOME`, `LD_LIBRARY_PATH`, `XDG_*`, `TMPDIR`
@@ -247,8 +246,10 @@ chroot-ng -u -l ./rootfs /sbin/apk add busybox   # hardlinked packages
 chroot-ng -u ./rootfs /usr/bin/strace -f /bin/ls  # tracing inside the rootfs
 ```
 
-Run `chroot-ng --probe` on any target device **first** — the whole in-process
-design depends on the SELinux `execmem` permission being granted.
+The in-process design needs a kernel that applies the guest's seccomp filter
+(3.5 or later, which every supported Android has); where anonymous memory may
+not be made executable (Android's `execmem` denial), the loader maps the
+guest's images from their files instead.
 
 ## License
 
@@ -258,5 +259,4 @@ chroot-ng is original, freestanding (no libc) AArch64 C and assembly. The
 guest-PID registry, the synthesized `/proc` files, the System V IPC layer, the
 guest `ptrace` model and the help renderer are ported from the chroot mode
 of the sibling [arm64emu](../arm64emu/README.md) emulator in this repository. chroot-ng is functionally comparable
-to `proot` but shares no code with it; `qemu-aarch64` is used only as a
-differential-testing oracle and is neither included nor linked.
+to `proot` but shares no code with it.

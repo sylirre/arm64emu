@@ -1,0 +1,178 @@
+# M8: the guest's own context (sourced by tests/chroot-ng/run.sh). Threads,
+# vfork-style clones, interrupted waits and the stacks a guest makes its
+# syscalls on: what the monitor runs inside of, and has to hand back as it was.
+echo "== M8: guest context: threads, vfork, waits, stacks =="
+
+ROOT=$(mktemp -d)
+mkdir -p "$ROOT/bin" "$ROOT/etc"
+# shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+m8run() { run_t 120 $CHROOTNG_GUEST_BINDS "$@"; }
+
+# Threads that each open a guest path and do floating-point work across the
+# calls: a thread that comes up with a damaged register file, or without a stack
+# for the dispatcher, shows as a wrong count. Differential against the same
+# program run straight under the kernel, which is what "threads work" means.
+if guest_xlate_ready "threads leg" &&
+    guest_cc_report "$ROOT/bin/threads" tests/chroot-ng/guests/threads.c -lpthread; then
+    printf 'THREADS-OK\n' > "$ROOT/etc/threads-marker"
+    want=$(emu_t 60 "$ROOT/bin/threads" "$ROOT/etc/threads-marker" 2>/dev/null)
+    out=$(m8run "$ROOT" /bin/threads /etc/threads-marker 2>/dev/null); rc=$?
+    check "a threaded guest runs" 0 $rc
+    check_contains "every thread started, opened a guest path and kept its FP" \
+        "threads: started=8 reads=8 tids=8 fp=8" "$out"
+    if [ -n "$want" ]; then
+        check "and matches the same program under the kernel" "$want" "$out"
+    else
+        skip "threads kernel differential: the reference run produced nothing"
+    fi
+fi
+
+# A wait is the kernel's own unless something could owe it an emulated ptrace
+# stop: a handler without SA_RESTART ends it with EINTR, one with it does not.
+# Differential against the same program under the kernel.
+if guest_xlate_ready "waits leg" &&
+    guest_cc_report "$ROOT/bin/waitintr" tests/chroot-ng/guests/waitintr.c -lpthread; then
+    want=$(emu_t 60 "$ROOT/bin/waitintr" 2>/dev/null)
+    out=$(m8run "$ROOT" /bin/waitintr 2>/dev/null)
+    if [ -z "$want" ]; then
+        skip "interrupted waits: the reference run produced nothing"
+    elif [ "$want" = "$out" ]; then
+        pass=$((pass + 1))
+        echo "  ok   waits are interrupted and restarted as the kernel's"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL waits diverge from the kernel"
+        printf '       kernel: %s\n       guest : %s\n' \
+            "$(echo "$want" | tr '\n' '|')" "$(echo "$out" | tr '\n' '|')"
+    fi
+fi
+
+# An execve is emulated in-process (translated, monitor kept): re-issued raw, it
+# would look the guest path up on the host and fail.
+if guest_xlate_ready "execve leg" &&
+    guest_cc_report "$ROOT/bin/hello" tests/chroot-ng/guests/hello.c &&
+    guest_cc_report "$ROOT/bin/execer" tests/chroot-ng/guests/execer.c; then
+    out=$(m8run "$ROOT" /bin/execer 2>/dev/null); rc=$?
+    check "an execve exits through the exec'd guest" 42 $rc
+    check_contains "exec'd program got its argv" "argv1=from-execer" "$out"
+fi
+
+# A vfork-style clone becomes a COW fork because our execve is emulated
+# in-process; the child comes back through the dispatcher's frames on the
+# scratch stack and has to leave onto the stack the guest handed it — glibc's
+# vfork hands the parent's own sp, posix_spawn a stack of its own.
+if guest_xlate_ready "vfork leg" &&
+    guest_cc_report "$ROOT/bin/hello" tests/chroot-ng/guests/hello.c &&
+    guest_cc_report "$ROOT/bin/vforker" tests/chroot-ng/guests/vforker.c; then
+    want=$(emu_t 60 "$ROOT/bin/vforker" "$ROOT/bin/hello" 2>/dev/null |
+        grep -v '^guest: ')
+    out=$(m8run "$ROOT" /bin/vforker /bin/hello 2>/dev/null); rc=$?
+    check "a vforking guest runs" 0 $rc
+    check_contains "a bare vfork child exits on the parent's stack" \
+        "vfork-exit: exited 7" "$out"
+    check_contains "a vfork child execs" "vfork-exec: exited 42" "$out"
+    case "$out" in
+    *"posix_spawn: none in this libc"*)
+        skip "posix_spawn: the guest's libc has none (bionic before API 28)" ;;
+    *)
+        check_contains "a posix_spawn child resumes on its own stack and execs" \
+            "spawn-exec: exited 42" "$out" ;;
+    esac
+    check_contains "the exec'd program got its argv" "argv1=from-vforker" "$out"
+    if [ -n "$want" ]; then
+        check "and the outcomes match the same program under the kernel" \
+            "$want" "$(printf '%s\n' "$out" | grep -v '^guest: ')"
+    else
+        skip "vforker kernel differential: the reference run produced nothing"
+    fi
+fi
+
+rm -rf "$ROOT"
+
+# An exec chain with BOTH programs non-PIE. Two ET_EXEC images share the
+# link-time vaddr 0x400000, so the MAP_FIXED load of the new one lands on the
+# .rodata/heap holding the very argv strings the caller passed — and those reach
+# the new stack only after the load. The exec'd program still ran and still
+# exited 42, so nothing but an argv assertion catches it. Built here with an
+# explicit -static -no-pie rather than whatever link mode the harness picked,
+# since the collision needs the fixed vaddr: on the usual static-PIE guest each
+# image gets its own base and the bug is invisible.
+XR=$(mktemp -d); mkdir -p "$XR/bin"
+if [ -n "$CHROOTNG_GUESTCC" ] &&
+    $CHROOTNG_GUESTCC -static -no-pie -O2 -o "$XR/bin/hello" tests/chroot-ng/guests/hello.c \
+        2>"$GUEST_CC_LOG" &&
+    $CHROOTNG_GUESTCC -static -no-pie -O2 -o "$XR/bin/execer" tests/chroot-ng/guests/execer.c \
+        2>>"$GUEST_CC_LOG"; then
+    check "exec chain: both programs are fixed-address ET_EXEC" EXEC \
+        "$(elf_type "$XR/bin/execer")"
+    out=$(run_t 60 "$XR" /bin/execer 2>/dev/null); rc=$?
+    check "ET_EXEC execs ET_EXEC at the same vaddr: exit code" 42 $rc
+    check_contains "argv0 survives the colliding load" "argv0=/bin/hello" "$out"
+    check_contains "argv1 survives the colliding load" "argv1=from-execer" "$out"
+    # envp goes through the same snapshot, so guard it too — though not against
+    # this bug: execer passes the environ it inherited (the environment chroot-ng
+    # built from -E), which lives on the original stack and no image load
+    # touches. This one is a check on the copy itself.
+    out=$(run_t 60 -E CHROOTNG_TEST=collide "$XR" /bin/execer 2>/dev/null)
+    check_contains "the environment still reaches the exec'd program" \
+        "CHROOTNG_TEST=collide" "$out"
+else
+    skip "fixed-vaddr exec-collision leg: no -static -no-pie AArch64 toolchain"
+fi
+rm -rf "$XR"
+
+# A translated syscall must stay inside the stack the guest was running on. The
+# dispatcher is deep — ~24 KiB for cng_dispatch's frame alone, ~66 KiB for a
+# whole openat translation — so the handler switches to a scratch stack of its
+# own before entering it; all that goes on the guest's is the kernel's signal
+# frame. A guest that runs syscalls on a small stack (musl's 128 KiB threads,
+# Go's ~8 KiB goroutines, any sigaltstack) would have the rest written off its
+# end, and not as a crash: a frame bigger than a guard page steps over the guard
+# into ordinary guest memory. The guest sets SP into a small region itself and
+# counts how many bytes of a canary below it moved.
+SSR=$(mktemp -d)
+mkdir -p "$SSR/etc"
+printf 'guest\n' > "$SSR/etc/hostname"
+if guest_xlate_ready "small-stack syscall leg" &&
+    guest_cc_report "$SSR/smallstack" tests/chroot-ng/guests/smallstack.c; then
+    for _k in 8 16 64; do
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$SSR" /smallstack $_k 2>/dev/null)
+        check "a syscall on a ${_k} KiB guest stack writes nothing below it" \
+            "clobbered=0" "$out"
+    done
+    # ...and again with no slot in the scratch table to be had: 256 live threads
+    # already holding one, an mmap the host refused, or an outer dispatch on this
+    # thread that is on the slot already (a nested trap, which a guest with its
+    # own sigaltstack reaches from inside its own signal handler). Falling back
+    # to the interrupted stack is the very failure the legs above measure.
+    # CHROOTNG_SCRATCH_NONE forces the case, since a working host does not reach
+    # it on its own.
+    for _k in 8 16 64; do
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(CHROOTNG_SCRATCH_NONE=1 run_t 60 $CHROOTNG_GUEST_BINDS "$SSR" /smallstack $_k \
+            2>/dev/null)
+        check "...and still nothing with no scratch slot to be had (${_k} KiB)" \
+            "clobbered=0" "$out"
+    done
+fi
+rm -rf "$SSR"
+
+# A thread that frees its own stack on the way out. musl's __unmapself and
+# bionic's _exit_with_stack_teardown are an munmap of the stack under the caller
+# and an exit, with nothing between that touches the stack — which is how every
+# detached thread of those libcs ends (the JVM's all are). A trap of the exit
+# has no stack to put its frame on, and the kernel kills the whole process for
+# it. The sequence is written out as libc has it, on a stack the guest mapped,
+# and each of twenty threads is started on a fresh one.
+UMD=$(mktemp -d)
+if guest_xlate_ready "stack-teardown leg" &&
+    guest_cc_report "$UMD/unmapself" tests/chroot-ng/guests/unmapself.c; then
+    for _v in musl bionic; do
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$UMD" /unmapself $_v 2>/dev/null)
+        check_contains "threads freeing their own stack survive ($_v's sequence)" \
+            "survived=20" "$out"
+    done
+fi
+rm -rf "$UMD"

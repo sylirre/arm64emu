@@ -10,13 +10,20 @@ against that rather than against a hardcoded devbox.
 
 | host | how binaries run | seccomp/SIGSYS tier | guest toolchain |
 |---|---|---|---|
-| Linux x86_64 | `qemu-aarch64[-static]` | **inert** — qemu-user rejects the filter, so `-R` svc-rewriting carries translation; a run that needs a monitor and has no `-R` is refused | `aarch64-linux-gnu-gcc*`, static-PIE |
+| Linux x86_64 | `build/arm64emu chroot --jit --keep-fds --shared-proc -w $PWD /`, the whole environment forwarded with `-E` | **live** — arm64emu's chroot mode applies a guest's filter, `RET_TRAP` and `SIGSYS` included (qemu-user does not, and cannot run chroot-ng) | `aarch64-linux-gnu-gcc*`, static-PIE |
 | Linux aarch64 | directly | **live** | native `gcc`/`cc`/`clang`, static-PIE |
 | Termux (Android aarch64) | directly | **live** | `clang` (bionic); often dynamic-only |
 
-Which tier is live is not inferred from `uname` — the harness runs
-`chroot-ng --probe` and reads the answer. Legs whose expected outcome depends on
-it (M8's no-`-R` control) flip accordingly.
+That the tier is live is checked, not inferred from `uname`: a compiled guest
+opens a file that is only in a scratch rootfs, and the suite stops with the
+reason where it is not found there — nothing a row asserts holds on a host that
+does not apply the filter. Whether anonymous memory may be made executable is
+asked of the host directly (`tests/chroot-ng/guests/execmem.c`).
+
+Where a differential compares against "the kernel", the reference on a foreign
+host is the same AArch64 build run under the runner without chroot-ng: the
+kernel a guest's calls reach there is arm64emu's (the 6.1 it advertises), not
+the x86 host's.
 
 ## Skips
 
@@ -112,7 +119,7 @@ expected failure:
 | variable | meaning |
 |---|---|
 | `CHROOTNG_BIN` | binary under test (default `build/chroot-ng`) |
-| `CHROOTNG_QEMU` | emulator command. Unset = auto-detect (none on an AArch64 host). Set **empty** to force direct execution on a cross host that runs AArch64 binaries another way (a `binfmt_misc` handler) |
+| `CHROOTNG_EMU` | the arm64emu that runs AArch64 programs on a foreign host. Unset = `build/arm64emu` there, none on an AArch64 host. Set **empty** to force direct execution on a cross host that runs AArch64 binaries another way (a `binfmt_misc` handler) |
 | `CHROOTNG_GUESTCC` | compiler for `tests/chroot-ng/guests/*.c`. Unset = probe a candidate list |
 | `CHROOTNG_GUESTLD` | link mode for those guests: `-static-pie`, `-static`, or empty for dynamic. Unset = try each in that order and keep the first that both links an AArch64 binary and runs here |
 | `CHROOTNG_GUEST_BINDS` | extra `-b SRC:DST` args a dynamic guest needs to find its ELF interpreter inside a synthetic rootfs. Auto-derived (`/system`, `/apex`, `/linkerconfig`, …) when the guest is not static |
@@ -125,7 +132,8 @@ expected failure:
 `cng_dyn_binds` sets `GUEST_DYN_BINDS`, the same list for a guest that is
 dynamic even where the probed link mode is static — M23 builds one deliberately,
 since the noexec `.so` path only exists for a guest whose own `ld.so` maps
-libraries.
+libraries. On a cross host it binds the sysroot's directories at the paths the
+binary names, which is how the loader finds the interpreter there.
 
 The suite provisions its rootfs images itself, under `$CHROOTNG_ROOTFS_DIR`. Each one
 is a pinned tarball (`cng_rootfs_pin` in `tests/chroot-ng/lib.sh`) that is downloaded
@@ -151,7 +159,7 @@ hosted Linux AArch64 runner) caches `downloads/` between runs.
 Source-level contract for a new `tests/chroot-ng/mNN_*.sh`:
 
 - `run` / `run_t SECS` — invoke chroot-ng; `emu` / `emu_t SECS` — invoke any
-  other AArch64 program. Never spell `$CHROOTNG_QEMU` or `build/chroot-ng` directly.
+  other AArch64 program. Never spell `$CHROOTNG_EMU` or `build/chroot-ng` directly.
 - `guest_cc OUT SRC` (rc 2 = no toolchain) or `guest_cc_report OUT SRC`, which
   emits the right diagnosis on its own. Never invoke a compiler by name.
 - `guest_xlate_ready WHAT` before any leg that needs a compiled guest's *own*
@@ -173,6 +181,6 @@ Source-level contract for a new `tests/chroot-ng/mNN_*.sh`:
   are refused; the gate took the devbox branch there and failed four legs for
   exactly the reason the emulation exists. Where a capability splits hosts,
   give each side its own assertions rather than skipping one.
-- The `-t` debug subcommands that build their own filesystem view (`_dtest`,
-  `_exectest`) accept `-b SRC:DST[:ro]`, so `$CHROOTNG_GUEST_BINDS` can be spliced into
-  them exactly as into a real invocation.
+- Ask what the guest sees with a guest program: chroot-ng has no self-test
+  entry, so a behaviour is checked end to end, through the filter, the way a
+  guest meets it.

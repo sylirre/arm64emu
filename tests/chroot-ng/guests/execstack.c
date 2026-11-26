@@ -25,7 +25,7 @@
  *   rwx_after        the first case again, after the thread has gone, so one
  *                    that wedged the mapping shows.
  * A host that denies anonymous executable memory altogether answers every one
- * of them with an error; the harness asks that question separately (--probe)
+ * of them with an error; the harness asks that question separately (execmem.c)
  * and does not run this there.
  * Exits 0 when the setup could be made, 2 when it could not.
  */

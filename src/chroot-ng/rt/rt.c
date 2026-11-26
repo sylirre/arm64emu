@@ -6,8 +6,8 @@
 /* ---- mem/str ----------------------------------------------------------
  *
  * Word-at-a-time, on the general registers only: the Makefile builds the
- * monitor with -mgeneral-regs-only because on the -R tier this code runs on
- * the guest's own register file, so there is no SIMD to be had and the wide
+ * monitor with -mgeneral-regs-only because from guest context this code runs
+ * on the guest's own register file, so there is no SIMD to be had and the wide
  * loads and stores are 64-bit. A copy reads its source at whatever alignment
  * it arrives with — AArch64 takes an unaligned access of Normal memory in
  * stride — and aligns only its stores, which is what the prologue byte loops
@@ -132,20 +132,6 @@ size_t strlen(const char *s) {
     for (p = (const char *)w; *p; p++)
         ;
     return (size_t)(p - s);
-}
-
-size_t cng_strnlen(const char *s, size_t max) {
-    size_t i = 0;
-    for (; i < max && rt_unaligned(s + i); i++)
-        if (!s[i])
-            return i;
-    /* A word is loaded only when all 8 of its bytes are within the bound,
-     * so this is exactly the read the byte loop would have made. */
-    for (; max - i >= 8 && !RT_HAS_ZERO(*(const u64_al *)(s + i)); i += 8)
-        ;
-    for (; i < max && s[i]; i++)
-        ;
-    return i;
 }
 
 int strcmp(const char *a, const char *b) {

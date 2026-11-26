@@ -86,9 +86,9 @@ fi
 # so a rootfs that was not there, or could not be entered, ran the guest —
 # from a bind, say — with the real cwd left at the launch directory and
 # nothing said about it. Refused now, like -w, before the guest is entered.
-run -R /no-such-rootfs -b "$M17W:/x" /x/no-such-program >/dev/null 2>&1
+run /no-such-rootfs -b "$M17W:/x" /x/no-such-program >/dev/null 2>&1
 check "a rootfs that is not there is refused" 1 $?
-out=$(run -R /no-such-rootfs -b "$M17W:/x" /x/no-such-program 2>&1)
+out=$(run /no-such-rootfs -b "$M17W:/x" /x/no-such-program 2>&1)
 check_contains "the missing rootfs is diagnosed with its errno" \
     "chroot-ng: rootfs '/no-such-rootfs': cannot enter (errno 2)" "$out"
 if [ "$(id -u)" = 0 ]; then
@@ -96,9 +96,9 @@ if [ "$(id -u)" = 0 ]; then
 else
     mkdir -p "$M17W/sealed"
     chmod 0000 "$M17W/sealed"
-    run -R -u 0:0 "$M17W/sealed" /no-such-program >/dev/null 2>&1
+    run -u 0:0 "$M17W/sealed" /no-such-program >/dev/null 2>&1
     check "a rootfs that cannot be entered is refused" 1 $?
-    out=$(run -R -u 0:0 "$M17W/sealed" /no-such-program 2>&1)
+    out=$(run -u 0:0 "$M17W/sealed" /no-such-program 2>&1)
     check_contains "the unenterable rootfs is diagnosed with its errno" \
         "chroot-ng: rootfs '$M17W/sealed': cannot enter (errno 13)" "$out"
     chmod 0755 "$M17W/sealed"
@@ -122,7 +122,7 @@ if guest_cc_report "$GDIR/cwdprobe" tests/chroot-ng/guests/cwdprobe.c; then
 
     # ...and a rootfs that is not there, with the program reachable through
     # a bind: used to run, told it was at "/" with the real cwd still here.
-    out=$(run -R -b "$M17W:/x" /no-such-rootfs /x/probe 2>/dev/null); rc=$?
+    out=$(run -b "$M17W:/x" /no-such-rootfs /x/probe 2>/dev/null); rc=$?
     check "a missing rootfs is refused before the guest is entered" 1 $rc
     check_absent "...so the guest never reports a cwd" "cwd=" "$out"
 
@@ -148,7 +148,7 @@ if ! guest_xlate_ready "-w rootfs legs"; then
     :
 elif [ "$m17w_probe" = 1 ]; then
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    m17w_run() { run -R $CHROOTNG_GUEST_BINDS "$@"; }
+    m17w_run() { run $CHROOTNG_GUEST_BINDS "$@"; }
 
     out=$(m17w_run "$M17W" /probe 2>/dev/null)
     check_contains "rootfs: the default cwd is the guest root" "cwd=/" "$out"
@@ -199,13 +199,12 @@ else
     # the bound $PREFIX), where the oracle would spell the cwd as the bind.
     M17W=$(cng_outside_binds "$M17W")
     # m17w_diff <desc> <args...> — the same invocation both sides, stdout
-    # compared whole. chroot-ng needs -R for translation on a cross host; the
-    # oracle emulates every instruction and needs nothing.
+    # compared whole.
     m17w_diff() {
         _d=$1
         shift
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
-        _got=$(run -R $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
+        _got=$(run $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
         # shellcheck disable=SC2086
         _want=$("$M17W_ORACLE" chroot $CHROOTNG_GUEST_BINDS "$@" 2>/dev/null)
         if [ -n "$_want" ] && [ "$_got" = "$_want" ]; then

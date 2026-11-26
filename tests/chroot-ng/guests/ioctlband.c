@@ -2,17 +2,16 @@
  *
  * The filter traps SIOCGIFNAME..SIOCGIFMAP (0x8910..0x8970) and cng_nl_ioctl
  * answers them from the interface enumeration, taking the argument for an
- * ifreq. That is the whole of what it is for -- but a trapped `svc` is patched
- * by the lazy rewriter, one site serves every request its syscall is asked,
- * and under -R every ioctl reaches the dispatcher anyway. Requests that were
+ * ifreq. That is the whole of what it is for -- but a tracee's filter traps
+ * every ioctl, so the dispatcher is handed the others too. Requests that were
  * never the band's then met the ifreq copy: a NULL argument, or one that ends
  * a mapping, was EFAULT where the host answers (a terminal's TIOCSCTTY lost
- * its controlling terminal that way on Android, under -R, once anything had
- * asked for the interface list).
+ * its controlling terminal that way on Android, once anything had asked for
+ * the interface list).
  *
  * Prints one line per case, 0 or -errno, so the expected text is a kernel's
  * wherever the first one is answered:
- *   siocgifconf   a band request, to have the site trapped and patched;
+ *   siocgifconf   a band request, which traps;
  *   fioclex       FIOCLEX, no argument at all: the close-on-exec bit is on;
  *   fionclex      FIONCLEX, likewise: off again;
  *   fionread_edge FIONREAD into the last word of a mapping with an unmapped

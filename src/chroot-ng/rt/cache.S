@@ -6,7 +6,7 @@
  * clean the D-cache to Point-of-Unification, then invalidate the I-cache,
  * using the line sizes reported by CTR_EL0.  Required before executing any
  * code we copy into anonymous RW->RX memory (execmem probe, ELF loader,
- * svc-rewriting).  Under qemu-user these ops are handled/harmless.
+ * execmap).
  */
     .text
     .global cng_flush_icache

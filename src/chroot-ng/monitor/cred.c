@@ -13,8 +13,8 @@
  * otherwise, which is what fakeroot-style installs check.
  *
  * These syscalls are trapped only when --fake-id is active (see seccomp.c), so
- * cng_cred_handle's !fake_id branch is reached through an -R trampoline, a
- * tracee's trap-everything filter, or an ambient filter's trap of a setter it
+ * cng_cred_handle's !fake_id branch is reached through a tracee's
+ * trap-everything filter, or an ambient filter's trap of a setter it
  * refuses — Android's refuses most of them (see real_set).
  */
 #include "cng/monitor.h"
@@ -572,10 +572,10 @@ static long reissue_cred(long nr, long a0, long a1, long a2, long a3, long a4,
  *
  * The ids are then the kernel's, and so are the answers: a setter is re-issued.
  * Our filter traps this family only under --fake-id, so one arrives here
- * through an -R trampoline, a tracee's trap-everything filter, or the trap of
- * an ambient filter that refuses it. Android's app filter refuses every uid
+ * through a tracee's trap-everything filter, or the trap of an ambient filter
+ * that refuses it. Android's app filter refuses every uid
  * and gid setter but setresuid (bionic's SECCOMP_BLOCKLIST_APP.TXT); capset is
- * allowed. All of them were answered ENOSYS, under -R on any host as well:
+ * allowed. All of them were answered ENOSYS:
  * `setgid(getgid())`, which is how many a program drops a set-id bit it may
  * have been started with, failed outright where the kernel says 0.
  *

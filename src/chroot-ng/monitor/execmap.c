@@ -3,11 +3,9 @@
 /* mmap(PROT_EXEC) of a file the host refuses to map executable — see
  * src/chroot-ng/include/cng/execmap.h for why this exists at all. */
 #include "cng/execmap.h"
-#include "cng/elf.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/ownmap.h"
-#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -35,129 +33,6 @@ static long fill_from_file(int fd, char *dst, unsigned long len,
         done += (unsigned long)r;
     }
     return (long)done;
-}
-
-/* One program header, read straight from the file rather than from the mapping
- * (which may begin past them). Returns 0/-1. */
-static int read_phdr(int fd, const Elf64_Ehdr *eh, int i, Elf64_Phdr *ph) {
-    unsigned long at = eh->e_phoff + (unsigned long)i * sizeof *ph;
-    return fill_from_file(fd, (char *)ph, sizeof *ph, at) == (long)sizeof *ph
-               ? 0
-               : -1;
-}
-
-/* Rewrite the `svc` sites of this mapping, but only where the object says its
- * code is. The M8 scan matches a bare 0xD4000001 word, and a PF_X PT_LOAD is
- * not a code segment: a musl link puts the whole read-only image in it, and
- * every link leaves the unwind tables there, where LSDA bytes really do equal
- * `svc #0` (see cng_code_ranges). So the segments say which bytes this mapping
- * carries and the section headers say which of them are instructions.
- *
- * The trampoline pool has to be within a `b`'s reach of the code. The loader
- * gets that by over-allocating its own reservation; here the mapping belongs to
- * the guest's linker, which has already reserved the object's whole span and
- * MAP_FIXEDs the remaining segments into it, so the pool goes immediately
- * outside that span instead — computed from the same headers. Both candidates
- * are taken with MAP_FIXED_NOREPLACE, so a busy neighbourhood costs the
- * rewriting and nothing else.
- *
- * Anything unexpected — not an ELF, a mapping matching no segment, nowhere to
- * put the pool — simply means no rewriting: the SIGSYS floor still covers those
- * sites and the mapping itself is already correct. Returns the number of sites
- * rewritten. */
-static int rewrite_text(int fd, unsigned long map, unsigned long off,
-                        unsigned long got) {
-    Elf64_Ehdr eh;
-    if (fill_from_file(fd, (char *)&eh, sizeof eh, 0) != (long)sizeof eh)
-        return 0;
-    if (eh.e_ident[0] != ELF_MAG0 || eh.e_ident[1] != ELF_MAG1 ||
-        eh.e_ident[2] != ELF_MAG2 || eh.e_ident[3] != ELF_MAG3 ||
-        eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_machine != EM_AARCH64 ||
-        eh.e_phentsize != sizeof(Elf64_Phdr) || eh.e_phnum == 0 ||
-        eh.e_phnum > CNG_MAX_PHDR)
-        return 0;
-
-    /* Pass one: the object's own load span, and the bias this mapping implies.
-     * A linker maps a segment at bias + page_down(p_vaddr) from file offset
-     * page_down(p_offset) — glibc and musl both — so the segment whose rounded
-     * offset is this mapping's names the bias. */
-    unsigned long vlo = ~0UL, vhi = 0, bias = 0;
-    int have_bias = 0;
-    for (int i = 0; i < eh.e_phnum; i++) {
-        Elf64_Phdr ph;
-        if (read_phdr(fd, &eh, i, &ph) != 0)
-            return 0;
-        if (ph.p_type != PT_LOAD)
-            continue;
-        /* A header whose end is not an address describes nothing — the sum
-         * wrapping, or rounding up to 0 from within a page of the top. */
-        unsigned long e;
-        if (cng_page_end(ph.p_vaddr, ph.p_memsz, &e) != 0)
-            return 0;
-        unsigned long s = cng_page_down(ph.p_vaddr);
-        if (s < vlo)
-            vlo = s;
-        if (e > vhi)
-            vhi = e;
-        if (!have_bias && cng_page_down(ph.p_offset) == off) {
-            bias = map - s;
-            have_bias = 1;
-        }
-    }
-    if (!have_bias || vhi <= vlo)
-        return 0;
-
-    /* Immediately above the object, then immediately below it, then wherever
-     * the kernel cares to put one: a library sits in a crowded neighbourhood
-     * (its neighbours were allocated from the same arena), so the two exact
-     * spots are often taken. The kernel's own choice comes out of that same
-     * arena and is normally within reach as well — and when it is not,
-     * cng_rewrite_seg rewrites nothing and the pool is handed straight back. */
-    unsigned long pool = cng_pool_at(bias + vhi, CNG_TRAMP_POOL);
-    if (!pool && bias + vlo >= CNG_TRAMP_POOL)
-        pool = cng_pool_at(bias + vlo - CNG_TRAMP_POOL, CNG_TRAMP_POOL);
-    if (!pool) {
-        void *any = sys_mmap(0, CNG_TRAMP_POOL,
-                             CNG_PROT_READ | CNG_PROT_WRITE,
-                             CNG_MAP_PRIVATE | CNG_MAP_ANONYMOUS, -1, 0);
-        if (!cng_is_err((long)any))
-            pool = (unsigned long)any;
-    }
-    if (!pool)
-        return 0;
-
-    /* Pass two: the executable segments, clipped to the bytes this mapping
-     * actually carries, and to the object's own code map. */
-    struct cng_code_ranges cr;
-    cng_code_ranges(fd, &cr);
-    unsigned long used = 0;
-    int sites = 0;
-    for (int i = 0; i < eh.e_phnum; i++) {
-        Elf64_Phdr ph;
-        if (read_phdr(fd, &eh, i, &ph) != 0)
-            break;
-        if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X) || !ph.p_filesz)
-            continue;
-        unsigned long slo = ph.p_offset, shi = ph.p_offset + ph.p_filesz;
-        if (shi < slo)
-            continue;
-        if (slo < off)
-            slo = off;
-        if (shi > off + got)
-            shi = off + got;
-        if (shi <= slo)
-            continue;
-        sites += cng_rewrite_seg(map + (slo - off), map + (shi - off), slo,
-                                 &cr, pool, CNG_TRAMP_POOL, &used);
-    }
-    if (!used) {
-        sys_munmap((void *)pool, CNG_TRAMP_POOL); /* nothing was reachable */
-        return 0;
-    }
-    sys_mprotect((void *)pool, cng_page_up(used),
-                 CNG_PROT_READ | CNG_PROT_EXEC);
-    cng_flush_icache((void *)pool, (void *)(pool + used));
-    return sites;
 }
 
 long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
@@ -208,10 +83,6 @@ long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
         return native;
     }
 
-    int sites = 0;
-    if (cng_g_rewrite && (prot & CNG_PROT_EXEC))
-        sites = rewrite_text(mfd, (unsigned long)p, off, (unsigned long)got);
-
     if (sys_mprotect(p, mlen, (int)prot) < 0) {
         /* execmem denied as well: there is no in-process way to run this code,
          * and the guest is owed the kernel's own answer for its request. */
@@ -245,8 +116,8 @@ long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
     if (cng_g_debug)
         cng_dprintf(2,
                     "[cng] execmap fd=%d off=%lu len=%lu prot=%ld -> %p"
-                    " (anon copy of %ld bytes, %d svc sites, %lu past eof)\n",
-                    mfd, off, mlen, prot, p, got, sites,
+                    " (anon copy of %ld bytes, %lu past eof)\n",
+                    mfd, off, mlen, prot, p, got,
                     have < mlen ? mlen - have : 0);
     return (long)p;
 }
@@ -269,8 +140,7 @@ long cng_execmap(unsigned long addr, unsigned long len, long prot, long flags,
  * included — and answers a range that went away under us with an errno where
  * a store of ours would fault in a handler that cannot take one. A page the
  * guest had written reads back as written, where the kernel would refault the
- * file's own bytes: the copy has no file under it to refault from, and the
- * one difference that matters — -R's rewritten svc sites — is better kept.
+ * file's own bytes: the copy has no file under it to refault from.
  *
  * Not every kernel moves a file mapping this way: DONTUNMAP is 5.7, and until
  * 5.13 it refused anything but private anonymous memory with EINVAL. There a

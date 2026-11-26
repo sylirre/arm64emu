@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # chroot-ng test harness. Runs the AArch64 binary — natively on an AArch64 host,
-# under qemu-aarch64 on a cross host — and checks behaviour. Extend per
+# under arm64emu's chroot mode on a cross host — and checks behaviour. Extend per
 # milestone. Everything host-dependent (emulator, guest toolchain, which
 # translation tier is live, rootfs images) is resolved in tests/chroot-ng/lib.sh; see the
 # header there for the environment knobs.
@@ -51,11 +51,22 @@ check_absent() { # desc, needle, haystack
 }
 
 cng_platform_init
-trap 'rm -rf "$CHROOTNG_TMP"' EXIT INT TERM
+# A signal ends the run: trapped without an exit, it removed the scratch
+# directory and let the suite go on without it.
+trap 'rm -rf "$CHROOTNG_TMP"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cng_platform_banner
 if [ "$CHROOTNG_EMU_MISSING" = 1 ]; then
-    echo "no qemu-aarch64 emulator found on a $HOST_ARCH host: install" \
-        "qemu-user (qemu-aarch64[-static]), or set CHROOTNG_QEMU= if AArch64 binaries run here anyway" >&2
+    echo "a $HOST_ARCH host runs the suite's AArch64 programs under arm64emu, and" \
+        "build/arm64emu is not built: make arm64emu, or set CHROOTNG_EMU= if AArch64 binaries run here anyway" >&2
+    exit 1
+fi
+# The seccomp filter is the whole of chroot-ng's interception, and nothing a
+# row asserts holds where it is not applied: qemu-user, or a kernel before 3.5.
+if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
+    echo "a guest's path syscalls are not translated here: this host does not" \
+        "apply a guest's seccomp filter, and chroot-ng cannot run on it" >&2
     exit 1
 fi
 echo
@@ -90,17 +101,15 @@ unset COLUMNS
 run >/dev/null 2>&1; check "no-args rc" 2 $?
 run --frobnicate >/dev/null 2>&1; check "unknown-option rc" 2 $?
 run / >/dev/null 2>&1; check "rootfs but no program rc" 2 $?
-run -t frobnicate >/dev/null 2>&1; check "unknown test rc" 2 $?
 
 # M2+ tests are appended as milestones land.
-if [ -f tests/chroot-ng/m2_probe.sh ]; then . tests/chroot-ng/m2_probe.sh; fi
 if [ -f tests/chroot-ng/m3_loader.sh ]; then . tests/chroot-ng/m3_loader.sh; fi
 if [ -f tests/chroot-ng/m4_dynamic.sh ]; then . tests/chroot-ng/m4_dynamic.sh; fi
-if [ -f tests/chroot-ng/m5_xlate.sh ]; then . tests/chroot-ng/m5_xlate.sh; fi
+if [ -f tests/chroot-ng/m5_view.sh ]; then . tests/chroot-ng/m5_view.sh; fi
 if [ -f tests/chroot-ng/m5b_monitor.sh ]; then . tests/chroot-ng/m5b_monitor.sh; fi
 if [ -f tests/chroot-ng/m6_execve.sh ]; then . tests/chroot-ng/m6_execve.sh; fi
 if [ -f tests/chroot-ng/m7_fidelity.sh ]; then . tests/chroot-ng/m7_fidelity.sh; fi
-if [ -f tests/chroot-ng/m8_rewrite.sh ]; then . tests/chroot-ng/m8_rewrite.sh; fi
+if [ -f tests/chroot-ng/m8_context.sh ]; then . tests/chroot-ng/m8_context.sh; fi
 if [ -f tests/chroot-ng/m9_androidnet.sh ]; then . tests/chroot-ng/m9_androidnet.sh; fi
 if [ -f tests/chroot-ng/m10_l2s_shell.sh ]; then . tests/chroot-ng/m10_l2s_shell.sh; fi
 if [ -f tests/chroot-ng/m11_proc.sh ]; then . tests/chroot-ng/m11_proc.sh; fi

@@ -1,255 +1,6 @@
-# M6 execve-emulation tests (sourced by tests/chroot-ng/run.sh). The seccomp trap of
-# execve is inert under qemu, but the two halves of the emulation are covered:
-# loading+stack-building is the same code M3/M4 validate, and the ucontext
-# redirect that resumes into the new program is validated here.
-echo "== M6: execve emulation (ucontext redirect) =="
-
-run -t jmptest >/dev/null 2>&1
-check "ucontext redirect resumes at new pc (exit 7)" 7 $?
-check_contains "landed in redirected context" \
-    "landed in redirected context" \
-    "$(run -t jmptest 2>&1)"
-
-# shebang script exec: #!interp [arg] -> [interp, arg, script, orig-args...]
-# $CHROOTNG_GUEST_BINDS is empty for a self-contained (static) guest; where the toolchain
-# only links dynamically it exposes the ELF interpreter's own directories, which
-# a rootfs holding nothing but the test binary cannot otherwise provide.
-ER=$(mktemp -d)
-if guest_cc_report "$ER/hello" tests/chroot-ng/guests/hello.c; then
-    printf '#!/hello sheb\n' > "$ER/script"
-    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    exectest() { run -t exectest $CHROOTNG_GUEST_BINDS -r "$ER" "$@"; }
-    out=$(exectest /script AA 2>&1); rc=$?
-    check "shebang exec exit 42" 42 $rc
-    check_contains "shebang interp is argv0"  "argv0=/hello" "$out"
-    check_contains "shebang arg passed"       "argv1=sheb"   "$out"
-    check_contains "script path passed"       "argv2=/script" "$out"
-    check_contains "original arg passed"      "argv3=AA"     "$out"
-    out=$(exectest /hello X 2>&1)
-    check_contains "plain ELF exec via emulate_execve" "argv0=/hello" "$out"
-    # /proc/self/exe fixup updates to the exec'd program (needed for e.g. Go's
-    # GOROOT derivation), with symlinks resolved to match the kernel.
-    check_contains "exec updates /proc/self/exe target" "exe=/hello" "$out"
-    ln -s /hello "$ER/go"
-    out=$(exectest /go X 2>&1)
-    check_contains "exec resolves symlink for /proc/self/exe" "exe=/hello" "$out"
-
-    # apk runs package scripts as execve("/proc/self/fd/N"). That magic link
-    # names an open file of *this* process: its target is a host path (or no
-    # path at all — memfd/O_TMPFILE/deleted), so it must not be re-rooted into
-    # the rootfs the way a guest symlink target is.
-    exec 9< "$ER/script"
-    out=$(exectest /proc/self/fd/9 AA 2>&1); rc=$?
-    check "shebang script exec'd via /proc/self/fd" 42 $rc
-    check_contains "interp gets the fd path as the script" \
-        "argv2=/proc/self/fd/9" "$out"
-    exec 9<&-
-    exec 9< "$ER/hello"
-    out=$(exectest /proc/self/fd/9 X 2>&1); rc=$?
-    check "plain ELF exec'd via /proc/self/fd" 42 $rc
-    check_contains "exec via fd path names the real file for /proc/self/exe" \
-        "exe=/hello" "$out"
-    exec 9<&-
-
-    # ...and the number in that name is a descriptor, which is an int. The
-    # parse accumulated digits with no bound, so a long enough one overflowed
-    # and wrapped: "/proc/self/fd/4294967305" is 2^32 + 9, which came out as 9
-    # and exec'd whatever this process had open there. No such descriptor
-    # exists, and the kernel has no such name either — the answer is ENOENT.
-    exec 9< "$ER/hello"
-    check_contains "an out-of-range fd number names no descriptor" \
-        "emulate_execve failed x0=-2" \
-        "$(exectest /proc/self/fd/4294967305 X 2>&1)"
-    exec 9<&-
-
-    # execve(2) checks *execute* permission; only a reopen needs read. apk's
-    # package scripts are exec'd through an fd whose inode grants exactly that,
-    # so the image has to come from the fd we already hold.
-    if [ "$(id -u)" -ne 0 ]; then
-        cp "$ER/hello" "$ER/xonly"
-        exec 9< "$ER/xonly"
-        chmod 111 "$ER/xonly"
-        out=$(exectest /proc/self/fd/9 X 2>&1); rc=$?
-        check "exec via fd of a file the guest may not read" 42 $rc
-        check_contains "loaded from the fd, not a reopen" \
-            "argv0=/proc/self/fd/9" "$out"
-        exec 9<&-
-    fi
-
-    # a failed exec must report why, like the kernel does: an unreadable target
-    # is EACCES, not a blanket ENOENT.
-    if [ "$(id -u)" -ne 0 ]; then
-        cp "$ER/hello" "$ER/noperm"; chmod 000 "$ER/noperm"
-        check_contains "unreadable exec target reports EACCES" \
-            "emulate_execve failed x0=-13" \
-            "$(exectest /noperm 2>&1)"
-    fi
-
-    # --- M17-10: shebang nesting -------------------------------------------
-    # A script whose interpreter is itself a script is followed a bounded number
-    # of times (BINPRM_MAX_RECURSION) and then answered ELOOP. Each level
-    # prepends its own interpreter and pushes the previous one down, so the whole
-    # chain shows up in the final argv — which is the only way to see that the
-    # levels ran in order rather than being collapsed.
-    #
-    # d1 is one script level, d2 two, and so on. The depth is measured rather
-    # than read: at four the emulation refused a chain the kernel executes, which
-    # no amount of reading fs/exec.c had settled.
-    #
-    # The host kernel's own answer is measured too, but as a sanity range rather
-    # than as the number to match — it is not a constant across kernels. The same
-    # ladder runs six deep on an Android 13 device (5.15 GKI) and five deep on a
-    # 6.17 dev host, both then ELOOP. The emulation carries one number and
-    # advertises 6.1.0, so it matches the device; what every host must show is
-    # that number followed by ELOOP.
-    _d=1
-    printf '#!/hello\n' >"$ER/d1"
-    while [ $_d -lt 8 ]; do
-        printf '#!/d%d\n' $_d >"$ER/d$((_d + 1))"
-        _d=$((_d + 1))
-    done
-    chmod 755 "$ER"/d? 2>/dev/null || :
-
-    NREF=$(mktemp -d)
-    printf '#!%s\nexit 0\n' "$HOST_SH" >"$NREF/d1"
-    _d=1
-    while [ $_d -lt 8 ]; do
-        printf '#!%s/d%d\n' "$NREF" $_d >"$NREF/d$((_d + 1))"
-        _d=$((_d + 1))
-    done
-    chmod 755 "$NREF"/d?
-    KDEPTH=0
-    _d=1
-    while [ $_d -le 8 ]; do
-        "$NREF/d$_d" 2>/dev/null || break
-        KDEPTH=$_d
-        _d=$((_d + 1))
-    done
-    rm -rf "$NREF"
-    check_contains "the host kernel bounds #! nesting somewhere sane" "$KDEPTH" \
-        "$(echo 4 5 6)"
-
-    GDEPTH=0
-    _d=1
-    while [ $_d -le 8 ]; do
-        exectest "/d$_d" AA >/dev/null 2>&1
-        [ $? = 42 ] || break   # 42 is what the exec'd guest exits with
-        GDEPTH=$_d
-        _d=$((_d + 1))
-    done
-    check "a #! chain nests as deep as the emulation bounds it" 6 "$GDEPTH"
-    check_contains "one level past that is ELOOP" "emulate_execve failed x0=-40" \
-        "$(exectest "/d$((GDEPTH + 1))" AA 2>&1)"
-
-    # The whole chain, in order, in the final argv: four levels is enough to
-    # show the pushing-down without depending on where the limit sits.
-    out=$(exectest /d4 AA 2>&1); rc=$?
-    check "a four-deep shebang chain runs" 42 $rc
-    check_contains "the innermost interpreter is argv0" "argv0=/hello" "$out"
-    check_contains "each level pushed its script down (1)" "argv1=/d1" "$out"
-    check_contains "each level pushed its script down (2)" "argv2=/d2" "$out"
-    check_contains "each level pushed its script down (3)" "argv3=/d3" "$out"
-    check_contains "the original script is last" "argv4=/d4" "$out"
-    check_contains "the guest's own argument survives all of it" "argv5=AA" \
-        "$out"
-
-    # --- M17-10: execveat's flags word -------------------------------------
-    # It was never read: a real dirfd resolved against the cwd instead, and
-    # AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW did nothing at all.
-    mkdir -p "$ER/sub"
-    cp "$ER/hello" "$ER/sub/hello"
-    out=$(exectest -D /sub hello X 2>&1); rc=$?
-    check "a relative execveat resolves against its dirfd" 42 $rc
-    check_contains "and runs the program there" "argv0=hello" "$out"
-    # ..-climbing out of a dirfd is clamped at the guest root, not followed onto
-    # the host: /sub/../../hello is /hello inside the rootfs.
-    check_contains "a dirfd-relative '..' is clamped at the guest root" \
-        "exe=/hello" "$(exectest -D /sub ../../hello X 2>&1)"
-    out=$(exectest -e /hello X 2>&1); rc=$?
-    check "AT_EMPTY_PATH executes the fd itself" 42 $rc
-    # ...and /proc/self/exe names the file, not the descriptor it came through.
-    # Those fds are opened O_CLOEXEC (apk's package scripts, every memfd exec),
-    # so the magic link has to be read before the commit point closes them; read
-    # after, it answered ENOENT and the exe link came out as "/". `go` computes
-    # GOROOT from this.
-    check_contains "an fd-exec still reports the file as /proc/self/exe" \
-        "exectest: exe=/hello" "$out"
-    check_contains "AT_SYMLINK_NOFOLLOW refuses a symlinked target" \
-        "emulate_execve failed x0=-40" "$(exectest -N /go X 2>&1)"
-    out=$(exectest -N /hello X 2>&1); rc=$?
-    check "AT_SYMLINK_NOFOLLOW on a real file still runs it" 42 $rc
-    # ...and on an emulated hardlink, which to the guest is a regular file and
-    # not the l2s symlink it is implemented with: the flag used to ELOOP it.
-    # /proc/self/exe then names the hardlink itself, as the kernel names the
-    # dentry it resolved — it used to read the backing file's path in the
-    # store, "/.l2s/.l2s.<ino>", a name the guest cannot even open. On a copy
-    # of the program: -L turns both names into l2s links, and the fixture's own
-    # /hello has legs after this one that want it plain.
-    cp "$ER/hello" "$ER/hello_l"
-    ln -s /hello_l "$ER/go_l"
-    out=$(exectest -l -L /hello_l:/hlink -N /hlink X 2>&1); rc=$?
-    check "AT_SYMLINK_NOFOLLOW runs an l2s name rather than ELOOP it" 42 $rc
-    check_contains "...and /proc/self/exe names the hardlink, not the store" \
-        "exe=/hlink" "$out"
-    # A real symlink leading to an l2s name: the chain ends at the hardlink.
-    check_contains "a symlink to an l2s name reports that name as exe" \
-        "exe=/hello_l" "$(exectest -l /go_l X 2>&1)"
-    check_contains "...while a real symlink is still refused under -l" \
-        "emulate_execve failed x0=-40" "$(exectest -l -N /go X 2>&1)"
-    check_contains "an undefined execveat flag is EINVAL" \
-        "emulate_execve failed x0=-22" "$(exectest -B /hello 2>&1)"
-
-    # --- M17-10: state a real execve drops with the address space ------------
-    # Ours keeps the address space, so the heap, any POSIX timer and the rseq
-    # registration outlive the program that owned them — a timer would go on
-    # firing into a program that never armed it, and the kernel would go on
-    # writing cpu ids into a TCB the next program no longer has (a forced
-    # SIGSEGV once the heap is wound back from under it, which is how a
-    # ptrace tracee died at its exec stop on a real kernel). -R arms all three
-    # before the emulation and reports afterwards. rseq is ENOSYS under
-    # qemu-user, so that part is only measured on a native host.
-    # The timers are a hundred armed through the dispatcher — the record used
-    # to hold 64, and the 65th outlived the exec — plus one armed raw, which the
-    # emulation never saw handed out: only the kernel's own list
-    # (/proc/self/timers) finds that one. Under qemu-user the ids in that list
-    # are the emulator's, not the guest's, and the emulator allows 32 timers in
-    # all, so the hundred and the unseen one are asserted natively.
-    out=$(exectest -R /hello 2>&1); rc=$?
-    check "exec resets the state that would have died with the image" 0 $rc
-    check_contains "the heap is wound back and every recorded timer deleted" \
-        "execreset: brk_back=1 timers_created=" "$out"
-    check_contains "...every one of them" "timers_gone=1" "$out"
-    if [ "$CHROOTNG_NATIVE" = 1 ]; then
-        check_contains "...a hundred of them, past the old record's 64" \
-            "timers_created=100" "$out"
-        # The raw timer is found by the kernel's own list and nothing else, so
-        # a kernel that publishes none (Android's GKI has no checkpoint/restore
-        # support, hence no /proc/self/timers) has nothing for the emulation to
-        # find it by: only the timers it was told of can be dropped there.
-        if [ -e /proc/self/timers ]; then
-            check_contains "...a timer the emulation never saw handed out too" \
-                "unseen_timer_gone=1" "$out"
-        else
-            skip "an unseen timer's exec reset: this kernel has no /proc/self/timers to list it by"
-        fi
-        # rseq is registered wherever the host allows it. Where the ambient filter
-        # refuses it (Android 15's does) there is no area to unregister: the driver
-        # says it was refused as unavailable, and nothing else excuses the leg.
-        case "$out" in
-        *"rseq_enosys=1 rseq_registered=0 rseq_gone=0 -> OK"*)
-            skip "rseq area reset: the host refuses rseq (ambient filter), so none was registered"
-            ;;
-        *)
-            check_contains "...and the rseq area unregistered" \
-                "rseq_registered=1 rseq_gone=1 -> OK" "$out"
-            ;;
-        esac
-    else
-        check_contains "...and there was no rseq area to unregister here" \
-            "rseq_registered=0 rseq_gone=0 -> OK" "$out"
-    fi
-fi
-rm -rf "$ER"
+# M6 execve-emulation tests (sourced by tests/chroot-ng/run.sh): what an execve
+# a guest makes leaves behind, and what the program it starts finds.
+echo "== M6: execve emulation =="
 
 # --- M17-10: a failed exec must leave the calling program running -----------
 # A binary whose PT_INTERP names a file that is not there is how an exec fails
@@ -276,7 +27,7 @@ IF_NOINTERP=/cng-no-such-interp.so
 # The oracle: on a host that runs AArch64 directly the guest pair is its own
 # reference; otherwise the same two sources built host-native and linked alike.
 if_oracle_build() {
-    if [ -z "$CHROOTNG_QEMU" ]; then
+    if [ -z "$CHROOTNG_EMU" ]; then
         IF_ORACLE=$IFD/interpfail
         IF_TARGET=$IFD/badinterp
         return 0
@@ -297,8 +48,6 @@ if_host_run() { if [ -n "$TIMEOUT" ]; then "$TIMEOUT" 60 env -u LD_PRELOAD "$@";
 
 if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "failed-exec survival: no AArch64 guest toolchain"
-elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "$CHROOTNG_EXECMEM" != 1 ]; then
-    skip "failed-exec survival: no filter is live and -R cannot rewrite without execmem"
 elif ! guest_cc "$IFD/interpfail" tests/chroot-ng/guests/interpfail.c -static -no-pie ||
     ! guest_cc "$IFD/badinterp" tests/chroot-ng/guests/hello.c -no-pie \
         "-Wl,--dynamic-linker=$IF_NOINTERP"; then
@@ -311,7 +60,7 @@ elif ! if_oracle_build; then
     skip "failed-exec survival: no host compiler for the differential oracle"
 else
     if_out_k=$(if_host_run "$IF_ORACLE" "$IF_TARGET" 2>/dev/null); if_rc_k=$?
-    if_out_g=$(run_t 90 -R "$IFD" /interpfail /badinterp 2>/dev/null); if_rc_g=$?
+    if_out_g=$(run_t 90 "$IFD" /interpfail /badinterp 2>/dev/null); if_rc_g=$?
     if [ "$if_out_k" = "$if_out_g" ] && [ "$if_rc_k" = "$if_rc_g" ]; then
         pass=$((pass + 1))
         printf '  ok   a missing ELF interpreter is an errno and a live caller, as the kernel has it\n'
@@ -331,7 +80,7 @@ else
     printf 'not an ELF\n' >"$IFD$IF_NOINTERP"
     chmod 755 "$IFD$IF_NOINTERP"
     check_contains "an unloadable interpreter also leaves the caller running" \
-        "alive=1" "$(run_t 90 -R "$IFD" /interpfail /badinterp 2>&1)"
+        "alive=1" "$(run_t 90 "$IFD" /interpfail /badinterp 2>&1)"
 fi
 rm -rf "$IFD"
 
@@ -388,8 +137,6 @@ for _c in ${HOSTCC:-} cc gcc clang; do have "$_c" && { ee_hostcc=$_c; break; }; 
 
 if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "failed-exec errno: no AArch64 guest toolchain"
-elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "$CHROOTNG_EXECMEM" != 1 ]; then
-    skip "failed-exec errno: no filter is live and -R cannot rewrite without execmem"
 elif [ -z "$ee_hostcc" ]; then
     skip "failed-exec errno: no host compiler for the differential oracle"
 # shellcheck disable=SC2086  # $CHROOTNG_GUESTLD is a flag or deliberately empty
@@ -405,7 +152,7 @@ else
     # shellcheck disable=SC2046  # ee_args is a deliberately split argument list
     ee_k=$(if_host_run "$EED/host/execerrno" $(ee_args "$EED/host") 2>/dev/null)
     # shellcheck disable=SC2046
-    ee_g=$(run_t 90 -R "$EED" /execerrno $(ee_args "") 2>/dev/null)
+    ee_g=$(run_t 90 "$EED" /execerrno $(ee_args "") 2>/dev/null)
     if [ -n "$ee_k" ] && [ "$ee_k" = "$ee_g" ]; then
         pass=$((pass + 1))
         printf '  ok   a failed exec answers the errno the kernel does, all five\n'
@@ -428,18 +175,16 @@ rm -rf "$EED"
 #
 # Referenced against the same binary with no chroot-ng under it, so the number
 # is the running kernel's rather than one written down here: on an AArch64 host
-# or device that is the kernel directly, and under qemu-user it agrees with the
-# host kernel (measured, both boundaries).
+# or device that is the kernel directly, elsewhere arm64emu's, which answers as
+# a kernel with 4 KiB pages does.
 AMD=$(mktemp -d)
 if ! guest_xlate_ready "argv string bound"; then
     :
 elif ! guest_cc_report "$AMD/argmax" tests/chroot-ng/guests/argmax.c; then
     :
-elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ] && [ "$CHROOTNG_EXECMEM" != 1 ]; then
-    skip "argv string bound: no filter is live and -R cannot rewrite without execmem"
 else
     am_k=$(emu_t 90 "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
-    am_g=$(run_t 90 -R / "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
+    am_g=$(run_t 90 / "$AMD/argmax" "$AMD/argmax" 2>/dev/null)
     if [ -n "$am_k" ] && [ "$am_k" = "$am_g" ]; then
         pass=$((pass + 1))
         printf '  ok   a single argv string is bounded where the kernel bounds it (%s)\n' \
@@ -482,7 +227,7 @@ else
     # inside it and the reclaim would sit out. On a host that runs AArch64
     # directly the flag changes nothing — there really is one thread.
     ec_k=$(emu_t 90 "$ECD/execchain" 8 2>/dev/null)
-    ec_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECD" /execchain 8 2>/dev/null)
+    ec_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 90 "$ECD" /execchain 8 2>/dev/null)
     case "$ec_k$ec_g" in
     *growth_kb=*growth_kb=*)
         ec_kn=${ec_k##*growth_kb=}
@@ -517,8 +262,7 @@ rm -rf "$ECD"
 # signal mask (ppoll, pselect, epoll_pwait, sigsuspend, sigwait): those are
 # trapped so SIGSYS can be taken out of the mask, or the exec would wait for
 # them forever — so completing in time is part of the answer. Differential
-# against the kernel; under qemu-user the thread count includes the
-# emulator's own thread on both sides.
+# against the kernel, or the emulator the guests run under, on both sides.
 TED=$(mktemp -d)
 if ! guest_xlate_ready "multithreaded execve"; then
     :
@@ -529,7 +273,7 @@ else
     for mode in leader nonleader; do
         te_k=$(cd "$TED/bin" && emu_t 60 ./threadexec $mode 2>/dev/null)
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-        te_g=$(run_t 90 -R $CHROOTNG_GUEST_BINDS "$TED" /bin/threadexec $mode 2>/dev/null)
+        te_g=$(run_t 90 $CHROOTNG_GUEST_BINDS "$TED" /bin/threadexec $mode 2>/dev/null)
         if [ -n "$te_k" ] && [ "$te_k" = "$te_g" ]; then
             pass=$((pass + 1))
             printf '  ok   execve by the %s thread matches the kernel (%s)\n' "$mode" "$te_g"
@@ -542,12 +286,19 @@ else
     # ...and the waits themselves still behave as the kernel's: the mask the
     # call installs is in force for the wait, the caller's own mask is back
     # afterwards, the result and errno are the kernel's, a full mask still
-    # works, and a set the kernel would refuse is refused as it would.
+    # works, and a set the kernel would refuse is refused as it would. The
+    # handler cannot run the wait itself and bounces it through a second svc
+    # in the gate. Whether the filter lets that svc through depends on where
+    # the gate ends relative to the instruction after it, which the kernel
+    # reports as the call's ip: with the gate one instruction short, every
+    # masked wait (musl's select() is one — it passes a {NULL, size} pair)
+    # trapped again from the stub, each round a record lower on the guest's
+    # stack, until it was gone (a SEGV on Android, a hang under a VM's TCG).
     if guest_cc "$TED/maskwait" tests/chroot-ng/guests/maskwait.c -pthread; then
         cp "$TED/maskwait" "$TED/bin/maskwait"
         mw_k=$(emu_t 60 "$TED/maskwait" 2>/dev/null)
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-        mw_g=$(run_t 90 -R $CHROOTNG_GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
+        mw_g=$(run_t 90 $CHROOTNG_GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
         if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_g" ]; then
             pass=$((pass + 1))
             echo "  ok   the mask-taking waits answer as the kernel's, SIGSYS taken out"
@@ -556,30 +307,6 @@ else
             echo "  FAIL the mask-taking waits diverge from the kernel"
             printf '       kernel: %s\n       guest : %s\n' \
                 "$(echo "$mw_k" | tr '\n' '|')" "$(echo "$mw_g" | tr '\n' '|')"
-        fi
-        # ...and on the SIGSYS tier, where the wait cannot be run by the
-        # handler and is bounced through a second svc in the gate. Whether the
-        # filter lets that svc through depends on where the gate ends relative
-        # to the instruction after it, which the kernel reports as the call's
-        # ip: with the gate one instruction short, every masked wait (musl's
-        # select() is one — it passes a {NULL, size} pair) trapped again from
-        # the stub, each round a record lower on the guest's stack, until it
-        # was gone (a SEGV on Android, a hang under a VM's TCG). The run needs
-        # a live filter and no -R, or it never reaches the handler.
-        if [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-            skip "masked waits on the SIGSYS tier: the seccomp filter is inert on this host"
-        else
-            # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-            mw_s=$(run_t 90 $CHROOTNG_GUEST_BINDS "$TED" /bin/maskwait 2>/dev/null)
-            if [ -n "$mw_k" ] && [ "$mw_k" = "$mw_s" ]; then
-                pass=$((pass + 1))
-                echo "  ok   the mask-taking waits answer as the kernel's on the SIGSYS tier too"
-            else
-                fail=$((fail + 1))
-                echo "  FAIL the mask-taking waits diverge from the kernel on the SIGSYS tier"
-                printf '       kernel: %s\n       guest : %s\n' \
-                    "$(echo "$mw_k" | tr '\n' '|')" "$(echo "$mw_s" | tr '\n' '|')"
-            fi
         fi
     else
         skip "masked waits: could not build tests/chroot-ng/guests/maskwait.c with -pthread"
@@ -594,37 +321,75 @@ else
     # an address to map back is the one that runs the whole dispatch there. On
     # the SIGSYS tier the handler must also run on the thread's own stack, as
     # the kernel delivers it, which takes the dispatch's blocking svc being made
-    # there (`sp`); under -R it still runs on the scratch stack.
+    # there (`sp`).
     if guest_cc "$TED/blkcall" tests/chroot-ng/guests/blkcall.c -pthread; then
         cp "$TED/blkcall" "$TED/bin/blkcall"
         mkdir -p "$TED/tmp"
-        for bc_tier in -R ""; do
-            if [ -z "$bc_tier" ] && [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-                skip "blocking calls on the SIGSYS tier: the seccomp filter is inert on this host"
-                continue
-            fi
-            bc_sp=sp
-            [ -n "$bc_tier" ] && bc_sp=-
-            bc_k=$(emu_t 90 "$TED/blkcall" "$TED/tmp" "$bc_sp" 2>/dev/null)
-            # shellcheck disable=SC2086  # deliberately split arg lists
-            bc_g=$(run_t 120 $bc_tier $CHROOTNG_GUEST_BINDS "$TED" /bin/blkcall /tmp \
-                "$bc_sp" 2>/dev/null)
-            bc_t=${bc_tier:-the SIGSYS tier}
-            if [ -n "$bc_k" ] && [ "$bc_k" = "$bc_g" ]; then
-                pass=$((pass + 1))
-                echo "  ok   a signal against a blocking call acts as the kernel's ($bc_t)"
-            else
-                fail=$((fail + 1))
-                echo "  FAIL a signal against a blocking call diverges from the kernel ($bc_t)"
-                printf '       kernel: %s\n       guest : %s\n' \
-                    "$(echo "$bc_k" | tr '\n' '|')" "$(echo "$bc_g" | tr '\n' '|')"
-            fi
-        done
+        bc_k=$(emu_t 90 "$TED/blkcall" "$TED/tmp" sp 2>/dev/null)
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        bc_g=$(run_t 120 $CHROOTNG_GUEST_BINDS "$TED" /bin/blkcall /tmp sp 2>/dev/null)
+        if [ -n "$bc_k" ] && [ "$bc_k" = "$bc_g" ]; then
+            pass=$((pass + 1))
+            echo "  ok   a signal against a blocking call acts as the kernel's"
+        else
+            fail=$((fail + 1))
+            echo "  FAIL a signal against a blocking call diverges from the kernel"
+            printf '       kernel: %s\n       guest : %s\n' \
+                "$(echo "$bc_k" | tr '\n' '|')" "$(echo "$bc_g" | tr '\n' '|')"
+        fi
     else
         skip "blocking calls: could not build tests/chroot-ng/guests/blkcall.c with -pthread"
     fi
 fi
 rm -rf "$TED"
+
+# Every way to name what an exec runs, and what it takes with it: #! scripts and
+# their chains, the fd links and execveat's forms, an unreadable program run by
+# descriptor, the descriptors, timers and signal state an exec keeps or drops.
+# The block is a kernel's, every line of it measured; how deep a #! chain may go
+# is not one number across kernels, so only four (runs) and eight (ELOOP) are
+# asked.
+XVD=$(mktemp -d)
+if guest_xlate_ready "exec variants" &&
+    guest_cc_report "$XVD/execvar" tests/chroot-ng/guests/execvar.c; then
+    xv_want='plain: argv w show BB exe=/execvar
+symlink: argv w show BB exe=/execvar
+shebang: argv /execvar sheb /xv/s1 AA exe=/execvar
+shebang 4 deep: argv /execvar sheb /xv/s1 /xv/s2 /xv/s3 /xv/s4 AA exe=/execvar
+shebang 8 deep: errno 40
+a script that is not executable: errno 13
+empty file: errno 8
+missing: errno 2
+a directory: errno 13
+relative: argv w show BB exe=/execvar
+fd path, program: argv w show BB exe=/execvar
+fd path, script: argv /execvar sheb /proc/self/fd/77 AA exe=/execvar
+fd path, no descriptor: errno 2
+O_PATH fd of an unreadable program: argv w show BB exe=/xv/unreadable
+execveat relative: argv w show BB exe=/execvar
+execveat above the root: argv w show BB exe=/execvar
+execveat AT_EMPTY_PATH: argv w show BB exe=/execvar
+execveat nofollow, a link: errno 40
+execveat nofollow, a file: argv w show BB exe=/execvar
+execveat unknown flag: errno 22
+execveat empty name: errno 2
+descriptors: argv w show BB exe=/execvar kept=1 closed=1
+timers: argv w show BB exe=/execvar timers_gone=1
+signals: argv w show BB exe=/execvar blocked=1 ignored=1 handler_reset=1'
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+    xv_got=$(run_t 120 $CHROOTNG_GUEST_BINDS "$XVD" /execvar 2>/dev/null)
+    if [ "$xv_got" = "$xv_want" ]; then
+        pass=$((pass + 1))
+        echo "  ok   every way to name an exec answers as the kernel's"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL every way to name an exec answers as the kernel's"
+        printf '%s\n' "$xv_want" >"$CHROOTNG_TMP/xv.want"
+        printf '%s\n' "$xv_got" >"$CHROOTNG_TMP/xv.got"
+        diff "$CHROOTNG_TMP/xv.want" "$CHROOTNG_TMP/xv.got" | sed 's/^/    /'
+    fi
+fi
+rm -rf "$XVD"
 
 # ...and from a process with more siblings than the de_thread's table held,
 # and from one whose siblings keep making threads. The siblings used to be
@@ -647,7 +412,7 @@ else
         # shellcheck disable=SC2086  # the shape is two words
         se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec $shape 2>/dev/null | grep '^report:')
         # shellcheck disable=SC2086
-        se_g=$(run_t 240 -R $CHROOTNG_GUEST_BINDS "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
+        se_g=$(run_t 240 $CHROOTNG_GUEST_BINDS "$SED" /bin/spawnexec $shape 2>/dev/null | grep '^report:')
         if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
             pass=$((pass + 1))
             printf '  ok   execve reaches every sibling (%s) as the kernel does (%s)\n' "$shape" "$se_g"
@@ -664,17 +429,17 @@ else
     # until there was no room for the next, and the kernel killed the whole
     # process with a SIGSEGV (a few chain runs in a hundred on Android 8,
     # where bionic's alternate stack is 16 KiB). The tracer that holds them is
-    # a native program (dtstall.c), so a host that runs the guest's binaries
-    # through qemu-user, whose host tracer would see the emulator's signals,
-    # has no such run.
-    if [ -n "$CHROOTNG_QEMU" ]; then
-        skip "de_thread with each request held at delivery: a host tracer under qemu-user sees the emulator's signals, not the guest's"
+    # a native program (dtstall.c): under an emulator a guest's tracer sees the
+    # emulated ptrace's stops, not the kernel's delivery, so a host that
+    # emulates AArch64 has no such run.
+    if [ -n "$CHROOTNG_EMU" ]; then
+        skip "de_thread with each request held at delivery: the tracer that holds them needs the kernel's own signal delivery, not an emulator's"
     elif ! guest_cc "$SED/dtstall" tests/chroot-ng/guests/dtstall.c; then
         skip "de_thread with each request held at delivery: could not build tests/chroot-ng/guests/dtstall.c"
     else
         se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec chain 16 2>/dev/null | grep '^report:')
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-        se_g=$(emu_t 240 "$SED/dtstall" 2 "$CHROOTNG_BIN" -R $CHROOTNG_GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
+        se_g=$(emu_t 240 "$SED/dtstall" 2 "$CHROOTNG_BIN" $CHROOTNG_GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
         se_rc=$?
         case "$se_g" in
         SKIP:*)
@@ -713,7 +478,7 @@ elif elf_has_interp "$ECM/manymaps"; then
     skip "many-mapping exec chain: needs a static guest (the dynamic form's binds are covered below)"
 else
     em_k=$(emu_t 90 "$ECM/manymaps" 1500 6 2>/dev/null)
-    em_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 90 -R "$ECM" /manymaps 1500 6 2>/dev/null)
+    em_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 90 "$ECM" /manymaps 1500 6 2>/dev/null)
     case "$em_k$em_g" in
     *growth_kb=*growth_kb=*)
         em_kn=${em_k##*growth_kb=}
@@ -734,19 +499,6 @@ else
     esac
 fi
 rm -rf "$ECM"
-
-# The registry the sweep asks "was this ever ours?" used to hold 96 records and
-# fail closed at the 97th: cng_own_ready() went false for good and the reclaim
-# sat out every later exec of that process. A shm attach list or the ptrace
-# registry adds a record per page it grows by, so the count was reachable. The
-# registry now sits on a table that grows a page at a time (tab.c); the
-# self-test drives both well past the old ceiling.
-out=$(run_t 60 -t tabtest 2>&1); rc=$?
-check "the own-map registry grows past 96 records and stays armed" 0 $rc
-check_contains "growing table: elements stable and in order" \
-    "stable and in order -> OK" "$out"
-check_contains "growing table: every record found, half dropped" \
-    "half dropped, still armed -> OK" "$out"
 
 # ...and the same chain with a guest whose OWN ld.so maps its libraries. That
 # memory is not the loader's and no recorded extent describes it, so it is the
@@ -770,12 +522,6 @@ ECDD=$(mktemp -d)
 cng_dyn_binds
 if [ -z "$CHROOTNG_GUESTCC" ]; then
     skip "dynamic exec-chain address space: no AArch64 guest toolchain"
-elif [ "$CHROOTNG_SECCOMP_LIVE" != 1 ]; then
-    # A dynamic guest's execve is libc's, in a library our loader never mapped,
-    # so -R cannot have rewritten it and an inert filter leaves nothing to trap:
-    # the call goes to the host kernel with the guest's own path and fails.
-    # Same prerequisite M23's dynamic legs have.
-    skip "dynamic exec-chain address space: filter inert here, so nothing reaches a dynamic guest's own execve"
 elif ! $CHROOTNG_GUESTCC -O2 -o "$ECDD/execchain" tests/chroot-ng/guests/execchain.c \
     2>"$GUEST_CC_LOG"; then
     fail=$((fail + 1)); printf '  FAIL could not build a dynamic execchain\n'
@@ -784,8 +530,8 @@ elif ! elf_has_interp "$ECDD/execchain"; then
     skip "dynamic exec-chain address space: this toolchain links even -O2 guests statically"
 else
     # shellcheck disable=SC2086  # both are deliberately split arg lists
-    ecd_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 200 $GUEST_DYN_L $GUEST_DYN_BINDS \
-        -R "$ECDD" /execchain 64 2>/dev/null)
+    ecd_g=$(CHROOTNG_EXEC_RECLAIM_FORCE=1 run_t 200 $GUEST_DYN_BINDS \
+        "$ECDD" /execchain 64 2>/dev/null)
     case "$ecd_g" in
     *growth_kb=*)
         ecd_gn=${ecd_g##*growth_kb=}
@@ -810,17 +556,3 @@ else
     esac
 fi
 rm -rf "$ECDD"
-
-# emulated execve must close FD_CLOEXEC fds like a real execve, or fork/exec
-# launchers (git run-command, posix_spawn) block on their O_CLOEXEC notify pipe.
-out=$(run -t cloexectest 2>&1); rc=$?
-check "cloexectest exit 0" 0 "$rc"
-check_contains "emulated execve closes FD_CLOEXEC fds" \
-    "cloexec: cloexec_closed=1 plain_open=1 -> OK" "$out"
-# ...and still does when /proc/self/fd cannot be opened. The pass reads that
-# directory, and a descriptor table filled to RLIMIT_NOFILE refuses the open
-# (EMFILE) -- from exactly the program with the most descriptors to lose. It
-# used to return quietly then and leak every one of them across the exec.
-check_contains "...and with a full descriptor table, where /proc/self/fd will not open" \
-    "cloexec no-proc: table_full=1 cloexec_closed=1 top_closed=1 plain_open=1 -> OK" \
-    "$out"

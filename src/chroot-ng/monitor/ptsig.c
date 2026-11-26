@@ -417,8 +417,6 @@ static void pt_restore_guest(int sig) {
 }
 
 void cng_pt_sig_install_kick(void) {
-    if (cng_g_no_ptrace)
-        return;
     struct pt_ksigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.handler = (void *)pt_kick_handler;
@@ -431,7 +429,7 @@ void cng_pt_sig_install_kick(void) {
      * trapped wait — used to be knocked out of it by that EINTR, so that the
      * retry would trap. The restart re-executes the svc, which the tracer
      * filter the kick just stacked traps the same way, with no retry of the
-     * guest's needed. The -R tier's native wait is ended by the handler
+     * guest's needed. A guest-context native wait is ended by the handler
      * either way (cng_pt_kick_taken). */
     sa.flags = CNG_SA_SIGINFO | CNG_SA_RESTORER | CNG_SA_ONSTACK |
                CNG_SA_RESTART;
@@ -445,8 +443,6 @@ void cng_pt_sig_install_kick(void) {
  * actually delivered. Run once at startup while we are still single-threaded
  * and the guest has no dispositions of its own to disturb. */
 void cng_pt_pick_kicksig(void) {
-    if (cng_g_no_ptrace)
-        return;
     for (int s = CNG_PT_KICKSIG; s >= 33; s--) {
         cng_g_kicksig = s;
         cng_pt_sig_install_kick();
@@ -516,12 +512,8 @@ int cng_pt_sigaction(int sig, u64 act, u64 oact, u64 sz, long *out) {
      * monitor itself — it used to be answered with a bare 0 before any of
      * this, so a bad pointer was never EFAULT, a query never saw the handler
      * the guest had installed, and (with the delivery side swallowing every
-     * non-seccomp SIGSYS) the handler never ran. The kick signal is ours only
-     * while ptrace is enabled: with --no-ptrace its handler is not installed,
-     * so a guest disposition for that number has to go to the kernel like any
-     * other, or a guest handler for SIGRTMAX silently never ran. */
-    int by_number = sig == CNG_SIGSYS ||
-                    (sig == cng_g_kicksig && !cng_g_no_ptrace);
+     * non-seccomp SIGSYS) the handler never ran. The kick signal is ours too. */
+    int by_number = sig == CNG_SIGSYS || sig == cng_g_kicksig;
     int mine = g_hooked[sig] || by_number;
 
     struct pt_ksigaction nd;

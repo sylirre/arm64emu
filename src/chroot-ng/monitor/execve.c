@@ -39,7 +39,6 @@
 #include "cng/pin.h"
 #include "cng/procfs.h"
 #include "cng/ptrace.h"
-#include "cng/rewrite.h"
 #include "cng/rt.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
@@ -1187,7 +1186,7 @@ static void cng_rseq_exec_reset(void) {
  * What the program mapped for ITSELF — the libraries its ld.so loaded, its
  * arenas, its allocator's reservations — has no such extent, and following it
  * would mean a VMA table of our own maintained on every mmap/munmap/mremap,
- * which is the per-syscall cost the -R tier exists to avoid. That memory is
+ * a trap on calls that now run untrapped. That memory is
  * given back by exec_sweep() below, which asks the question the other way
  * round and needs no table at all. (The brk heap, the one such region with a
  * handle on it, is wound back in cng_exec_reset instead.)
@@ -1487,14 +1486,12 @@ void cng_exec_generation(const struct cng_loaded *prog,
  * All best-effort: a kernel without POSIX timers has no such file, and a failed
  * brk simply leaves the heap where it was. */
 static void cng_exec_reset(void) {
-    cng_rewrite_lazy_reset(); /* the sites those pools branch from are gone */
     cng_timers_exec_reset();
     CNG_SYS(__NR_set_tid_address, 0, 0, 0, 0, 0, 0);
     /* Android blocks set_robust_list (measured: SIGSYS from the zygote filter on
      * Android 13), and a syscall we know is refused is not one to issue — the
      * trap would be answered by the gate-net, i.e. by the nested SIGSYS delivery
-     * the design does not want to depend on, and where no handler is installed
-     * at all (the direct-drive `-t exectest` driver) it is simply fatal.
+     * the design does not want to depend on.
      *
      * Nothing is left behind by skipping it, either. The filter that refuses it
      * is one ambient filter over the whole process — which is what cng_blocked
@@ -1771,6 +1768,21 @@ static long execve_plan(struct exec_job *j, int dirfd, const char *path,
                     cng_dprintf(2, "[cng] execve open %s -> errno=%d\n", host,
                                 (int)-fd);
                 return fd; /* the real errno (EACCES, ELOOP, ENOENT, ...) */
+            }
+        }
+        /* open_exec's own checks come before anything is read: a #! file that
+         * is not a regular file with an execute bit is EACCES, as the program
+         * at the end of the chain is (elf.c, elf_check_execable). Read first,
+         * a script of mode 0644 ran. */
+        {
+            char st[128]; /* AArch64 struct stat: mode@16 */
+            unsigned mode = 0;
+            if (CNG_SYS(__NR_fstat, fd, st, 0, 0, 0, 0) == 0)
+                mode = *(unsigned *)(st + 16);
+            if ((mode & 0170000) != 0100000 || !(mode & 0111)) {
+                if (gfd < 0)
+                    sys_close((int)fd);
+                return -EACCES;
             }
         }
         /* Read the header the way the loader reads its own (read_exact in
@@ -2201,9 +2213,8 @@ static long execve_core(int dirfd, const char *path, char **argv, char **envp,
         return rc;
     }
 
-    /* l2s machinery is invisible to the guest — not executable either. Both
-     * tiers (SIGSYS cng_emulate_execve, -R cng_execve_tramp) come through
-     * here, so this covers every exec path.
+    /* l2s machinery is invisible to the guest — not executable either. Every
+     * exec (cng_emulate_execve) comes through here.
      *
      * Judged on the snapshot, never on the guest's own pointer. The string this
      * reads has to be the string that then gets loaded, and between the check
@@ -2389,30 +2400,6 @@ int cng_exec_takeover_frame(struct cng_ucontext *uc) {
     return 1;
 }
 
-static _Noreturn void exec_takeover_enter(void) {
-    unsigned long sp, entry, mask;
-    if (exec_takeover(&sp, &entry, &mask) != 0) {
-        /* Another thread is carrying it, and its de_thread is about to
-         * reach this one: nothing to enter here, so go. */
-        for (;;)
-            sys_exit(0);
-    }
-    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
-    if (cng_pt_active()) {
-        struct cng_uregs regs;
-        memset(&regs, 0, sizeof regs);
-        regs.sp = sp;
-        regs.pc = entry;
-        cng_pt_set_frame(&regs, 0);
-        cng_pt_report_exec(&regs, g_job.pt_nr, g_job.pt_owed);
-        sp = regs.sp;
-        entry = regs.pc;
-        cng_pt_set_frame(0, 0);
-    }
-    cng_scratch_leave();
-    cng_enter(sp, entry);
-}
-
 void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
                         char **argv, char **envp, int flags) {
     unsigned long long *r = uc->uc_mcontext.regs;
@@ -2443,38 +2430,4 @@ void cng_emulate_execve(struct cng_ucontext *uc, int dirfd, const char *path,
      * since it never enters the kernel's exec path. */
     cng_pt_set_frame(cng_pt_uregs(uc), uc);
     cng_pt_report_exec(cng_pt_uregs(uc), -1, 0);
-}
-
-long cng_execve_tramp(int dirfd, const char *path, char **argv, char **envp,
-                      int flags) {
-    unsigned long sp, entry, mask = 0;
-    /* Ordinary call context: the live mask is the guest's own. */
-    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, 0, &mask, 8, 0, 0);
-    long rc = execve_core(dirfd, path, argv, envp, flags, mask, &sp, &entry);
-    if (rc < 0)
-        return rc;
-    if (rc == CNG_EXEC_TAKEOVER)
-        exec_takeover_enter();
-    /* Ordinary call context (no signal frame): abandon the old program's stack
-     * and enter the new image directly, like the initial `run` does. */
-    if (cng_pt_active()) {
-        /* The post-execve stops, on a frame describing the entry state we are
-         * about to jump to — there is no signal context here to rewrite, so the
-         * tracer's register edits are read back before the jump. */
-        struct cng_uregs regs;
-        memset(&regs, 0, sizeof regs);
-        regs.sp = sp;
-        regs.pc = entry;
-        cng_pt_set_frame(&regs, 0);
-        cng_pt_report_exec(&regs, -1, 0);
-        sp = regs.sp;
-        entry = regs.pc;
-        cng_pt_set_frame(0, 0);
-    }
-    /* This is the one path out of the trampoline dispatcher that does not
-     * return: we enter the new program instead. Hand the scratch stack back
-     * first, or the flag stays set and every syscall the new program makes on
-     * this thread runs the dispatcher on the guest's own stack again. */
-    cng_scratch_leave();
-    cng_enter(sp, entry);
 }

@@ -5,8 +5,7 @@
  * call that changes nothing, EPERM for one that would, EINVAL for an id of -1,
  * the current id from setfsuid and setfsgid, and EPERM from setgroups whatever
  * it is handed. That is an Android app's process, whose filter refuses every
- * setter but setresuid — they were all answered ENOSYS there, and under -R on
- * any host. A process the description does not fit says SKIP, since what a
+ * setter but setresuid — they were all answered ENOSYS there. A process the description does not fit says SKIP, since what a
  * kernel answers it differs.
  *
  * The last call is made with a second thread running, which libc turns into

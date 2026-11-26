@@ -109,7 +109,7 @@ COLORTERM=cng-color"
     # m17_alpine ARGS... — a guest program under the same fixed host environment.
     m17_alpine() {
         TERM=cng-term COLORTERM=cng-color CHROOTNG_TEST=leak HOME=/host/home \
-            run -R -E FOO=bar "$M17_ALPINE" "$@" 2>/dev/null
+            run -E FOO=bar "$M17_ALPINE" "$@" 2>/dev/null
     }
 
     # m17_exact <desc> <got> — the environment must be m17_want and nothing else.
@@ -143,7 +143,7 @@ COLORTERM=cng-color"
 
     # No PATH is set, and nothing needs one: a shell supplies its own default,
     # which is why chroot-ng synthesizes nothing here.
-    got=$(run -R "$M17_ALPINE" /bin/busybox sh -c 'head -1 /etc/os-release' \
+    got=$(run "$M17_ALPINE" /bin/busybox sh -c 'head -1 /etc/os-release' \
         2>/dev/null)
     check_contains "a guest shell still works with no PATH in its environment" \
         "Alpine Linux" "$got"

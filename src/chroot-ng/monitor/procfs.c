@@ -225,8 +225,8 @@ static void put_mounts(int fd, int fmt) {
     int nb;
     /* The snapshot is static (50 KiB, more than a stack here should carry)
      * and so is taken one reader at a time — with every signal blocked until
-     * it is given back, as the view's writer does (path.c). On the -R tier the
-     * dispatcher runs on the guest's own mask, so a guest handler delivered
+     * it is given back, as the view's writer does (path.c). From guest context
+     * (a bounced dispatch) it runs on the guest's own mask, so a guest handler delivered
      * here, on the way out of any syscall the emission makes, that opened a
      * mount table itself waited for the snapshot its own thread held: forever,
      * since the takeover below is only for a holder that is gone. */
@@ -400,8 +400,8 @@ static unsigned long stat_ncpu(void) {
     unsigned long n = 0;
     for (unsigned long i = 0; i < (unsigned long)r / sizeof mask[0]; i++) {
         /* Kernighan's, not __builtin_popcountl: the builtin compiles either to
-         * `cnt v0.8b` — a vector register the guest still owns on the -R tier,
-         * see -mgeneral-regs-only in the Makefile — or to a libgcc helper a
+         * `cnt v0.8b` — a vector register the guest still owns in a dispatch
+         * from guest context, see -mgeneral-regs-only in the Makefile — or to a libgcc helper a
          * -nostdlib link cannot resolve. One iteration per set bit, and the bits
          * here are CPUs. */
         for (unsigned long m = mask[i]; m; m &= m - 1)
@@ -1332,6 +1332,30 @@ static int task_status(const char *leaf) {
     return !strcmp(q, "/status");
 }
 
+/* "task/<tid>/<leaf>": the rest of a thread's directory, which is its process's
+ * — its address space, its mounts, its strings — and describes chroot-ng on the
+ * host just as the process's own file does. One of the process's threads, or
+ * the name is not there. */
+static int task_kind(const char *canon, const char *leaf) {
+    if (strncmp(leaf, "task/", 5) || leaf[5] < '1' || leaf[5] > '9')
+        return 0;
+    const char *q = leaf + 5;
+    while (*q >= '0' && *q <= '9')
+        q++;
+    if (*q != '/')
+        return 0;
+    int kind = per_pid_kind(q + 1);
+    if (!kind || kind == PF_STATUS) /* status is the thread's: task_status */
+        return 0;
+    char dir[64];
+    size_t n = (size_t)(q - canon);
+    if (n >= sizeof dir)
+        return 0;
+    memcpy(dir, canon, n);
+    dir[n] = '\0';
+    return CNG_SYS(__NR_faccessat, CNG_AT_FDCWD, dir, 0, 0, 0, 0) == 0 ? kind : 0;
+}
+
 /* The guest stack of the program running here, kept so our own cmdline/environ/
  * auxv can be answered from live state when the registry cannot answer (see
  * self_snapshot), and where on it the loader put the argv and environment
@@ -1596,6 +1620,8 @@ static int synth_kind(const char *canon, char *host, size_t hsz, int *pid,
     const char *leaf = pid_tail(canon, pid);
     if (leaf) {
         kind = per_pid_kind(leaf);
+        if (!kind)
+            kind = task_kind(canon, leaf);
         if (!kind && task_status(leaf) && strncmp(canon + 6, "thread-self/", 12))
             kind = PF_STATUS;
         /* status only diverges under a fake identity; everything else about a

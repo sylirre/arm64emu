@@ -98,6 +98,16 @@ static int fs_has_ro(void);
 static size_t proc_pid_prefix(const char *p, int self_only);
 static long parse_int_run(const char **p);
 
+/* Is `host` an fd magic link itself, "/proc/<pid>/fd/<n>" — not the directory,
+ * nor a name below the link? */
+static int is_fd_link(const char *host) {
+    size_t pl = proc_pid_prefix(host, 0);
+    if (!pl || strncmp(host + pl, "fd/", 3) != 0)
+        return 0;
+    const char *d = host + pl + 3;
+    return parse_int_run(&d) >= 0 && !*d;
+}
+
 /* --- :ro binds, through an fd magic link ----------------------------------
  *
  * "/proc/<pid>/fd/<n>" resolves to a host path that names no mount of ours,
@@ -125,12 +135,8 @@ static long parse_int_run(const char **p);
  * (an anonymous description too: a pipe or a memfd is on no mount of ours),
  * and -1 when `host` is not an fd link at all. */
 static int fd_link_ro(const char *host) {
-    size_t pl = proc_pid_prefix(host, 0);
-    if (!pl || strncmp(host + pl, "fd/", 3) != 0)
+    if (!is_fd_link(host))
         return -1;
-    const char *d = host + pl + 3;
-    if (parse_int_run(&d) < 0 || *d)
-        return -1; /* the fd directory, or a name below the link: not this */
     char real[CNG_PATH_MAX];
     long n = sys_readlinkat(CNG_AT_FDCWD, host, real, sizeof real - 1);
     if (n <= 0 || real[0] != '/')
@@ -932,7 +938,10 @@ static long parse_int_run(const char **p) {
 }
 
 /* Length of a leading "/proc/<pid|self|thread-self>/" in a canonical guest
- * path, or 0. `self_only` matches only this process's own view. */
+ * path, or 0, a "task/<tid>/" after it counted in: a thread's directory holds
+ * the same links and the same fd table as its process's. (/proc/thread-self is
+ * a symlink to that spelling, so the walk always arrives with it.) `self_only`
+ * matches only this process's own view. */
 static size_t proc_pid_prefix(const char *p, int self_only) {
     if (strncmp(p, "/proc/", 6) != 0)
         return 0;
@@ -948,6 +957,13 @@ static size_t proc_pid_prefix(const char *p, int self_only) {
         if (n == 0 || q[n] != '/')
             return 0;
         n++;
+    }
+    if (n && strncmp(q + n, "task/", 5) == 0) {
+        size_t t = n + 5;
+        while (q[t] >= '0' && q[t] <= '9')
+            t++;
+        if (t > n + 5 && q[t] == '/')
+            n = t + 1;
     }
     return n ? (size_t)(q - p) + n : 0;
 }
@@ -975,6 +991,20 @@ static int proc_pid_visible(const char *canon) {
 static int proc_fd_dir(const char *canon) {
     size_t pl = proc_pid_prefix(canon, 0);
     return pl && strcmp(canon + pl, "fd") == 0;
+}
+
+/* Is `canon` one of the links of a process the guest sees whose target the view
+ * supplies — exe, cwd, root — and itself a name of the host's /proc? */
+static int proc_view_link(const char *canon) {
+    size_t pl = proc_pid_prefix(canon, 0);
+    if (!pl || !proc_pid_visible(canon))
+        return 0;
+    const char *rest = canon + pl;
+    if (strcmp(rest, "exe") && strcmp(rest, "cwd") && strcmp(rest, "root"))
+        return 0;
+    char host[CNG_PATH_MAX];
+    return cng_fs_translate(cng_g_fs, canon, host, sizeof host) == 0 &&
+           strcmp(host, canon) == 0;
 }
 
 static int proc_magic(char *cur, size_t sz) {
@@ -1473,6 +1503,11 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
          * name the view cannot express (see dev_magic). */
         if (dev_magic(canon, sizeof canon) < 0)
             return -ENAMETOOLONG;
+        /* ...and exe, cwd and root not followed are the kernel's symlinks to
+         * describe or refuse, as an fd link is below: lstat of /proc/self/exe
+         * described the program's file, and an unlink of it removed that. */
+        if (last && !deref_final && !want_dir && proc_view_link(canon))
+            continue;
         int magic = proc_magic(canon, sizeof canon);
         /* A magic link is a link: RESOLVE_NO_MAGICLINKS refuses it, and
          * RESOLVE_NO_SYMLINKS implies NO_MAGICLINKS. Both are ELOOP, which is
@@ -2669,6 +2704,8 @@ static int synth_stat_canon(long dirfd, const char *gp, char *canon,
 static int rl_may_fdlink(long dirfd, const char *p) {
     if (!p)
         return 0;
+    if (!p[0])
+        return (int)dirfd >= 0; /* the link the descriptor itself is of */
     if (p[0] == '/')
         return !strncmp(p, "/proc", 5);
     if ((int)dirfd == CNG_AT_FDCWD)
@@ -2758,6 +2795,17 @@ static int at_canon(long dirfd, const char *path, char *out, size_t sz) {
     if (cng_strlcpy(tmp + n, path, sizeof tmp - n) >= sizeof tmp - n)
         return -1;
     return cng_path_canon(tmp, out, sz);
+}
+
+/* at_canon for a readlinkat, whose empty name is the symlink an O_PATH|O_NOFOLLOW
+ * descriptor was opened on: the name the kernel gives that descriptor is the
+ * link's own. Only one of procfs's is of interest — any other is the rootfs's,
+ * and its text the guest's already. */
+static int rl_canon(long dirfd, const char *path, char *out, size_t sz) {
+    if (path[0])
+        return at_canon(dirfd, path, out, sz);
+    return dirfd_host((int)dirfd, out, sz) == 0 && proc_pid_prefix(out, 0) ? 0
+                                                                           : -1;
 }
 
 /* 1 if the open fd refers to the host's real /proc — the directory whose
@@ -3148,8 +3196,8 @@ static int has_dotdot(const char *p) {
  * containment.
  *
  * Exported because exec is the one path-bearing call that does not come through
- * the dispatcher's argument table: cng_emulate_execve and cng_execve_tramp go
- * straight to the emulation, and it asks this for itself. */
+ * the dispatcher's argument table: cng_emulate_execve goes straight to the
+ * emulation, and it asks this for itself. */
 long cng_dotdot_verdict(long dirfd, const char *path) {
     if (!path || !has_dotdot(path))
         return 0;
@@ -4269,15 +4317,12 @@ static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
     return 0;
 }
 
-/* Test aids, see monitor.h: each side's first moment out of a converted clone. */
-void (*cng_g_fork_child_probe)(void);
-void (*cng_g_fork_parent_probe)(long kid);
 
-/* clone, for the process-making kinds the tiers trap (a thread's clone runs
- * natively on both: the filter tests CLONE_VM/CLONE_VFORK, tramp.S does the
- * same). `ur` is the guest's register frame — the SIGSYS tier's signal context
- * or the -R trampoline's saved register file — read for the arguments and
- * written with the result, and in the child with its stack.
+/* clone, for the process-making kinds the filter traps (a thread's clone runs
+ * natively: the filter tests CLONE_VM/CLONE_VFORK). `ur` is the guest's
+ * register frame — the signal context, or the record of a dispatch bounced to
+ * guest context — read for the arguments and written with the result, and in
+ * the child with its stack.
  *
  * A vfork-style clone (CLONE_VM|CLONE_VFORK) shares the parent's address space
  * and suspends the parent until the child execs. Our execve is emulated
@@ -4286,14 +4331,13 @@ void (*cng_g_fork_parent_probe)(long kid);
  * fork, with two stack adjustments:
  *  - pass child_stack=0 to the real clone so the forked child inherits (COW)
  *    the parent's current SP — which here is the *scratch stack* this runs on.
- *    The child must unwind these frames and leave through the tier's exit;
+ *    The child must unwind these frames and leave through the handler's exit;
  *    giving it the caller-supplied child stack instead sets its SP into a
  *    buffer with none of them -> the return from the raw syscall restores
- *    garbage and the child dies before it can even execve. The -R tier did
- *    exactly that: glibc's vfork passes the current sp as child_stack, and
- *    every vfork/posix_spawn under -R ended in the child's SIGSEGV.
+ *    garbage and the child dies before it can even execve (glibc's vfork
+ *    passes the current sp as child_stack).
  *  - then point the frame's sp at that caller-supplied child stack for the
- *    child, so once the tier returns to the guest it resumes on the stack the
+ *    child, so once the handler returns to the guest it resumes on the stack the
  *    guest's clone wrapper expects (musl's __clone/posix_spawn stored the child
  *    fn+arg there). child_stack==0 is a bare vfork: the child continues on the
  *    parent's stack, so the frame's sp is left alone. A bare glibc vfork hands
@@ -4309,8 +4353,8 @@ void (*cng_g_fork_parent_probe)(long kid);
  * own child stayed invisible for good.
  *
  * Every signal but SIGSYS is blocked from before the fork until each side is
- * done here, which is the mask the SIGSYS tier's handler runs all of this
- * under anyway. The -R trampoline runs it on the guest's own mask, and the
+ * done here, which is the mask the SIGSYS handler runs all of this under
+ * anyway. From guest context it would run on the guest's own mask, and the
  * child's hooks rebuild per-process state that came across the fork describing
  * the parent: a handler delivered to the child on the way out of the clone ran
  * against the parent's state, and whatever it recorded was then wiped by the
@@ -4352,8 +4396,6 @@ void cng_clone_convert(struct cng_uregs *ur) {
                             (long)ur->x[4], (long)ur->x[5], __NR_clone);
     if (ret == 0) {
         cng_sig_in_handler(1);
-        if (cng_g_fork_child_probe)
-            cng_g_fork_child_probe();
         cng_procreg_fork_child(forker); /* registered before any guest code */
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
         cng_rseq_fork_child(rseq_keep);
@@ -4374,8 +4416,6 @@ void cng_clone_convert(struct cng_uregs *ur) {
     }
     ur->x[0] = (u64)ret;
     if (ret > 0) {
-        if (cng_g_fork_parent_probe)
-            cng_g_fork_parent_probe(ret);
         cng_procreg_fork((int)ret);
         cng_pt_report_event(ur, ev, (u64)ret);
         /* A real vfork would have suspended us until the child exec'd or
@@ -4482,9 +4522,9 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         }
     }
 
-    /* The designed-ENOSYS set. The filter answers these with RET_ERRNO, so a
-     * seccomp-tier guest never gets here; a rewritten svc site (-R) has no
-     * filter and calls straight in, so the refusal has to live here too. */
+    /* The designed-ENOSYS set. The base filter answers these with RET_ERRNO,
+     * but a tracee's trap-everything filter traps them instead, so the
+     * refusal has to live here too. */
     if (cng_denied_syscall(nr)) {
         if (cng_g_debug)
             cng_dprintf(2, "[cng] nr=%ld denied (designed ENOSYS)\n", nr);
@@ -5121,7 +5161,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * did not. */
         if (gp) {
             char canon[CNG_PATH_MAX], val[CNG_PATH_MAX];
-            if (at_canon(a0, gp, canon, sizeof canon) == 0) {
+            if (rl_canon(a0, gp, canon, sizeof canon) == 0) {
                 long fx = proc_self_fixup(canon, val, sizeof val);
                 if (fx >= 0) {
                     if (fx > bufsiz)
@@ -5173,7 +5213,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * guest's and corrected there. */
         if (rl_may_fdlink(a0, gp)) {
             char canon[CNG_PATH_MAX];
-            if (at_canon(a0, gp, canon, sizeof canon) == 0) {
+            if (rl_canon(a0, gp, canon, sizeof canon) == 0) {
                 size_t pl = proc_pid_prefix(canon, 0);
                 if (pl && (!strncmp(canon + pl, "fd/", 3) ||
                            !strncmp(canon + pl, "map_files/", 10)))
@@ -5358,8 +5398,8 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * EAGAIN from it is its SO_RCVTIMEO, already waited out). One that
          * would not wait can be ahead of the daemon, as a receive can
          * (cng_nl_recv): the daemon is asked to finish, and the read made
-         * once more. The seccomp tier never traps a read on an ordinary fd;
-         * this is the -R tier's, at a site the rewriter patched. */
+         * once more. The base filter never traps a read on an ordinary fd;
+         * this is a tracee's, under the trap-everything filter. */
         if (r == -EAGAIN &&
             (sys_fcntl((int)a0, CNG_F_GETFL, 0) & CNG_O_NONBLOCK) &&
             cng_nl_sync((int)a0))
@@ -5374,18 +5414,14 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         return reissue_svc(av, nr);
     }
 
-    /* execve/execveat: only reached via an M8 trampoline (-R); the SIGSYS path
-     * intercepts them in cng_sigsys_body (it must rewrite the signal context).
-     * Emulate in-process — re-issuing the raw syscall would exec the
-     * untranslated guest path on the host (ENOENT), or worse, succeed and wipe
-     * the monitor. On success cng_execve_tramp enters the new program and never
-     * returns; on failure return -errno like a real execve. */
+    /* execve/execveat never get here: cng_sigsys_body emulates them before it
+     * dispatches anything (it has to rewrite the signal context). Re-issuing
+     * the raw syscall would exec the untranslated guest path on the host, or
+     * worse succeed and wipe the monitor, so a call that somehow arrives is
+     * refused instead. */
     case __NR_execve:
-        return cng_execve_tramp(CNG_AT_FDCWD, (const char *)a0, (char **)a1,
-                                (char **)a2, 0);
     case __NR_execveat:
-        return cng_execve_tramp((int)a0, (const char *)a1, (char **)a2,
-                                (char **)a3, (int)a4);
+        return -ENOSYS;
 
     /* rename: two translated paths. If the destination is one of our
      * link2symlink names, it is replaced by the rename, so drop its group's
@@ -5638,8 +5674,13 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         if (force || link_src_l2s(srch))
             r = -EPERM;
         else
+            /* An fd link the guest followed (the other O_TMPFILE publish idiom)
+             * is one only the host can follow, to the file the descriptor
+             * holds; linked itself, it is a name on the proc filesystem, and
+             * the answer was EXDEV. */
             r = reissue(CNG_AT_FDCWD, (long)srch, CNG_AT_FDCWD, (long)dsth,
-                        empty     ? CNG_AT_SYMLINK_FOLLOW
+                        empty || (follow && is_fd_link(srch))
+                            ? CNG_AT_SYMLINK_FOLLOW
                         : flagged ? CNG_AT_EMPTY_PATH
                                   : 0,
                         0, __NR_linkat);
@@ -6507,16 +6548,16 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
     case __NR_ptrace:
         return cng_pt_syscall(a0, a1, (u64)a2, (u64)a3);
 
-    /* The waits are trapped only on a tracer, but every -R site reaches the
-     * dispatcher, so there the guest's own wait is made by the kernel unless
-     * this process could be owed an emulated stop (cng_pt_wait_native). That
-     * wait needs the guest's own mask, which the SIGSYS handler does not run
-     * on. There a wait polls the registry instead, and ends for a ptrace kick
+    /* The waits are trapped only on a tracer. From guest context (a bounced
+     * dispatch) the guest's own wait is made by the kernel unless this
+     * process could be owed an emulated stop (cng_pt_wait_native). That wait
+     * needs the guest's own mask, which the SIGSYS handler does not run on.
+     * There a wait polls the registry instead, and ends for a ptrace kick
      * with CNG_ERESTART (see cng_sig_kick_pending). */
     case __NR_wait4:
     case __NR_waitid: {
         long w;
-        int guest = trapped == CNG_DISP_TRAMP || trapped == CNG_DISP_BOUNCED;
+        int guest = trapped == CNG_DISP_BOUNCED;
         if (guest && cng_pt_wait_native(nr, a0, a1, a2, a3, a4, &w))
             return w;
         w = nr == __NR_wait4
@@ -6625,8 +6666,8 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
 
-    /* rt_sigprocmask on the trampoline path (the SIGSYS path handles it via
-     * uc_sigmask): apply the mask but never block SIGSYS. */
+    /* rt_sigprocmask from guest context (the handler answers it from
+     * uc_sigmask before it dispatches): apply the mask but never block SIGSYS. */
     case __NR_rt_sigprocmask: {
         int how = (int)a0;
         /* Only a sigsetsize the kernel accepts gets the copy: for any other the
@@ -6732,8 +6773,8 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * handed, so no guest thread is ever parked with it blocked (execve.c's
      * de_thread has to be able to reach every thread) and no signalfd ever
      * dequeues it. The SIGSYS tier runs the waits from guest context instead
-     * (sigsys.c's bounce) and reaches here only for a stack it could not use;
-     * the -R tier, in ordinary context, re-issues in place. A set the kernel
+     * (sigsys.c's bounce) and reaches here only for a stack it could not use.
+     * A set the kernel
      * would refuse is refused as it would: a size that is not its own is
      * EINVAL before the pointer is looked at, an unreadable set EFAULT. */
     case __NR_rt_sigsuspend:
@@ -6875,9 +6916,9 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * end of every dynamically linked guest on such a mount. execmap.c serves
      * it from anonymous memory instead. Every other mmap (all the anonymous
      * ones, which is nearly all of them) goes straight back out; the filter
-     * already tests the same two arguments, so on the seccomp tier this case is
-     * only reached by the mappings it is for, while under -R it sees them all
-     * and has to say so itself. */
+     * already tests the same two arguments, so this case is only reached by the
+     * mappings it is for -- but a tracee's trap-everything filter sends it all
+     * of them, and so it says so itself. */
     case __NR_mmap:
         if (!((int)a2 & CNG_PROT_EXEC) || ((int)a3 & CNG_MAP_ANONYMOUS))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
@@ -6892,9 +6933,8 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * do. Anonymous mappings of equal permissions merge, so a page beside a
      * thread's stack is refused for it — the JVM's startup probe, among others.
      * The scratch stack is bounded by guard pages (scr_mmap) and so is never
-     * in a VMA the guest can reach. Under -R every syscall comes through here
-     * on that stack already; the case is spelled out so the reason is not
-     * lost with the default. */
+     * in a VMA the guest can reach. The case is spelled out so the reason is
+     * not lost with the default. */
     case __NR_mprotect:
         return reissue(a0, a1, a2, a3, a4, a5, nr);
 
@@ -6902,8 +6942,8 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * reading what backs it: a file's bytes, or zero-fill. The loader's images
      * are anonymous copies standing in for file mappings, so a move out of one
      * is made as a file mapping's would be (execmap.c). The filter traps only
-     * the flag; under -R every mremap comes here and the rest go straight back
-     * out. */
+     * the flag; a tracee's trap-everything filter sends every mremap here,
+     * and the rest go straight back out. */
     case __NR_mremap:
         if (!((unsigned long)a3 & CNG_MREMAP_DONTUNMAP) ||
             !cng_execmap_copied((unsigned long)a0, (unsigned long)a1))
@@ -6917,7 +6957,7 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * privilege rules. These never re-issue under --fake-id: the setters sit on
      * Android's seccomp block-list, and a re-issue from inside this (SIGSYS)
      * handler force-kills the process (masked nested seccomp SIGSYS). Without
-     * it they arrive from -R, a tracee, or that block-list's own trap, and are
+     * it they arrive from a tracee, or that block-list's own trap, and are
      * re-issued unless the probe found them refused — then cred.c answers from
      * the real ids what the kernel would. */
     case __NR_getuid:
@@ -6946,20 +6986,16 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
          * reading below does not apply, and the designed-ENOSYS set (which that
          * filter converts from the base filter's RET_ERRNO into a trap) has to
          * be refused by hand. */
-        if (trapped && cng_pt_traceall()) {
+        if (cng_pt_traceall()) {
             if (cng_denied_syscall(nr))
                 return -ENOSYS;
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         }
-        /* From a seccomp trap, an unhandled syscall was blocked by Android
-         * (our filter only traps handled ones) => emulate ENOSYS rather than
-         * re-issue and die on the nested trap. From a trampoline it is just an
-         * ordinary syscall we don't translate => run it. */
-        if (trapped) {
-            cng_note_blocked((int)nr);
-            return -ENOSYS;
-        }
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        /* Otherwise an unhandled syscall here was blocked by Android (our
+         * filter only traps handled ones) => emulate ENOSYS rather than
+         * re-issue and die on the nested trap. */
+        cng_note_blocked((int)nr);
+        return -ENOSYS;
     }
 }
 
@@ -7233,9 +7269,9 @@ __attribute__((noinline)) static long dac_bypass(long nr, long a0, long a1,
     if (pa.p2)
         a[pa.i2] = (long)pb2;
     /* Every signal but SIGSYS held from the lock to the unlock — which is the
-     * mask the SIGSYS tier runs all of this under anyway. On the -R tier a
-     * handler of the guest's would otherwise run inside the window, and one
-     * that longjmp'd out of it left the mode lent for good. */
+     * mask the SIGSYS handler runs all of this under anyway. From guest
+     * context a handler of the guest's would otherwise run inside the window,
+     * and one that longjmp'd out of it left the mode lent for good. */
     unsigned long hold = ~0UL & ~(1UL << (CNG_SIGSYS - 1)), mask = 0;
     CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &hold, &mask, 8, 0, 0);
     /* The turn (see above). Where none can be had the lend goes ahead
@@ -7293,32 +7329,26 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     return r;
 }
 
-/* The -R trampoline's entry point: one rewritten `svc` site, with a full
- * register frame the trampoline built on its own stack (see tramp.S).
- *
- * It is the SIGSYS handler's counterpart on a tier that has no signal frame,
- * and it exists so the two tiers behave the same for a ptrace tracee: the same
- * entry/exit stops around the syscall, the same register file for the tracer to
- * read and write, and the same single-step report. `trapped` is 0 here — an
- * unhandled syscall on this path is an ordinary one to re-issue, not one
- * Android blocked. */
-/* The same entry serves a trap the SIGSYS handler sent back out to be
- * dispatched from guest context (cng_dispatch_bounced): what differs is that
- * the handler already reported the entry stop. */
-struct tramp_call {
+/* A trap the SIGSYS handler sent back out to be dispatched from guest context
+ * (cng_dispatch_bounced), with the guest's registers in the record the handler
+ * left below its stack: the same entry/exit stops around the syscall as the
+ * handler gives, the same register file for a tracer to read and write, and
+ * the same single-step report -- what differs is that the handler already
+ * reported the entry stop. */
+struct gctx_call {
     struct cng_gframe f; /* f.r: the guest's registers */
     long nr;
-    int mode;            /* CNG_DISP_TRAMP or CNG_DISP_BOUNCED */
-    int owed;            /* bounced: the handler reported the entry stop */
+    int mode;            /* CNG_DISP_BOUNCED */
+    int owed;            /* the handler reported the entry stop */
 };
 
-/* The trapped syscall itself, the -R counterpart of sigsys_syscall: the one
- * case that needs the register frame rather than six arguments (the converted
- * clone puts the child's stack into it, for the trampoline's exit to install),
- * then the dispatcher for everything else. A tracer that changed the registers
- * at a stop taken inside the call abandoned it (pt_inflight_stop in ptrace.c):
- * its result is then dropped, and the registers are the tracer's. */
-static void tramp_syscall(struct tramp_call *c, long nr) {
+/* The trapped syscall itself, the guest-context counterpart of
+ * sigsys_syscall: the one case that needs the register frame rather than six
+ * arguments (the converted clone puts the child's stack into it), then the
+ * dispatcher for everything else. A tracer that changed the registers at a
+ * stop taken inside the call abandoned it (pt_inflight_stop in ptrace.c): its
+ * result is then dropped, and the registers are the tracer's. */
+static void gctx_syscall(struct gctx_call *c, long nr) {
     struct cng_uregs *r = c->f.r;
     if (nr == __NR_clone) {
         cng_clone_convert(r);
@@ -7332,8 +7362,8 @@ static void tramp_syscall(struct tramp_call *c, long nr) {
     c->f.done = 1;
 }
 
-static void tramp_body(void *p) {
-    struct tramp_call *c = (struct tramp_call *)p;
+static void gctx_body(void *p) {
+    struct gctx_call *c = (struct gctx_call *)p;
     struct cng_uregs *r = c->f.r;
     long nr = c->nr;
     u64 after = r->pc; /* the instruction after the guest's svc */
@@ -7357,7 +7387,7 @@ static void tramp_body(void *p) {
         }
         c->f.owed = c->owed;
         c->f.orig_x0 = cng_pt_orig_x0(r->x[0]);
-        tramp_syscall(c, nr);
+        gctx_syscall(c, nr);
         /* Active now, if not before: an attach can land in the call, and a
          * tracer that resumed into syscall tracing then saw its restart's
          * entry stop (pt_inflight_stop). A guest handler that ran over a call
@@ -7391,10 +7421,8 @@ static void tramp_body(void *p) {
             entered = 1;
         } else {
             /* Abandoned at the stop, and left at the svc: the call is made
-             * again, with the registers the tracer left — here rather than by
-             * resuming at the site, which under -R would spend x16/x17 on the
-             * trampoline's general exit. Left anywhere else, the thread goes
-             * there. */
+             * again, with the registers the tracer left. Left anywhere else,
+             * the thread goes there. */
             if (r->pc != after - 4)
                 return;
             r->pc = after;
@@ -7406,37 +7434,20 @@ static void tramp_body(void *p) {
     }
 }
 
-void cng_tramp_dispatch(struct cng_uregs *r) {
-    for (;;) {
-        struct tramp_call c = {.f = {.r = r}, .nr = (long)r->x[8],
-                               .mode = CNG_DISP_TRAMP};
-        /* On the guest's own stack this is the same overflow the SIGSYS tier
-         * has a 256 KiB scratch stack to avoid, and here it is not even a
-         * fault: the dispatcher's frame is larger than a guard page, so it
-         * steps over the guard and writes into ordinary guest memory below,
-         * silently. */
-        if (!cng_run_scratch_in(tramp_body, &c, &c.f))
-            tramp_body(&c);
-        /* What a tracee's call held back, taken now that the call is over,
-         * on the guest's registers (cng_pt_dispatch_end) — which does not
-         * come back if a signal is delivered. One cut short by a signal
-         * that, after all, nothing took is made again here rather than from
-         * the site, as an abandoned call is (tramp_body). */
-        if (!cng_pt_dispatch_end(r, &c.f))
-            return;
-        r->pc += 4;
-    }
-}
-
 void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed) {
-    struct tramp_call c = {.f = {.r = r}, .nr = nr, .mode = CNG_DISP_BOUNCED,
+    struct gctx_call c = {.f = {.r = r}, .nr = nr, .mode = CNG_DISP_BOUNCED,
                            .owed = owed};
     /* Guest context, guest mask: the blocking call the dispatch makes runs on
-     * the guest's own stack, below the record (see reissue). */
-    c.f.gsp = ((unsigned long)r - 8) & ~15UL;
+     * the guest's own stack (see reissue), below the frames this dispatch
+     * keeps there -- the sp the switch to the scratch stack leaves behind,
+     * which it measures into gsp. Run in place, with no stack of ours to be
+     * had, the call is made where the dispatch stands, below them all. */
+    c.f.gsp = 1;
     __atomic_add_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
-    if (!cng_run_scratch_in(tramp_body, &c, &c.f))
-        tramp_body(&c);
+    if (!cng_run_scratch_in(gctx_body, &c, &c.f)) {
+        c.f.gsp = 0;
+        gctx_body(&c);
+    }
     __atomic_sub_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
     /* ...and the same here: held back until the call is over, and taken on
      * the record's registers, the completion trap then never made. */

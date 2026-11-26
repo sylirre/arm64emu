@@ -37,7 +37,7 @@ else
     # way of the rootfs; the readback must be the guest path, not the host one;
     # and the host must never gain the name. The last of the three holds even
     # when the suite runs as root, where the first proves less.
-    out=$(m15run -R "$R1" /bin/uxsock /run/s.sock 2>&1)
+    out=$(m15run "$R1" /bin/uxsock /run/s.sock 2>&1)
     check_contains "m15 a pathname bind lands inside the rootfs" "bind: ok" "$out"
     check_contains "m15 getsockname reports the guest path" \
         "getsockname: /run/s.sock" "$out"
@@ -67,7 +67,7 @@ else
     DEEP=$M15D
     while [ ${#DEEP} -lt 110 ]; do DEEP="$DEEP/d"; done
     mkdir -p "$DEEP/run" "$DEEP/bin" && cp "$M15D/uxsock" "$DEEP/bin/uxsock"
-    out=$(m15run -R "$DEEP" /bin/uxsock /run/s.sock 2>&1)
+    out=$(m15run "$DEEP" /bin/uxsock /run/s.sock 2>&1)
     check_contains "m15 an over-long translated path still binds" "bind: ok" \
         "$out"
     # ...and reads back as the name the guest bound. The kernel stores sun_path
@@ -86,10 +86,10 @@ else
     # open for the binding, so a peer's getpeername reads the link back to
     # the host directory and that to the guest's name. It used to answer the
     # internal spelling, "/proc/self/fd/5/s.sock", for exactly this reader.
-    m15run -R "$DEEP" /bin/uxsock /run/s.sock x 4 >/dev/null 2>&1 &
+    m15run "$DEEP" /bin/uxsock /run/s.sock x 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
-    out=$(m15run -R "$DEEP" /bin/uxsock /run/s.sock peer 2>&1)
+    out=$(m15run "$DEEP" /bin/uxsock /run/s.sock peer 2>&1)
     wait $m15bg 2>/dev/null
     check_contains "m15 a peer process reads the name back as the guest bound it" \
         "getpeername: /run/s.sock" "$out"
@@ -101,7 +101,7 @@ else
     # guest the internal spelling.
     if guest_cc "$M15D/uxmany" tests/chroot-ng/guests/uxmany.c; then
         cp "$M15D/uxmany" "$R1/bin/uxmany"; mkdir -p "$R1/mnt"
-        out=$(m15run -R -b "$DEEP/run:/mnt" "$R1" /bin/uxmany /mnt 12 2>&1)
+        out=$(m15run -b "$DEEP/run:/mnt" "$R1" /bin/uxmany /mnt 12 2>&1)
         check_contains "m15 twelve fallback binds under a bind all read back" \
             "many: bound=12 ok=12 internal=0" "$out"
     else
@@ -109,13 +109,13 @@ else
     fi
 
     # --- abstract namespace ----------------------------------------------
-    out=$(m15run -R "$R1" /bin/uxsock myabs abstract 2>&1)
+    out=$(m15run "$R1" /bin/uxsock myabs abstract 2>&1)
     check_contains "m15 an abstract bind works" "bind: ok" "$out"
     check_contains "m15 the per-rootfs tag is invisible to the guest" \
         "getsockname: @myabs" "$out"
 
     # ...but it IS on the wire: the host sees the tag, so the name is scoped.
-    m15run -R "$R1" /bin/uxsock tagprobe abstract 4 >/dev/null 2>&1 &
+    m15run "$R1" /bin/uxsock tagprobe abstract 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
     hostview=$(grep -a 'tagprobe' /proc/net/unix 2>/dev/null | awk '{print $NF}' \
@@ -136,21 +136,21 @@ else
     esac
 
     # Two DIFFERENT rootfs must both be able to take the same abstract name.
-    m15run -R "$R1" /bin/uxsock shared abstract 4 >/dev/null 2>&1 &
+    m15run "$R1" /bin/uxsock shared abstract 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
-    out=$(m15run -R "$R2" /bin/uxsock shared abstract 2>&1)
+    out=$(m15run "$R2" /bin/uxsock shared abstract 2>&1)
     wait $m15bg 2>/dev/null
     check_contains "m15 abstract names are isolated between rootfs" "bind: ok" \
         "$out"
 
     # --share-abstract-sockets opts out, and then they DO collide — the control
     # that proves the isolation above comes from the tag and not from luck.
-    m15run -R --share-abstract-sockets "$R1" \
+    m15run --share-abstract-sockets "$R1" \
         /bin/uxsock shared2 abstract 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
-    out=$(m15run -R --share-abstract-sockets "$R2" \
+    out=$(m15run --share-abstract-sockets "$R2" \
         /bin/uxsock shared2 abstract 2>&1)
     wait $m15bg 2>/dev/null
     check_contains "m15 --share-abstract-sockets shares the host namespace" \
@@ -166,7 +166,7 @@ else
     # unchanged.
     M15LONG=
     while [ ${#M15LONG} -lt 100 ]; do M15LONG="${M15LONG}L"; done
-    out=$(m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 2>&1)
+    out=$(m15run "$R1" /bin/uxsock "$M15LONG" abstract 2>&1)
     check_contains "m15 an abstract name too long to tag still binds" \
         "bind: ok" "$out"
     check_contains "m15 ...and reads back as the name the guest bound" \
@@ -174,11 +174,11 @@ else
 
     # The two halves of the containment: the guest's name is not on the wire at
     # all, and a second rootfs can still take it.
-    m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 4 >/dev/null 2>&1 &
+    m15run "$R1" /bin/uxsock "$M15LONG" abstract 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
     hostview=$(grep -ac "$M15LONG" /proc/net/unix 2>/dev/null)
-    out=$(m15run -R "$R2" /bin/uxsock "$M15LONG" abstract 2>&1)
+    out=$(m15run "$R2" /bin/uxsock "$M15LONG" abstract 2>&1)
     wait $m15bg 2>/dev/null
     check_contains "m15 ...and a second rootfs can still take it" "bind: ok" \
         "$out"
@@ -194,10 +194,10 @@ else
     # bind: two guests of the SAME rootfs must still meet on it, or the
     # isolation above would be nothing more than every bind getting a name
     # nobody else can guess.
-    m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 4 >/dev/null 2>&1 &
+    m15run "$R1" /bin/uxsock "$M15LONG" abstract 4 >/dev/null 2>&1 &
     m15bg=$!
     sleep 2
-    out=$(m15run -R "$R1" /bin/uxsock "$M15LONG" abstract 2>&1)
+    out=$(m15run "$R1" /bin/uxsock "$M15LONG" abstract 2>&1)
     wait $m15bg 2>/dev/null
     check_contains "m15 ...and two guests of one rootfs still meet on it" \
         "Address already in use" "$out"
@@ -212,7 +212,7 @@ else
         :
     else
         cp "$M15D/uxmmsg" "$R1/bin/uxmmsg"
-        out=$(m15run -R "$R1" /bin/uxmmsg /run/d.sock /run/c.sock 2>&1)
+        out=$(m15run "$R1" /bin/uxmmsg /run/d.sock /run/c.sock 2>&1)
         check_contains "m15 mmsg both array-form sockets bind in the rootfs" \
             "bind: ok" "$out"
         check_contains "m15 sendmmsg translates every message's address" \
@@ -255,7 +255,7 @@ else
 
         # An abstract source address carries the per-rootfs tag on the wire, and
         # recvmmsg has to strip it per message like recvmsg does for its one.
-        out=$(m15run -R "$R1" /bin/uxmmsg /run/d.sock @uxmc 2>&1)
+        out=$(m15run "$R1" /bin/uxmmsg /run/d.sock @uxmc 2>&1)
         check_contains "m15 recvmmsg strips the abstract tag per message" \
             "msg[2]: hello-2 from @uxmc" "$out"
     fi
@@ -274,7 +274,7 @@ else
         # An abstract name is the same string with and without a rootfs under it,
         # so this leg is a byte-for-byte differential against the real kernel.
         k=$(emu_t 60 "$M15D/uxtrunc" @m15trunc 2>/dev/null)
-        e=$(m15run -R "$R1" /bin/uxtrunc @m15trunc 2>/dev/null)
+        e=$(m15run "$R1" /bin/uxtrunc @m15trunc 2>/dev/null)
         if [ -z "$k" ]; then
             skip "m15 truncated-readback differential: no reference run"
         elif [ "$k" = "$e" ]; then
@@ -290,7 +290,7 @@ else
         # asserted directly: the length must be the guest view's -- 2 + the 11
         # bytes of /run/s.sock + its NUL -- and the four bytes that fit must be
         # the guest path's, never the rootfs prefix's.
-        out=$(m15run -R "$R1" /bin/uxtrunc /run/s.sock 2>&1)
+        out=$(m15run "$R1" /bin/uxtrunc /run/s.sock 2>&1)
         check_contains "m15 a truncated readback reports the guest-view length" \
             "short getsockname: rc=0 len=14 bytes=2f72756e poison=1" "$out"
         check_contains "m15 ...and getpeername agrees" \
@@ -319,7 +319,7 @@ else
     if ! guest_cc "$M15D/uxtimeo" tests/chroot-ng/guests/uxtimeo.c; then
         ut_ready=0
         skip "m15 recvmmsg timeout: the guest program does not build here"
-    elif [ -n "$CHROOTNG_QEMU" ]; then
+    elif [ -n "$CHROOTNG_EMU" ]; then
         ut_ready=0
         for _c in ${HOSTCC:-} cc gcc clang; do
             have "$_c" || continue
@@ -340,7 +340,7 @@ else
         else
             ut_k=$("$UT_ORACLE" 2>/dev/null)
         fi
-        ut_e=$(m15run -R "$R1" /bin/uxtimeo 2>/dev/null)
+        ut_e=$(m15run "$R1" /bin/uxtimeo 2>/dev/null)
         if [ -z "$ut_k" ]; then
             skip "m15 recvmmsg timeout: no reference run"
         elif [ "$ut_k" = "$ut_e" ]; then
@@ -374,7 +374,7 @@ else
     cp "$M15D/uxsock" "$R3/bin/uxsock"
     M15ESC=/tmp/cng-m15-escape.sock
     rm -f "$M15ESC"
-    out=$(m15run -R "$R3" /bin/uxsock "$M15ESC" 2>&1)
+    out=$(m15run "$R3" /bin/uxsock "$M15ESC" 2>&1)
     check_absent "m15 a name too long to contain is not bound at all" \
         "bind: ok" "$out"
     if [ -e "$M15ESC" ]; then

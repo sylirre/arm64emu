@@ -47,7 +47,7 @@ l2s_diff() {
     RO=$(mktemp -d); REM=$(mktemp -d)
     cp -a "$M10_ALPINE/." "$RO"; cp -a "$M10_ALPINE/." "$REM"
     out_o=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$2" 2>/dev/null); rc_o=$?
-    out_e=$(run -R -l "$REM" /bin/sh -c "$2" 2>/dev/null); rc_e=$?
+    out_e=$(run -l "$REM" /bin/sh -c "$2" 2>/dev/null); rc_e=$?
     if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
         pass=$((pass + 1)); echo "  ok   m10 $1"
     else
@@ -142,7 +142,7 @@ if [ "$m10_ready" -eq 1 ]; then
     # ...and the emulator says so itself: an update it had to run unlocked is
     # logged, and there must be none.
     REM=$(mktemp -d); cp -a "$M10_ALPINE/." "$REM"
-    err=$(CHROOTNG_DEBUG=1 run -R -l "$REM" /bin/sh -c \
+    err=$(CHROOTNG_DEBUG=1 run -l "$REM" /bin/sh -c \
         'cd /tmp; echo hi>a; chmod 000 a; ln a b; ln b c; rm b; rm c' 2>&1 >/dev/null)
     check_absent "m10 the marker update of an unreadable group was locked" \
         "unlocked update" "$err"
@@ -159,8 +159,8 @@ if [ "$m10_ready" -eq 1 ]; then
         readlink b; echo rc=$?; ls -a'
     o1=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s1" 2>/dev/null)
     o2=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s2" 2>/dev/null); rc_o=$?
-    e1=$(run -R -l "$REM" /bin/sh -c "$s1" 2>/dev/null)
-    e2=$(run -R -l "$REM" /bin/sh -c "$s2" 2>/dev/null); rc_e=$?
+    e1=$(run -l "$REM" /bin/sh -c "$s1" 2>/dev/null)
+    e2=$(run -l "$REM" /bin/sh -c "$s2" 2>/dev/null); rc_e=$?
     if [ "$o1" = "$e1" ] && [ "$o2" = "$e2" ] && [ "$rc_o" = "$rc_e" ]; then
         pass=$((pass + 1)); echo "  ok   m10 persistence across sessions"
     else
@@ -189,12 +189,12 @@ if [ "$m10_ready" -eq 1 ]; then
         busybox rm a b; busybox ls -a'
     s3='cd /tmp; busybox cat a; busybox stat -c %h a b'
     o1=$("$M10_ORACLE" chroot "$RO/r" /bin/sh -c "$s1" 2>/dev/null)
-    e1=$(run -R -l "$REM/r" /bin/sh -c "$s1" 2>/dev/null)
+    e1=$(run -l "$REM/r" /bin/sh -c "$s1" 2>/dev/null)
     cp -a "$RO/r" "$RO/c"; cp -a "$REM/r" "$REM/c"
     o2=$("$M10_ORACLE" chroot "$RO/c" /bin/sh -c "$s2" 2>/dev/null)
-    e2=$(run -R -l "$REM/c" /bin/sh -c "$s2" 2>/dev/null)
+    e2=$(run -l "$REM/c" /bin/sh -c "$s2" 2>/dev/null)
     o3=$("$M10_ORACLE" chroot "$RO/r" /bin/sh -c "$s3" 2>/dev/null); rc_o=$?
-    e3=$(run -R -l "$REM/r" /bin/sh -c "$s3" 2>/dev/null); rc_e=$?
+    e3=$(run -l "$REM/r" /bin/sh -c "$s3" 2>/dev/null); rc_e=$?
     if [ "$o1|$o2|$o3" = "$e1|$e2|$e3" ] && [ "$rc_o" = "$rc_e" ] &&
         [ -n "$o3" ]; then
         pass=$((pass + 1)); echo "  ok   m10 a copied rootfs leaves the original's groups alone"
@@ -249,7 +249,7 @@ if [ "$m10_ready" -eq 1 ]; then
        stat -c %h m1 m2; cat m2; ln m1 m3; rm m1; stat -c %h m2 m3;
        stat -c %h q /h/p; cat q; rm /h/p q; ls -a /h; rm b s/c; ls -a . s'
     out_o=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s" 2>/dev/null); rc_o=$?
-    out_e=$(run -R -l "$REM" /bin/sh -c "$s" 2>/dev/null); rc_e=$?
+    out_e=$(run -l "$REM" /bin/sh -c "$s" 2>/dev/null); rc_e=$?
     if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
         pass=$((pass + 1)); echo "  ok   m10 proot-distro's groups read as hardlinks"
     else
@@ -286,11 +286,11 @@ if [ "$m10_ready" -eq 1 ] && guest_xlate_ready "l2s raw-dirent leg" &&
         /bin/dents . | sort; /bin/dents sub | sort'
     s2='cd /tmp/d; /bin/dents . | sort; /bin/dents sub | sort; stat -c %h a b sub/c'
     o1=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s1" 2>/dev/null)
-    e1=$(run -R -l "$REM" /bin/sh -c "$s1" 2>/dev/null)
+    e1=$(run -l "$REM" /bin/sh -c "$s1" 2>/dev/null)
     mv "$RO" "$RO.moved"; mv "$REM" "$REM.moved"
     RO="$RO.moved"; REM="$REM.moved"
     o2=$("$M10_ORACLE" chroot "$RO" /bin/sh -c "$s2" 2>/dev/null); rc_o=$?
-    e2=$(run -R -l "$REM" /bin/sh -c "$s2" 2>/dev/null); rc_e=$?
+    e2=$(run -l "$REM" /bin/sh -c "$s2" 2>/dev/null); rc_e=$?
     if [ "$o1" = "$e1" ] && [ "$o2" = "$e2" ] && [ "$rc_o" = "$rc_e" ] &&
         [ -n "$o1" ]; then
         pass=$((pass + 1)); echo "  ok   m10 raw dirents: d_type/d_ino of the links"
@@ -315,15 +315,15 @@ if guest_xlate_ready "l2s first-link race leg" &&
     mkdir -p "$R/bin" "$R/w"
     cp "$CHROOTNG_TMP/l2srace" "$R/bin/l2srace"
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 300 $CHROOTNG_GUEST_BINDS -R -l "$R" /bin/l2srace /w 30 2>/dev/null)
+    out=$(run_t 300 $CHROOTNG_GUEST_BINDS -l "$R" /bin/l2srace /w 30 2>/dev/null)
     check_contains "m10 first links at once: none fails or loses the file, no reader sees it go" \
         "linkfail=0 miss=0 lost=0 nlinkbad=0 inobad=0" "$out"
     rm -rf "$R"
 fi
 
 # A link and an unlink from a signal handler that interrupted another. Every
-# count change holds the store lock (an flock) across several syscalls, and on
-# the -R tier the dispatcher runs on the guest's own signal mask: a handler
+# count change holds the store lock (an flock) across several syscalls, and from
+# guest context the dispatcher runs on the guest's own signal mask: a handler
 # delivered inside one that linked or unlinked a name itself waited for the
 # lock its own thread held, forever. The timer's delay is swept across the time
 # one link+unlink takes; with real hardlinks every call succeeds and the group
@@ -334,7 +334,7 @@ if guest_xlate_ready "l2s link from a signal handler leg" &&
     mkdir -p "$R/bin" "$R/w"
     cp "$CHROOTNG_TMP/l2ssig" "$R/bin/l2ssig"
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 120 $CHROOTNG_GUEST_BINDS -R -l "$R" /bin/l2ssig /w 2>/dev/null)
+    out=$(run_t 120 $CHROOTNG_GUEST_BINDS -l "$R" /bin/l2ssig /w 2>/dev/null)
     check_contains "m10 a link from a handler that interrupted another" \
         "l2ssig: handled>0=1 bad=0 nlink=2" "$out"
     rm -rf "$R"
@@ -352,16 +352,15 @@ if guest_xlate_ready "l2s link beside a fork leg" &&
     mkdir -p "$R/bin" "$R/w"
     cp "$CHROOTNG_TMP/l2sfork" "$R/bin/l2sfork"
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
-    out=$(run_t 120 $CHROOTNG_GUEST_BINDS -R -l "$R" /bin/l2sfork /w 2>/dev/null)
+    out=$(run_t 120 $CHROOTNG_GUEST_BINDS -l "$R" /bin/l2sfork /w 2>/dev/null)
     check_contains "m10 a fork while the lock is held does not keep it" \
         "l2sfork: stalled=0 bad=0" "$out"
     rm -rf "$R"
 fi
 
 # Debian leg: glibc + GNU coreutils/findutils (`find -samefile`, GNU stat).
-# Gated on a smoke test proving translation is live — a dynamic-glibc guest
-# under -R + qemu can silently run untranslated (ld.so-loaded libc.so has no
-# rewritten svc sites), which would read the HOST's /etc, not the guest's.
+# Gated on a smoke test proving translation is live — a guest run untranslated
+# would read the HOST's /etc, not the guest's.
 # The image is provisioned here and nowhere else: nothing but this leg uses
 # it, and the leg needs the oracle too, which most hosts lack.
 m10_deb_why=
@@ -373,7 +372,7 @@ fi
 if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]; then
     RD=$(mktemp -d)
     cp -a "$M10_DEBIAN/." "$RD"
-    smoke=$(run -R -l "$RD" /bin/sh -c 'head -1 /etc/os-release' 2>/dev/null)
+    smoke=$(run -l "$RD" /bin/sh -c 'head -1 /etc/os-release' 2>/dev/null)
     case "$smoke" in
     *[Dd]ebian*)
         RDO=$(mktemp -d)
@@ -382,7 +381,7 @@ if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]
             [ "$(stat -c %i a)" = "$(stat -c %i b)" ] && echo same-ino;
             find . -samefile a | sort; cat b'
         out_o=$("$M10_ORACLE" chroot "$RDO" /bin/sh -c "$ds" 2>/dev/null); rc_o=$?
-        out_e=$(run -R -l "$RD" /bin/sh -c "$ds" 2>/dev/null); rc_e=$?
+        out_e=$(run -l "$RD" /bin/sh -c "$ds" 2>/dev/null); rc_e=$?
         if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
             pass=$((pass + 1)); echo "  ok   m10 debian: GNU stat + find -samefile"
         else
@@ -393,7 +392,7 @@ if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]
         rm -rf "$RDO"
         ;;
     *)
-        skip "debian glibc guest not translating under -R (got '$smoke')"
+        skip "debian glibc guest not translating (got '$smoke')"
         ;;
     esac
     rm -rf "$RD"
@@ -424,7 +423,7 @@ if [ "$m10_ready" -eq 1 ] && [ "${GUEST_STATIC:-0}" = 1 ]; then
             # shellcheck disable=SC2086  # $m10a is one word or empty
             out_o=$("$M10_ORACLE" chroot -E TMPDIR=/tmp "$RO" /t/$m10t $m10a 2>/dev/null); rc_o=$?
             # shellcheck disable=SC2086
-            out_e=$(run -R -l "$REM" /usr/bin/env TMPDIR=/tmp /t/$m10t $m10a 2>/dev/null); rc_e=$?
+            out_e=$(run -l "$REM" /usr/bin/env TMPDIR=/tmp /t/$m10t $m10a 2>/dev/null); rc_e=$?
             if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
                 pass=$((pass + 1)); echo "  ok   m10 c/$m10t${m10a:+ $m10a}"
             else

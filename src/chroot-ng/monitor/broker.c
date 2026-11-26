@@ -60,7 +60,7 @@ void cng_broker_seed_session(void) {
 
 static u64 session(void) {
     if (!g_session)
-        cng_broker_seed_session(); /* no cng_run ran: a -t self-test */
+        cng_broker_seed_session(); /* not seeded at startup */
     return g_session;
 }
 
@@ -136,13 +136,6 @@ static void ipc_ns(struct broker_ns *ns) {
         broker_ns(ns, root, 0);
     else
         broker_ns(ns, 0, session());
-}
-
-unsigned cng_broker_self_addr(struct cng_sockaddr_un *a) {
-    struct broker_ns ns;
-    ipc_ns(&ns);
-    *a = ns.addr;
-    return ns.alen;
 }
 
 /* The hello: what a client sends first on every connection, ahead of its
@@ -1479,35 +1472,6 @@ int cng_broker_rpc_fd(struct cng_breq *q, int fd_in, struct cng_bresp *r,
             return -1;
     }
     return -1;
-}
-
-/* Testing: a client of the namespace `rootfs` names — its daemon started if
- * need be — that presents `key` as its rootfs, asking the one question that
- * changes nothing (IPC_INFO). 0 when the daemon answered, -1 when it hung
- * up on the hello, or nobody could be reached. There is no other way to
- * reach a daemon with a key that is not its own: a client always presents
- * the path its name was made from, and a second rootfs with the same name
- * is a 64-bit coincidence. */
-int cng_broker_test_hello(const char *rootfs, const char *key) {
-    struct broker_ns ns;
-    broker_ns(&ns, rootfs, 0);
-    cng_strlcpy(ns.key, key, sizeof ns.key);
-    ns.klen = (unsigned)strlen(ns.key);
-    int s = broker_connect(&ns);
-    if (s < 0)
-        return -1;
-    struct cng_breq q;
-    memset(&q, 0, sizeof q);
-    q.op = CNG_REQ_SHMCTL;
-    q.arg = CNG_IPC_INFO;
-    q.pid = (s32)sys_getpid();
-    struct cng_bresp r;
-    int rc = cng_broker_send(s, &q, sizeof q, -1) == 0 &&
-                     cng_broker_recv(s, &r, sizeof r, 0) == 0
-                 ? 0
-                 : -1;
-    sys_close(s);
-    return rc;
 }
 
 int cng_broker_table_fd(const char *rootfs_key) {

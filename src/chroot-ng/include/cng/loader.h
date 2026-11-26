@@ -49,9 +49,8 @@ struct cng_loaded {
     unsigned long load_hi; /* highest mapped page end (absolute) */
     /* The one mapping the loader made for this object, which is what gives it
      * back: both strategies reserve the whole span up front and place every
-     * segment inside it, and the anonymous one reserves the -R trampoline pool
-     * on top. load_hi is where the object's own pages end; this is where the
-     * reservation does. */
+     * segment inside it. load_hi is where the object's own pages end; this is
+     * where the reservation does. */
     unsigned long map_lo, map_len;
     /* The pages the anonymous strategy filled from the file, one range per
      * PT_LOAD with a file part: to the kernel each would be a private mapping
@@ -113,13 +112,6 @@ void cng_loader_check_execmem(void);
  * Detects PT_INTERP but does not load it (see cng_load_interp). */
 int cng_load_elf(const char *path, unsigned long base_hint,
                  struct cng_loaded *out);
-
-/* Same, from an already-open fd (left open, and its file offset untouched —
- * everything is pread/mmap). Lets an exec of "/proc/self/fd/N" load the open
- * file description itself rather than reopening the magic link: the kernel
- * checks *execute* permission for execve where a reopen needs *read*, and the
- * file may have no readable name at all (memfd, O_TMPFILE, deleted). */
-int cng_load_elf_fd(int fd, unsigned long base_hint, struct cng_loaded *out);
 
 /* Program headers we are willing to look at. */
 #define CNG_MAX_PHDR 64
