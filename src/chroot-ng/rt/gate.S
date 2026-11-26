@@ -136,12 +136,15 @@ cng_pt_unhold_ret:
  * (cng_bounce_svc_end) and answers by putting the guest's registers back and
  * resuming it after its own svc with the wait's result. The number in x8 there
  * only has to be one every filter of ours traps; uname is. Nothing runs past
- * the completion, hence the brk. */
+ * the completion, hence the brk. The completion is in the cngtrap section,
+ * which the filter's admission of the host's code leaves out (seccomp.c). */
     .global cng_bounce_wait
     .type cng_bounce_wait, %function
 cng_bounce_wait:
     svc     #0
     mov     x8, #160                /* __NR_uname */
+    b       cng_bounce_complete
+    .size cng_bounce_wait, . - cng_bounce_wait
 
     .global __cng_gate_end
     .hidden __cng_gate_end
@@ -149,11 +152,17 @@ __cng_gate_end:
     .if (__cng_gate_end - __cng_gate_start) > 256
     .error "the gate is longer than the 256 bytes it is aligned to (see the top)"
     .endif
+
+    .section cngtrap,"ax",%progbits
+    .balign 16
+    .global cng_bounce_complete
+    .type cng_bounce_complete, %function
+cng_bounce_complete:
     svc     #0
     .global cng_bounce_svc_end
 cng_bounce_svc_end:
     brk     #0
-    .size cng_bounce_wait, . - cng_bounce_wait
+    .size cng_bounce_complete, . - cng_bounce_complete
 
 /* The guest's FP/SIMD registers, saved to and loaded from a struct
  * user_fpsimd_state at \base: q0..q31, then fpsr and fpcr. x9 is spent. */
@@ -268,7 +277,7 @@ cng_bounce_dispatch:
     .global cng_bounce_dispatch_done
 cng_bounce_dispatch_done:
     mov     x8, #160                /* __NR_uname, as above */
-    b       __cng_gate_end
+    b       cng_bounce_complete
     .size cng_bounce_dispatch, . - cng_bounce_dispatch
 
 /* long cng_syscall_window(const long *a, long nr, unsigned long sp,

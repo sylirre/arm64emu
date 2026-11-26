@@ -73,4 +73,8 @@ int cng_hits_image(unsigned long addr, unsigned long len);
  * on it but what the gate and the bounce run in guest context. */
 extern unsigned long cng_host_tp __attribute__((visibility("hidden")));
 
+/* The host's executable segments (rt/hostcode.c): up to `max` [lo, hi) pairs
+ * into `out`, the vDSO at `vdso` left out. Returns how many. */
+int cng_host_code(unsigned long (*out)[2], int max, unsigned long vdso);
+
 #endif /* CNG_RT_H */

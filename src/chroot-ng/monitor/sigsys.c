@@ -339,11 +339,11 @@ int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
     unsigned long wait = (unsigned long)cng_bounce_wait,
                   disp = (unsigned long)cng_bounce_dispatch,
                   ddone = (unsigned long)cng_bounce_dispatch_done,
-                  done = (unsigned long)__cng_gate_end;
+                  done = (unsigned long)cng_bounce_complete;
     /* The dispatch's entry is its first two instructions, which read the
      * record and nothing else; it is done from the label on, the stack and
      * the guest's FP/SIMD registers back as they were. */
-    int at_wait = pc == wait, after_wait = pc == wait + 4,
+    int at_wait = pc == wait, after_wait = pc == wait + 4 || pc == wait + 8,
         at_disp = pc == disp || pc == disp + 4,
         after_disp = pc == ddone || pc == ddone + 4, at_done = pc == done;
     if (!at_wait && !after_wait && !at_disp && !after_disp && !at_done)
@@ -1218,12 +1218,18 @@ int cng_sig_filter_stacked(int tag) {
     return 0;
 }
 
-/* Is `pc` in one of the bounce stubs, which run in guest context? */
+/* Is `pc` in one of the bounce stubs, at a point that runs in guest context?
+ * The dispatch's own is that only at its entry and from its done label on:
+ * in between it is ours, switching stacks and keeping the guest's FP/SIMD
+ * registers, and a request landing there is left like any other in our code. */
 static int pc_in_stub(unsigned long pc) {
     unsigned long w = (unsigned long)cng_bounce_wait,
-                  d = (unsigned long)cng_bounce_dispatch;
-    return pc == w || pc == w + 4 || pc == (unsigned long)__cng_gate_end ||
-           pc == (unsigned long)cng_bounce_svc_end || (pc >= d && pc <= d + 12);
+                  d = (unsigned long)cng_bounce_dispatch,
+                  dd = (unsigned long)cng_bounce_dispatch_done;
+    return pc == w || pc == w + 4 || pc == w + 8 ||
+           pc == (unsigned long)cng_bounce_complete ||
+           pc == (unsigned long)cng_bounce_svc_end || pc == d || pc == d + 4 ||
+           pc == dd || pc == dd + 4;
 }
 
 /* The request, served on the scratch stack with the guest's alt-stack out of

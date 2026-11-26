@@ -694,8 +694,13 @@ int cng_install_seccomp_tracer(void);
 
 /* ...and the same split the base filter has: they are only installed once a
  * guest traces. */
-#define CNG_SECCOMP_TRACEALL_INSNS 24
-#define CNG_SECCOMP_TRACER_INSNS   24
+/* The admission of the host's own code every filter starts with (seccomp.c):
+ * one block of six per range, the ranges at most CNG_ADMIT_MAX, less up to two
+ * for the section of ours that is to trap, and the reload after. */
+#define CNG_ADMIT_MAX 12
+#define CNG_SECCOMP_ADMIT_INSNS ((CNG_ADMIT_MAX + 2) * 6 + 1)
+#define CNG_SECCOMP_TRACEALL_INSNS (24 + CNG_SECCOMP_ADMIT_INSNS)
+#define CNG_SECCOMP_TRACER_INSNS   (24 + CNG_SECCOMP_ADMIT_INSNS)
 struct sock_filter;
 int cng_build_seccomp_traceall(struct sock_filter *f, int cap);
 int cng_build_seccomp_tracer(struct sock_filter *f, int cap);
@@ -710,7 +715,7 @@ int cng_build_seccomp_tracer(struct sock_filter *f, int cap);
  * own. The kernel's own
  * limit is 4096 instructions; the tail's per-syscall jump offset is a u8, which
  * stays valid while the trapped set is under 255. */
-#define CNG_SECCOMP_MAX_INSNS 320
+#define CNG_SECCOMP_MAX_INSNS (320 + CNG_SECCOMP_ADMIT_INSNS)
 
 /* The ioctl requests a :ro bind refuses by descriptor (see uapi.h): the
  * filter traps them when the view has a :ro bind, the dispatcher answers them

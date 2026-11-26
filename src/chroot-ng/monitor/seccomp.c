@@ -365,6 +365,106 @@ static int view_has_ro(void) {
     return 0;
 }
 
+/* ---- the host's own code ------------------------------------------------
+ *
+ * The libc chroot-ng runs on makes syscalls of its own once the monitor calls
+ * into it -- pthread_create's clone and signal masks, the new thread's robust
+ * list and rseq area, fork, the heap -- and those are the host's, not the
+ * guest's: trapped, the dispatcher would answer them as the guest's (a mask
+ * the guest asked for, a break of the guest's), and a trap taken where the
+ * monitor runs on a host frame is one too many. So every filter of ours lets
+ * a syscall through whose instruction pointer is in the host's code, as it
+ * lets the gate's through: every executable segment of every object the
+ * dynamic linker has loaded -- our image, and in a static build the libc with
+ * it; the libc and its loader in a dynamic one -- less the vDSO, whose
+ * fallbacks the guest's own calls go through, and less the cngtrap section of
+ * ours, where the svcs are that are to trap (the bounce's completion, the
+ * filter probe). The guest's own images are none of these: our loader maps
+ * them, and the dynamic linker never hears of them.
+ *
+ * Gathered once, at the base filter's build, before the guest runs; the
+ * tracer's and the tracee's filters, stacked later, take the same list. Each
+ * range is split at 4 GiB boundaries, so that its block compares one high
+ * word and a low-word range, as the gate's does. */
+static struct {
+    unsigned long lo, hi;
+} g_admit[CNG_ADMIT_MAX];
+static int g_nadmit;
+
+static void admit_add(unsigned long lo, unsigned long hi) {
+    while (lo < hi && g_nadmit < CNG_ADMIT_MAX) {
+        unsigned long cut = (lo | 0xffffffffUL) + 1; /* the next 4 GiB boundary */
+        unsigned long end = cut && cut < hi ? cut : hi;
+        g_admit[g_nadmit].lo = lo;
+        g_admit[g_nadmit].hi = end;
+        g_nadmit++;
+        lo = end;
+    }
+}
+
+static void admit_init(void) {
+    static int done;
+    if (done)
+        return;
+    done = 1;
+    unsigned long vdso = 0;
+    for (unsigned long *a = cng_host_auxv; a && a[0]; a += 2)
+        if (a[0] == 33 /* AT_SYSINFO_EHDR */)
+            vdso = a[1];
+    unsigned long seg[CNG_ADMIT_MAX][2];
+    int nseg = cng_host_code(seg, CNG_ADMIT_MAX, vdso);
+    for (int i = 0; i < nseg; i++)
+        admit_add(seg[i][0], seg[i][1]);
+    if (cng_g_debug)
+        for (int i = 0; i < g_nadmit; i++)
+            cng_dprintf(2, "[cng] filter admits %lx-%lx\n", g_admit[i].lo,
+                        g_admit[i].hi);
+}
+
+/* One range's block: in [lo, hi) -> `in` (an instruction of its own, the
+ * sixth), else on to the next block. */
+static int emit_range(struct sock_filter *f, int n, unsigned long lo,
+                      unsigned long hi, struct sock_filter in) {
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP + 4);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)(lo >> 32), 0, 4);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K, (uint32_t)lo, 0, 2);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K, (uint32_t)(hi - 1), 1, 0);
+    f[n++] = in;
+    return n;
+}
+
+/* The admission, ending with A = nr again. */
+static int emit_admit(struct sock_filter *f, int n) {
+    if (!g_nadmit)
+        return n;
+    unsigned long ts = (unsigned long)__start_cngtrap,
+                  te = (unsigned long)__stop_cngtrap;
+    unsigned long tcut = (ts | 0xffffffffUL) + 1;
+    unsigned long trap[2][2] = {{ts, tcut && tcut < te ? tcut : te},
+                                {tcut && tcut < te ? tcut : te, te}};
+    int ntrap = trap[1][0] < trap[1][1] ? 2 : 1;
+    /* Each exclusion's sixth instruction jumps past everything after it. */
+    for (int t = 0; t < ntrap; t++) {
+        int after = (ntrap - 1 - t) * 6 + g_nadmit * 6;
+        n = emit_range(f, n, trap[t][0], trap[t][1],
+                       (struct sock_filter)CNG_BPF_STMT(
+                           CNG_BPF_JMP | CNG_BPF_JA, (uint32_t)after));
+    }
+    for (int i = 0; i < g_nadmit; i++)
+        n = emit_range(f, n, g_admit[i].lo, g_admit[i].hi,
+                       (struct sock_filter)CNG_BPF_STMT(
+                           CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW));
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR);
+    return n;
+}
+
 int cng_build_seccomp(struct sock_filter *f, int cap) {
     unsigned long gs = (unsigned long)__cng_gate_start;
     unsigned long ge = (unsigned long)__cng_gate_end;
@@ -503,6 +603,8 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* in-gate allow */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* A = nr */
+    /* The host's own code (see emit_admit). */
+    n = emit_admit(f, n);
 
     /* clone: trap process creation, let thread creation run natively.
      *  - without CLONE_VM the clone makes a new process, and the parent must
@@ -843,7 +945,7 @@ static int emit_prologue(struct sock_filter *f) {
                                               CNG_SECCOMP_RET_ALLOW);
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR);
-    return n;
+    return emit_admit(f, n);
 }
 
 static int install_filter(const struct sock_filter *f, int n) {
@@ -956,6 +1058,7 @@ static struct sock_filter g_base[CNG_SECCOMP_MAX_INSNS];
 static int g_base_n;
 
 int cng_install_seccomp(void) {
+    admit_init();
     struct sock_filter f[CNG_SECCOMP_MAX_INSNS];
     int n = cng_build_seccomp(f, (int)(sizeof f / sizeof f[0]));
     if (n < 0)

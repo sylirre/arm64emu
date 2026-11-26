@@ -41,7 +41,12 @@ extern char __cng_gate_end[];
 extern char cng_bounce_wait[];
 extern char cng_bounce_dispatch[];
 extern char cng_bounce_dispatch_done[];
+extern char cng_bounce_complete[];
 extern char cng_bounce_svc_end[];
+/* The svcs of ours that are to trap -- the completion above, the filter
+ * probe (sig.S) -- in a section of their own, which the filter's admission
+ * of the host's code leaves out (seccomp.c). */
+extern char __start_cngtrap[], __stop_cngtrap[];
 
 /* The kickable wait in the gate (see gate.S): wait4/waitid `nr` with a0..a4,
  * made only while *kicks still reads `seen`. CNG_WAIT_KICKED means a ptrace
