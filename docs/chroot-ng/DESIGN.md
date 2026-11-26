@@ -58,15 +58,17 @@ guest's link-time vaddr (`src/chroot-ng/loader/elf.c`), `shmat(SHM_REMAP)`
 (`src/chroot-ng/monitor/shm.c`) and the mmap hook's anonymous stand-in
 (`src/chroot-ng/monitor/execmap.c`) — the range is checked against everything that is the
 monitor's and refused (`ENOEXEC` / `EINVAL` / the kernel's own answer):
-`cng_hits_monitor()` covers the image `[__cng_image_start, __cng_image_end)`,
+`cng_hits_monitor()` covers the image (`__ehdr_start` to `_end`, wherever the
+loader put it),
 every region the own-map registry records (the floor, the registries, the argv
 snapshot an exec stands on) and the scratch stacks with the signal frame a
 dispatch returns through — the same three answers the exec sweep uses to tell
 the monitor's memory from the outgoing program's. A monitor mapped over by its
-own hand has nothing left to report the failure with. That is what the 64 GiB
-link base (see the 0x400000 entry in `docs/chroot-ng/STATUS.md`) moved out of the way of,
-and `p_vaddr` is a field in a file, so the base alone is not a guarantee — and
-the image is not the only mapping a file can name.
+own hand has nothing left to report the failure with. That is what the image's
+placement (a PIE now, once a 64 GiB link base: see the 0x400000 entry in
+`docs/chroot-ng/STATUS.md`) keeps out of the way of, and `p_vaddr` is a field in a
+file, so the placement alone is not a guarantee — and the image is not the only
+mapping a file can name.
 
 ## Why not the obvious approaches
 
@@ -499,8 +501,11 @@ arm64emu's chroot mode, which applies a guest's seccomp filter (`RET_TRAP`,
 and natively on AArch64; every test is a guest's, through the filter
 (docs/chroot-ng/testing.md).
 
-The binary is freestanding (`-nostdlib`, own `_start`, own syscall gate) so it
-never depends on libc and the SIGSYS handler has no re-entrancy hazards. Its
+The binary is an ordinary PIE linked against its toolchain's libc, whose
+startup runs before `main` and is all of it that runs: the monitor makes its
+syscalls through its own gate and calls nothing of the libc, so the SIGSYS
+handler has no re-entrancy hazards and no dependence on the libc it happens to
+be linked with. Its
 syscall numbers are its own table too (`src/chroot-ng/include/cng/unistd.h`, the stable
 AArch64 ABI spelled out) rather than the build host's `<asm/unistd.h>`: what
 the filter traps and refuses must not depend on how old the headers were where

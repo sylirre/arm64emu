@@ -382,10 +382,10 @@ static int elf_read_headers(int fd, struct cng_elf_plan *plan,
         return CNG_LOAD_EFORMAT;
 
     /* An ET_EXEC image goes down MAP_FIXED at its link-time vaddr, and the
-     * monitor shares this address space: a span reaching 0x1000000000 would
-     * map the guest over chroot-ng's own text and data, which is how the
-     * pre-relocation build died on gcc's cc1 (see the 0x400000 entry in
-     * STATUS.md). The base moved out of every real toolchain's way, but the
+     * monitor shares this address space: a span reaching the monitor's image
+     * would map the guest over chroot-ng's own text and data, which is how the
+     * build linked at 0x400000 died on gcc's cc1 (see the 0x400000 entry in
+     * STATUS.md). A PIE is placed out of every real toolchain's way, but the
      * vaddr is a field in a file, so refuse the collision rather than trust
      * the layout. Refused here, in the pass that maps nothing, so an exec
      * that would have hit it answers ENOEXEC with the caller still alive.

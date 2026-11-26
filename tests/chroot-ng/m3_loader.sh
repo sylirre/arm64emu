@@ -98,9 +98,10 @@ fi
 rm -rf "$EBD"
 
 # Fixed-address non-PIE guest (ET_EXEC @ 0x400000, e.g. gcc's cc1). chroot-ng is
-# linked high (0x1000000000) precisely so MAP_FIXED-loading such a guest at
-# 0x400000 doesn't overwrite our own monitor; verify it loads and runs (both the
-# anon and file-backed paths, since the collision is in the fixed mapping).
+# a PIE, placed where no such guest's link-time address is, so MAP_FIXED-loading
+# one at 0x400000 does not overwrite our own monitor; verify it loads and runs
+# (both the anon and file-backed paths, since the collision is in the fixed
+# mapping).
 if [ -n "$CHROOTNG_GUESTCC" ] &&
     $CHROOTNG_GUESTCC -static -no-pie -O2 -o "$GDIR/hello_exec" tests/chroot-ng/guests/hello.c \
         2>"$GUEST_CC_LOG"; then

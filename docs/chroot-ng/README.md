@@ -43,6 +43,11 @@ says so when it does not). Override the compiler if needed:
 make CHROOTNG_CC=aarch64-linux-gnu-gcc-12 chroot-ng
 ```
 
+The result is a PIE linked against the toolchain's libc: dynamic where it runs
+on the system that built it, static-PIE where it runs under arm64emu (the
+foreign host's tree has no AArch64 dynamic loader). `CHROOTNG_LINKMODE` picks
+the other (`-pie`, `-static-pie`).
+
 `make test-chroot-ng` also builds [arm64emu](../arm64emu/README.md), whose
 chroot mode runs the suite on a foreign host and is the oracle the
 differential `--link2symlink` legs compare against.
@@ -255,7 +260,8 @@ guest's images from their files instead.
 
 **Apache License 2.0** — see [LICENSE](../../LICENSE) and [NOTICE](../../NOTICE).
 
-chroot-ng is original, freestanding (no libc) AArch64 C and assembly. The
+chroot-ng is original AArch64 C and assembly, linked against its toolchain's libc
+but calling nothing of it from the monitor. The
 guest-PID registry, the synthesized `/proc` files, the System V IPC layer, the
 guest `ptrace` model and the help renderer are ported from the chroot mode
 of the sibling [arm64emu](../arm64emu/README.md) emulator in this repository. chroot-ng is functionally comparable

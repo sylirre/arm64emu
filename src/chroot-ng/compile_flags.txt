@@ -1,6 +1,6 @@
 --target=aarch64-linux-gnu
 -std=gnu11
--ffreestanding
+-fPIE
 -fno-builtin
 -Iinclude
 -I../../lib/link2symlink

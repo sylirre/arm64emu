@@ -4,8 +4,8 @@
  *
  * We deliberately avoid pulling in libc or hunting through kernel headers for
  * these; the values are part of the stable syscall ABI and identical across
- * every AArch64 kernel we target (>= 3.5).  Keeping them local makes the
- * freestanding build hermetic.
+ * every AArch64 kernel we target (>= 3.5).  Keeping them local keeps the
+ * build hermetic, whatever the toolchain's headers know.
  */
 #ifndef CNG_UAPI_H
 #define CNG_UAPI_H

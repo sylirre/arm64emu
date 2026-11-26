@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* The syscall gate: the ONLY `svc #0` in chroot-ng.
+/* The syscall gate: the only `svc #0` of the monitor's (the libc it is linked
+ * with has its own, which run before the filter and never after: nothing of the
+ * monitor calls into the libc).
  *
  * long cng_syscall6(long a0,a1,a2,a3,a4,a5, long nr)
  *   AAPCS64: a0..a5 arrive in x0..x5, nr in x6, result returned in x0.
@@ -13,9 +15,14 @@
  * The instruction pointer the filter sees is the one AFTER the svc, so a svc
  * is in the gate only if the instruction that follows it is too: __cng_gate_end
  * must never directly follow a svc that is meant to be allowed.
+ *
+ * The filter compares the pointer's high word for equality and its low word
+ * against the range (seccomp.c), which is exact only for a gate that does not
+ * cross a 4 GiB boundary; wherever the loader puts the image, one that starts
+ * 256-aligned and fits in 256 bytes cannot (the end of the file asserts it).
  */
     .section .text.gate,"ax",%progbits
-    .balign 64
+    .balign 256
     .global __cng_gate_start
     .hidden __cng_gate_start
 __cng_gate_start:
@@ -139,6 +146,9 @@ cng_bounce_wait:
     .global __cng_gate_end
     .hidden __cng_gate_end
 __cng_gate_end:
+    .if (__cng_gate_end - __cng_gate_start) > 256
+    .error "the gate is longer than the 256 bytes it is aligned to (see the top)"
+    .endif
     svc     #0
     .global cng_bounce_svc_end
 cng_bounce_svc_end:

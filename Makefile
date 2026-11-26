@@ -31,7 +31,7 @@
 # CFLAGS="-O3 -flto=8"` optimizes all of it). Everything specific to one
 # program carries its prefix: ARM64EMU_*, CHROOTNG_* (chroot-ng is cross-built,
 # so it has a compiler and flags of its own: CHROOTNG_CC, CHROOTNG_CFLAGS,
-# CHROOTNG_LDFLAGS).
+# CHROOTNG_LDFLAGS, CHROOTNG_LINKMODE).
 
 BUILD    := build
 OBJDIR   := $(BUILD)/obj
@@ -297,8 +297,9 @@ $(ARM64EMU_VERSIONED): ARM64EMU_VER := $(VERSION_DEFINE)
 
 # ============================================================================
 # chroot-ng — ptrace-free chroot/bind emulation for rootless Android (AArch64).
-# Freestanding: no libc, our own _start. Built with an AArch64 compiler — the
-# aarch64-linux-gnu cross toolchain on other hosts, run there under qemu-aarch64.
+# An ordinary hosted program, linked against the libc of its toolchain, built
+# with an AArch64 compiler -- the aarch64-linux-gnu cross toolchain on other
+# hosts, run there under arm64emu's chroot mode.
 # ============================================================================
 
 # The cross toolchain when one is installed, else the host compiler (on an
@@ -332,12 +333,12 @@ endif
 # Is the compiler clang (Termux/NDK) rather than gcc? Some flags are gcc-only.
 CHROOTNG_IS_CLANG := $(shell $(CHROOTNG_CC) --version 2>/dev/null | grep -ci clang)
 
-# Only the compile-time halves of "freestanding, no PIE" belong here
-# (-ffreestanding, -fno-pie); the link-only `-static -nostdlib -no-pie` live in
-# the link flags below. They used to be listed in both, which is a silent no-op
-# on gcc but makes clang (Termux/NDK) report `-no-pie` as "argument unused
-# during compilation" — fatal in the one unit built with -Werror.
-CHROOTNG_FLAGS = -O2 -g -std=gnu11 -ffreestanding -fno-pie \
+# Position-independent, as the link below is. -fno-stack-protector because the
+# monitor runs on the guest's TLS, where Bionic keeps the stack guard, and
+# -fno-builtin because the mem/str helpers are the monitor's own (rt/rt.c):
+# libc's use the SIMD registers, which a dispatch from guest context spends
+# out of the guest's (see -mgeneral-regs-only below).
+CHROOTNG_FLAGS = -O2 -g -std=gnu11 -fPIE \
                  -fno-stack-protector \
                  -fno-asynchronous-unwind-tables -fno-builtin \
                  -ffunction-sections -fdata-sections \
@@ -346,14 +347,15 @@ CHROOTNG_FLAGS = -O2 -g -std=gnu11 -ffreestanding -fno-pie \
                  $(CHROOTNG_GCCONLY) $(CHROOTNG_INLINEATOMICS) -mgeneral-regs-only \
                  $(CHROOTNG_CFLAGS)
 # Stop gcc turning our mem* loops into calls to themselves. Clang rejects this
-# flag and instead honors -ffreestanding/-fno-builtin for the same effect.
+# flag and honors -fno-builtin for the same effect.
 ifeq ($(CHROOTNG_IS_CLANG),0)
 CHROOTNG_GCCONLY := -fno-tree-loop-distribute-patterns
 endif
 # GCC 13+ defaults to -moutline-atomics, which routes every __atomic builtin
-# through a libgcc helper (__aarch64_cas4_acq_rel) that a -nostdlib link has no
-# way to resolve. The PID registry uses CAS, so ask for inline atomics — the
-# LL/SC form works on every ARMv8. Probed, since not every compiler has it.
+# through a libgcc helper (__aarch64_cas4_acq_rel) that picks LSE or LL/SC by a
+# flag a constructor of libgcc's sets. The monitor's atomics run in the SIGSYS
+# handler, from the first trap on, so they are inline -- the LL/SC form works
+# on every ARMv8. Probed, since not every compiler has it.
 CHROOTNG_INLINEATOMICS := $(shell $(CHROOTNG_CC) -mno-outline-atomics -E -x c /dev/null \
                             >/dev/null 2>&1 && echo -mno-outline-atomics)
 # -mgeneral-regs-only: no floating point or SIMD anywhere in the monitor. A
@@ -366,25 +368,15 @@ CHROOTNG_INLINEATOMICS := $(shell $(CHROOTNG_CC) -mno-outline-atomics -E -x c /d
 # slot for a pointer. Deliberately not probed: silently dropping it would put
 # the clobber back.
 
-# Link chroot-ng far above the guest ET_EXEC range via an explicit linker
-# script (src/chroot-ng/chroot-ng.ld). A non-PIE guest (notably gcc's cc1)
-# loads at the fixed address 0x400000 — where a -no-pie executable also
-# defaults to — so if chroot-ng lived there, MAP_FIXED-loading such a guest
-# would overwrite our own monitor code. The script sets the location counter to
-# 0x1000000000 (64 GiB) so the first segment *starts* there; the -T*/
-# --image-base flags don't relocate a -no-pie binary cleanly on lld (they pad a
-# segment up from 0x200000 instead).
-#
-# gcc links PIE by default on most distributions, so it needs -no-pie to keep
-# the fixed-address ET_EXEC the script above lays out. Clang already implies
-# non-PIE from -static (-static-pie being the opt-in), and says so by warning
-# that -no-pie went unused, so it is only passed to gcc.
-CHROOTNG_LDS     := src/chroot-ng/chroot-ng.ld
+# A PIE, which the loader places where nothing a guest names can be: a non-PIE
+# guest (gcc's cc1) loads at its link-time 0x400000, and the monitor shares its
+# address space. Dynamic where it runs on the system that built it; static-PIE
+# where it runs under arm64emu on a foreign host, whose tree has no AArch64
+# dynamic loader for it to find. CHROOTNG_LINKMODE overrides the choice.
+CHROOTNG_LINKMODE ?= $(if $(CHROOTNG_RUN),-static-pie,-pie)
 CHROOTNG_LDFLAGS ?=
-CHROOTNG_LINK     = $(CHROOTNG_LDFLAGS) -static -nostdlib -Wl,-T,$(CHROOTNG_LDS) \
-                    -Wl,--build-id=none -Wl,-z,noexecstack \
-                    -Wl,--gc-sections -Wl,-e,_start \
-                    $(if $(filter 0,$(CHROOTNG_IS_CLANG)),-no-pie)
+CHROOTNG_LINK     = $(CHROOTNG_LDFLAGS) $(CHROOTNG_LINKMODE) -Wl,-z,noexecstack \
+                    -Wl,--gc-sections
 
 CHROOTNG_SRC := $(shell find src/chroot-ng -name '*.c' -o -name '*.S' 2>/dev/null | LC_ALL=C sort) \
                 $(LIB_L2S)
@@ -407,9 +399,7 @@ CHROOTNG_VERSIONED := $(addprefix $(OBJDIR)/chroot-ng/src/chroot-ng/,main.c.o ru
 $(CHROOTNG_VERSIONED): VERSION
 $(CHROOTNG_VERSIONED): CHROOTNG_FLAGS += $(VERSION_DEFINE)
 
-# The linker script shapes the image as much as the objects do (its PHDRS is
-# the whole program header table), so a change to it relinks.
-$(BUILD)/chroot-ng: $(CHROOTNG_OBJ) $(CHROOTNG_LDS)
+$(BUILD)/chroot-ng: $(CHROOTNG_OBJ)
 	$(CHROOTNG_CC) $(CHROOTNG_LINK) -o $@ $(CHROOTNG_OBJ)
 
 -include $(CHROOTNG_OBJ:.o=.d)

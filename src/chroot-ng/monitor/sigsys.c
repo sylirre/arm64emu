@@ -7,7 +7,7 @@
  * svc. We emulate the syscall (translating paths) and write the result into x0;
  * on return the restorer runs rt_sigreturn and the guest continues.
  */
-#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+#include "cng/broker.h" /* cng_broker_env: the monitor calls no getenv */
 #include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/procreg.h"
@@ -1116,8 +1116,7 @@ static void sigsys_kick(struct cng_ucontext *uc) {
      * handler returns), or in any other code of ours but a dispatch running
      * in guest context, which is where the kick's own stops are taken too. */
     int later = i >= 0 && ((cng_scr[i].busy && cng_scr[i].uc) || cng_scr[i].inh);
-    if (!later && pc >= (unsigned long)__cng_image_start &&
-        pc < (unsigned long)__cng_image_end && !pc_in_stub(pc) &&
+    if (!later && pc >= cng_image_lo() && pc < cng_image_hi() && !pc_in_stub(pc) &&
         !(i >= 0 && cng_scr[i].gf))
         later = 1;
     if (later) {

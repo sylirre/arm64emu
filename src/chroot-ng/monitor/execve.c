@@ -29,7 +29,7 @@
  * de_thread note below) — so the gate is what stands between the reclaim and
  * a thread that could not be reached. See the block comments on each below.
  */
-#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+#include "cng/broker.h" /* cng_broker_env: the monitor calls no getenv */
 #include "cng/execmap.h"
 #include "cng/l2s.h"
 #include "cng/loader.h"

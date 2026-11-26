@@ -23,9 +23,8 @@ src/chroot-ng/
   monitor/             the syscall monitor: SIGSYS handler, dispatcher,
                        and the emulated subsystems (/proc, ptrace, SysV IPC, netlink, link2symlink, ...)
   path/                rootfs path translation and containment
-  rt/                  the freestanding runtime: _start, the syscall gate (the only svc #0), libc-like helpers
+  rt/                  the runtime: main, the syscall gate (the monitor's only svc #0), libc-like helpers
   include/cng/         headers, including the UAPI constants re-declared from the AArch64 syscall ABI
-  chroot-ng.ld         linker script: the image lives far above the guest ET_EXEC range
 lib/link2symlink/      (repository root) the -l/--link2symlink engine, shared with arm64emu's chroot mode;
                        monitor/l2s.c is chroot-ng's host for it (struct l2s_ops) and its stat answers
 tests/chroot-ng/       run.sh + lib.sh (host detection) + one m*.sh per milestone; guests/ are the
@@ -33,8 +32,11 @@ tests/chroot-ng/       run.sh + lib.sh (host detection) + one m*.sh per mileston
 docs/chroot-ng/        README.md (user guide), DESIGN.md, STATUS.md (milestone log), testing.md
 ```
 
-chroot-ng is freestanding: no libc, raw syscalls only, and no floating point or SIMD
-anywhere in the monitor (`-mgeneral-regs-only`; the Makefile explains why).
+chroot-ng is a hosted PIE linked against its toolchain's libc, but the monitor
+calls nothing of it: raw syscalls through the gate only, its own mem/str and
+formatting helpers, and no floating point or SIMD anywhere
+(`-mgeneral-regs-only`; the Makefile explains why). The libc's startup runs
+before `main`, and is all of it that runs.
 
 ## Testing
 

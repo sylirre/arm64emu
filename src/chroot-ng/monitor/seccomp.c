@@ -462,7 +462,13 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Gate allowlist: a syscall issued from inside our own gate is a re-issue
      * from the handler and must not trap again. Offsets below are relative, so
-     * "-> nr" means the A = nr load that follows this block. */
+     * "-> nr" means the A = nr load that follows this block. The pointer's
+     * high word is compared for equality and its low word against the range,
+     * which is the whole 64-bit compare for a gate that does not cross a 4 GiB
+     * boundary -- and wherever the loader put the image, this one cannot
+     * (gate.S aligns it to its own size, and asserts that). */
+    if ((gs >> 32) != ((ge - 1) >> 32))
+        return -1;
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_IP + 4); /* ip high */
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(

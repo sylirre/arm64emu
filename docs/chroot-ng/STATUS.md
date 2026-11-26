@@ -5147,6 +5147,24 @@ kernel 3.18 (Galaxy S7).
   - pt_probe's restart scenario waited for ever on a restart that blocks on
     the tracer's descriptor; it feeds that descriptor a byte after a second.
 
+- [x] **M115 — a hosted program: a PIE linked against its toolchain's libc**
+  - Step 2.2 of the merge into arm64emu, whose build is an ordinary one.
+    No -ffreestanding, -nostdlib, own _start or linker script any more:
+    chroot-ng is a PIE with the libc's startup and a `main` (rt/rt.c),
+    dynamic where it runs on the system that built it and static-PIE where
+    it runs under arm64emu (CHROOTNG_LINKMODE). The image is where the
+    loader put it, so its bounds are `__ehdr_start` and `_end` at run time;
+    the fixed 64 GiB base the script laid out is gone, and an ET_EXEC guest
+    at 0x400000 is out of a PIE's way as it was out of the base's.
+  - The gate is 256-aligned and asserted to fit in 256 bytes, so it cannot
+    cross a 4 GiB boundary wherever it is loaded: the filter's high-word
+    equality and low-word range are the whole 64-bit compare then, which
+    the filter's builder checks too.
+  - The monitor still calls nothing of the libc, and keeps its own mem/str
+    helpers, -mgeneral-regs-only, -fno-stack-protector and inline atomics:
+    a dispatch from guest context runs on the guest's live FP registers
+    and its TLS until the context switch (step 2.4) gives it the host's.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

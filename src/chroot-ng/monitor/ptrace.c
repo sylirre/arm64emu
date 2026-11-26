@@ -2299,8 +2299,8 @@ static void pt_kick_stops(struct pt_self *s, struct cng_ucontext *uc,
     int how = cng_bounce_unwind(uc, 1, &owed, &rval, &nr, &ox);
     if (how == CNG_UNWIND_NONE) {
         struct cng_gframe *gf;
-        if (r->pc >= (u64)__cng_image_start &&
-            r->pc < (u64)__cng_image_end && (gf = cng_gframe_cur())) {
+        if (r->pc >= cng_image_lo() && r->pc < cng_image_hi() &&
+            (gf = cng_gframe_cur())) {
             pt_inflight_stop(s, uc, gf, attach, intr, ss, sd);
             return;
         }
@@ -2581,7 +2581,7 @@ int cng_pt_signal_frame(struct cng_ucontext *uc, int sig,
         return 0;
     }
     struct cng_gframe *gf;
-    if (r->pc < (u64)__cng_image_start || r->pc >= (u64)__cng_image_end ||
+    if (r->pc < cng_image_lo() || r->pc >= cng_image_hi() ||
         !(gf = cng_gframe_cur()))
         return 0;
     /* SIGSYS can be neither blocked nor held: a seccomp trap meeting it

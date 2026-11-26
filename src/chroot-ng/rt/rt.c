@@ -490,13 +490,13 @@ _Noreturn void cng_die(const char *msg, long err) {
 
 /* ---- the monitor's own image ------------------------------------------ */
 
-/* [addr, addr+len) against [__cng_image_start, __cng_image_end). `len` is
+/* [addr, addr+len) against the image [cng_image_lo, cng_image_hi). `len` is
  * guest-supplied at both call sites, so a wrapping sum is a real input: treat
  * it as reaching the top of the address space rather than wrapping round to a
  * range that happens to miss us. */
 int cng_hits_image(unsigned long addr, unsigned long len) {
-    unsigned long lo = (unsigned long)__cng_image_start;
-    unsigned long hi = (unsigned long)__cng_image_end;
+    unsigned long lo = cng_image_lo();
+    unsigned long hi = cng_image_hi();
     if (!len)
         return 0; /* an empty range covers nothing */
     unsigned long end = addr + len;
@@ -513,10 +513,11 @@ unsigned long cng_page_size = 4096;
 
 int cng_main(int argc, char **argv, char **envp, unsigned long *auxv);
 
-void cng_bootstrap(unsigned long *sp) {
-    long argc = (long)sp[0];
-    char **argv = (char **)&sp[1];
-    char **envp = argv + argc + 1;
+/* The libc's startup has run by now; argv and envp are still the vectors the
+ * kernel laid out, and the auxv follows the environment's terminator. The run
+ * ends with exit_group whatever cng_main returns: nothing of the libc's is
+ * there to be flushed or torn down. */
+int main(int argc, char **argv, char **envp) {
     char **p = envp;
     while (*p)
         p++;
@@ -526,6 +527,6 @@ void cng_bootstrap(unsigned long *sp) {
         if (a[0] == 6 /* AT_PAGESZ */ && a[1])
             cng_page_size = a[1];
 
-    int rc = cng_main((int)argc, argv, envp, auxv);
+    int rc = cng_main(argc, argv, envp, auxv);
     sys_exit_group(rc);
 }

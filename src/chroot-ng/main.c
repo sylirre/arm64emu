@@ -10,7 +10,7 @@
  * -h/--help), which reflows it to the terminal width. Keep the option strings
  * there and the overview in README.md in sync.
  *
- * The runtime is freestanding (no libc), so the help renderer — ported from the
+ * The monitor calls nothing of the libc, so the help renderer — ported from the
  * sibling arm64emu program — is built on the cng_ I/O helpers plus a raw
  * ioctl(TIOCGWINSZ). cng_dprintf has fixed widths only (no "%*s"), so column
  * alignment is done with out_pad().
@@ -38,7 +38,7 @@ int cng_run(const char *rootfs, const char *workdir,
             const int *bind_ro, int nb, char *const *env_set, int ne,
             int gargc, char **gargv, char **envp, unsigned long *auxv);
 
-/* --- freestanding output primitives for the help renderer ----------------- */
+/* --- output primitives for the help renderer ------------------------------ */
 
 static void out(int fd, const char *s, int n) { cng_write_all(fd, s, (size_t)n); }
 static void out_str(int fd, const char *s) { cng_write_all(fd, s, strlen(s)); }

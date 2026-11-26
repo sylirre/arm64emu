@@ -22,8 +22,8 @@
  * link replies (sys_netlink.c build_host_links): interfaces enumerated from
  * the one dump Android leaves open (RTM_GETADDR — the same enumeration
  * Bionic's getifaddrs falls back to under this policy), fleshed out with
- * SIOCGIF* ioctls. chroot-ng is -nostdlib, so this is that Bionic fallback
- * rebuilt from raw syscalls.
+ * SIOCGIF* ioctls. The monitor calls nothing of the libc, so this is that
+ * Bionic fallback rebuilt from raw syscalls.
  *
  * The guest's fd is one end of a real AF_UNIX SOCK_SEQPACKET socketpair, and
  * the namespace's broker daemon (broker.c) holds the other. Replies are pushed
@@ -68,7 +68,7 @@
 #include "cng/tab.h"
 #include "cng/uapi.h"
 
-#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+#include "cng/broker.h" /* cng_broker_env: the monitor calls no getenv */
 
 int cng_nl_force_block = 0;
 int cng_nl_no_relay = 0;

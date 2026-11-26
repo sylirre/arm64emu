@@ -4,8 +4,8 @@
  *
  * Ported from the sem/msg half of arm64emu's proctab.c. Runs only inside the
  * broker daemon, single-threaded from the poll loop in broker.c, so nothing here
- * needs locking. Freestanding like the rest of the monitor: raw syscalls through
- * the gate, no libc — which is the one structural difference from the original,
+ * needs locking. Like the rest of the monitor: raw syscalls through the gate,
+ * nothing of the libc's — which is the one structural difference from the original,
  * whose daemon could malloc. Semaphore vectors and queued messages are
  * variable-sized and come and go, so they come from the small arena below
  * instead.

@@ -2,7 +2,7 @@
 /* Copyright 2026 Sylirre */
 #include "cng/path.h"
 #include "cng/monitor.h" /* cng_g_fs */
-#include "cng/broker.h" /* cng_broker_env: no getenv in a freestanding build */
+#include "cng/broker.h" /* cng_broker_env: the monitor calls no getenv */
 #include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"

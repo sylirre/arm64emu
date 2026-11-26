@@ -21,7 +21,8 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
-/* Compiler may emit calls to these; provide freestanding implementations. */
+/* The monitor's own, which the compiler's calls reach too: libc's use the SIMD
+ * registers (see -mgeneral-regs-only in the Makefile). */
 void *memset(void *d, int c, size_t n);
 void *memcpy(void *d, const void *s, size_t n);
 void *memmove(void *d, const void *s, size_t n);
@@ -57,14 +58,18 @@ _Noreturn void cng_die(const char *msg, long err);
  * coherent after writing code into it. */
 void cng_flush_icache(void *start, void *end);
 
-/* Linker-provided bounds of chroot-ng's own image (src/chroot-ng/chroot-ng.ld).
- * The guest runs in this address space, so a mapping chroot-ng makes at an
- * address the *guest* chose can land on the monitor itself — which is not a
- * failure the guest gets to see, because there is no monitor left to report
- * it. Both such places (an ET_EXEC's link-time vaddr going down MAP_FIXED,
- * and shmat(SHM_REMAP)) ask cng_hits_image() first and refuse instead. */
-extern char __cng_image_start[];
-extern char __cng_image_end[];
+/* The bounds of chroot-ng's own image, wherever the loader put it: the ELF
+ * header the linker places at its start and the end of its data, both symbols
+ * every linker defines for a program. The guest runs in this address space, so
+ * a mapping chroot-ng makes at an address the *guest* chose can land on the
+ * monitor itself — which is not a failure the guest gets to see, because there
+ * is no monitor left to report it. Both such places (an ET_EXEC's link-time
+ * vaddr going down MAP_FIXED, and shmat(SHM_REMAP)) ask cng_hits_image() first
+ * and refuse instead. */
+extern const char __ehdr_start[] __attribute__((visibility("hidden")));
+extern char _end[] __attribute__((visibility("hidden")));
+static inline unsigned long cng_image_lo(void) { return (unsigned long)__ehdr_start; }
+static inline unsigned long cng_image_hi(void) { return (unsigned long)_end; }
 
 /* Does [addr, addr+len) overlap the image? A length that wraps past the top of
  * the address space counts as reaching everything above `addr`, since that is
