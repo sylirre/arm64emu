@@ -4408,16 +4408,45 @@ void cng_clone_convert(struct cng_uregs *ur) {
      * the fork: in the child, gettid answers a tid no table has. With no
      * handler of ours under it (a dispatch in guest context), the register
      * is the guest's and stays as the kernel set it. */
-    unsigned long *gtp = cng_guest_tp_slot();
+    unsigned long *gtp = cng_guest_tp_slot(), htp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(htp));
     long flags = (long)(orig_flags &
                         ~(unsigned long)(CNG_CLONE_VM | CNG_CLONE_VFORK));
-    long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
-                            (long)ur->x[4], (long)ur->x[5], __NR_clone);
+    /* A plain fork -- the exit signal SIGCHLD and at most the tid words -- is
+     * the host libc's fork(), so that its state is right in the child: one
+     * thread, the forking one, its locks reset, its lists of our other
+     * threads (pthreads of its own, thread.c) emptied. The tid words are
+     * then the guest's call's, as the kernel would have them: the parent's
+     * at PARENT_SETTID, the child's at CHILD_SETTID, and clear_child_tid
+     * CHILD_CLEARTID's or none, where the libc's fork set its own. Anything
+     * else is the raw clone, as before. */
+    const unsigned long tidw = CNG_CLONE_PARENT_SETTID | CNG_CLONE_CHILD_SETTID |
+                               CNG_CLONE_CHILD_CLEARTID;
+    long ret;
+    if (((unsigned long)flags & ~tidw) == 17 /* SIGCHLD */) {
+        ret = cng_host_fork();
+        u32 id;
+        if (ret == 0) {
+            CNG_SYS(__NR_set_tid_address,
+                    (flags & CNG_CLONE_CHILD_CLEARTID) ? (long)ur->x[4] : 0, 0, 0,
+                    0, 0, 0);
+            id = (u32)sys_gettid();
+            if (flags & CNG_CLONE_CHILD_SETTID)
+                cng_user_copyout((void *)ur->x[4], &id, sizeof id);
+        } else if (ret > 0 && (flags & CNG_CLONE_PARENT_SETTID)) {
+            id = (u32)ret;
+            cng_user_copyout((void *)ur->x[2], &id, sizeof id);
+        }
+    } else {
+        ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
+                           (long)ur->x[4], (long)ur->x[5], __NR_clone);
+    }
     if (ret == 0 && (orig_flags & CNG_CLONE_SETTLS) && gtp) {
-        __asm__ volatile("msr tpidr_el0, %0" ::"r"(cng_host_tp));
+        __asm__ volatile("msr tpidr_el0, %0" ::"r"(htp));
         *gtp = (unsigned long)ur->x[3];
     }
     if (ret == 0) {
+        cng_thread_fork_child(); /* first: whose host context this is */
         cng_sig_in_handler(1);
         cng_procreg_fork_child(forker); /* registered before any guest code */
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
@@ -6675,10 +6704,13 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         return r;
     }
 
-    /* exit/exit_group are trapped only on a tracee (the trap-everything
-     * filter). The death has to reach the tracer: PTRACE_EVENT_EXIT first if it
-     * asked for one, then either a synthetic exit in the registry or a plain
-     * link drop when the tracer is our parent and reaps us for real. */
+    /* exit is trapped for every thread, since a guest thread of ours leaves
+     * through its start routine (thread.c) -- after the tracer has had the
+     * death, which is the rest of this: exit_group is trapped only on a tracee
+     * (the trap-everything filter). PTRACE_EVENT_EXIT first if it asked for
+     * one, then either a synthetic exit in the registry or a plain link drop
+     * when the tracer is our parent and reaps us for real. The leader's exit,
+     * and every exit_group, is the kernel's. */
     case __NR_exit:
     case __NR_exit_group: {
         int wstatus = ((int)a0 & 0xff) << 8;
@@ -6686,6 +6718,8 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
         if (ur)
             cng_pt_exit_stop(ur, wstatus);
         cng_pt_exit_report(wstatus);
+        if (nr == __NR_exit && cng_thread_unwinds())
+            cng_thread_exit();
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
 
@@ -7397,7 +7431,17 @@ struct gctx_call {
  * result is then dropped, and the registers are the tracer's. */
 static void gctx_syscall(struct gctx_call *c, long nr) {
     struct cng_uregs *r = c->f.r;
-    if (nr == __NR_clone) {
+    if (nr == __NR_clone && (r->x[0] & CNG_CLONE_VM) &&
+        !(r->x[0] & CNG_CLONE_VFORK)) {
+        /* A thread, from guest context: the guest's mask and thread pointer
+         * are the live ones, its FP/SIMD registers the gate's save area. */
+        unsigned long mask = 0, tp;
+        CNG_SYS(__NR_rt_sigprocmask, 0, 0, &mask, 8, 0, 0);
+        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+        long res = cng_thread_clone(r, c->f.fpsave, mask, tp);
+        if (!c->f.abandon)
+            r->x[0] = (u64)res;
+    } else if (nr == __NR_clone) {
         cng_clone_convert(r);
     } else {
         long res = cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],

@@ -324,3 +324,50 @@ EOF
     fi
 fi
 rm -rf "$FKD"
+
+# A thread made by a raw clone(2), the way each libc and runtime makes one,
+# now that chroot-ng makes it a pthread of the host's (monitor/thread.c):
+# Go's shape (no CLONE_SETTLS, no tid words) and glibc's, the tid words
+# written and CHILD_CLEARTID's cleared with a wake, a private descriptor
+# table without CLONE_FILES, the parent's mask, no alternate stack, the
+# kernel's refusals, and a robust mutex whose owner thread exited holding it.
+# Differential against the same program under the kernel. A cwd of its own
+# without CLONE_FS is not one: the monitor keeps one guest cwd a process.
+CTD=$(mktemp -d)
+mkdir -p "$CTD/tmp" "$CTD/dev"
+if guest_xlate_ready "raw-clone threads leg" &&
+    guest_cc_report "$CTD/clonethr" tests/chroot-ng/guests/clonethr.c -lpthread; then
+    want=$( (cd "$CTD" && emu_t 60 "$CTD/clonethr") 2>/dev/null |
+        grep -v '^without CLONE_FS')
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(m8run -b /dev/null:/dev/null "$CTD" /clonethr 2>/dev/null |
+        grep -v '^without CLONE_FS')
+    if [ -z "$want" ]; then
+        skip "raw-clone threads: the reference run produced nothing"
+    elif [ "$want" = "$out" ]; then
+        pass=$((pass + 1))
+        echo "  ok   threads made by a raw clone start as the kernel's do"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL threads made by a raw clone diverge from the kernel's"
+        printf '       kernel: %s\n       guest : %s\n' \
+            "$(echo "$want" | tr '\n' '|')" "$(echo "$out" | tr '\n' '|')"
+    fi
+    skip "a thread without CLONE_FS: its cwd is the process's, one guest cwd a process (path.c)"
+fi
+rm -rf "$CTD"
+
+# Repeated execs from a threaded program: every thread an exec ends is given
+# back -- its stacks, and the pthread's, alternate and scratch stacks chroot-ng
+# kept for it (monitor/thread.c) -- so the address space of the last
+# generation is the first's, as a kernel's exec has it. They used to be kept:
+# a megabyte and more a generation.
+ETD=$(mktemp -d)
+if guest_xlate_ready "threaded exec leg" &&
+    guest_cc_report "$ETD/execthr" tests/chroot-ng/guests/execthr.c -lpthread; then
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 120 $CHROOTNG_GUEST_BINDS "$ETD" /execthr 2>&1)
+    check_contains "execs from a threaded program give its threads back" \
+        "the address space did not grow" "$out"
+fi
+rm -rf "$ETD"

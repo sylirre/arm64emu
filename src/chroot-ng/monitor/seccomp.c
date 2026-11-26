@@ -474,7 +474,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
      * when faking, plus the conditional entries below). */
-    int nr[NPATH + NIPC + NID + NROFD + 12];
+    int nr[NPATH + NIPC + NID + NROFD + 15];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -547,6 +547,16 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     /* brk: the kernel's break is the host libc's heap, and the guest's is
      * kept apart from it (brk.c). */
     nr[nsys++] = __NR_brk;
+    /* clone, every kind: a process is published into the registry, a
+     * vfork's shared address space is made a fork (our execve runs in place),
+     * and a thread is made a pthread of the host's (thread.c) -- whose own
+     * clone, from the host's code, the admission above lets through. exit,
+     * which a guest thread of ours makes by leaving through its start
+     * routine; and sigaltstack, since such a thread's kernel alternate stack
+     * is ours while the guest has none. */
+    nr[nsys++] = __NR_clone;
+    nr[nsys++] = __NR_exit;
+    nr[nsys++] = __NR_sigaltstack;
 
     if (cap < CNG_SECCOMP_MAX_INSNS)
         return -1;
@@ -606,38 +616,6 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     /* The host's own code (see emit_admit). */
     n = emit_admit(f, n);
 
-    /* clone: trap process creation, let thread creation run natively.
-     *  - without CLONE_VM the clone makes a new process, and the parent must
-     *    publish it into the PID registry (procreg) for the /proc view;
-     *  - with CLONE_VFORK (Go's os/exec, posix_spawn) the child shares our
-     *    address space and suspends us until its execve — but our execve is
-     *    emulated in-process, so a shared VM would corrupt the parent; dispatch
-     *    converts it to a real fork.
-     * A thread (CLONE_VM, no CLONE_VFORK) is neither, and runs untrapped.
-     * clone flags are in args[0] (low 32 bits). */
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_clone, 0,
-        8); /* 10: nr==clone? no->19 (reload nr) */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* 11: A=flags lo */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VM); /* 12 */
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 3,
-        0); /* 13: (flags&VM)==0? yes->17 trap (new process), no->14 */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* 14: reload flags */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VFORK); /* 15 */
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 1,
-        0); /* 16: (flags&VFORK)==0? yes->18 allow (thread), no->17 trap */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_TRAP); /* 17 */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* 18: plain thread */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* 19: reload A=nr */
 
     /* prctl: four ops are ours, the rest of the syscall is not.
      *
@@ -956,19 +934,19 @@ static int install_filter(const struct sock_filter *f, int n) {
 
 /* The filter a task stacks when it becomes a ptrace tracee: trap *everything*,
  * because a tracee must stop on every syscall and the base filter only traps
- * the path-bearing set. Three exceptions, each mandatory rather than an
+ * the path-bearing set. Two exceptions, each mandatory rather than an
  * optimization:
  *
- *  - our gate (the prologue), or the handler's own re-issue would trap;
+ *  - our gate and the host's own code (the prologue), or the handler's own
+ *    re-issue -- and the libc's own calls, a thread's creation among them --
+ *    would trap;
  *  - rt_sigreturn, which must execute with sp still pointing at the kernel's
  *    signal frame. We can only "execute" a trapped syscall by re-issuing it
  *    from the gate, where sp is the handler's — so trapping it would restore a
- *    garbage context. It carries nothing a tracer needs;
- *  - a thread-creating clone (CLONE_VM without CLONE_VFORK). A re-issued clone
- *    returns into the handler on the new thread's stack, with no frame to
- *    sigreturn through; the base filter lets threads run natively for exactly
- *    that reason. The cost is that a tracer does not see thread creation
- *    (process creation, which is what strace -f follows, traps normally).
+ *    garbage context. It carries nothing a tracer needs.
+ *
+ * A thread-making clone traps like any other call now: the thread is made by
+ * the host's libc (thread.c), not re-issued.
  *
  * Stacked filters compose by most-restrictive-action-wins, so this also
  * converts the base filter's RET_ERRNO answers into traps; the dispatcher
@@ -981,21 +959,7 @@ int cng_build_seccomp_traceall(struct sock_filter *f, int cap) {
         return -1;
     int n = emit_prologue(f);
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_rt_sigreturn, 7, 0);
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_clone, 0, 7);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VM);
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 4, 0); /* no VM -> trap */
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(
-        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_CLONE_VFORK);
-    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
-        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 0, 1); /* thread -> allow */
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_rt_sigreturn, 0, 1);
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                               CNG_SECCOMP_RET_ALLOW);
     f[n++] = (struct sock_filter)CNG_BPF_STMT(

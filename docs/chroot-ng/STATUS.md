@@ -5238,6 +5238,66 @@ kernel 3.18 (Galaxy S7).
     trap with TPIDR_EL0 = 0 and garbage in x18). The expected block is a
     6.8 kernel's.
 
+- [x] **M118 — guest threads as the host's own**
+  - Step 2.5 of the merge into arm64emu, the thread model.
+  - Every filter lets the host's own code through (4caf8d73): every
+    executable segment of every object the dynamic linker loaded, less the
+    vDSO and the cngtrap section, which holds the svcs of ours that are to
+    trap.
+  - A thread-making clone traps and is made a pthread of the host libc's
+    on a stack of ours (monitor/thread.c), entering the guest by
+    rt_sigreturn on a frame built from the trap. The guest's robust list
+    and clear_child_tid stay the kernel's, untrapped: the new thread sets
+    the clone's (none, CLONE_CHILD_CLEARTID's) in place of its libc's, so
+    the kernel processes the guest's when the thread dies, however it
+    dies -- a deviation from the plan's userspace walk, which a crash or a
+    SIGKILL would have skipped (LMDB's robust mutexes, for one, need it).
+  - exit traps; a guest thread of ours (not the leader) unwinds to its
+    start routine for the libc to end it, and so does one an exec's
+    de_thread ends. The leader exits by the svc: its code is the group's.
+    Its stacks -- the pthread's, the alternate one, the scratch stack -- go
+    back once it is gone (tgkill ESRCH); the scratch table gets tombstones
+    for it.
+  - sigaltstack traps: a guest thread of ours has a kernel alternate stack
+    of ours while the guest has none, so that musl's __unmapself and
+    bionic's teardown, which exit on a stack they unmapped, have somewhere
+    for that exit's SIGSYS frame; the guest is answered with its own.
+    Armed SS_AUTODISARM where the kernel has it (4.7): a handler leaves
+    the alternate stack for its scratch stack, and a SIGSYS -- the one
+    signal it cannot block -- coming before it has disarmed it was put at
+    the alternate stack's top, over the frames of the handler it
+    interrupted (m18's spinafter, which kicks a spinning thread by SIGSYS,
+    hung or died "stack smashing detected" two runs in three). Probed at
+    startup; before 4.7 the window stays, as it was for a guest's own.
+  - The handler's entry finds the host context of the thread it lands on
+    by tid (TPIDR_EL0 and x18, Bionic's shadow call stack), the main
+    thread's for any other. A fork child keys its one thread anew.
+  - A plain fork (SIGCHLD and the tid words, a vfork converted) is the
+    libc's fork(), its state right in the child; the tid words and
+    clear_child_tid are then set as the guest's call asked.
+  - glibc: mallopt(M_ARENA_MAX, 1), so that our threads allocate from the
+    brk heap the exec sweep keeps, not from an mmap'd arena it would take.
+    And its first pthread_create installs handlers of its own for
+    SIGCANCEL and SIGSETXID (late_init), which are the guest's glibc's
+    signals too: a setuid in a threaded guest broadcast SIGSETXID and ran
+    the host's handler, which crashed (m9's setter rows, m7's setgroups
+    race, on the first run). The deferred setup is now made at startup by
+    a thread that does nothing, before the guest's dispositions exist, and
+    the two are kept around every pthread_create besides.
+  - Tests: m8 clonethr (raw clones: Go's shape and glibc's, the tid words
+    and CHILD_CLEARTID's wake, CLONE_FILES, the mask, no alternate stack,
+    the kernel's refusals, a robust mutex's EOWNERDEAD after its owner
+    thread exits; differential), m8 execthr (five execs from four threads
+    each: no growth -- the build before this grew 5280 kB, every killed
+    thread's scratch stack kept).
+  - Open: a thread without CLONE_FS gets a private fs from the kernel, but
+    the monitor keeps one guest cwd a process (path.c), so its chdir is
+    the process's (as before; the clonethr row is a named skip). Bionic's
+    per-thread mappings made inside pthread_create are not recorded for
+    the exec sweep (a fork child's stale g_thread_list would then point
+    into swept memory): the device round. CLONE_VM without CLONE_THREAD
+    (a process sharing the address space) answers EINVAL.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

@@ -519,6 +519,10 @@ int cng_dethread_doomed(void) {
  * thread is shown, and the per-task ptrace state goes back with the task. */
 void cng_dethread_die(void) {
     cng_pt_exit_report(9 /*SIGKILL*/);
+    /* A guest thread of ours leaves through its start routine, as from an
+     * exit of its own (thread.c), for its libc to end it. */
+    if (cng_thread_unwinds())
+        cng_thread_exit();
     for (;;)
         sys_exit(0);
 }
@@ -1466,6 +1470,9 @@ void cng_exec_generation(const struct cng_loaded *prog,
          * ranges above cannot describe. Both live and dead are settled by now,
          * so the sweep can tell them from what it is here to reclaim. */
         memcpy(g_gen_live, neu, sizeof g_gen_live);
+        /* The stacks of the threads de_thread ended are ours: given back
+         * here, not swept. */
+        cng_thread_reclaim();
         exec_sweep();
         return;
     }
@@ -2387,7 +2394,15 @@ extern const unsigned int __rseq_size __attribute__((weak));
 #define CNG_RSEQ_SIG 0xd428bc00u
 
 void cng_entry_reset(void) {
+    cng_thread_warmup();
     reset_dispositions(0);
+    cng_rseq_drop_host();
+}
+
+/* The libc's rseq registration of the calling thread, given back: at the
+ * guest's entry, and in a guest thread of ours before it enters the guest
+ * (thread.c), whose libc registered one as it started it. */
+void cng_rseq_drop_host(void) {
     if (&__rseq_size && &__rseq_offset && __rseq_size) {
         unsigned long tp;
         __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));

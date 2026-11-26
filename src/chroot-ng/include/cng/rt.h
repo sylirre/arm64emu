@@ -66,11 +66,13 @@ static inline unsigned long cng_image_hi(void) { return (unsigned long)_end; }
  * what mapping it would have to cover. */
 int cng_hits_image(unsigned long addr, unsigned long len);
 
-/* The thread pointer the libc gave the thread main() runs on: the host
- * context every handler of ours switches to on entry (monitor/hentry.S), and
- * back from on its way out. A guest thread's own is the guest's to set, and
- * whatever it is -- 0, a TCB of the guest's libc, Go's -- no code of ours runs
- * on it but what the gate and the bounce run in guest context. */
+/* The thread pointer the libc gave the thread main() runs on (in a fork child,
+ * the one thread's). A handler of ours switches to the host context of the
+ * thread it lands on (monitor/hentry.S, monitor/thread.c): a guest thread of
+ * ours has its pthread's, any other thread this one. A guest thread's own is
+ * the guest's to set, and whatever it is -- 0, a TCB of the guest's libc,
+ * Go's -- no code of ours runs on it but what the gate and the bounce run in
+ * guest context. */
 extern unsigned long cng_host_tp __attribute__((visibility("hidden")));
 
 /* The host's executable segments (rt/hostcode.c): up to `max` [lo, hi) pairs

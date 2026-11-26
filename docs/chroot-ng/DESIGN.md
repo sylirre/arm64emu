@@ -266,6 +266,36 @@ exec-permitted mount keeps its real file mapping, its page-cache sharing and
 its identity in `/proc/self/maps`; only `MAP_PRIVATE` can be served this way,
 since a copy cannot carry `MAP_SHARED`'s visibility.
 
+**The host's own code is let through as the gate is.** The libc chroot-ng runs
+on makes syscalls of its own once the monitor calls into it -- a thread's
+creation, its signal masks, fork, the heap -- so every filter of ours admits a
+syscall whose instruction pointer is in an executable segment of an object the
+dynamic linker loaded: our image, and the libc and its loader where they are
+apart from it. The vDSO is left out, and so is a section of ours, `cngtrap`,
+which holds the two svcs that are to trap (the filter probe, the bounce's
+completion). The guest's images are none of these: our loader maps them.
+
+**Guest threads are the host's.** A clone that makes a thread is trapped and
+made as a pthread of the host libc's on a stack of ours (`monitor/thread.c`),
+which enters the guest by `rt_sigreturn` on a frame built from the trap: the
+parent's registers with x0 = 0 and the new stack, its FP/SIMD registers, its
+mask, and `CLONE_SETTLS`'s thread pointer or the parent's. The new thread first
+gives back what its libc gave it that a kernel's new thread has none of (rseq,
+a robust list, a clear_child_tid) and takes what the clone asked for
+(`CLONE_CHILD_CLEARTID`, the tid words, a private descriptor table or fs). The
+guest's robust list and clear_child_tid stay the kernel's, untrapped, so the
+kernel processes them when the thread dies however it dies. A thread's exit is
+trapped and unwinds to its start routine, for the libc to end the thread as it
+ends its own -- the leader's is the kernel's, its code being the group's -- and
+an exec's de_thread ends its siblings the same way. Each thread of ours has a
+kernel alternate signal stack of ours while the guest has none, so the SIGSYS
+frame of an exit made after unmapping the thread's own stack (musl's
+`__unmapself`, bionic's teardown) has somewhere to go; `sigaltstack` is trapped
+and answers with the guest's own. A plain fork is the libc's `fork()`, the
+tid words then the guest's call's. The handler's entry switches to the host
+context of the thread it lands on -- the pthread's TCB and shadow call stack --
+found by tid.
+
 **The filter is the whole of the interception.** When it cannot be installed
 there is nothing left that intercepts, and the invocation — a rootfs, binds,
 `-u`, `-l`, `--shared-proc` — cannot be delivered at all, so `cng_run` refuses

@@ -308,9 +308,25 @@ unsigned long cng_host_tp;
 uintptr_t __stack_chk_guard __attribute__((visibility("hidden")));
 #endif
 
+void cng_thread_main(unsigned long tp, unsigned long x18);
+
+/* glibc's malloc gives every thread that allocates an arena of its own,
+ * mmap'd -- memory the exec sweep, which keeps the heap and what we record,
+ * would take for the guest's. Our threads (monitor/thread.c) allocate through
+ * pthread_create, so the arena is the main one, the brk heap, for all. */
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 __attribute__((no_stack_protector))
 int main(int argc, char **argv, char **envp) {
-    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(cng_host_tp));
+    unsigned long x18;
+    __asm__ volatile("mrs %0, tpidr_el0\n\tmov %1, x18"
+                     : "=r"(cng_host_tp), "=r"(x18));
+    cng_thread_main(cng_host_tp, x18);
+#ifdef __GLIBC__
+    mallopt(M_ARENA_MAX, 1);
+#endif
     char **p = envp;
     while (*p)
         p++;

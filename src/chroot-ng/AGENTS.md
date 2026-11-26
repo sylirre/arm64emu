@@ -38,8 +38,10 @@ raw syscalls through the gate only, its own formatting helpers. Every handler
 it installs is entered through monitor/hentry.S, which switches to the host's
 thread pointer and back; the guest's FP/SIMD registers are kept by the signal
 frame, and in a dispatch bounced to guest context by the gate's save area
-(rt/gate.S; the Makefile has the story). The libc's startup runs before
-`main`; what it leaves that an execve would
+(rt/gate.S; the Makefile has the story). Guest threads are pthreads of the
+host libc's (monitor/thread.c), and every filter lets the host's own code
+through by instruction pointer, as it does the gate. The libc's startup runs
+before `main`; what it leaves that an execve would
 not (handlers, an alternate stack, an rseq area, the thread pointer) is undone
 before the guest's first instruction, and the kernel's program break is the
 libc's, the guest's being emulated (monitor/brk.c).

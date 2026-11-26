@@ -499,8 +499,10 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
     /* sigaltstack is the same kind of call: state the sigreturn restores from
      * the frame, so it is answered there (sigsys_altstack). */
     if (nr == __NR_sigaltstack) {
-        r[0] = (unsigned long long)sigsys_altstack(uc, (const void *)r[0],
-                                                   (void *)r[1]);
+        long rr;
+        if (!cng_thread_altstack(uc, (const void *)r[0], (void *)r[1], &rr))
+            rr = sigsys_altstack(uc, (const void *)r[0], (void *)r[1]);
+        r[0] = (unsigned long long)rr;
         return 1;
     }
 
@@ -520,6 +522,14 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
      * fork, and the child's stack goes into the context for sigreturn to
      * install (cng_clone_convert has the whole story). */
     if (nr == __NR_clone) {
+        unsigned long fl = (unsigned long)r[0];
+        if ((fl & CNG_CLONE_VM) && !(fl & CNG_CLONE_VFORK)) {
+            unsigned char fp[528];
+            cng_frame_fpsimd(uc, fp);
+            r[0] = (unsigned long long)cng_thread_clone(
+                ur, fp, uc->uc_sigmask.sig[0], cng_guest_tp());
+            return 1;
+        }
         cng_clone_convert(ur);
         return 1;
     }
@@ -839,9 +849,18 @@ static int cng_scratch_slot(long tid) {
     if (cng_g_scratch_none)
         return -1;
     unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+    /* A slot given back (cng_scratch_release) is -1: the probe goes on past
+     * it, since the tid may be further along, and takes the first such once
+     * the end shows the tid is not there. */
+    int tomb = -1;
     for (unsigned k = 0; k < CNG_SCR_N; k++) {
         unsigned i = (h + k) % CNG_SCR_N;
         long t = cng_scr[i].tid;
+        if (t == -1 && tomb < 0)
+            tomb = (int)i;
+        if (t == 0 && tomb >= 0 &&
+            cng_claim_slot(&cng_scr[tomb].tid, -1, tid))
+            return scr_map((unsigned)tomb) == 0 ? tomb : -1;
         if (t == tid)
             /* Ours, but the stack is published after the TID, so a re-entry
              * landing between the two would be handed a slot with no stack and
@@ -1067,7 +1086,7 @@ void cng_handler_run(int sig, cng_siginfo_t *si, void *uc, struct cng_tps *t) {
         sig > 0 && sig <= 64 ? __atomic_load_n(&g_hfn[sig], __ATOMIC_ACQUIRE) : 0;
     int i = cng_scratch_slot(sys_gettid());
     if (i >= 0) {
-        t->prev = t->tp == cng_host_tp ? cng_scr[i].tps : 0;
+        t->prev = t->tp == t->host ? cng_scr[i].tps : 0;
         cng_scr[i].tps = t;
     }
     if (fn)
@@ -1090,7 +1109,7 @@ unsigned long *cng_tp_slot(void) {
  * the guest. */
 unsigned long *cng_guest_tp_slot(void) {
     for (struct cng_tps *t = tps_cur(); t; t = t->prev)
-        if (t->tp != cng_host_tp)
+        if (t->tp != t->host)
             return &t->tp;
     return 0;
 }
@@ -1407,6 +1426,66 @@ void cng_scratch_leave(void) {
     int i = cng_scratch_slot(sys_gettid());
     if (i >= 0)
         cng_scr[i].busy = 0;
+}
+
+/* A thread that has left for good gives its slot back, stack and all, once
+ * it is off that stack (thread.c, as its start routine returns). */
+void cng_scratch_release(long tid) {
+    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+    for (unsigned k = 0; k < CNG_SCR_N; k++) {
+        unsigned i = (h + k) % CNG_SCR_N;
+        long t = __atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE);
+        if (t == 0)
+            return;
+        if (t != tid)
+            continue;
+        unsigned long lo = cng_scr[i].lo;
+        __atomic_store_n(&cng_scr[i].hi, 0, __ATOMIC_RELEASE);
+        if (lo)
+            scr_unmap(lo);
+        cng_scr[i].lo = 0;
+        cng_scr[i].busy = 0;
+        cng_scr[i].uc = 0;
+        cng_scr[i].sigfull = 0;
+        cng_scr[i].gf = 0;
+        cng_scr[i].attach = 0;
+        cng_scr[i].inh = 0;
+        cng_scr[i].tps = 0;
+        __atomic_store_n(&cng_scr[i].tid, -1, __ATOMIC_RELEASE);
+        return;
+    }
+}
+
+void cng_scratch_gone(void) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0)
+        return;
+    cng_scr[i].busy = 0;
+    cng_scr[i].uc = 0;
+    cng_scr[i].gf = 0;
+    cng_scr[i].tps = 0;
+    cng_scr[i].attach = 0;
+    cng_scr[i].inh = 0;
+}
+
+/* The FP/SIMD registers of the frame `uc`, as a user_fpsimd_state: its
+ * FPSIMD record's q registers, fpsr and fpcr, which every frame has. */
+void cng_frame_fpsimd(const struct cng_ucontext *uc, void *out) {
+    unsigned char *o = out;
+    memset(o, 0, 528);
+    const unsigned char *p = uc->uc_mcontext.__reserved;
+    const unsigned char *end = p + sizeof uc->uc_mcontext.__reserved;
+    while (p + 8 <= end) {
+        unsigned magic = *(const unsigned *)p, size = *(const unsigned *)(p + 4);
+        if (!magic || size < 8 || size > (unsigned long)(end - p))
+            return;
+        if (magic == 0x46508001 && size >= 528) {
+            memcpy(o, p + 16, 512);
+            memcpy(o + 512, p + 8, 8);
+            return;
+        }
+        p += size;
+    }
 }
 
 /* Is a signal pending that the guest would take delivery of?

@@ -248,6 +248,35 @@ void cng_timer_forget(int id);
  * libc's rseq registration (execve.c). Before anything of the monitor's is
  * installed. */
 void cng_entry_reset(void);
+void cng_rseq_drop_host(void);
+
+/* Guest threads as the host's own (thread.c): a thread-making clone made as a
+ * pthread that enters the guest with the trapping thread's registers `ur`,
+ * FP/SIMD registers `fp` (a user_fpsimd_state), signal mask and thread
+ * pointer -- the tid, or -errno; whether this thread's exit unwinds to its
+ * start routine (a guest thread of ours that is not the leader), and the
+ * unwind; the fork child's fix-up; the stacks of threads that are gone, given
+ * back; the main thread's host context, from main(); and sigaltstack for a
+ * guest thread of ours (1 when answered, with the result in *ret). */
+struct cng_ucontext;
+struct cng_uregs;
+long cng_thread_clone(const struct cng_uregs *ur, const void *fp,
+                      unsigned long mask, unsigned long gtp);
+int cng_thread_unwinds(void);
+void cng_thread_exit(void) __attribute__((noreturn));
+void cng_thread_fork_child(void);
+void cng_thread_reclaim(void);
+void cng_thread_main(unsigned long tp, unsigned long x18);
+long cng_host_fork(void);
+void cng_thread_warmup(void);
+int cng_thread_altstack(struct cng_ucontext *uc, const void *uss, void *uoss,
+                        long *ret);
+/* This thread's scratch slot, given up for good: the thread is leaving
+ * through no frame of ours (sigsys.c). */
+void cng_scratch_gone(void);
+void cng_scratch_release(long tid);
+/* The FP/SIMD registers of a signal frame, as a user_fpsimd_state. */
+void cng_frame_fpsimd(const struct cng_ucontext *uc, void *out);
 void cng_rseq_note(unsigned long area, unsigned long len, unsigned int sig);
 void cng_rseq_forget(void);
 /* Across a trapped fork: the forking thread's entry, sampled before the clone,
@@ -620,6 +649,7 @@ void *cng_sig_entry(int sig, cng_sighandler_t h);
 struct cng_tps {
     unsigned long tp;
     struct cng_tps *prev;
+    unsigned long host; /* the thread pointer the handler runs on */
 };
 /* The innermost handler's slot on this thread (0: none) -- what the frame
  * it returns through resumes with, which an emulated execve sets to 0 -- and

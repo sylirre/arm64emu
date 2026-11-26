@@ -93,6 +93,14 @@ struct cng_open_how {
 #define CNG_CLONE_VM     0x00000100
 #define CNG_CLONE_VFORK  0x00004000
 #define CNG_CLONE_SETTLS 0x00080000
+#define CNG_CLONE_FS          0x00000200
+#define CNG_CLONE_FILES       0x00000400
+#define CNG_CLONE_SIGHAND     0x00000800
+#define CNG_CLONE_THREAD      0x00010000
+#define CNG_CLONE_SYSVSEM     0x00040000
+#define CNG_CLONE_PARENT_SETTID 0x00100000
+#define CNG_CLONE_CHILD_CLEARTID 0x00200000
+#define CNG_CLONE_CHILD_SETTID 0x01000000
 
 /* fcntl ops (the subset the monitor issues) */
 #define CNG_F_DUPFD          0
