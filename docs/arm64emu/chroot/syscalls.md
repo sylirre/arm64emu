@@ -1777,7 +1777,9 @@ then make the consequences the caller depends on true:
   targets during the walk (`path_proc_magic`), so `stat /proc/self/exe` reaches
   the guest binary and `/proc/self/root/…` resolves inside the rootfs instead of
   escaping to the host fs; `readlinkat` reports the same guest targets, and
-  strips the rootfs prefix from `fd/N` link targets. This covers every "this
+  strips the rootfs prefix from `fd/N` link targets -- by name, and through an
+  `O_PATH|O_NOFOLLOW` descriptor of the link with an empty name, which used to
+  read back the emulator's own binary (`tests/arm64emu/chroot/fixtures/proclink.c`). This covers every "this
   process" spelling the kernel offers — `self`, the own-pid form, `thread-self`,
   and the `task/<tid>` sub-path of any of them for one of our own threads
   (`proc_self_tail`, shared with the synthesized-file classifier so both agree)
@@ -2371,8 +2373,9 @@ guest).
 ## `execve`
 
 `do_execve` (`src/arm64emu/chroot/sys_proc.c`) resolves the target through `path.c`, checks that
-the guest may **execute** it, handles a `#!` shebang loop (depth 4, rebuilding
-argv), and for an ELF64/AArch64 file performs an **in-process reload**: tear down
+the guest may **execute** it, handles a `#!` shebang loop (five scripts and the
+program they end in, `exec_binprm`'s bound from 5.8; it used to stop at four),
+rebuilding argv, and for an ELF64/AArch64 file performs an **in-process reload**: tear down
 the address space, close CLOEXEC fds, reset signal handlers, and `load_elf`.
 
 The `#!` line is read the way `load_script` (binfmt_script.c, 5.1+) reads it,
@@ -2484,8 +2487,10 @@ The **filename** an exec carries is the one it was GIVEN. A kernel keeps
 symlink is not followed for it, a script's is the script's — and makes it
 `AT_EXECFN`, the process's `comm` (`kbasename` of it) and a string the argument
 budget measures. `do_execve` hands `load_elf` that string (`execfn`) beside the
-canonical path (`canon`), which is for `/proc/self/exe` and the mapping names;
-it used to hand all of it the canonical one, so a program run through a symlink
+canonical path (`canon`), which is for `/proc/self/exe` and the mapping names
+-- the file's own name when it was run through one of the caller's descriptors
+(`/proc/self/fd/N`, `execveat`'s `AT_EMPTY_PATH`), as `d_path` names it, and not
+the fd link the walk ended on; it used to hand all of it the canonical one, so a program run through a symlink
 was told its target's name. That matters to anything that dispatches on it:
 uutils' coreutils takes its utility from `argv[0]` only when
 `basename(AT_EXECFN) == basename(argv[0])`, and otherwise from `AT_EXECFN`, so
@@ -2544,7 +2549,10 @@ format — what a shell's "cannot execute binary file" and an `execvp` `PATH` wa
 read) or `ENOENT` (no such interpreter). The kernel makes the same two checks in
 the same order, ahead of its own `begin_new_exec`. `elf_header_check` is the
 single validator: the probe runs it, and `load_one` runs it again on the way to
-loading, so the two can never drift apart.
+loading, so the two can never drift apart. A `PT_INTERP` is judged in
+`load_elf_binary`'s order: a length outside 2..`PATH_MAX` is `ENOEXEC`, a string
+past the end of the file `EIO` (`elf_read`), one whose last byte is no NUL
+`ENOEXEC` (`tests/arm64emu/chroot/fixtures/elfinterp.c`).
 
 What a kernel does *not* decide before committing is whether the segments
 themselves are loadable — `binfmt_elf` checks those after `begin_new_exec`, and

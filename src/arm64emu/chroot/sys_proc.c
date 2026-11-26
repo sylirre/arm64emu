@@ -3308,8 +3308,10 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
      * on every path: the loop below cannot reach its break without a check
      * that filled this in. */
     struct stat img_st = {0};
+    /* exec_binprm's bound, `depth > 5`: five #! files and the program they end
+     * in (5.8 on, which the advertised 6.1 is). This stopped a level short. */
     for (int depth = 0; ; depth++) {
-        if (depth > 4) { free_execvecs(argv, envp); return (u64)(s64)-ELOOP; }
+        if (depth > 5) { free_execvecs(argv, envp); return (u64)(s64)-ELOOP; }
         int r = path_resolve(m, G_AT_FDCWD, pathbuf, 0, pin.host, canon);
         if (r < 0) { free_execvecs(argv, envp); return (u64)(s64)r; }
         /* Pinned so that no component of the path can be turned into a symlink
@@ -3566,6 +3568,21 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
     if (!m->link2symlink ||
         path_resolve(m, G_AT_FDCWD, pathbuf, PATH_STOP_AT_L2S, shown_host, shown) < 0)
         snprintf(shown, sizeof shown, "%s", canon);
+    /* An image run through one of our descriptors -- execve of /proc/self/fd/N,
+     * execveat's AT_EMPTY_PATH -- is shown under the file's own name, d_path of
+     * what the descriptor holds, and not the fd link the walk ended on. */
+    int sfd = proc_own_fd_path(shown);
+    if (sfd >= 0) {
+        char lk[64], t[PATH_MAX], opened[PATH_MAX];
+        snprintf(lk, sizeof lk, "/proc/self/fd/%d", sfd);
+        ssize_t tn = readlink(lk, t, sizeof t - 1);
+        if (tn > 0) {
+            t[tn] = 0;
+            if (fdname_get(m, sfd, t, opened)) strcpy(t, opened);
+            else path_strip_rootfs(m, t);
+            snprintf(shown, sizeof shown, "%s", t);
+        }
+    }
     int r = load_elf(m, imgfd, ifd, shown, gpath, argv, envp);
     exec_close_image(imgfd);
     if (ifd >= 0) exec_close_image(ifd);

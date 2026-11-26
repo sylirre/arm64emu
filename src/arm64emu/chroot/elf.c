@@ -88,11 +88,15 @@ static int elf_header_check(int fd, char *interp) {
         return -ENOEXEC;
     for (int i = 0; i < eh.e_phnum; i++) {
         if (ph[i].p_type != PT_INTERP) continue;
-        if (ph[i].p_filesz == 0 || ph[i].p_filesz >= PATH_MAX) return -ENOEXEC;
+        /* load_elf_binary's order: a length outside [2, PATH_MAX] is ENOEXEC,
+         * a string past the end of the file EIO (elf_read), and one with no
+         * NUL as its last byte ENOEXEC. A one-byte string used to be looked up
+         * as a name (ENOENT), and one past the end was ENOEXEC. */
+        if (ph[i].p_filesz < 2 || ph[i].p_filesz > PATH_MAX) return -ENOEXEC;
         if (pread(fd, interp, ph[i].p_filesz, (off_t)ph[i].p_offset) !=
             (ssize_t)ph[i].p_filesz)
-            return -ENOEXEC;
-        interp[ph[i].p_filesz] = 0;
+            return -EIO;
+        if (interp[ph[i].p_filesz - 1]) return -ENOEXEC;
         break;
     }
     return 0;

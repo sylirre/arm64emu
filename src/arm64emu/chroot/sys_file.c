@@ -1938,9 +1938,19 @@ SYSDEF(readlinkat) {
         char lbuf[PATH_MAX];
         ssize_t ln = readlinkat((int)(s32)a0, "", lbuf, sizeof lbuf - 1);
         if (ln < 0) return host_err();
-        size_t out = (size_t)ln < cap ? (size_t)ln : cap;
-        if (copy_to_guest(c, a2, lbuf, out) < 0) return (u64)(s64)-EFAULT;
-        return out;
+        /* One of procfs's links (exe, cwd, root, an fd's) names the emulator's
+         * state or a host path: it is answered as its name is below, which is
+         * the name the kernel gives the descriptor. */
+        char self[64], nm[PATH_MAX];
+        snprintf(self, sizeof self, "/proc/self/fd/%d", (int)(s32)a0);
+        ssize_t kn = readlink(self, nm, sizeof nm - 1);
+        if (kn > 0) nm[kn] = 0;
+        if (kn <= 0 || strncmp(nm, "/proc/", 6)) {
+            size_t out = (size_t)ln < cap ? (size_t)ln : cap;
+            if (copy_to_guest(c, a2, lbuf, out) < 0) return (u64)(s64)-EFAULT;
+            return out;
+        }
+        strcpy(gpath, nm);
     }
     PathPin pin;
     char canon[PATH_MAX];
