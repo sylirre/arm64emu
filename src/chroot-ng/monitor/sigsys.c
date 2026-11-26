@@ -31,7 +31,7 @@ extern void cng_sigrestore(void); /* src/chroot-ng/monitor/sig.S */
 int cng_sig_install(int signo, cng_sighandler_t h) {
     struct cng_ksigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.handler = (void *)h;
+    sa.handler = cng_sig_entry(signo, h);
     /* SA_NODEFER keeps SIGSYS unmasked inside the handler: when we re-issue a
      * translated syscall through the gate and Android's own seccomp filter
      * blocks it, a *nested* SIGSYS must be deliverable (a masked seccomp SIGSYS
@@ -113,6 +113,11 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
  * own rules. */
 struct cng_bounce {
     unsigned long magic;
+    /* Where cng_bounce_dispatch runs the dispatch (BOUNCE_DISP), read by the
+     * assembly at these offsets: the top of a stack of ours (0: none, run in
+     * place), the busy flag of the slot it is (0: a stack mapped for the
+     * call), and that mapping's extent, given back after. */
+    unsigned long stk, busyp, temp, templen;
     unsigned long long regs[31], sp, pc, pstate; /* a struct cng_uregs */
     unsigned long set;    /* the stripped sigset */
     unsigned long sel[2]; /* pselect6's {sigset *, size} */
@@ -123,6 +128,11 @@ struct cng_bounce {
                                  * stop: what a restart is made with */
 };
 #define CNG_BOUNCE_MAGIC 0x636e67426f756e63UL
+_Static_assert(__builtin_offsetof(struct cng_bounce, stk) == 8 &&
+                   __builtin_offsetof(struct cng_bounce, busyp) == 16 &&
+                   __builtin_offsetof(struct cng_bounce, temp) == 24 &&
+                   __builtin_offsetof(struct cng_bounce, templen) == 32,
+               "rt/gate.S reads these at fixed offsets");
 #define BOUNCE_WAIT 0 /* a mask-taking wait, its mask the record's copy */
 #define BOUNCE_RAW  1 /* the guest's call as it stands */
 #define BOUNCE_DISP 2 /* the dispatch, from guest context */
@@ -148,15 +158,23 @@ static void bounce_fill(struct cng_bounce *b, const struct cng_ucontext *uc,
     b->pstate = uc->uc_mcontext.pstate;
 }
 
+static void bounce_stack(struct cng_bounce *b);
+static void scr_temp_free(unsigned long base);
+
 /* A bounce of the guest's own call (BOUNCE_RAW) or of its dispatch
  * (BOUNCE_DISP). 0 when there is no room below the guest's sp, and the caller
  * makes the call in the handler, as every call was made before. */
 static int bounce_call(struct cng_ucontext *uc, long nr, int kind) {
     struct cng_bounce b;
     bounce_fill(&b, uc, kind, nr);
+    if (kind == BOUNCE_DISP)
+        bounce_stack(&b);
     unsigned long rec = bounce_rec(uc);
-    if (cng_user_copyout((void *)rec, &b, sizeof b) < 0)
+    if (cng_user_copyout((void *)rec, &b, sizeof b) < 0) {
+        if (b.temp)
+            scr_temp_free(b.temp + cng_page_size);
         return 0;
+    }
     uc->uc_mcontext.sp = rec;
     if (kind == BOUNCE_RAW) {
         uc->uc_mcontext.regs[8] = (unsigned long long)nr;
@@ -168,9 +186,13 @@ static int bounce_call(struct cng_ucontext *uc, long nr, int kind) {
     return 1;
 }
 
-/* cng_bounce_dispatch's call into the dispatcher, with the record. */
-void cng_bounce_dispatch_c(struct cng_bounce *b) {
-    cng_dispatch_bounced((struct cng_uregs *)&b->regs[0], b->nr, b->owed);
+/* cng_bounce_dispatch's call into the dispatcher, with the record, on the
+ * stack the gate switched to; `gsp` is the guest's sp it left (0 when it
+ * stays on the guest's stack), `fpsave` the guest's FP/SIMD registers. */
+void cng_bounce_dispatch_c(struct cng_bounce *b, void *fpsave,
+                           unsigned long gsp) {
+    cng_dispatch_bounced((struct cng_uregs *)&b->regs[0], b->nr, b->owed, gsp,
+                         fpsave);
 }
 
 /* Which argument carries the sigset pointer, and where its size is; -1 for
@@ -316,10 +338,14 @@ int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
     unsigned long long *r = uc->uc_mcontext.regs;
     unsigned long wait = (unsigned long)cng_bounce_wait,
                   disp = (unsigned long)cng_bounce_dispatch,
+                  ddone = (unsigned long)cng_bounce_dispatch_done,
                   done = (unsigned long)__cng_gate_end;
+    /* The dispatch's entry is its first two instructions, which read the
+     * record and nothing else; it is done from the label on, the stack and
+     * the guest's FP/SIMD registers back as they were. */
     int at_wait = pc == wait, after_wait = pc == wait + 4,
         at_disp = pc == disp || pc == disp + 4,
-        after_disp = pc == disp + 8 || pc == disp + 12, at_done = pc == done;
+        after_disp = pc == ddone || pc == ddone + 4, at_done = pc == done;
     if (!at_wait && !after_wait && !at_disp && !after_disp && !at_done)
         return CNG_UNWIND_NONE;
     struct cng_bounce b;
@@ -344,6 +370,9 @@ int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
     if (ox)
         *ox = b.orig_x0;
     if (undo) {
+        /* A stack mapped for a dispatch that will not run now. */
+        if (at_disp && b.temp)
+            scr_temp_free(b.temp + cng_page_size);
         /* ...from orig_x0: the restart do_signal sets up, whatever a tracer
          * changed at the entry stop. */
         bounce_restore(uc, &b, b.orig_x0);
@@ -673,7 +702,7 @@ static struct {
      * is what the exec's de_thread reads to leave a thread that is leaving. */
     int sigfull;
     /* The innermost dispatch this thread is running from guest context
-     * (cng_run_scratch_in), for a ptrace stop that lands inside it. */
+     * (cng_run_bounced), for a ptrace stop that lands inside it. */
     struct cng_gframe *gf;
     /* A ptrace request carried by SIGSYS that landed where no stop can be
      * taken, left for the handler it interrupted to take (sigsys_kick); and
@@ -687,6 +716,9 @@ static struct {
     struct {
         unsigned long long pc, sp, x0, x1, x2, x8, x30;
     } back;
+    /* The thread pointer the innermost handler of ours on this thread found
+     * and gives back (cng_handler_run). */
+    struct cng_tps *tps;
 } cng_scr[CNG_SCR_N];
 
 /* Claim `*p` from `want` to `tid` (inline LL/SC so we need no libgcc atomics
@@ -839,6 +871,7 @@ static int cng_scratch_slot(long tid) {
         cng_scr[i].gf = 0;
         cng_scr[i].attach = 0;
         cng_scr[i].inh = 0;
+        cng_scr[i].tps = 0;
         memset(&cng_scr[i].back, 0, sizeof cng_scr[i].back);
         /* Its owner can have died between claiming the slot and mapping it. */
         if (!cng_scr[i].hi && scr_map(i) != 0)
@@ -846,6 +879,32 @@ static int cng_scratch_slot(long tid) {
         return (int)i;
     }
     return -1;
+}
+
+static unsigned long scr_temp(void);
+
+/* Where a dispatch bounced to guest context is to run (rt/gate.S,
+ * cng_bounce_dispatch): this thread's scratch stack, which the handler
+ * setting the bounce up stands on and leaves as it returns -- the gate marks
+ * it busy again once it is on it -- or, when the handler is not on it (an
+ * outer dispatch holds the slot, or there is no slot), a stack mapped for the
+ * call and given back after it. With neither, nothing is set, and the
+ * dispatch runs in place on the guest's stack, as it did before there was a
+ * scratch stack at all. */
+static void bounce_stack(struct cng_bounce *b) {
+    int i = cng_scratch_slot(sys_gettid());
+    unsigned long sp = (unsigned long)&i;
+    if (i >= 0 && sp >= cng_scr[i].lo && sp < cng_scr[i].hi) {
+        b->stk = cng_scr[i].hi;
+        b->busyp = (unsigned long)&cng_scr[i].busy;
+        return;
+    }
+    unsigned long base = scr_temp();
+    if (!base)
+        return;
+    b->stk = (base + CNG_SCR_SZ) & ~15UL;
+    b->temp = base - cng_page_size;
+    b->templen = CNG_SCR_SZ + 2 * cng_page_size;
 }
 
 /* A thread of a program that calls pthread_exit on a detached thread — bionic
@@ -978,6 +1037,78 @@ static void takeover_on_scratch(void *ucv, void *si) {
         CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
     }
     cng_exec_takeover_frame(uc);
+}
+
+/* ---- the host context of our handlers ----
+ *
+ * Every handler of ours is entered through cng_hentry (hentry.S), which saves
+ * the thread pointer the signal interrupted into a struct cng_tps on its own
+ * frame and runs the handler on the host's; the C side is here. The table
+ * says which handler each signal of ours runs: dispositions are process-wide,
+ * and so is this. */
+extern void cng_hentry(int, cng_siginfo_t *, void *);
+static cng_sighandler_t g_hfn[65];
+
+void *cng_sig_entry(int sig, cng_sighandler_t h) {
+    if (sig > 0 && sig <= 64)
+        __atomic_store_n(&g_hfn[sig], h, __ATOMIC_RELEASE);
+    return (void *)cng_hentry;
+}
+
+/* The slot is published as this thread's innermost for as long as the
+ * handler runs. One whose saved pointer is not the host's interrupted the
+ * guest -- its own code, or a dispatch running in guest context -- and has
+ * no handler of ours below it on this thread: a handler that interrupted
+ * one of ours finds the host's there, and chains onto the one it
+ * interrupted. A table with no slot for this thread publishes nothing, and
+ * the slot is then only the frame's own. */
+void cng_handler_run(int sig, cng_siginfo_t *si, void *uc, struct cng_tps *t) {
+    cng_sighandler_t fn =
+        sig > 0 && sig <= 64 ? __atomic_load_n(&g_hfn[sig], __ATOMIC_ACQUIRE) : 0;
+    int i = cng_scratch_slot(sys_gettid());
+    if (i >= 0) {
+        t->prev = t->tp == cng_host_tp ? cng_scr[i].tps : 0;
+        cng_scr[i].tps = t;
+    }
+    if (fn)
+        fn(sig, si, uc);
+    if (i >= 0)
+        cng_scr[i].tps = t->prev;
+}
+
+static struct cng_tps *tps_cur(void) {
+    int i = cng_scratch_slot(sys_gettid());
+    return i >= 0 ? cng_scr[i].tps : 0;
+}
+
+unsigned long *cng_tp_slot(void) {
+    struct cng_tps *t = tps_cur();
+    return t ? &t->tp : 0;
+}
+
+/* The slot holding the guest's own: the outermost, the one that interrupted
+ * the guest. */
+unsigned long *cng_guest_tp_slot(void) {
+    for (struct cng_tps *t = tps_cur(); t; t = t->prev)
+        if (t->tp != cng_host_tp)
+            return &t->tp;
+    return 0;
+}
+
+unsigned long cng_guest_tp(void) {
+    unsigned long *p = cng_guest_tp_slot(), v;
+    if (p)
+        return *p;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v));
+    return v;
+}
+
+void cng_guest_tp_set(unsigned long v) {
+    unsigned long *p = cng_guest_tp_slot();
+    if (p)
+        *p = v;
+    else
+        __asm__ volatile("msr tpidr_el0, %0" ::"r"(v));
 }
 
 /* ---- a ptrace request carried by SIGSYS ----
@@ -1226,47 +1357,26 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     cng_scr[i].busy = 0;
 }
 
-/* Run `fn(arg)` on a stack of ours; 0 only when none could be had at all and the
- * caller has to run it where it stands.
- *
- * The SIGSYS handler is not the only way into the path dispatcher. A call
- * bounced to guest context (cng_dispatch_bounced) reaches the very same code
- * from an ordinary call, on the guest's own stack — which is the stack the
- * handler above refuses to use, for reasons that do not change with the route:
+/* A dispatch bounced to guest context reaches the path dispatcher from an
+ * ordinary call rather than from the handler, and on a stack the gate
+ * switched it to (rt/gate.S, cng_bounce_dispatch): this thread's scratch
+ * stack, or one mapped for the call when an outer dispatch holds it -- the
+ * guest's own will not do, for the reasons the handler's does not use it:
  * `cng_dispatch`'s own frame is ~24 KiB and a translated openat runs ~66 KiB
  * deep, against musl's 128 KiB thread stacks, Go's ~8 KiB goroutine stacks,
- * and whatever size a guest hands sigaltstack.
- *
- * Nesting is detected by the same busy flag the handler uses, and for the same
- * reason an SP range test will not do it: the re-entry need not be on the
- * scratch stack. A guest that registers a sigaltstack takes its own signals on
- * that alt-stack, and one delivered while we are mid-dispatch — the kernel
- * delivers it on the way out of a syscall we issued ourselves — makes a call
- * that traps from there. SP is then the guest's alt-stack, nowhere near
- * the scratch stack an outer invocation is still using, and switching onto it
- * again overwrites those frames. The SP test is kept alongside for the direct
- * re-entry it does catch. Either way the nested call gets a stack of its own
- * rather than the guest's, which is the one thing the guest's cannot survive. */
-static int cng_run_scratch_on(int i, unsigned long sp, void (*fn)(void *),
-                              void *arg, struct cng_gframe *f);
-
-int cng_run_scratch(void (*fn)(void *), void *arg) {
-    return cng_run_scratch_in(fn, arg, 0);
-}
-
-/* The record is published with a plain store: the only reader is a kick
- * handler on this same thread, which a signal delivery orders after it. */
-int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f) {
+ * and whatever size a guest hands sigaltstack. What is left here is the
+ * gframe, published for the kick handler as the stack switch once did. The
+ * record is published with a plain store: the only reader is a kick handler
+ * on this same thread, which a signal delivery orders after it. */
+void cng_run_bounced(void (*fn)(void *), void *arg, struct cng_gframe *f) {
     int i = cng_scratch_slot(sys_gettid());
-    unsigned long sp = (unsigned long)&i;
-    if (f && i >= 0) {
+    if (i >= 0) {
         f->prev = cng_scr[i].gf;
         cng_scr[i].gf = f;
     }
-    int ran = cng_run_scratch_on(i, sp, fn, arg, f);
-    if (f && i >= 0)
+    fn(arg);
+    if (i >= 0)
         cng_scr[i].gf = f->prev;
-    return ran;
 }
 
 struct cng_gframe *cng_gframe_cur(void) {
@@ -1283,55 +1393,7 @@ struct cng_gframe *cng_gframe_cur(void) {
     return 0;
 }
 
-/* A bounced dispatch makes its blocking call on the guest's own stack (the
- * gframe's gsp, reissue_svc in dispatch.c), and it has to be made below every
- * frame live there: a guest handler delivered while the call waits gets its
- * signal frame below that sp, and the frames between the bounce record and
- * here -- the dispatch's own, entered from the record -- are still to be
- * returned through. The call used to be made at the record, above them, and
- * survived only because the kernel writes just the parts of a signal frame it
- * uses, leaving the rest of the 4 KiB __reserved area as it was; a frame
- * written whole (an SVE register file, an emulator's) took the return
- * addresses with it. The sp here, just before the switch, is the lowest
- * address in use: cng_run_on_stack pushes nothing on this stack. */
-static inline __attribute__((always_inline)) void
-scratch_gsp(struct cng_gframe *f) {
-    if (f && f->gsp) {
-        unsigned long sp;
-        __asm__ volatile("mov %0, sp" : "=r"(sp));
-        f->gsp = sp & ~15UL;
-    }
-}
-
-/* The switch itself, for a slot already looked up (`i`, -1 for none) from a
- * caller standing at `sp`. */
-static int cng_run_scratch_on(int i, unsigned long sp, void (*fn)(void *),
-                              void *arg, struct cng_gframe *f) {
-    if (i >= 0 && !cng_scr[i].busy &&
-        !(sp >= cng_scr[i].lo && sp < cng_scr[i].hi)) {
-        cng_scr[i].busy = 1;
-        scratch_gsp(f);
-        cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, arg, 0);
-        cng_scr[i].busy = 0;
-        return 1;
-    }
-    /* No slot, or an outer dispatch is on it. Running in place is what the
-     * guest's own alt-stack cannot survive, so take a stack for this call.
-     *
-     * `fn` need not come back: an exit made from a guest-context dispatch
-     * ends the thread from inside it (cng_scratch_leave), and then this
-     * mapping is never given back -- 256 KiB, on a path reached only by an
-     * exit from inside a nested dispatch. */
-    unsigned long base = scr_temp();
-    if (!base)
-        return 0;
-    scratch_gsp(f);
-    cng_run_on_stack((void *)(base + CNG_SCR_SZ), (void *)fn, arg, 0);
-    scr_temp_free(base);
-    return 1;
-}
-
-/* Give the stack back for a call that will not return through cng_run_scratch:
+/* Give the stack back for a call that will not return through the gate:
  * an exit made from a guest-context dispatch ends the thread there. Left set,
  * the flag would send every later SIGSYS on this thread back onto the guest's
  * own stack — the thing this all exists to avoid. */

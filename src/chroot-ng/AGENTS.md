@@ -32,11 +32,14 @@ tests/chroot-ng/       run.sh + lib.sh (host detection) + one m*.sh per mileston
 docs/chroot-ng/        README.md (user guide), DESIGN.md, STATUS.md (milestone log), testing.md
 ```
 
-chroot-ng is a hosted PIE linked against its toolchain's libc, but the monitor
-calls nothing of it: raw syscalls through the gate only, its own mem/str and
-formatting helpers, and no floating point or SIMD anywhere
-(`-mgeneral-regs-only`; the Makefile explains why). The libc's startup runs
-before `main`, and is all of it that runs; what it leaves that an execve would
+chroot-ng is a hosted PIE linked against its toolchain's libc and built as an
+ordinary program, but the monitor calls nothing of the libc except mem/str:
+raw syscalls through the gate only, its own formatting helpers. Every handler
+it installs is entered through monitor/hentry.S, which switches to the host's
+thread pointer and back; the guest's FP/SIMD registers are kept by the signal
+frame, and in a dispatch bounced to guest context by the gate's save area
+(rt/gate.S; the Makefile has the story). The libc's startup runs before
+`main`; what it leaves that an execve would
 not (handlers, an alternate stack, an rseq area, the thread pointer) is undone
 before the guest's first instruction, and the kernel's program break is the
 libc's, the guest's being emulated (monitor/brk.c).

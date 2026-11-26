@@ -25,6 +25,12 @@ long cng_syscall6(long a0, long a1, long a2, long a3, long a4, long a5,
  * blocks on the guest's behalf from guest context (see gate.S). */
 long cng_syscall6_on(long a0, long a1, long a2, long a3, long a4, long a5,
                      long nr, unsigned long sp);
+/* The guest's call, for a dispatch bounced to guest context: `a` its six
+ * arguments, made on the stack `sp` (0: where the caller stands) with the
+ * guest's FP/SIMD registers loaded from `fpsave` for its length and saved back
+ * after it -- what a guest handler delivered while it blocks finds, and may
+ * change, in its frame (gate.S). */
+long cng_syscall_window(const long *a, long nr, unsigned long sp, void *fpsave);
 
 /* Linker-provided bounds of the gate (see gate.S). */
 extern char __cng_gate_start[];
@@ -34,6 +40,7 @@ extern char __cng_gate_end[];
  * whole dispatch — and where the completion of either traps. */
 extern char cng_bounce_wait[];
 extern char cng_bounce_dispatch[];
+extern char cng_bounce_dispatch_done[];
 extern char cng_bounce_svc_end[];
 
 /* The kickable wait in the gate (see gate.S): wait4/waitid `nr` with a0..a4,

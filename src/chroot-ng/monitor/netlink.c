@@ -22,7 +22,7 @@
  * link replies (sys_netlink.c build_host_links): interfaces enumerated from
  * the one dump Android leaves open (RTM_GETADDR — the same enumeration
  * Bionic's getifaddrs falls back to under this policy), fleshed out with
- * SIOCGIF* ioctls. The monitor calls nothing of the libc, so this is that
+ * SIOCGIF* ioctls. The monitor calls nothing of the libc's but mem/str, so this is that
  * Bionic fallback rebuilt from raw syscalls.
  *
  * The guest's fd is one end of a real AF_UNIX SOCK_SEQPACKET socketpair, and

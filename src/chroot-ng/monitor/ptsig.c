@@ -374,7 +374,7 @@ static int pt_sig_hookable(int sig, const struct pt_ksigaction *d, int set) {
 static void pt_install(int sig, cng_sighandler_t h) {
     struct pt_ksigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.handler = (void *)h;
+    sa.handler = cng_sig_entry(sig, h);
     unsigned long gf = g_disp_set[sig] ? g_disp[sig].flags : 0;
     void *gh = g_disp_set[sig] ? g_disp[sig].handler : 0;
     /* SA_NOCLDWAIT and SA_NOCLDSTOP are instructions to the kernel's child
@@ -419,7 +419,7 @@ static void pt_restore_guest(int sig) {
 void cng_pt_sig_install_kick(void) {
     struct pt_ksigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.handler = (void *)pt_kick_handler;
+    sa.handler = cng_sig_entry(cng_g_kicksig, pt_kick_handler);
     /* SA_RESTART, because the kick is not the guest's signal and must not show
      * as one. An attach is a stop, not a delivery, and the kernel restarts the
      * call the stop cut short; the kick used to end it with EINTR instead, so a

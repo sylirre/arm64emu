@@ -686,7 +686,10 @@ static int g_disp_bounced;
  * while it waits then lands on the stack the thread was on when it made the
  * call, as for any call of its own, and not on our scratch stack — where a
  * collector that scans the interrupted thread's stack from the handler's sp
- * (a conservative GC's suspend signal) would be scanning ours. */
+ * (a conservative GC's suspend signal) would be scanning ours. And with the
+ * guest's FP/SIMD registers in place, which the dispatch spends otherwise
+ * (cng_syscall_window): the handler's frame holds what the guest's call
+ * would have left. */
 /* A tracee's signal held back from the dispatch (ptrace.c,
  * cng_pt_signal_frame), pending as the guest's call is about to be made: the
  * kernel's call would have been cut short by it at once, so it is let go
@@ -707,12 +710,11 @@ static int reissue_unhold(struct cng_gframe *gf) {
 static long reissue_svc(const long *a, long nr) {
     if (__atomic_load_n(&g_disp_bounced, __ATOMIC_RELAXED)) {
         struct cng_gframe *gf = cng_gframe_cur();
-        if (gf && gf->gsp) {
+        if (gf && gf->fpsave) {
             if (cng_pt_active() && reissue_unhold(gf))
                 return -EINTR;
             gf->reissuing = 1;
-            long r = cng_syscall6_on(a[0], a[1], a[2], a[3], a[4], a[5], nr,
-                                     gf->gsp);
+            long r = cng_syscall_window(a, nr, gf->gsp, gf->fpsave);
             gf->reissuing = 0;
             gf->reissued = 1;
             return r;
@@ -4399,10 +4401,22 @@ void cng_clone_convert(struct cng_uregs *ur) {
      * names a parent only while that parent lives, and under CLONE_PARENT
      * never this process at all. */
     int forker = (int)sys_getpid();
+    /* The slot a handler of ours keeps the guest's thread pointer in: the
+     * child's is the one CLONE_SETTLS names, which the kernel puts in the
+     * register itself -- where this handler runs on the host's -- so it goes
+     * into the slot, and the host's back into the register. Looked up before
+     * the fork: in the child, gettid answers a tid no table has. With no
+     * handler of ours under it (a dispatch in guest context), the register
+     * is the guest's and stays as the kernel set it. */
+    unsigned long *gtp = cng_guest_tp_slot();
     long flags = (long)(orig_flags &
                         ~(unsigned long)(CNG_CLONE_VM | CNG_CLONE_VFORK));
     long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
                             (long)ur->x[4], (long)ur->x[5], __NR_clone);
+    if (ret == 0 && (orig_flags & CNG_CLONE_SETTLS) && gtp) {
+        __asm__ volatile("msr tpidr_el0, %0" ::"r"(cng_host_tp));
+        *gtp = (unsigned long)ur->x[3];
+    }
     if (ret == 0) {
         cng_sig_in_handler(1);
         cng_procreg_fork_child(forker); /* registered before any guest code */
@@ -7467,20 +7481,18 @@ static void gctx_body(void *p) {
     }
 }
 
-void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed) {
+void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed,
+                          unsigned long gsp, void *fpsave) {
     struct gctx_call c = {.f = {.r = r}, .nr = nr, .mode = CNG_DISP_BOUNCED,
                            .owed = owed};
     /* Guest context, guest mask: the blocking call the dispatch makes runs on
-     * the guest's own stack (see reissue), below the frames this dispatch
-     * keeps there -- the sp the switch to the scratch stack leaves behind,
-     * which it measures into gsp. Run in place, with no stack of ours to be
-     * had, the call is made where the dispatch stands, below them all. */
-    c.f.gsp = 1;
+     * the guest's own stack (see reissue), at the sp the gate left it at, below
+     * the bounce record. Run in place, with no stack of ours to be had, the
+     * call is made where the dispatch stands, below everything it keeps. */
+    c.f.gsp = gsp;
+    c.f.fpsave = fpsave;
     __atomic_add_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
-    if (!cng_run_scratch_in(gctx_body, &c, &c.f)) {
-        c.f.gsp = 0;
-        gctx_body(&c);
-    }
+    cng_run_bounced(gctx_body, &c, &c.f);
     __atomic_sub_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
     /* ...and the same here: held back until the call is over, and taken on
      * the record's registers, the completion trap then never made. */

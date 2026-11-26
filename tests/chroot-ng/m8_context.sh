@@ -289,3 +289,38 @@ else
     esac
 fi
 rm -rf "$ESD" "$ESO"
+
+# The FP/SIMD registers across a call, which the monitor's code now spends
+# (an ordinary build since 2.4): kept by the signal frame for a call answered
+# in the handler, by the gate's save area for one dispatched from guest
+# context (a connect of a blocking AF_UNIX socket), and handed to a guest
+# handler that cuts a blocked accept short, in its frame, where what it writes
+# is what the program has after. And a trap made with no thread pointer and
+# garbage in x18, which the handler's entry switches away from and back. The
+# expected block is a kernel's (6.8, static and dynamic glibc alike).
+FKD=$(mktemp -d)
+mkdir -p "$FKD/fpkeep.d"
+: >"$FKD/fpkeep.d/f"
+if guest_xlate_ready "FP/SIMD leg" &&
+    guest_cc_report "$FKD/fpkeep" tests/chroot-ng/guests/fpkeep.c; then
+    want=$(cat <<'EOF'
+a call with no thread pointer and x18 garbage: answered, tpidr_el0 still 0, x18 kept
+a call answered in the handler: kept (r=fd)
+a call dispatched from guest context: kept (r=0)
+a blocked call cut short: r=EINTR, the handler found them in its frame
+...and after it: kept
+EOF
+)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$FKD" /fpkeep 2>/dev/null)
+    if [ "$want" = "$out" ]; then
+        pass=$((pass + 1))
+        echo "  ok   the FP/SIMD registers, the thread pointer and x18 come back as the kernel gives them"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL the registers across a call diverge from the kernel's"
+        printf '       kernel: %s\n       guest : %s\n' \
+            "$(echo "$want" | tr '\n' '|')" "$(echo "$out" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$FKD"

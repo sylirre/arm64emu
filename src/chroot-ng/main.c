@@ -10,7 +10,7 @@
  * -h/--help), which reflows it to the terminal width. Keep the option strings
  * there and the overview in README.md in sync.
  *
- * The monitor calls nothing of the libc, so the help renderer — ported from the
+ * The monitor calls nothing of the libc but its mem/str, so the help renderer — ported from the
  * sibling arm64emu program — is built on the cng_ I/O helpers plus a raw
  * ioctl(TIOCGWINSZ). cng_dprintf has fixed widths only (no "%*s"), so column
  * alignment is done with out_pad().

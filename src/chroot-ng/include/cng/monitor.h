@@ -297,14 +297,19 @@ struct cng_uregs;
  * (CNG_EBOUNCE_DISP): `r` is the guest's register file, saved below its stack
  * by the handler, `nr` the call (a tracer may have redirected it), `owed` 1 when
  * the handler reported the entry stop and the exit stop is this dispatch's to
- * give. Writes the result into r->x[0]. */
-void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed);
+ * give. Writes the result into r->x[0]. It runs on a stack of ours already
+ * (rt/gate.S, cng_bounce_dispatch), `gsp` the guest's stack pointer it left
+ * (0: it runs in place, on the guest's stack), and `fpsave` the guest's
+ * FP/SIMD registers as the call left them, a struct user_fpsimd_state that
+ * the gate loads back before the guest has them again. */
+void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed,
+                          unsigned long gsp, void *fpsave);
 
 /* A dispatch in progress from guest context — a bounced one — as a ptrace
  * stop taken inside it has to see it: the guest's
  * registers, which hold the call's arguments until `done`, and its result
  * after. Kept per thread, innermost first (a guest handler can run on top of a
- * dispatch that is blocked, and make calls of its own), by cng_run_scratch_in. A
+ * dispatch that is blocked, and make calls of its own), by cng_run_bounced. A
  * stop inside the dispatch reports these instead of the monitor's own, and a
  * tracer that changes them there `abandon`s the call: its result is dropped
  * and the thread resumes with the registers the tracer left. `owed` is the
@@ -314,9 +319,11 @@ void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed);
  * tracer cancelled. `gsp`, when set, is a stack pointer on the guest's own
  * stack for the blocking call the dispatch makes (reissue in dispatch.c): a
  * guest handler that runs while it blocks is then delivered there, as for a
- * call of its own, and not onto the scratch stack. A bounced dispatch sets it
- * to ask for one, and the switch to the scratch stack measures it, below
- * every frame still live on the guest's (cng_run_scratch_in). `orig_x0` is x0 as the
+ * call of its own, and not onto the scratch stack -- the guest's sp where the
+ * gate switched stacks, below the bounce record. `fpsave` is where the
+ * guest's FP/SIMD registers are while the dispatch spends them: loaded for
+ * that call and saved again after it, and the FP/SIMD state a ptrace stop
+ * inside the dispatch reads and writes. `orig_x0` is x0 as the
  * trap found it, before the entry stop, which a restart starts from;
  * `reissuing` is set while the dispatch makes the guest's call itself
  * (reissue_svc), where a signal cuts the call short rather than waiting for
@@ -333,6 +340,7 @@ struct cng_gframe {
     int entered;
     long nr;
     unsigned long gsp;
+    void *fpsave;
     unsigned long long orig_x0;
     int reissuing;
     int reissued;          /* ...and has made it */
@@ -599,17 +607,36 @@ int cng_sig_all_blocked(long tid);
 /* Install a signal handler with our own rt_sigreturn restorer. Returns 0/-errno. */
 int cng_sig_install(int signo, cng_sighandler_t h);
 
-/* Run `fn(arg)` on this thread's per-thread scratch stack, returning 1 when it
- * switched and 0 when the caller must run it in place (no slot, or already on
- * the stack). The path dispatcher needs far more stack than a guest thread is
- * likely to have — see sigsys.c — so both tiers enter it through this.
- * cng_scratch_leave gives the stack back for a call that never returns. */
-int cng_run_scratch(void (*fn)(void *), void *arg);
+/* The handler address to install for `sig` to run `h` (sigsys.c): the entry
+ * every handler of ours shares (hentry.S), which runs `h` on the host's
+ * thread pointer and puts the interrupted one back after. Every handler of
+ * ours is installed through this. */
+void *cng_sig_entry(int sig, cng_sighandler_t h);
+
+/* The interrupted thread pointer a handler of ours keeps, and gives back on
+ * its way out: `tp` as the entry found it, whatever the handler leaves there
+ * as it returns. `prev` is the one of an outer handler of ours on this thread
+ * that this one interrupted (sigsys.c, cng_handler_run). */
+struct cng_tps {
+    unsigned long tp;
+    struct cng_tps *prev;
+};
+/* The innermost handler's slot on this thread (0: none) -- what the frame
+ * it returns through resumes with, which an emulated execve sets to 0 -- and
+ * the guest's own, which a tracer's NT_ARM_TLS reads and writes: the slot of
+ * the handler that interrupted the guest, or the live register where no
+ * handler of ours is running (a dispatch in guest context). */
+unsigned long *cng_tp_slot(void);
+unsigned long *cng_guest_tp_slot(void);
+unsigned long cng_guest_tp(void);
+void cng_guest_tp_set(unsigned long v);
+
+/* Run `fn(arg)` for a dispatch from guest context, already on the stack the
+ * gate switched it to, with `f` (its r set) published as this thread's
+ * innermost cng_gframe for as long as `fn` runs. cng_scratch_leave gives the
+ * scratch stack back for a call that never returns. */
+void cng_run_bounced(void (*fn)(void *), void *arg, struct cng_gframe *f);
 void cng_scratch_leave(void);
-/* ...for a dispatch from guest context, with `f` (its r set) published as this
- * thread's innermost cng_gframe for as long as `fn` runs. The slot lookup is
- * the one the stack switch makes anyway, so this costs three stores. */
-int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f);
 
 /* A ptrace kick landed with `uc` inside one of the bounce stubs (sigsys.c):
  * put the frame back to the guest's own state, as if the call had not been

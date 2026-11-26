@@ -2419,9 +2419,12 @@ static void exec_frame(struct cng_ucontext *uc, unsigned long sp,
     uc->uc_stack.ss_flags = CNG_SS_DISABLE;
     uc->uc_stack.ss_size = 0;
     /* ...and no thread pointer: the kernel's exec clears TPIDR_EL0
-     * (tls_thread_flush), which no frame carries, so it is cleared here, on
-     * the way out through the frame. Nothing of ours reads it. */
-    __asm__ volatile("msr tpidr_el0, xzr");
+     * (tls_thread_flush), which no frame carries -- the handler's entry keeps
+     * it, and puts what it is left back on the way out through the frame
+     * (sigsys.c, cng_tp_slot). */
+    unsigned long *tp = cng_tp_slot();
+    if (tp)
+        *tp = 0;
 }
 
 int cng_exec_takeover_frame(struct cng_ucontext *uc) {

@@ -92,6 +92,7 @@ struct cng_open_how {
 /* clone(2) flags (subset). */
 #define CNG_CLONE_VM     0x00000100
 #define CNG_CLONE_VFORK  0x00004000
+#define CNG_CLONE_SETTLS 0x00080000
 
 /* fcntl ops (the subset the monitor issues) */
 #define CNG_F_DUPFD          0

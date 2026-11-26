@@ -5205,6 +5205,39 @@ kernel 3.18 (Galaxy S7).
     the frame is what the handler returns through). The kernel has no
     frame to keep. For the context switch (step 2.4) to move.
 
+- [x] **M117 — the context switch: an ordinary build**
+  - Step 2.4 of the merge into arm64emu. The monitor is built as an
+    ordinary program: no -mgeneral-regs-only, -fno-stack-protector,
+    -fno-builtin or inline atomics, and its mem/str are the libc's.
+  - Every handler of ours (SIGSYS, the ptrace hook and kick, the filter
+    probe) is entered through one entry, monitor/hentry.S, which keeps
+    the TPIDR_EL0 it interrupted in a slot on its frame, runs the handler
+    on the host's (cng_host_tp, the main thread's, taken in main) and puts
+    the slot back on the way out. The slot is the guest's thread pointer
+    for the handler's length: an emulated execve sets it to 0 there, a
+    tracer's NT_ARM_TLS reads and writes it, and a converted fork with
+    CLONE_SETTLS puts the child's into it. Per-thread host contexts come
+    with the thread model (step 2.5).
+  - The FP/SIMD registers are the signal frame's to keep in a handler. A
+    dispatch bounced to guest context has none: the gate now switches it
+    to its stack (the scratch stack, or one mapped for the call, chosen by
+    the handler that set the bounce up) and saves the guest's registers
+    there before any C runs, loads them for the guest's own call
+    (cng_syscall_window) and for the delivery at the dispatch's end
+    (cng_pt_deliver_fp), saves them again after, and loads them last.
+    ptrace's NT_PRFPREG reads and writes that save area for a stop in the
+    dispatch. On SVE hardware the syscall itself leaves only the 128-bit
+    V halves, which is what is kept.
+  - The stack protector's canary is the global __stack_chk_guard
+    (-mstack-protector-guard=global): Bionic's TLS slot for it is the
+    guest's in a bounced dispatch, which still runs on the guest's thread
+    pointer and signal mask, as before.
+  - Tests: m8 fpkeep (all 32 q registers and FPSR across a call answered
+    in the handler, one dispatched from guest context, and a blocked one
+    cut short by a handler that finds and changes them in its frame; a
+    trap with TPIDR_EL0 = 0 and garbage in x18). The expected block is a
+    6.8 kernel's.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

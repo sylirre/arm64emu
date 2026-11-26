@@ -502,10 +502,17 @@ and natively on AArch64; every test is a guest's, through the filter
 (docs/chroot-ng/testing.md).
 
 The binary is an ordinary PIE linked against its toolchain's libc, whose
-startup runs before `main` and is all of it that runs: the monitor makes its
-syscalls through its own gate and calls nothing of the libc, so the SIGSYS
-handler has no re-entrancy hazards and no dependence on the libc it happens to
-be linked with. Its
+startup runs before `main`: the monitor makes its syscalls through its own gate
+and calls nothing of the libc but its mem/str, so the SIGSYS handler has no
+re-entrancy hazards and no dependence on the libc it happens to be linked with.
+It is an ordinary build too. Every handler of ours is entered through one
+entry (`monitor/hentry.S`) that runs it on the host's thread pointer and gives
+the interrupted one back on the way out; the guest's FP/SIMD registers are the
+signal frame's to keep in a handler, and a save area's of the gate's in a
+dispatch bounced to guest context (`rt/gate.S`, `cng_bounce_dispatch`), which
+hands them back for the guest's own call and to a ptrace stop. The stack
+protector's canary is the global `__stack_chk_guard`, not Bionic's TLS slot: a
+bounced dispatch runs on the guest's thread pointer. Its
 syscall numbers are its own table too (`src/chroot-ng/include/cng/unistd.h`, the stable
 AArch64 ABI spelled out) rather than the build host's `<asm/unistd.h>`: what
 the filter traps and refuses must not depend on how old the headers were where

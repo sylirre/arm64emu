@@ -749,12 +749,13 @@ struct cng_ucontext *cng_pt_cur_uc(void) {
  * header, and the q registers follow, which is why the two are converted
  * rather than copied.
  *
- * With no signal frame — a stop of a dispatch bounced to guest context, or the
- * emulated execve's — the registers are the live ones, read and written in
- * place. They are the guest's own there: nothing in the monitor is built to
- * spend them (-mgeneral-regs-only, see the Makefile), and the kernel
- * preserves them across every syscall made since, so what the guest returns
- * to is exactly what the stop left in them. */
+ * A stop of a dispatch bounced to guest context reads and writes the save
+ * area the gate keeps the guest's registers in while the dispatch spends them
+ * (gate.S, cng_bounce_dispatch; the gframe's fpsave) -- unless the stop came
+ * in a window that has them loaded, the guest's own call or the delivery at
+ * its end, whose frame then has them and gives them back to the save area.
+ * With no signal frame and no save area — the emulated execve's stop — they
+ * are the live ones, read and written in place. */
 #define PT_FPSIMD_MAGIC 0x46508001
 #define PT_SVE_MAGIC    0x53564501
 #define PT_EXTRA_MAGIC  0x45585401
@@ -816,9 +817,8 @@ static u8 *pt_frame_rec(struct pt_self *s, struct cng_uregs *r, u32 magic) {
     return 0;
 }
 
-/* The live registers, saved and loaded. The directives are for clang, whose
- * assembler takes -mgeneral-regs-only to mean no FP instruction at all, inline
- * asm included; gcc's leaves inline asm alone either way. */
+/* The live registers, saved and loaded. The directives are for an assembler
+ * whose default architecture leaves the FP and SIMD extensions out. */
 #define PT_FP_ARCH ".arch_extension fp\n\t.arch_extension simd\n\t"
 
 static void pt_fp_live_save(u8 *out) {
@@ -878,7 +878,22 @@ static void pt_fp_live_load(const u8 *in) {
                      : "x9", "memory");
 }
 
+/* The save area of the bounced dispatch whose registers `r` are, outside the
+ * windows that have the guest's FP/SIMD state loaded (see above). */
+static u8 *pt_fp_saved(struct pt_self *s, struct cng_uregs *r) {
+    struct cng_gframe *gf = cng_gframe_cur();
+    if (!gf || !gf->fpsave || gf->r != r || gf->reissuing || (s && s->deliver))
+        return 0;
+    return (u8 *)gf->fpsave;
+}
+
 static void pt_fp_get(struct pt_self *s, struct cng_uregs *r, u8 *out) {
+    u8 *fs = pt_fp_saved(s, r);
+    if (fs) {
+        memcpy(out, fs, PT_FPSIMD_SZ);
+        memset(out + PT_FP_FPCR + 4, 0, 8);
+        return;
+    }
     u8 *f = pt_frame_rec(s, r, PT_FPSIMD_MAGIC);
     if (!f) {
         pt_fp_live_save(out);
@@ -905,6 +920,11 @@ static void pt_fp_set(struct pt_self *s, struct cng_uregs *r, const u8 *in,
     u8 st[PT_FPSIMD_SZ];
     pt_fp_get(s, r, st);
     memcpy(st, in, len > sizeof st ? sizeof st : len);
+    u8 *fs = pt_fp_saved(s, r);
+    if (fs) {
+        memcpy(fs, st, PT_FPSIMD_SZ);
+        return;
+    }
     u8 *f = pt_frame_rec(s, r, PT_FPSIMD_MAGIC);
     if (!f) {
         pt_fp_live_load(st);
@@ -1068,9 +1088,11 @@ static u32 pt_build_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
         pt_fp_get(s, r, out);
         return PT_FPSIMD_SZ;
     case CNG_NT_ARM_TLS: {
-        /* tls_get: TPIDR_EL0, then TPIDR2_EL0 -- 0 on a CPU without SME. */
+        /* tls_get: TPIDR_EL0, then TPIDR2_EL0 -- 0 on a CPU without SME.
+         * The guest's own, which a handler of ours keeps while the host's is
+         * in the register (sigsys.c, cng_guest_tp). */
         u64 tls[2] = {0, 0};
-        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls[0]));
+        tls[0] = cng_guest_tp();
         if (pt_has_sme())
             tls[1] = pt_tpidr2_get(s, r);
         memcpy(out, tls, sizeof tls);
@@ -1144,7 +1166,7 @@ static long pt_apply_regset(struct pt_self *s, struct cng_uregs *r, u32 which,
         u64 tls[2];
         pt_build_regset(s, r, CNG_NT_ARM_TLS, (u8 *)tls);
         memcpy(tls, in, len > sizeof tls ? sizeof tls : len);
-        __asm__ volatile("msr tpidr_el0, %0" ::"r"(tls[0]));
+        cng_guest_tp_set(tls[0]);
         if (pt_has_sme())
             pt_tpidr2_set(s, r, tls[1]);
         return 0;
@@ -2661,7 +2683,7 @@ int cng_pt_dispatch_end(struct cng_uregs *r, struct cng_gframe *gf) {
          * the guest from `r` (cng_pt_signal_frame). */
         if (s)
             s->deliver = r;
-        cng_pt_deliver(&held);
+        cng_pt_deliver_fp(&held, gf->fpsave);
         if (s)
             s->deliver = 0;
     }

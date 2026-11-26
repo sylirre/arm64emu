@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* Freestanding runtime: mem/str helpers and minimal formatted output.
- * No libc — chroot-ng must run with no external dependencies so it behaves
- * identically for glibc, musl, static and Go/Rust guests, and so the SIGSYS
- * handler can call these helpers without re-entrancy hazards.
+/* The runtime the monitor has of its own: formatted output, the bounds of its
+ * image. Its mem/str are the libc's; everything else of the libc's it leaves
+ * alone, and makes its syscalls through the gate (rt/gate.S) rather than
+ * through the libc's wrappers, which an Android app process can have
+ * interposed (libsigchain's sigaction).
  */
 #ifndef CNG_RT_H
 #define CNG_RT_H
@@ -11,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <string.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -21,18 +23,6 @@ typedef int16_t s16;
 typedef int32_t s32;
 typedef int64_t s64;
 
-/* The monitor's own, which the compiler's calls reach too: libc's use the SIMD
- * registers (see -mgeneral-regs-only in the Makefile). */
-void *memset(void *d, int c, size_t n);
-void *memcpy(void *d, const void *s, size_t n);
-void *memmove(void *d, const void *s, size_t n);
-int memcmp(const void *a, const void *b, size_t n);
-
-size_t strlen(const char *s);
-int strcmp(const char *a, const char *b);
-int strncmp(const char *a, const char *b, size_t n);
-char *strchr(const char *s, int c);
-char *strrchr(const char *s, int c);
 size_t cng_strlcpy(char *dst, const char *src, size_t size);
 
 /* I/O helpers */
@@ -75,5 +65,12 @@ static inline unsigned long cng_image_hi(void) { return (unsigned long)_end; }
  * the address space counts as reaching everything above `addr`, since that is
  * what mapping it would have to cover. */
 int cng_hits_image(unsigned long addr, unsigned long len);
+
+/* The thread pointer the libc gave the thread main() runs on: the host
+ * context every handler of ours switches to on entry (monitor/hentry.S), and
+ * back from on its way out. A guest thread's own is the guest's to set, and
+ * whatever it is -- 0, a TCB of the guest's libc, Go's -- no code of ours runs
+ * on it but what the gate and the bounce run in guest context. */
+extern unsigned long cng_host_tp __attribute__((visibility("hidden")));
 
 #endif /* CNG_RT_H */

@@ -1,7 +1,8 @@
 --target=aarch64-linux-gnu
 -std=gnu11
 -fPIE
--fno-builtin
+-fstack-protector-strong
+-mstack-protector-guard=global
 -Iinclude
 -I../../lib/link2symlink
 -Wall

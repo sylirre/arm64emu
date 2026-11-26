@@ -268,6 +268,9 @@ long cng_pt_restart_code(long nr, const u64 *a);
 /* rt_sigprocmask(SIG_UNBLOCK, set), at the two points a held signal is let
  * go at (rt/gate.S). */
 void cng_pt_deliver(const unsigned long *set);
+/* ...with the guest's FP/SIMD registers in place from `fpsave` while it lets
+ * the set go, and saved back after (a dispatch bounced to guest context). */
+void cng_pt_deliver_fp(const unsigned long *set, void *fpsave);
 void cng_pt_unhold(const unsigned long *set);
 
 /* Signal-delivery / fault stop: report `sig` to the tracer and return the signal

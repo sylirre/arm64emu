@@ -330,43 +330,24 @@ else
 CHROOTNG_RUN ?=
 endif
 
-# Is the compiler clang (Termux/NDK) rather than gcc? Some flags are gcc-only.
-CHROOTNG_IS_CLANG := $(shell $(CHROOTNG_CC) --version 2>/dev/null | grep -ci clang)
-
-# Position-independent, as the link below is. -fno-stack-protector because the
-# monitor runs on the guest's TLS, where Bionic keeps the stack guard, and
-# -fno-builtin because the mem/str helpers are the monitor's own (rt/rt.c):
-# libc's use the SIMD registers, which a dispatch from guest context spends
-# out of the guest's (see -mgeneral-regs-only below).
+# Position-independent, as the link below is, and an ordinary build otherwise:
+# the monitor's code runs on the guest's thread and stack, but with the FP/SIMD
+# half of the guest's register file kept where the guest gets it back from --
+# the kernel's signal frame in the SIGSYS handler, a save area of ours for a
+# dispatch bounced to guest context (rt/gate.S, cng_bounce_dispatch) -- so it
+# may spend those registers, and its mem/str are the libc's.
+#
+# The stack protector's canary is the global __stack_chk_guard, which gcc
+# takes on AArch64 anyway and clang does only when asked: Bionic's own place
+# for it is a TLS slot, and a dispatch bounced to guest context runs on the
+# guest's thread pointer, where that slot is whatever the guest keeps there.
 CHROOTNG_FLAGS = -O2 -g -std=gnu11 -fPIE \
-                 -fno-stack-protector \
-                 -fno-asynchronous-unwind-tables -fno-builtin \
+                 -fstack-protector-strong -mstack-protector-guard=global \
+                 -fno-asynchronous-unwind-tables \
                  -ffunction-sections -fdata-sections \
                  -Wall -Wextra -Wno-unused-parameter -Isrc/chroot-ng/include \
                  -Ilib/link2symlink \
-                 $(CHROOTNG_GCCONLY) $(CHROOTNG_INLINEATOMICS) -mgeneral-regs-only \
                  $(CHROOTNG_CFLAGS)
-# Stop gcc turning our mem* loops into calls to themselves. Clang rejects this
-# flag and honors -fno-builtin for the same effect.
-ifeq ($(CHROOTNG_IS_CLANG),0)
-CHROOTNG_GCCONLY := -fno-tree-loop-distribute-patterns
-endif
-# GCC 13+ defaults to -moutline-atomics, which routes every __atomic builtin
-# through a libgcc helper (__aarch64_cas4_acq_rel) that picks LSE or LL/SC by a
-# flag a constructor of libgcc's sets. The monitor's atomics run in the SIGSYS
-# handler, from the first trap on, so they are inline -- the LL/SC form works
-# on every ARMv8. Probed, since not every compiler has it.
-CHROOTNG_INLINEATOMICS := $(shell $(CHROOTNG_CC) -mno-outline-atomics -E -x c /dev/null \
-                            >/dev/null 2>&1 && echo -mno-outline-atomics)
-# -mgeneral-regs-only: no floating point or SIMD anywhere in the monitor. A
-# dispatch made from guest context (a bounced call, sigsys.c BOUNCE_DISP) runs
-# on the guest's own register file with no signal frame holding the FP half of
-# it, and the kernel preserves those registers across a syscall, so anything we
-# spend there is taken from the guest -- and a ptrace stop there reads and
-# writes the live registers as the guest's (NT_PRFPREG, monitor/ptrace.c). gcc
-# does spend it: `cnt v0.8b` for a popcount, `fmov d1, x0` as a cheap spill
-# slot for a pointer. Deliberately not probed: silently dropping it would put
-# the clobber back.
 
 # A PIE, which the loader places where nothing a guest names can be: a non-PIE
 # guest (gcc's cc1) loads at its link-time 0x400000, and the monitor shares its
