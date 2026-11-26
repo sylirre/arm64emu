@@ -10,7 +10,10 @@
  *     CLONE_CHILD_SETTID one in the child, and CLONE_CHILD_CLEARTID's cleared
  *     with a futex wake when the child exits;
  *   - without CLONE_FS, a chdir of the child's is its own; without
- *     CLONE_FILES, a close of the child's is its own;
+ *     CLONE_FILES, a close of the child's is its own (the chdir is to "tmp",
+ *     relative: the milestone makes one in the directory the program starts
+ *     in, the guest's root and the reference run's cwd alike, where a host
+ *     need not have a /tmp -- Android 14 has none);
  *   - the parent's signal mask, inherited, and no alternate signal stack;
  *   - x0 = 0 in the child and the stack it was given;
  *   - a robust mutex whose owner thread exits holding it: EOWNERDEAD (not
@@ -90,7 +93,7 @@ static int probe(void *arg) {
 
 static int chdir_child(void *arg) {
     (void)arg;
-    syscall(SYS_chdir, "/tmp");
+    syscall(SYS_chdir, "tmp");
     set_done();
     return 0;
 }
@@ -175,6 +178,9 @@ int main(void) {
     printf("without CLONE_FS: %s, the parent's cwd %s\n",
            r > 0 ? "a thread" : strerror((int)-r),
            strcmp(before, after) ? "moved" : "kept");
+    /* Back where it was, which under chroot-ng it is not (one guest cwd a
+     * process), or the next leg would find it moved already. */
+    chdir(before);
     s = stk();
     r = raw_clone(BASE, s, 0, 0, 0, chdir_child, 0);
     wait_done();

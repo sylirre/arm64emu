@@ -5268,7 +5268,8 @@ kernel 3.18 (Galaxy S7).
     the alternate stack's top, over the frames of the handler it
     interrupted (m18's spinafter, which kicks a spinning thread by SIGSYS,
     hung or died "stack smashing detected" two runs in three). Probed at
-    startup; before 4.7 the window stays, as it was for a guest's own.
+    startup; before 4.7 the window stays, as it was for a guest's own
+    (closed for both by M120).
   - The handler's entry finds the host context of the thread it lands on
     by tid (TPIDR_EL0 and x18, Bionic's shadow call stack), the main
     thread's for any other. A fork child keys its one thread anew.
@@ -5357,6 +5358,75 @@ kernel 3.18 (Galaxy S7).
     after the exec of a fork child a thread that is not the main one made
     (the second died without the kept stacks, the third without the
     marks).
+
+- [x] **M120 — a 4.19 device, and SIGSYS on a guest's own alternate stack**
+  - Step 2.5's device round on the Pixel 5 (Android 14, 4.19): M119's
+    thread model holds there unchanged. Its first suite failed one row,
+    and a test's fault: clonethr's CLONE_FS leg changed into /tmp, which
+    Android 14 has not (the Zenfone's Android 15 has one an app may
+    enter), so the kernel reference's chdir failed and it said the cwd
+    kept, while the guest's, in a root with a tmp, moved. The chdir is to
+    a relative tmp now, which the milestone makes in the reference run's
+    cwd and the guest's root alike (with the owner's leave). And the leg
+    puts the cwd back between its two cases: a process has one cwd under
+    chroot-ng, the case without CLONE_FS had moved it already, and the
+    case with CLONE_FS passed whatever the clone did.
+  - The second suite failed m23's past-EOF row instead: its guest's fork
+    child, dying of the SIGBUS the row expects, went through bionic's crash
+    handler, and that handler died of "stack corruption detected" and hung
+    in the abort that re-entered it -- one run in twenty there, and one
+    crash in forty of a plain fork child that segfaults. Its own alternate
+    stack, dumped from the hung child, had at its top a frame no handler
+    there should have: the SIGSYS of a kick (crash_dump64, run in the guest,
+    attaching through the emulated ptrace), taken with SP at the very top of
+    a scratch stack of ours and that alternate stack armed. A handler of
+    ours leaves the stack it was delivered on for its scratch stack and
+    disarms it from there, as the kernel refuses to change the stack SP is
+    on; a SIGSYS sent from elsewhere between the two -- a kick, a sibling's
+    de_thread request, a kill(2) -- found the stack armed and SP off it,
+    and the kernel put it at the stack's top: over a guest handler's frames,
+    where the guest had been running on it, and over the trap's own frame,
+    which it was delivered at, where it had not. M118 armed our own stacks
+    with SS_AUTODISARM against this and left a guest's own -- bionic's on
+    every thread, Go's on every M -- and ours before 4.7. Now every switch
+    of a handler onto a stack of ours goes through one helper (sigsys.c,
+    scr_run): where the frame says the stack is armed without the flag it
+    blocks SIGSYS while still on it, and unblocks it once the stack is
+    disarmed, so what was sent meanwhile is delivered onto ours. Nothing in
+    between can trap (every filter of ours admits our code; Android's has
+    both calls). Two syscalls a trap more for such a guest, about 2% of a
+    translated call on the Pixel (13.4 us); one fewer for a thread of ours
+    on 4.7 and later, whose stack the kernel has disarmed already. 600
+    crashes through bionic's handler after it, none hung.
+  - Tests: m8 altsys -- a process trapping on mkdirat and unlinkat, from a
+    signal handler on an alternate stack of its own and from its main stack
+    with one registered, sent SIGSYS every 200 us, which it ignores; it must
+    run on with its calls answered and a pattern in its frame kept. The
+    window is a few instructions, so CHROOTNG_ALTSTACK_DELAY, a new test
+    aid, holds the handler there 50 us: with the block taken out, five runs
+    in five failed, the handler's frame overwritten in one leg and the
+    process hung in the other. Paced, not a flood: SIGSYS is never blocked
+    under chroot-ng, and a flood nests handlers of ours one on another deep
+    enough to overflow a 64 KiB alternate stack (17 to 67 KiB measured where
+    the kernel's delivery took 7) -- with this change and without it, an
+    open item.
+  - Open: the flood above; and a call bounced to guest context to run the
+    dispatcher (BOUNCE_DISP) from a guest handler running on its own
+    alternate stack runs on our scratch stack with that stack armed, so a
+    guest signal delivered while it blocks goes to the stack's top, over
+    that handler's frames, where the kernel would put it below its SP.
+    And on the x86 runner m6's "execve reaches every sibling (chain 16)"
+    leaves threads behind in one run in four or so, the build before this
+    change as often (9 runs in 20 against 5): arm64emu runs every guest
+    thread as a host thread of its own, the row comes after the 4500-thread
+    one, and a sibling the de_thread cannot reach in a second is given up
+    on. It held on the devices and the VM.
+  - After this: 945 passed, 0 failed, 28 skipped, on the device.
+  - What only this kernel skips: faccessat2 (5.8), MREMAP_DONTUNMAP (5.7),
+    ptrace's PTRACE_GET_SYSCALL_INFO, two-word NT_ARM_TLS and restart
+    references (5.3, 5.19, e057b9477232); and the NULL-pathname
+    differential, whose reference Android's filter kills there at its
+    openat2 before it prints (the guest's is the emulation's, M97).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

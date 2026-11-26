@@ -986,38 +986,102 @@ int cng_sig_all_blocked(long tid) {
     return 0;
 }
 
-/* Runs on the scratch stack, and the first thing it does is take the guest's
- * alt-stack out of the picture for the duration.
+/* A handler's work, on a stack of ours, with the alt-stack out of the picture
+ * for the duration.
  *
  * The kernel picks where a signal frame goes with sigsp(): SA_ONSTACK plus an SP
  * that is not currently on the alt-stack means the alt-stack TOP. That is how
  * our own frame got there — and having moved SP to the scratch stack, it is also
  * true of a *nested* SIGSYS, which SA_NODEFER deliberately leaves deliverable so
- * the gate-net can catch a re-issue Android's own filter blocks. So the nested
- * frame is written at the alt-stack top: the same address as the outer one.
- * Measured on the host and under qemu — delta from the outer frame, exactly 0.
- * The outer frame is then rubble, and the sigreturn that reads it resumes a
+ * the gate-net can catch a re-issue Android's own filter blocks, and of a kick or
+ * a sibling's de_thread request, which another thread or process sends when it
+ * will. So the nested frame is written at the alt-stack top: the same address
+ * as the outer one when the trap came from off the alt-stack (measured on the
+ * host and under qemu — delta from the outer frame, exactly 0), and over the
+ * guest's own frames when it came from a guest handler running on it. The
+ * outer frame is then rubble, and the sigreturn that reads it resumes a
  * context from the middle of our own re-issue; in the repro that is an endless
  * loop of the handler re-entering itself, with every signal but SIGSYS masked.
+ * The guest's are rubble the same way: bionic's crash handler, its pseudothread
+ * and crash_dump done, returned through a frame a kick from that crash_dump's
+ * attach had been written over, died of "stack corruption detected", and then
+ * hung in the abort that re-entered it (m23's past-EOF leg, one run in twenty
+ * on a 4.19 Pixel).
  *
- * Disarming the alt-stack sends the nested frame to the current SP instead —
+ * Disarming the alt-stack sends a nested frame to the current SP instead —
  * the scratch stack, below the dispatcher's own frames, where it belongs. It
  * needs no undo: the kernel saves the alt-stack settings in each signal frame
  * and rt_sigreturn restores them, so the guest gets its own back at every exit
- * from here, including the nested one's.
+ * from here, including the nested one's. The kernel refuses to change the
+ * stack SP is on, so the disarm is made from the stack of ours -- and between
+ * the switch and the disarm a SIGSYS sent from elsewhere still found the
+ * alt-stack armed and SP off it. So SIGSYS is blocked across the two, from the
+ * alt-stack, where a frame delivered first goes below this one: nothing in
+ * between makes a syscall a filter traps (ours admit our code, Android's has
+ * both calls), and what was sent meanwhile is delivered once the stack is
+ * disarmed, onto ours.
  *
  * The check is free: uc_stack is what the kernel saved in the frame, so a guest
- * with no alt-stack registered — most of them — costs nothing, and one that has
- * registered it is exactly the guest at risk. */
+ * with no alt-stack registered costs nothing, and neither does a thread of ours
+ * on a kernel with SS_AUTODISARM, whose stack the kernel disarmed as it
+ * delivered onto it. One registered without the flag -- bionic's on every
+ * thread, Go's on every M, ours before 4.7 -- costs three syscalls a trap
+ * where it cost one; two of them, the block and the unblock, are about 2% of a
+ * translated call on a 4.19 Pixel. */
 int cng_g_traps_live;
 
-static void sigsys_on_scratch(void *ucv, void *si) {
-    struct cng_ucontext *uc = ucv;
-    if (uc->uc_stack.ss_size && !(uc->uc_stack.ss_flags & CNG_SS_DISABLE)) {
+struct scr_call {
+    void (*fn)(void *, void *);
+    void *a0, *a1;
+    int disarm;
+};
+
+/* CHROOTNG_ALTSTACK_DELAY=N, a test aid: N microseconds spent on the stack of
+ * ours before the alt-stack is disarmed, which makes of the few instructions
+ * between the two a window a SIGSYS sent from elsewhere can be aimed at.
+ * Counter ticks, 0 for none. */
+static unsigned long g_alt_delay;
+
+static void scr_delay(void) {
+    unsigned long t0, t;
+    __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(t0));
+    do
+        __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(t));
+    while (t - t0 < g_alt_delay);
+}
+
+static void scr_enter(void *cv, void *unused) {
+    (void)unused;
+    struct scr_call *c = cv;
+    if (c->disarm) {
+        if (g_alt_delay)
+            scr_delay();
         cng_stack_t off = {0, CNG_SS_DISABLE, 0};
+        unsigned long sys = 1UL << (CNG_SIGSYS - 1);
         CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
+        CNG_SYS(__NR_rt_sigprocmask, 1 /*SIG_UNBLOCK*/, (long)&sys, 0, sizeof sys,
+                0, 0);
     }
-    cng_sigsys_body(uc, si);
+    c->fn(c->a0, c->a1);
+}
+
+/* fn(uc, a1) on the stack whose top is `top`. */
+static void scr_run(unsigned long top, void (*fn)(void *, void *),
+                    struct cng_ucontext *uc, void *a1) {
+    struct scr_call c = {fn, uc, a1, 0};
+    int fl = uc->uc_stack.ss_flags;
+    if (uc->uc_stack.ss_size && !(fl & CNG_SS_DISABLE) &&
+        !(fl & CNG_SS_AUTODISARM)) {
+        unsigned long sys = 1UL << (CNG_SIGSYS - 1);
+        c.disarm = 1;
+        CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, (long)&sys, 0, sizeof sys,
+                0, 0);
+    }
+    cng_run_on_stack((void *)top, (void *)scr_enter, &c, 0);
+}
+
+static void sigsys_on_scratch(void *ucv, void *si) {
+    cng_sigsys_body((struct cng_ucontext *)ucv, si);
 }
 
 /* A stack for a call that cannot have this thread's slot: the table is full of
@@ -1047,15 +1111,10 @@ static void scr_temp_free(unsigned long base) { scr_unmap(base); }
  * re-switch, clobbering the outer dispatcher frame. */
 /* An exec handed to this thread, the group leader, by a sibling (execve.c):
  * carried out on a stack of ours, with the guest's alt-stack disarmed like a
- * dispatch, since the commit is the dispatcher's own code. */
+ * dispatch (scr_run), since the commit is the dispatcher's own code. */
 static void takeover_on_scratch(void *ucv, void *si) {
     (void)si;
-    struct cng_ucontext *uc = ucv;
-    if (uc->uc_stack.ss_size && !(uc->uc_stack.ss_flags & CNG_SS_DISABLE)) {
-        cng_stack_t off = {0, CNG_SS_DISABLE, 0};
-        CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
-    }
-    cng_exec_takeover_frame(uc);
+    cng_exec_takeover_frame((struct cng_ucontext *)ucv);
 }
 
 /* ---- the host context of our handlers ----
@@ -1252,15 +1311,10 @@ static int pc_in_stub(unsigned long pc) {
 }
 
 /* The request, served on the scratch stack with the guest's alt-stack out of
- * the way, as a dispatch is (sigsys_on_scratch). `direct` is non-null for one
+ * the way, as a dispatch is (scr_run). `direct` is non-null for one
  * delivered straight onto the frame (see cng_pt_sigsys_kick). */
 static void kick_on_scratch(void *ucv, void *direct) {
-    struct cng_ucontext *uc = ucv;
-    if (uc->uc_stack.ss_size && !(uc->uc_stack.ss_flags & CNG_SS_DISABLE)) {
-        cng_stack_t off = {0, CNG_SS_DISABLE, 0};
-        CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
-    }
-    cng_pt_sigsys_kick(uc, direct != 0);
+    cng_pt_sigsys_kick((struct cng_ucontext *)ucv, direct != 0);
 }
 
 static void sigsys_kick(struct cng_ucontext *uc) {
@@ -1290,8 +1344,7 @@ static void sigsys_kick(struct cng_ucontext *uc) {
         if (i >= 0 && !cng_scr[i].busy) {
             cng_scr[i].busy = 1;
             cng_scr[i].uc = uc;
-            cng_run_on_stack((void *)cng_scr[i].hi, (void *)kick_on_scratch, uc,
-                             direct ? (void *)1 : 0);
+            scr_run(cng_scr[i].hi, kick_on_scratch, uc, direct ? (void *)1 : 0);
             cng_scr[i].uc = 0;
             cng_scr[i].busy = 0;
         } else {
@@ -1362,20 +1415,19 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
                 cng_exec_takeover_frame((struct cng_ucontext *)ucv);
             return;
         }
-        cng_run_on_stack((void *)(base + CNG_SCR_SZ), (void *)fn, ucv, si);
+        scr_run(base + CNG_SCR_SZ, fn, (struct cng_ucontext *)ucv, si);
         scr_temp_free(base);
         return;
     }
     cng_scr[i].busy = 1;
     cng_scr[i].uc = (struct cng_ucontext *)ucv;
-    cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, ucv, si);
+    scr_run(cng_scr[i].hi, fn, (struct cng_ucontext *)ucv, si);
     scr_note_back(i, (struct cng_ucontext *)ucv);
     /* A request that came in while this handler was busy (sigsys_kick): the
      * frame is the guest's again, and it is taken on that, here. */
     while (cng_scr[i].attach) {
         cng_scr[i].attach = 0;
-        cng_run_on_stack((void *)cng_scr[i].hi, (void *)kick_on_scratch, ucv,
-                         0);
+        scr_run(cng_scr[i].hi, kick_on_scratch, (struct cng_ucontext *)ucv, 0);
         scr_note_back(i, (struct cng_ucontext *)ucv);
     }
     cng_scr[i].uc = 0;
@@ -1612,6 +1664,14 @@ int cng_install_monitor(struct cng_fs *fs) {
      * SECCOMP_RET_TRAP with no handler for the signal kills the process. */
     cng_g_sigsys_ready = 1;
     cng_g_scratch_none = cng_broker_env("CHROOTNG_SCRATCH_NONE") != 0;
+    const char *ad = cng_broker_env("CHROOTNG_ALTSTACK_DELAY");
+    if (ad) {
+        unsigned long us = 0, f;
+        while (*ad >= '0' && *ad <= '9' && us < 1000000)
+            us = us * 10 + (unsigned long)(*ad++ - '0');
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        g_alt_delay = us * f / 1000000;
+    }
     /* The ptrace kick signal is answered by every guest process, whether or not
      * it ever traces anything: it is how a tracer reaches a running task
      * (PTRACE_ATTACH), and how a process is told its child asked to be traced. */

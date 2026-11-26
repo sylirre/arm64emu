@@ -291,7 +291,13 @@ an exec's de_thread ends its siblings the same way. Each thread of ours has a
 kernel alternate signal stack of ours while the guest has none, so the SIGSYS
 frame of an exit made after unmapping the thread's own stack (musl's
 `__unmapself`, bionic's teardown) has somewhere to go; `sigaltstack` is trapped
-and answers with the guest's own. A plain fork is the libc's `fork()`, the
+and answers with the guest's own. A handler of ours does its work on a stack of
+ours with the alternate stack it was delivered on disarmed -- by the kernel where
+that stack is armed with `SS_AUTODISARM` (ours, from 4.7), otherwise by the
+handler, which blocks SIGSYS from before it leaves that stack until the disarm
+(the kernel refuses to change the stack SP is on): a SIGSYS sent from elsewhere
+in between, a tracer's kick or a kill(2), would be written at that stack's top,
+over the frames there. A plain fork is the libc's `fork()`, the
 tid words then the guest's call's. The handler's entry switches to the host
 context of the thread it lands on -- the pthread's TCB and shadow call stack --
 found by tid. What the libc made for such a thread is the host's, and an

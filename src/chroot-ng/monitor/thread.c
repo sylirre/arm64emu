@@ -250,13 +250,12 @@ void cng_thread_reclaim(void) { thr_reclaim(); }
 
 /* The flags our alternate stack is armed with: SS_AUTODISARM where the kernel
  * has it (4.7). A handler of ours leaves the alternate stack for its scratch
- * stack, and SIGSYS, the one signal it cannot block, can come before it has
- * disarmed it (sigsys.c, sigsys_on_scratch): the kernel then puts that frame
- * at the alternate stack's top, over the frames of the handler it interrupts.
- * Disarmed for the handler's length by the kernel itself, the stack is not
- * there to be taken. Before 4.7 the flag is refused -- and a frame carrying
- * it would fail rt_sigreturn -- and the window stays. */
-#define CNG_SS_AUTODISARM ((int)(1U << 31))
+ * stack, and has it disarmed while it is away, or a signal delivered to it
+ * there would be put at the alternate stack's top, over the frames of the
+ * handler it interrupted (sigsys.c, scr_run). Disarmed for the handler's
+ * length by the kernel itself, the stack needs nothing more from it. Before
+ * 4.7 the flag is refused -- and a frame carrying it would fail rt_sigreturn
+ * -- and the handler disarms ours as it does a guest's own. */
 static int g_alt_flags, g_alt_probed;
 
 /* Asked once, at startup (cng_thread_warmup), before anything runs on an
@@ -564,7 +563,7 @@ int cng_thread_altstack(struct cng_ucontext *uc, const void *uss, void *uoss,
         old.ss_size = 0;
         old.ss_flags = CNG_SS_DISABLE;
     } else {
-        old.ss_flags = (old.ss_flags & (int)0x80000000 /* SS_AUTODISARM */) |
+        old.ss_flags = (old.ss_flags & CNG_SS_AUTODISARM) |
                        (on ? CNG_SS_ONSTACK : 0);
     }
     if (uss) {
@@ -576,7 +575,7 @@ int cng_thread_altstack(struct cng_ucontext *uc, const void *uss, void *uoss,
             *ret = -EPERM;
             return 1;
         }
-        int mode = neu.ss_flags & ~(int)0x80000000;
+        int mode = neu.ss_flags & ~CNG_SS_AUTODISARM;
         if (mode != 0 && mode != CNG_SS_DISABLE && mode != CNG_SS_ONSTACK) {
             *ret = -EINVAL;
             return 1;

@@ -414,6 +414,11 @@ static void help(char **envp) {
                       "stack table had no slot to give, so every dispatch runs "
                       "on a stack mapped for the call. Test aid: a working host "
                       "reaches that only with 256 threads live at once."},
+        {"CHROOTNG_ALTSTACK_DELAY", "Spend this many microseconds on the "
+                      "monitor's own stack, at the start of a trap's handling, "
+                      "before the guest's alternate signal stack is disarmed. "
+                      "Test aid: widens a window of a few instructions, in which "
+                      "a SIGSYS sent from elsewhere must not reach that stack."},
         {"CHROOTNG_DEVSHM_FORCE_TMP", "Serve the guest's /dev/shm from the per-uid "
                       "directory under $TMPDIR even where the host has a real "
                       "/dev/shm; where none can be made the guest has no "

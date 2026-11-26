@@ -20,6 +20,8 @@ typedef struct {
 /* ss_flags */
 #define CNG_SS_ONSTACK 1
 #define CNG_SS_DISABLE 2
+/* 4.7: the kernel disarms the stack as it delivers onto it, until sigreturn. */
+#define CNG_SS_AUTODISARM ((int)(1U << 31))
 
 struct cng_sigcontext {
     unsigned long long fault_address;

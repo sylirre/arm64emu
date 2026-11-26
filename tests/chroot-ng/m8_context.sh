@@ -336,8 +336,10 @@ rm -rf "$FKD"
 # written and CHILD_CLEARTID's cleared with a wake, a private descriptor
 # table without CLONE_FILES, the parent's mask, no alternate stack, the
 # kernel's refusals, and a robust mutex whose owner thread exited holding it.
-# Differential against the same program under the kernel. A cwd of its own
-# without CLONE_FS is not one: the monitor keeps one guest cwd a process.
+# Differential against the same program under the kernel, run in $CTD as the
+# guest is in its root: both have the tmp the child changes into. A cwd of
+# its own without CLONE_FS is not one: the monitor keeps one guest cwd a
+# process.
 CTD=$(mktemp -d)
 mkdir -p "$CTD/tmp" "$CTD/dev"
 if guest_xlate_ready "raw-clone threads leg" &&
@@ -361,6 +363,35 @@ if guest_xlate_ready "raw-clone threads leg" &&
     skip "a thread without CLONE_FS: its cwd is the process's, one guest cwd a process (path.c)"
 fi
 rm -rf "$CTD"
+
+# SIGSYS sent from elsewhere -- a tracer's kick, a sibling's de_thread
+# request, a kill(2) -- to a process that traps with an alternate signal stack
+# of its own, registered without SS_AUTODISARM as bionic's and Go's are: one
+# that came after a handler of ours had left that stack for its own and
+# before it had disarmed it was put at the stack's top, over a guest handler's
+# frame or over the trap's own (monitor/sigsys.c, scr_run). Bionic's crash
+# handler died of it when crash_dump attached, one crash in twenty on a 4.19
+# Pixel. The window is a few instructions; CHROOTNG_ALTSTACK_DELAY widens it
+# to 50 us for the SIGSYS the guest is sent to reach it. Differential against
+# the same program under the kernel.
+ATD=$(mktemp -d)
+if guest_xlate_ready "alternate-stack SIGSYS leg" &&
+    guest_cc_report "$ATD/altsys" tests/chroot-ng/guests/altsys.c; then
+    want=$( (cd "$ATD" && emu_t 120 "$ATD/altsys") 2>/dev/null)
+    out=$(CHROOTNG_ALTSTACK_DELAY=50 m8run "$ATD" /altsys 2>/dev/null)
+    if [ -z "$want" ]; then
+        skip "alternate-stack SIGSYS: the reference run produced nothing"
+    elif [ "$want" = "$out" ]; then
+        pass=$((pass + 1))
+        echo "  ok   SIGSYS from elsewhere leaves a guest's own alternate stack alone"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL SIGSYS from elsewhere reached a guest's own alternate stack"
+        printf '       kernel: %s\n       guest : %s\n' \
+            "$(echo "$want" | tr '\n' '|')" "$(echo "$out" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$ATD"
 
 # Repeated execs from a threaded program: every thread an exec ends is given
 # back -- its stacks, and the pthread's, alternate and scratch stacks chroot-ng
