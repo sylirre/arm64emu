@@ -167,17 +167,24 @@ static u64 brk_locked(CPU *c, u64 a0) {
      * top page wraps to 0, which would read as "shrink to nothing" below and
      * unmap everything under the old break, the guest's own image included. */
     if (newbrk >= GUEST_TASK_SIZE) return as->brk;
+    /* RLIMIT_DATA, as check_data_rlimit counts it: the heap to the break as
+     * asked, plus the data segment -- and asked of a shrink too, which the
+     * kernel refuses as well while what is left stays over the limit. brk(2)
+     * reports a refusal as the unchanged break rather than an errno, which is
+     * what malloc reads to fall back on mmap. */
+    u64 dcap = rlim_cur(c->m, G_RLIMIT_DATA);
+    if (dcap != G_RLIM_INFINITY &&
+        (newbrk - as->brk_start) + (as->end_data - as->start_data) > dcap)
+        return as->brk;
     u64 old_end = PG_UP(as->brk), new_end = PG_UP(newbrk);
     if (new_end > old_end) {
-        /* refuse if the range collides with an existing mapping */
-        for (u64 va = old_end; va < new_end; va += GUEST_PAGE_SIZE)
-            if (as_find_region(as, va)) return as->brk;
-        /* ...or if it would cross RLIMIT_AS, or take the heap past
-         * RLIMIT_DATA. brk(2) reports a refusal as the unchanged break rather
-         * than an errno, which is what malloc reads to fall back on mmap. */
-        u64 dcap = rlim_cur(c->m, G_RLIMIT_DATA);
-        if (dcap != G_RLIM_INFINITY && new_end - as->brk_start > dcap)
-            return as->brk;
+        /* Refuse if the range collides with an existing mapping, or comes up
+         * against one: the kernel keeps a page between the heap and the next
+         * mapping above it, and a stack's guard gap below that one besides
+         * (brk's `newbrk + PAGE_SIZE > vm_start_gap(next)`). */
+        const Region *nx = as_next_region(as, old_end);
+        if (nx && as_gap_start(nx) < new_end + GUEST_PAGE_SIZE) return as->brk;
+        /* ...or if it would cross RLIMIT_AS. */
         if (!as_fits(c->m, new_end - old_end)) return as->brk;
         /* ...and the same limit again, this time as may_expand_vm applies it:
          * the heap is a data mapping like any other, so what has to fit is the

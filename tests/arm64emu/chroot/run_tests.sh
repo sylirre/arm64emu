@@ -4096,6 +4096,15 @@ check_fixture proclink $'/proc/self exe: lstat=0 link=1 stat=0 kind=1 nofollow=4
 # the name all the same.
 check_fixture recvname0 $'inet 0: r=1 namelen=16 untouched=1\ninet null: r=1 namelen=16 untouched=-1\ninet 16: r=1 namelen=16 untouched=0\nunix 0: r=1 namelen=19 untouched=1\nunix unnamed 0: r=1 namelen=0 untouched=1\nmmsg 0: r=1 namelen=19'
 
+# The program break by the kernel's rules (sys_mm.c, brk_locked): exactly the
+# break asked, pages given back on a shrink and zero-filled when they come
+# back, a growth refused into the next mapping and up against it (the kernel
+# keeps a page between), RLIMIT_DATA, a fork child's own, none of it left
+# after an exec, and the heap named in maps. The expected block is a kernel's
+# (6.8, static and dynamic glibc alike); chroot-ng's suite runs the same
+# program (tests/chroot-ng/guests/brkheap.c).
+check_fixture brkheap $'brk(0) answers the break: yes\nbelow start_brk: unchanged\ngrow by 100: exactly as asked\ngrow by three pages: exactly as asked, mapped to the break\nshrink: exactly as asked, pages given back\ngrow back: exactly as asked, zero-filled\nunaligned break kept: yes\ninto a mapping: refused\nup against a mapping: refused\na page short of a mapping: allowed\nthe mapping is untouched: yes\npast every address: refused\npast RLIMIT_DATA: refused\nRLIMIT_DATA 0: refused\nlimit lifted: allowed\nmaps [heap]: named, end to end, ending at the break\nfork: the child grew its own, the parent\'s break unchanged, its heap its own\nexec: the old heap is gone'
+
 # mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped
 # afresh -- zeroes behind private anonymous memory, the file again behind a
 # private file mapping, the same pages behind a shared one. Self-checking:
