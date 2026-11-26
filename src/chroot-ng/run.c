@@ -206,11 +206,9 @@ int cng_run(const char *rootfs, const char *workdir,
     cng_host_auxv = auxv;
     cng_g_exe_guest = prog_guest;
     cng_g_host_envp = envp;
-    /* The break before any guest program has run: what an emulated execve winds
-     * the heap back to, since it cannot drop it with the address space. */
-    long brk0 = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
-    if (brk0 > 0)
-        cng_g_brk0 = (unsigned long)brk0;
+    /* What the libc's startup left that an exec would not: before anything of
+     * ours is installed (execve.c). */
+    cng_entry_reset();
 
     /* Key the System V shm namespace to this invocation (unless --shared-proc
      * widens it to the rootfs). Seeded here, in the root process while we are
@@ -464,6 +462,7 @@ int cng_run(const char *rootfs, const char *workdir,
      * replaced — but an exec has to have something to retire when it comes. */
     cng_exec_generation(&prog, prog.has_interp ? &interp : 0, cng_g_stack_lo,
                         cng_g_stack_len);
+    cng_brk_place(&prog);
     /* (svc rewriting + its pool are handled inside the loader, per object.) */
 
     /* /proc emulation: bring up the PID registry and reserve the synthesized fd

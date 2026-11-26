@@ -654,15 +654,70 @@ static int put_status(int fd, const char *host, int pid) {
 
 /* ---- maps ---------------------------------------------------------------- */
 
+/* The range a maps line starts with. */
+static int maps_range(const char *p, unsigned long *lo, unsigned long *hi) {
+    unsigned long v[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        int n = 0;
+        for (;; p++, n++) {
+            unsigned c = (unsigned char)*p;
+            unsigned d = c - '0' < 10          ? c - '0'
+                         : (c | 32) - 'a' < 6 ? (c | 32) - 'a' + 10
+                                              : 16;
+            if (d > 15)
+                break;
+            v[k] = (v[k] << 4) | d;
+        }
+        if (!n || (k == 0 && *p++ != '-'))
+            return 0;
+    }
+    *lo = v[0];
+    *hi = v[1];
+    return 1;
+}
+
+/* The fields of `line` (`head` bytes, the space that ends them included),
+ * then `name` if there is one, in the kernel's layout. */
+static void maps_print(int fd, const char *line, size_t head, const char *name) {
+    char out[160];
+    if (head > 72 + sizeof out - 80)
+        head = 72 + sizeof out - 80;
+    memcpy(out, line, head);
+    size_t n = head;
+    if (name) {
+        while (n < 72)
+            out[n++] = ' ';
+        out[n++] = ' ';
+        size_t l = strlen(name);
+        memcpy(out + n, name, l);
+        n += l;
+    }
+    out[n] = '\0';
+    cng_dprintf(fd, "%s\n", out);
+}
+
 /* The guest's mappings ARE this process's mappings — addresses, protections,
  * device and inode are all true — so unlike the emulator this is a rewrite, not
  * a fabrication: a file-backed line naming a path inside the guest view has
  * that path translated back to its guest spelling, a line naming a host path
  * outside the view (chroot-ng's own text and data, our memfds) is dropped
  * because it is not part of the guest's image, and anonymous lines — including
- * every segment our loader mapped, plus [heap]/[stack]/[vdso] — pass through
- * unchanged. Returns 0, or -1 if the host file cannot be read. */
-static int put_maps(int fd, const char *host) {
+ * every segment our loader mapped, plus [stack]/[vdso] — pass through
+ * unchanged.
+ *
+ * Except for which of them is [heap]. The kernel's names the break it keeps,
+ * which is the host libc's heap (brk.c), so that line is shown as the
+ * anonymous memory of ours it is, and the name goes where the kernel's
+ * show_map_vma would put it for the guest's break: on an anonymous mapping
+ * that reaches from at or below the break to at or above start_brk. Only
+ * where the break is ours to know, in a maps of this process; another
+ * process's heap is shown unnamed. The column the name starts in is the
+ * kernel's too: the fields padded to 72, then a space.
+ *
+ * Returns 0, or -1 if the host file cannot be read. */
+static int put_maps(int fd, const char *host, int pid) {
+    unsigned long hs = 0, hb = 0;
+    int heap = pid == (int)sys_getpid() && cng_brk_extent(&hs, &hb);
     long hf = open_host_ro(host);
     if (hf < 0)
         return -1;
@@ -692,11 +747,25 @@ static int put_maps(int fd, const char *host) {
                 p++;
             field++;
         }
-        if (!*p) { /* anonymous mapping: no pathname column */
-            cng_dprintf(fd, "%s\n", line);
+        int kheap = !strcmp(p, "[heap]");
+        if (!*p || kheap) { /* anonymous mapping: no pathname column */
+            /* The fields and the one space that ends them, which is how the
+             * kernel prints a mapping with no name. */
+            size_t head = (size_t)(p - line);
+            if (kheap) {
+                while (head && line[head - 1] == ' ')
+                    head--;
+                head++;
+            }
+            unsigned long lo, hi;
+            int named = heap && maps_range(line, &lo, &hi) && lo <= hb && hi >= hs;
+            if (!kheap && !named)
+                cng_dprintf(fd, "%s\n", line);
+            else
+                maps_print(fd, line, head, named ? "[heap]" : 0);
             continue;
         }
-        if (*p != '/') { /* [heap], [stack], [vdso], anon shmem, ... */
+        if (*p != '/') { /* [stack], [vdso], anon shmem, ... */
             cng_dprintf(fd, "%s\n", line);
             continue;
         }
@@ -1807,7 +1876,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         rc = put_status((int)fd, host, pid);
         break;
     case PF_MAPS:
-        rc = put_maps((int)fd, host);
+        rc = put_maps((int)fd, host, pid);
         break;
     }
     if (rc < 0) { /* host file unreadable: let the real open answer */

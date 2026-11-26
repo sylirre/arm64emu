@@ -176,3 +176,116 @@ if guest_xlate_ready "stack-teardown leg" &&
     done
 fi
 rm -rf "$UMD"
+
+# The program break. The kernel's is the host libc's heap, and the guest's is
+# kept apart from it (monitor/brk.c) by the kernel's rules: exactly the break
+# asked, pages given back on a shrink and zero-filled when they come back, a
+# growth refused into the next mapping and up against it, RLIMIT_DATA, a fork
+# child's own, none of it left after an exec, and [heap] in maps naming the
+# guest's heap and no other. The expected block is a kernel's (6.8, static and
+# dynamic glibc alike); arm64emu's suite runs the same program.
+BKD=$(mktemp -d)
+if guest_xlate_ready "program-break leg" &&
+    guest_cc_report "$BKD/brkheap" tests/chroot-ng/guests/brkheap.c; then
+    want=$(cat <<'EOF'
+brk(0) answers the break: yes
+below start_brk: unchanged
+grow by 100: exactly as asked
+grow by three pages: exactly as asked, mapped to the break
+shrink: exactly as asked, pages given back
+grow back: exactly as asked, zero-filled
+unaligned break kept: yes
+into a mapping: refused
+up against a mapping: refused
+a page short of a mapping: allowed
+the mapping is untouched: yes
+past every address: refused
+past RLIMIT_DATA: refused
+RLIMIT_DATA 0: refused
+limit lifted: allowed
+maps [heap]: named, end to end, ending at the break
+fork: the child grew its own, the parent's break unchanged, its heap its own
+exec: the old heap is gone
+EOF
+)
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$BKD" /brkheap 2>/dev/null)
+    if [ "$want" = "$out" ]; then
+        pass=$((pass + 1))
+        echo "  ok   the guest's program break answers as the kernel's"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL the guest's program break diverges from the kernel's"
+        printf '       kernel: %s\n       guest : %s\n' \
+            "$(echo "$want" | tr '\n' '|')" "$(echo "$out" | tr '\n' '|')"
+    fi
+fi
+rm -rf "$BKD"
+
+# What a program finds at its first instruction, and again past an exec of
+# itself made after setting each piece of it: no thread pointer (the libc
+# chroot-ng runs on sets one), no alternate signal stack and every caught
+# signal at its default (Bionic installs both before main), an ignored one
+# still ignored, no rseq area (glibc registers one), and none of the
+# descriptors above 2 its exec'er left it unless --keep-fds -- where one on a
+# directory outside the view is closed all the same. The kernel keyrings
+# answer ENOSYS unless --host-keyring, and PR_PAC_RESET_KEYS answers as the
+# kernel's checks do. Freestanding, with an entry of its own: the reference is
+# the same program under the kernel, with every descriptor it was given.
+ESD=$(mktemp -d)
+ESO=$(mktemp -d)
+mkdir -p "$ESD/in"
+# Built without the link mode the suite probed, as M3's freestanding guest is:
+# there is no libc, and so no self-relocation a static-pie would need.
+if ! guest_xlate_ready "entry-state leg"; then
+    :
+elif ! $CHROOTNG_GUESTCC -nostdlib -static -ffreestanding -fno-builtin \
+    -fno-stack-protector -fno-tree-loop-distribute-patterns -O2 \
+    -o "$ESD/entrystate" tests/chroot-ng/guests/entrystate.c 2>"$GUEST_CC_LOG"; then
+    fail=$((fail + 1))
+    printf '  FAIL could not build %s\n' tests/chroot-ng/guests/entrystate.c
+    sed 's/^/    /' "$GUEST_CC_LOG" 2>/dev/null | head -8
+else
+    ref=$( (trap '' USR2; emu_t 60 "$ESD/entrystate" 3</dev/null 4<"$ESO" \
+        5<"$ESD/in") 2>/dev/null)
+    case "$ref" in
+    *"entry: fds: 3 4 5"*"exec: fds: 3 4 5"*)
+        out=$( (trap '' USR2; m8run "$ESD" /entrystate 3</dev/null 4<"$ESO" \
+            5<"$ESD/in") 2>/dev/null)
+        for _l in "entry: tpidr_el0 zero" "entry: no alternate stack" \
+            "entry: caught: 0, SIGUSR2 ignored" "exec: tpidr_el0 zero" \
+            "exec: no alternate stack" "exec: caught: 0, SIGUSR2 ignored" \
+            "entry: fds: none" "exec: fds: none" "keyctl: ENOSYS"; do
+            check_contains "a program starts as an execve starts it: $_l" "$_l" "$out"
+        done
+        want=$(printf '%s\n' "$ref" |
+            sed -e 's/fds: .*/fds: none/' -e 's/^keyctl: .*/keyctl: ENOSYS/')
+        check "...and its rseq and PAC answers are the kernel's" "$want" "$out"
+        out=$( (trap '' USR2; m8run --keep-fds "$ESD" /entrystate 3</dev/null \
+            4<"$ESO" 5<"$ESD/in") 2>/dev/null)
+        check_contains "--keep-fds: kept, less a directory outside the view" \
+            "entry: fds: 3 5" "$out"
+        check_contains "--keep-fds: ...and across an exec" "exec: fds: 3 5" "$out"
+        # The keyring of the host, where the host has one to answer with. The
+        # emulator under a cross host is a kernel of its own and refuses it
+        # too unless told.
+        if [ -n "$CHROOTNG_EMU" ]; then
+            hk() { "$TIMEOUT" -s KILL 60 "$CHROOTNG_EMU" chroot --jit --keep-fds \
+                --host-keyring --shared-proc -w "$PWD" / "$@"; }
+        else
+            hk() { "$TIMEOUT" -s KILL 60 "$@"; }
+        fi
+        kref_k=$(hk "$ESD/entrystate" 2>/dev/null | grep '^keyctl:')
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+        out_k=$(hk "$CHROOTNG_BIN" --host-keyring $CHROOTNG_GUEST_BINDS "$ESD" \
+            /entrystate 2>/dev/null | grep '^keyctl:')
+        case "$kref_k" in
+        "keyctl: answered")
+            check "--host-keyring: the host's keyring answers" "$kref_k" "$out_k" ;;
+        *) skip "--host-keyring: the host has no keyring to answer (${kref_k:-no run})" ;;
+        esac
+        ;;
+    *) skip "entry state: the reference run did not complete" ;;
+    esac
+fi
+rm -rf "$ESD" "$ESO"

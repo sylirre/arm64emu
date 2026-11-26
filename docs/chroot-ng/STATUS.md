@@ -5165,6 +5165,46 @@ kernel 3.18 (Galaxy S7).
     a dispatch from guest context runs on the guest's live FP registers
     and its TLS until the context switch (step 2.4) gives it the host's.
 
+- [x] **M116 — an exec-like entry, the guest's own break, the PAC trap**
+  - Step 2.3 of the merge into arm64emu. The libc's startup leaves state
+    the kernel's execve would not hand a program, and the first one is
+    now started as an exec starts one: caught dispositions back at their
+    default (Bionic's linker installs debuggerd's), no alternate signal
+    stack (Bionic gives every thread one), glibc's rseq registration
+    handed back (`__rseq_offset`/`__rseq_size`, weak; a thread has one
+    registration, and the guest's libc could not make its own), and
+    TPIDR_EL0 cleared at cng_enter and in the frame an emulated exec
+    leaves through, as tls_thread_flush clears it.
+  - Inherited descriptors above 2 are closed unless `--keep-fds`; one on a
+    directory outside the view is closed either way (cng_fds_sanitize).
+    keyctl/add_key/request_key answer ENOSYS from the filter unless
+    `--host-keyring`. Both as arm64emu's chroot mode has them.
+  - The guest's program break (monitor/brk.c). The kernel's is the host
+    libc's heap now, cached by its sbrk, so brk is trapped and the guest's
+    is a region of its own, by mm/mmap.c's rules: the break as asked,
+    check_data_rlimit, shrinks unmapped, a growth refused into the next
+    mapping and up against it (a page kept between), MAP_FIXED_NOREPLACE
+    with the pre-4.17 hint fallback. start_brk is load_elf_binary's for
+    an ET_EXEC program (past .bss, a page, up to 1 GiB at random); an
+    ET_DYN one is in the mmap region with no room above it, so its heap
+    goes past the host's break by 256 MiB, then the same random offset.
+    The exec sweep gives the old heap back; the wind-back of the kernel's
+    break at exec is gone. /proc/self/maps names the guest's heap [heap]
+    as show_map_vma would and shows the kernel's as unnamed memory.
+  - PR_PAC_RESET_KEYS is trapped and answered by the kernel's argument
+    and HWCAP checks without resetting: the keys sign the monitor's and
+    its libc's return addresses too.
+  - Tests: m8 brkheap (the expected block is a 6.8 kernel's, static and
+    dynamic glibc alike; arm64emu's suite runs the same program, and its
+    brk now keeps the page below the next mapping and counts the data
+    segment as check_data_rlimit does) and entrystate (freestanding, with
+    an entry of its own; then the same past an exec that set each piece).
+  - Open: an emulated exec whose own signal frame lies under the incoming
+    image -- an alternate stack in an ET_EXEC program's .bss, exec'ing an
+    ET_EXEC at the same address -- is refused ENOEXEC (CNG_LOAD_ECLOBBER:
+    the frame is what the handler returns through). The kernel has no
+    frame to keep. For the context switch (step 2.4) to move.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

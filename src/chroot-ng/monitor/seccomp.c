@@ -254,7 +254,22 @@ static const int enosys_syscalls[] = {
     __NR_mq_notify,
     __NR_mq_getsetattr,
 };
-#define NENOSYS ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
+#define NENOSYS_FIXED ((int)(sizeof(enosys_syscalls) / sizeof(enosys_syscalls[0])))
+
+/* The kernel keyrings, unless --host-keyring: a keyring is the invoking user's
+ * and the session's, not scoped to a rootfs, so the guest would read, add to
+ * and revoke the user's own keys. ENOSYS is what a kernel built without
+ * CONFIG_KEYS answers, and what every keyctl user falls back from; arm64emu's
+ * chroot mode answers the same. */
+static const int key_syscalls[] = {__NR_add_key, __NR_request_key, __NR_keyctl};
+#define NKEYS ((int)(sizeof(key_syscalls) / sizeof(key_syscalls[0])))
+int cng_g_host_keyring = 0;
+
+/* The whole designed-ENOSYS set as the options make it. */
+#define NENOSYS (NENOSYS_FIXED + (cng_g_host_keyring ? 0 : NKEYS))
+static int enosys_nr(int i) {
+    return i < NENOSYS_FIXED ? enosys_syscalls[i] : key_syscalls[i - NENOSYS_FIXED];
+}
 
 /* The same set as a bitset, for the dispatcher: a tracee's trap-everything
  * filter sends it every syscall of the task, and it asks this before anything
@@ -269,7 +284,7 @@ static int g_denied_built;
 static void denied_build(void) {
     u64 set[DENIED_WORDS] = {0};
     for (int i = 0; i < NENOSYS; i++) {
-        unsigned nr = (unsigned)enosys_syscalls[i];
+        unsigned nr = (unsigned)enosys_nr(i);
         if (nr < DENIED_WORDS * 64)
             set[nr >> 6] |= 1ULL << (nr & 63);
     }
@@ -283,7 +298,7 @@ int cng_denied_syscall(long nr) {
         /* Beyond the bitset (no number is today): the list itself is the
          * policy, so it is still the answer rather than a silent "allowed". */
         for (int i = 0; i < NENOSYS; i++)
-            if (nr == enosys_syscalls[i])
+            if (nr == enosys_nr(i))
                 return 1;
         return 0;
     }
@@ -359,7 +374,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
      * when faking, plus the conditional entries below). */
-    int nr[NPATH + NIPC + NID + NROFD + 11];
+    int nr[NPATH + NIPC + NID + NROFD + 12];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -429,6 +444,9 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     if (cng_g_l2s || !cng_g_no_proc || !cng_g_no_dev ||
         (cng_g_fs && cng_g_fs->nbinds > 0))
         nr[nsys++] = __NR_getdents64;
+    /* brk: the kernel's break is the host libc's heap, and the guest's is
+     * kept apart from it (brk.c). */
+    nr[nsys++] = __NR_brk;
 
     if (cap < CNG_SECCOMP_MAX_INSNS)
         return -1;
@@ -453,7 +471,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         for (int i = 0; i < NENOSYS; i++)
             f[n++] = (struct sock_filter)CNG_BPF_JUMP(
                 CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K,
-                (uint32_t)enosys_syscalls[i], (uint8_t)(NENOSYS - 1 - i),
+                (uint32_t)enosys_nr(i), (uint8_t)(NENOSYS - 1 - i),
                 (uint8_t)(i == NENOSYS - 1 ? 1 : 0));
         f[n++] = (struct sock_filter)CNG_BPF_STMT(
             CNG_BPF_RET | CNG_BPF_K,
@@ -529,15 +547,21 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
      *    for, and which tells it setuid-on-exec is dead when our emulated execve
      *    still honors it.
      *
+     *  - PR_PAC_RESET_KEYS would give the thread new pointer-authentication
+     *    keys, with frames of the monitor's and its libc's signed under the
+     *    old ones still to be returned through.
+     *
      * Everything else prctl does (PR_SET_NAME, PR_SET_VMA, PR_SET_PDEATHSIG, the
      * capability bounding set) is real process state that works natively and must
      * not pay for a trap — bionic's allocator calls PR_SET_VMA on every mapping.
      * The op is a scalar in args[0], so BPF can tell them apart. */
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
         CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_prctl, 0,
-        7); /* not prctl -> reload nr */
+        8); /* not prctl -> reload nr */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS); /* A = op */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_PR_PAC_RESET_KEYS, 5, 0);
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
         CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, CNG_PR_GET_SECCOMP, 4, 0);
     f[n++] = (struct sock_filter)CNG_BPF_JUMP(
@@ -936,6 +960,9 @@ int cng_install_seccomp(void) {
     int n = cng_build_seccomp(f, (int)(sizeof f / sizeof f[0]));
     if (n < 0)
         return -EINVAL; /* the buffer cannot hold the filter: ours, not the host's */
+    if (cng_g_debug)
+        cng_dprintf(2, "[cng] filter: %d of %d instructions\n", n,
+                    CNG_SECCOMP_MAX_INSNS);
     struct sock_fprog prog = {.len = (uint16_t)n, .filter = f};
 
     long r = sys_prctl(CNG_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);

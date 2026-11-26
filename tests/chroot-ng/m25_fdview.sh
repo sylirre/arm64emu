@@ -16,7 +16,8 @@ echo "== M25: descriptors and the guest view =="
 
 # End to end: a guest with the launcher's leaks in its table (fd 7 a host
 # directory, fd 8 a host file, both outside the rootfs), and every route a
-# relative name used to take out of the view. The rootfs supplies the marker
+# relative name used to take out of the view. Without --keep-fds no
+# descriptor above 2 is inherited at all; with it, the directory still goes. The rootfs supplies the marker
 # the escapes must land on instead, and a /dev so "/dev/pts/../.." has a
 # parent to walk through.
 FVR=$(mktemp -d); FVO=$(mktemp -d)
@@ -33,9 +34,16 @@ if ! guest_xlate_ready "descriptor legs"; then
 elif guest_cc_report "$FVR/fdescape" tests/chroot-ng/guests/fdescape.c; then
     # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
     out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$FVR" /fdescape 7<"$FVO" 8<"$FVO/file" 2>&1)
-    check_contains "a leaked directory fd is closed before the guest runs" \
+    check_contains "no leaked fd is inherited: the directory" \
         "inherited-dirfd=Bad file descriptor" "$out"
-    check_contains "a leaked file fd stays, for the I/O it carries" \
+    check_contains "no leaked fd is inherited: the file" \
+        "inherited-file=Bad file descriptor" "$out"
+    # shellcheck disable=SC2086
+    out=$(run_t 60 $CHROOTNG_GUEST_BINDS --keep-fds "$FVR" /fdescape 7<"$FVO" \
+        8<"$FVO/file" 2>&1)
+    check_contains "--keep-fds: a leaked directory fd is closed before the guest runs" \
+        "inherited-dirfd=Bad file descriptor" "$out"
+    check_contains "--keep-fds: a leaked file fd stays, for the I/O it carries" \
         "inherited-file=ok(HOST-LEAK)" "$out"
     # One of the standard three on an outside directory (`< /`) is replaced
     # by /dev/null rather than left closed: a program is entitled to find 0,

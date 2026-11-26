@@ -120,6 +120,7 @@ struct cng_open_how {
 
 /* getrlimit/prlimit64 resources */
 #define CNG_RLIMIT_STACK  3
+#define CNG_RLIMIT_DATA 2
 #define CNG_RLIMIT_NOFILE 7
 #define CNG_RLIM_INFINITY (~0UL)
 
@@ -144,6 +145,7 @@ struct cng_open_how {
 #define CNG_PR_SET_SECCOMP      22
 #define CNG_PR_GET_SECCOMP      21
 #define CNG_PR_CAPBSET_READ     23 /* EINVAL past CAP_LAST_CAP */
+#define CNG_PR_PAC_RESET_KEYS 54
 #define CNG_PR_SET_TAGGED_ADDR_CTRL 55
 #define CNG_PR_GET_TAGGED_ADDR_CTRL 56
 /* Memory-Deny-Write-Execute (Linux 6.3+): with REFUSE_EXEC_GAIN set, an

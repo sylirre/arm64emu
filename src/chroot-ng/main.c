@@ -335,6 +335,17 @@ static void help(char **envp) {
                       "other rootfs instances stay separate — abstract names have "
                       "no filesystem node, so the rootfs prefix cannot scope them "
                       "and we cannot give the guest its own network namespace."},
+        {"    --keep-fds", "Let the guest inherit the open descriptors above "
+                      "stdin/stdout/stderr that the caller left it. They are "
+                      "closed before the guest starts by default: guest fd is "
+                      "host fd, so an inherited one is a live handle onto a "
+                      "host file outside the rootfs. One on a directory the "
+                      "guest has no name for is closed even so."},
+        {"    --host-keyring", "Forward keyctl/add_key/request_key to the host "
+                      "keyring. They report the facility as absent (ENOSYS) by "
+                      "default: keyrings are not scoped to a rootfs, so the "
+                      "guest would read, add to and revoke the invoking user's "
+                      "own keys."},
         {"    --no-dev", "Disable the /dev device-node passthrough. By default "
                       "a fixed whitelist of harmless host devices (null, zero, "
                       "full, random, urandom, tty, ptmx, console, pts/*, shm/*, "
@@ -771,6 +782,12 @@ int cng_main(int argc, char **argv, char **envp, unsigned long *auxv) {
             } else if (!strcmp(n, "no-dev")) {
                 if (val) return err_noval(arg);
                 cng_g_no_dev = 1;
+            } else if (!strcmp(n, "keep-fds")) {
+                if (val) return err_noval(arg);
+                cng_g_keep_fds = 1;
+            } else if (!strcmp(n, "host-keyring")) {
+                if (val) return err_noval(arg);
+                cng_g_host_keyring = 1;
             } else if (!strcmp(n, "share-abstract-sockets")) {
                 if (val) return err_noval(arg);
                 cng_g_share_abstract = 1;

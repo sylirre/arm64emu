@@ -224,10 +224,14 @@ void cng_exec_generation(const struct cng_loaded *prog,
                          unsigned long stack_lo, unsigned long stack_len);
 void cng_exec_reap(void);
 
-/* The program break before the first guest program ran. A real execve drops the
- * heap with the address space; ours keeps the address space, so the break is
- * wound back to this at each exec. 0 = never recorded, and nothing is done. */
-extern unsigned long cng_g_brk0;
+/* The guest's program break, kept apart from the kernel's, which is the host
+ * libc's heap (brk.c). cng_brk_place gives a program just loaded the break
+ * the kernel would; cng_brk is the syscall; cng_brk_extent says where the
+ * heap is (start_brk and the break), 0 before any program is placed. */
+struct cng_loaded;
+void cng_brk_place(const struct cng_loaded *prog);
+long cng_brk(unsigned long brk);
+int cng_brk_extent(unsigned long *start, unsigned long *cur);
 
 /* Record / forget a POSIX timer the guest created. A real execve deletes them
  * all, and nothing enumerates a process's timers, so the dispatcher hands over
@@ -239,6 +243,11 @@ void cng_timer_forget(int id);
  * it with the address space; ours has to unregister it, which takes the exact
  * area, length and signature, so the dispatcher hands them over as the guest
  * registers (see the table in execve.c). */
+/* The state a libc's startup leaves that the kernel's execve would not hand the
+ * guest's first program: caught dispositions, an alternate signal stack, the
+ * libc's rseq registration (execve.c). Before anything of the monitor's is
+ * installed. */
+void cng_entry_reset(void);
 void cng_rseq_note(unsigned long area, unsigned long len, unsigned int sig);
 void cng_rseq_forget(void);
 /* Across a trapped fork: the forking thread's entry, sampled before the clone,
@@ -440,6 +449,11 @@ int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz);
  * let in and a directory is not. */
 int cng_fd_admit(int fd);
 void cng_fds_sanitize(void);
+/* --keep-fds: the descriptors above 2 the launcher left are the guest's to
+ * inherit (cng_fds_sanitize closes them otherwise). --host-keyring: the key
+ * syscalls reach the host (seccomp.c answers them ENOSYS otherwise). */
+extern int cng_g_keep_fds;
+extern int cng_g_host_keyring;
 
 /* The guest name of a host directory the kernel reported (a /proc/self/fd
  * readback, a getcwd): inside the view, or one of the two zones. 0/-1 — and

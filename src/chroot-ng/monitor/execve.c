@@ -62,12 +62,14 @@ unsigned long *cng_host_auxv = 0;
  * same, or the new program inherits the previous one's handlers and altstack —
  * e.g. a C compiler exec'd from Go would inherit Go's SIGSEGV/SIGURG handlers
  * and Go's small per-thread sigaltstack, onto which our SA_ONSTACK SIGSYS
- * handler would then deliver. SIGSYS is left alone (our monitor owns it). */
-static void cng_reset_signals(void) {
+ * handler would then deliver. SIGSYS is left alone at an exec (our monitor
+ * owns it); at the guest's entry nothing of ours is installed yet, and it is
+ * reset with the rest (cng_entry_reset). */
+static void reset_dispositions(int keep_sigsys) {
     /* kernel struct sigaction: handler, flags, restorer, mask (32 bytes). */
     unsigned long cur[4], dfl[4] = {0, 0, 0, 0};
     for (int s = 1; s <= 64; s++) {
-        if (s == CNG_SIGSYS)
+        if (s == CNG_SIGSYS && keep_sigsys)
             continue;
         if (CNG_SYS(__NR_rt_sigaction, s, 0, cur, 8, 0, 0) < 0)
             continue;             /* SIGKILL/SIGSTOP etc.: unqueryable, skip */
@@ -78,6 +80,10 @@ static void cng_reset_signals(void) {
     /* stack_t: ss_sp(8), ss_flags(4)@8, ss_size(8)@16 => 24 bytes. SS_DISABLE=2. */
     unsigned long ss[3] = {0, 2, 0};
     CNG_SYS(__NR_sigaltstack, ss, 0, 0, 0, 0, 0);
+}
+
+static void cng_reset_signals(void) {
+    reset_dispositions(1);
     /* Same reset applied to the record ptsig.c keeps of what the guest asked
      * for, and reinstatement of the dispositions that must outlive an exec:
      * the ptrace kick handler, and our own hooks if this task is still traced
@@ -972,8 +978,6 @@ static int leader_reachable(void) {
  * path/argv/envp are the snapshot taken by execve_core, not the guest's own
  * pointers: everything from cng_load_elf onwards would otherwise be reading
  * memory the load just replaced. */
-unsigned long cng_g_brk0 = 0;
-
 /* POSIX timers the guest created. There is no syscall that enumerates a
  * process's timers, so they are deleted at the next exec from two records:
  *
@@ -1480,11 +1484,12 @@ void cng_exec_generation(const struct cng_loaded *prog,
  *    lands in whatever the new program put there.
  *  - the robust futex list is walked by the kernel on exit, following pointers
  *    the old program owned.
- *  - the heap keeps every byte the old program allocated, and an exec chain
- *    (a wrapper script running a wrapper script) accumulates all of them.
  *
- * All best-effort: a kernel without POSIX timers has no such file, and a failed
- * brk simply leaves the heap where it was. */
+ * (The heap was the fourth, wound back here. It is a region of the guest's
+ * own now (brk.c), memory of the outgoing program the exec sweep gives back,
+ * and the next program is given a break of its own after the load.)
+ *
+ * All best-effort: a kernel without POSIX timers has no such file. */
 static void cng_exec_reset(void) {
     cng_timers_exec_reset();
     CNG_SYS(__NR_set_tid_address, 0, 0, 0, 0, 0, 0);
@@ -1502,11 +1507,6 @@ static void cng_exec_reset(void) {
     if (!cng_blocked[__NR_set_robust_list])
         CNG_SYS(__NR_set_robust_list, 0,
                 24 /* sizeof(struct robust_list_head) */, 0, 0, 0, 0);
-    if (cng_g_brk0) {
-        long cur = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
-        if (cur > 0 && (unsigned long)cur > cng_g_brk0)
-            CNG_SYS(__NR_brk, cng_g_brk0, 0, 0, 0, 0, 0);
-    }
 }
 
 /* A failure after the point of no return.
@@ -2067,12 +2067,14 @@ static long execve_commit(struct exec_job *j, unsigned long *out_sp,
      * address space; ours keeps it, so the mappings have to go explicitly (and
      * the broker's nattch with them). */
     cng_shm_detach_all();
-    /* ...and neither do POSIX timers, the clear_child_tid futex, the robust
-     * futex list, or the heap. A real execve drops all four with the address
-     * space; ours keeps the address space, so each is state of a program that no
-     * longer exists, pointing into memory the new one now owns. (The rseq area
-     * is the fifth, unregistered at the point of no return above.) */
+    /* ...and neither do POSIX timers, the clear_child_tid futex or the robust
+     * futex list. A real execve drops all three with the address space; ours
+     * keeps the address space, so each is state of a program that no longer
+     * exists, pointing into memory the new one now owns. (The rseq area is the
+     * fourth, unregistered at the point of no return above.) */
     cng_exec_reset();
+    /* The new program's break, where the kernel's load would have put it. */
+    cng_brk_place(prog);
 
     /* setuid/setgid-on-exec against the fake credential set (--setuid-root /
      * --setgid-root): `host` is the ELF the kernel would honor the set-id bit on
@@ -2367,6 +2369,37 @@ static long exec_takeover(unsigned long *out_sp, unsigned long *out_entry,
     return rc;
 }
 
+/* What the exec that started chroot-ng gave the guest, less what the libc's
+ * startup has made of it since: the guest's first program is to start as a
+ * kernel's execve starts one.
+ *  - Dispositions: a caught signal back to its default, an ignored one kept.
+ *    Nothing of the guest's is installed yet, and the libc's (Bionic's linker
+ *    installs debuggerd's crash handlers) are not the guest's to inherit.
+ *  - No alternate signal stack: Bionic gives every thread one.
+ *  - No rseq area: glibc registers one for the main thread, and a thread has
+ *    one registration at a time, so the guest's own libc could not register
+ *    its own -- glibc then runs without, and sched_getcpu goes back to the
+ *    syscall. Unregistering takes the length it was registered with, which
+ *    glibc does not say (__rseq_size is the feature size since 2.40), so the
+ *    lengths it has used are tried in turn; a wrong one is EINVAL. */
+extern const long __rseq_offset __attribute__((weak));
+extern const unsigned int __rseq_size __attribute__((weak));
+#define CNG_RSEQ_SIG 0xd428bc00u
+
+void cng_entry_reset(void) {
+    reset_dispositions(0);
+    if (&__rseq_size && &__rseq_offset && __rseq_size) {
+        unsigned long tp;
+        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+        unsigned long area = tp + (unsigned long)__rseq_offset;
+        const unsigned long lens[] = {32, __rseq_size, 64, 128, 256};
+        for (unsigned i = 0; i < sizeof lens / sizeof lens[0]; i++)
+            if (CNG_SYS(__NR_rseq, area, lens[i], CNG_RSEQ_FLAG_UNREGISTER,
+                        CNG_RSEQ_SIG, 0, 0) == 0)
+                break;
+    }
+}
+
 /* The frame the new program is entered through, from a signal handler: the
  * registers cleared, the entry state in sp/pc, the requester's mask (the
  * thread's own, on the direct path), and no alternate signal stack — a real
@@ -2385,6 +2418,10 @@ static void exec_frame(struct cng_ucontext *uc, unsigned long sp,
     uc->uc_stack.ss_sp = 0;
     uc->uc_stack.ss_flags = CNG_SS_DISABLE;
     uc->uc_stack.ss_size = 0;
+    /* ...and no thread pointer: the kernel's exec clears TPIDR_EL0
+     * (tls_thread_flush), which no frame carries, so it is cleared here, on
+     * the way out through the frame. Nothing of ours reads it. */
+    __asm__ volatile("msr tpidr_el0, xzr");
 }
 
 int cng_exec_takeover_frame(struct cng_ucontext *uc) {

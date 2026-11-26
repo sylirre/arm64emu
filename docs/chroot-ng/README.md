@@ -81,7 +81,22 @@ it also reads and keeps the hardlinks of a rootfs installed by `proot-distro`),
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
 independent invocations of the same rootfs, for both the process view and the
-System V IPC namespace).
+System V IPC namespace), `--keep-fds` (let the guest inherit the descriptors
+above 2 it was started with), `--host-keyring` (let `keyctl`/`add_key`/
+`request_key` reach the host's kernel keyrings).
+
+The guest's first program starts as a kernel's `execve` would start it, not
+as chroot-ng itself was started: no descriptors above stdin/stdout/stderr
+(guest fd is host fd, so an inherited one is a live handle onto a host file
+outside the rootfs; `--keep-fds` keeps them, less one on a directory the guest
+has no name for), every caught signal back at its default (an ignored one stays
+ignored), no alternate signal stack, no rseq registration and no thread pointer.
+The kernel keyrings report the facility as absent (`ENOSYS`) unless
+`--host-keyring`: they are the invoking user's and the session's, not scoped to
+a rootfs. The program break is the guest's own, a region apart from the one the
+kernel keeps for chroot-ng's libc, by the kernel's rules (and `[heap]` in
+`/proc/self/maps` names it); `PR_PAC_RESET_KEYS` is answered by the kernel's
+checks without resetting, since the keys also sign chroot-ng's own frames.
 
 `/proc` is visible to the guest without a bind, and describes the guest rather
 than chroot-ng: host processes are hidden from it (by path and from listings,

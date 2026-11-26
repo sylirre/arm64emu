@@ -550,6 +550,21 @@ int cng_elf_map(const struct cng_elf_plan *plan, unsigned long base_hint,
         out->copied[out->ncopied].hi = cng_page_up(v + ph[i].p_filesz);
         out->ncopied++;
     }
+    out->elf_brk = out->start_data = out->end_data = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD)
+            continue;
+        unsigned long v = ph[i].p_vaddr;
+        if (out->start_data < v)
+            out->start_data = v;
+        if (out->end_data < v + ph[i].p_filesz)
+            out->end_data = v + ph[i].p_filesz;
+        if (out->elf_brk < v + ph[i].p_memsz)
+            out->elf_brk = v + ph[i].p_memsz;
+    }
+    out->elf_brk += bias;
+    out->start_data += bias;
+    out->end_data += bias;
     out->is_dyn = plan->is_dyn;
     return CNG_LOAD_OK;
 }

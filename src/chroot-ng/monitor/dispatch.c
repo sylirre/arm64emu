@@ -1852,9 +1852,14 @@ int cng_fd_admit(int fd) {
     return 0;
 }
 
+int cng_g_keep_fds = 0;
+
 /* Run cng_fd_admit over every descriptor the guest is about to inherit. Called
  * once, from cng_run, with the view published and before the first program is
- * loaded. Our own descriptors are all close-on-exec — the launcher's
+ * loaded. Above the standard three, none is inherited at all without
+ * --keep-fds: guest fd is host fd, so one the launcher left open is a live
+ * handle onto a host file the rootfs does not contain. Our own descriptors
+ * are all close-on-exec — the launcher's
  * close-on-exec ones did not survive the exec that started us, so at this
  * point the flag is ours alone — and are skipped, the directory being read
  * among them. One of the standard three that goes (`chroot-ng ... < /`) is
@@ -1884,6 +1889,10 @@ void cng_fds_sanitize(void) {
             long fl = sys_fcntl((int)fd, CNG_F_GETFD, 0);
             if (fl < 0 || (fl & 1 /*FD_CLOEXEC*/))
                 continue;
+            if (fd > 2 && !cng_g_keep_fds) {
+                sys_close((int)fd);
+                continue;
+            }
             if (!cng_fd_admit((int)fd) && fd <= 2) {
                 long nul = sys_openat(CNG_AT_FDCWD, "/dev/null", CNG_O_RDWR, 0);
                 if (nul >= 0 && nul != fd) {
@@ -6906,6 +6915,26 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
             if (a1 || a2 || a3 || a4)
                 return -EINVAL; /* the kernel's own check, as for the setter */
             return cng_nnp_get();
+        case CNG_PR_PAC_RESET_KEYS: {
+            /* Judged as ptrauth_prctl_reset_keys judges it, and answered
+             * without the reset: the keys sign the return addresses of the
+             * monitor's frames and its libc's as well as the guest's, and a
+             * frame signed under the old ones fails authentication on its
+             * way back. The guest keeps the keys its program started with --
+             * which our execve never gave it new ones of either. */
+            unsigned long hw = 0;
+            for (unsigned long *v = cng_host_auxv; v && v[0]; v += 2)
+                if (v[0] == AT_HWCAP)
+                    hw = v[1];
+            int paca = (hw >> 30) & 1, pacg = (hw >> 31) & 1;
+            if (a2 || a3 || a4 || (!paca && !pacg))
+                return -EINVAL;
+            unsigned long keys = (unsigned long)a1;
+            if ((keys & ~0x1fUL) || ((keys & 0xf) && !paca) ||
+                ((keys & 0x10) && !pacg))
+                return -EINVAL;
+            return 0;
+        }
         }
         return reissue(a0, a1, a2, a3, a4, a5, nr);
     }
@@ -6937,6 +6966,10 @@ static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
      * not lost with the default. */
     case __NR_mprotect:
         return reissue(a0, a1, a2, a3, a4, a5, nr);
+
+    /* The program break is the guest's own, apart from the kernel's (brk.c). */
+    case __NR_brk:
+        return cng_brk((unsigned long)a0);
 
     /* mremap with MREMAP_DONTUNMAP, which leaves the old range mapped — and
      * reading what backs it: a file's bytes, or zero-fill. The loader's images

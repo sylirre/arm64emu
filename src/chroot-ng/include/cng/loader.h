@@ -62,6 +62,12 @@ struct cng_loaded {
         unsigned long lo, hi;
     } copied[CNG_LOAD_COPIED];
     int ncopied;
+    /* What the kernel's load_elf_binary keeps of the object for the program
+     * break, absolute and by its own rules: elf_brk, where the highest
+     * segment's memory ends, and start_data/end_data, the highest p_vaddr and
+     * the highest end of a file part -- the data the RLIMIT_DATA check of brk
+     * counts beside the heap (brk.c). */
+    unsigned long elf_brk, start_data, end_data;
     int is_dyn;            /* ET_DYN vs ET_EXEC */
     int has_interp;        /* PT_INTERP present */
     char interp[256];      /* interpreter path if has_interp */

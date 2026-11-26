@@ -106,8 +106,9 @@ int main(void) {
     struct stat st;
 
     /* The launcher's leaks: the directory is gone, the file is still there
-     * for the I/O it carries. And what stdin is: a directory there is
-     * replaced by /dev/null rather than left closed. */
+     * for the I/O it carries -- under --keep-fds; without it, both are gone.
+     * And what stdin is: a directory there is replaced by /dev/null rather
+     * than left closed. */
     rc("inherited-dirfd", fcntl(7, F_GETFD));
     content("inherited-file", dup(8));
     if (fstat(0, &st) == 0 && S_ISCHR(st.st_mode) && readlink("/proc/self/fd/0", p, sizeof p - 1) > 0 &&
