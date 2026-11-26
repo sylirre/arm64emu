@@ -304,8 +304,8 @@ handler where a kernel resumes them (the FIFO open then left a writer blocked
 forever), and a timed futex wait was restarted where a kernel reports it
 (`tests/arm64emu/chroot/fixtures/sarestart.c`; qemu-user has a restart list of its own).
 
-The restart starts from `orig_x0` — x0 as the `SVC` found it
-(`g_tls.sc_orig_x0`), before a tracer's entry stop changed it — as
+The restart starts from `orig_x0` (`g_tls.sc_orig_x0`) — x0 as the `SVC`
+found it, or as a tracer left it at the call's entry stop (e057b9477232) — as
 `do_signal`'s does, which rewinds pc to the `SVC` and puts `orig_x0` back in
 x0 *before* `get_signal` takes a single stop. A tracer is shown the kernel's
 whole sequence: the interrupted call's exit stop has the restart code in x0
@@ -2042,7 +2042,7 @@ exit (`PTRACE_GETEVENTMSG` reads it too, and 0 once the stop is over), and
 only a stop with `PTRACE_O_TRACESYSGOOD`'s `si_code` is one, a seccomp stop
 by its event; any other is op `NONE`, the registers alone (24 bytes). The
 entry and seccomp stops give the number (sign-extended) and the arguments,
-the first being `orig_x0` whatever the tracer has written to x0 since, and the
+the first being `orig_x0`, which a register write at either stop moves with x0, and the
 seccomp stop the filter's data (80 and 84 bytes); the exit stop the result,
 flagged an error for -4095..-1 (33 bytes) (`pt_scinfo`,
 `tests/arm64emu/chroot/ptrace/origx0.c`). It used to be `EIO`.

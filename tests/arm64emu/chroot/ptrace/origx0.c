@@ -2,24 +2,27 @@
  * implements neither a guest's seccomp filter nor enough of ptrace to serve
  * as the differential oracle).
  *
- * arm64's regs->orig_x0 is x0 as the SVC found it, and the kernel goes on
- * using it where a tracer's x0 is not the point:
- *   - seccomp judges it as args[0] (syscall_get_arguments): at the first look
- *     after the entry stop, whatever the tracer changed there, and at the
- *     second after a RET_TRACE stop; for a call of -1 too, whose x0 is
- *     already -ENOSYS;
+ * arm64's regs->orig_x0 is x0 as the SVC found it -- and, since e057b9477232
+ * ("arm64: syscall: Ensure saved x0 is kept in-sync with tracer updates", in
+ * every stable kernel), x0 as a tracer leaves it at the call's entry stop or
+ * its RET_TRACE stop, for a call that is made (not -1). The kernel goes on
+ * using it:
+ *   - seccomp judges it as args[0] (syscall_get_arguments): the tracer's x0
+ *     after the entry stop, and after a RET_TRACE stop at the recheck; for a
+ *     call of -1 the x0 it was made with, its x0 being -ENOSYS by then;
  *   - RET_TRAP puts it back (syscall_rollback): the exit stop, the SIGSYS
  *     frame and the call's answer all hold it -- -ENOSYS is never left;
  *   - PTRACE_GET_SYSCALL_INFO gives it as the first argument;
  *   - a restart starts from it: do_signal rewinds pc to the SVC and puts it
  *     back in x0 before get_signal, so the stop that follows an interrupted
- *     call shows the call about to be made again as it was made, and the
- *     restart is that call (a handler without SA_RESTART turning it into
+ *     call shows the call about to be made again as the tracer left it, and
+ *     the restart is that call (a handler without SA_RESTART turning it into
  *     EINTR after the stop).
  * The interrupted call's exit stop shows its restart code (-ERESTARTSYS for
  * a read), and rt_sigreturn's exit stop the -1 a frame taken back leaves.
  *
- * Verified against a 6.8 kernel (qemu-system, neoverse-n2). */
+ * Verified against a 6.8 kernel with that fix (Ubuntu 6.8.0-151, qemu-system,
+ * neoverse-n2). */
 #define _GNU_SOURCE
 #include <elf.h>
 #include <errno.h>
@@ -207,12 +210,12 @@ static void case_untraced(void) {
     check(out[3] == -ENOSYS, "a call of -1 the filter allows", out[3]);
 }
 
-/* ---- seccomp, traced: a tracer's x0 is not the filter's ---- */
+/* ---- seccomp, traced: a tracer's x0 is the filter's, but for a call of -1 ---- */
 #define NSC 6
 static const unsigned long sc_nr[NSC] = { NR_GETPPID, NR_GETPPID, NR_GETPPID,
                                           NR_GETPPID, ~0UL, NR_GETPPID };
 static const long sc_a0[NSC] = { 0x1234, 0, 0x5555, 0x7777, 0x1234, 0x9999 };
-static const long sc_set[NSC] = { 0, 0x1234, -1, 0x1111, -1, 0x4321 };
+static const long sc_set[NSC] = { 0, 0x1234, -1, -1, -1, 0x4321 };
 
 static void case_traced(void) {
     int p[2];
@@ -266,8 +269,9 @@ static void case_traced(void) {
         snprintf(what, sizeof what, "call %d: GET_SYSCALL_INFO entry", i);
         check(n == 80 && si.op == 1 && si.arch == 0xc00000b7u &&
               (int64_t)si.entry.nr == want_nr && si.ip == r.pc && si.sp == r.sp, what, n);
-        snprintf(what, sizeof what, "call %d: GET_SYSCALL_INFO entry: args[0] is x0 as made", i);
-        check(si.entry.args[0] == (uint64_t)sc_a0[i], what, (long)si.entry.args[0]);
+        snprintf(what, sizeof what, "call %d: GET_SYSCALL_INFO entry: args[0] is the tracer's x0", i);
+        check(si.entry.args[0] == (uint64_t)(sc_set[i] != -1 ? sc_set[i] : sc_a0[i]), what,
+              (long)si.entry.args[0]);
         ptrace(PTRACE_SYSCALL, pid, 0, 0);
 
         st = stop(pid);
@@ -279,7 +283,7 @@ static void case_traced(void) {
             n = info(pid, &si);
             check(n == 84 && si.op == 3 && (int64_t)si.seccomp.nr == NR_GETPPID &&
                   si.seccomp.ret_data == 5, "call 2: GET_SYSCALL_INFO seccomp", n);
-            check(si.seccomp.args[0] == 0x5555, "call 2: GET_SYSCALL_INFO seccomp: args[0] is x0 as made",
+            check(si.seccomp.args[0] == 0x1234, "call 2: GET_SYSCALL_INFO seccomp: args[0] is the tracer's x0",
                   (long)si.seccomp.args[0]);
             ptrace(PTRACE_SYSCALL, pid, 0, 0);
             st = stop(pid);
@@ -287,7 +291,7 @@ static void case_traced(void) {
         snprintf(what, sizeof what, "call %d: exit stop", i);
         check(is_sc(st), what, st);
         regs(pid, &r);
-        const long want_ret[NSC] = { -77, me, me, 0x7777, -78, me };
+        const long want_ret[NSC] = { me, -77, -77, 0x7777, -78, me };
         snprintf(what, sizeof what, "call %d: x0 at the exit stop", i);
         check((long)r.regs[0] == want_ret[i], what, (long)r.regs[0]);
         snprintf(what, sizeof what, "call %d: the exit stop's eventmsg", i);
@@ -311,7 +315,7 @@ static void case_traced(void) {
     close(p[0]);
     st = stop(pid);
     check(WIFEXITED(st) && WEXITSTATUS(st) == 0 && k == (ssize_t)sizeof out, "traced child", st);
-    const long want[NSC] = { -77, me, me, 0x7777, -78, me };
+    const long want[NSC] = { me, -77, -77, 0x7777, -78, me };
     for (int i = 0; i < NSC; i++) {
         char what[64];
         snprintf(what, sizeof what, "call %d answered", i);
@@ -375,7 +379,7 @@ static void case_restart(const char *name, int sig, int flags) {
     EXPECT(WIFSTOPPED(st) && WSTOPSIG(st) == sig, "the signal's stop", st);
     EXPECT(scno(pid) == -1, "the signal's stop is outside the call", scno(pid));
     EXPECT(r.pc == site, "the signal's stop is at the SVC, rewound", r.pc - site);
-    EXPECT(r.regs[0] == (uint64_t)a[0], "the signal's stop has x0 as the read was made", r.regs[0]);
+    EXPECT(r.regs[0] == (uint64_t)b[0], "the signal's stop has x0 as the tracer left it", r.regs[0]);
     ptrace(PTRACE_SYSCALL, pid, 0, (void *)(long)sig);
 
     int restarts = flags < 0 || (flags & SA_RESTART);
@@ -388,7 +392,7 @@ static void case_restart(const char *name, int sig, int flags) {
         EXPECT(is_sc(st), "rt_sigreturn's exit stop", st);
         EXPECT(scno(pid) == -1, "rt_sigreturn's exit stop: no call", scno(pid));
         if (restarts)
-            EXPECT(r.pc == site && r.regs[0] == (uint64_t)a[0],
+            EXPECT(r.pc == site && r.regs[0] == (uint64_t)b[0],
                    "rt_sigreturn restores the restart", r.pc - site);
         else
             EXPECT(r.pc == site + 4 && (long)r.regs[0] == -EINTR,
@@ -399,8 +403,8 @@ static void case_restart(const char *name, int sig, int flags) {
         st = stop(pid);
         regs(pid, &r);
         EXPECT(is_sc(st) && scno(pid) == NR_READ && r.pc == site + 4, "the restart's entry stop", st);
-        EXPECT(r.regs[0] == (uint64_t)a[0], "the restart is the read as it was made", r.regs[0]);
-        if (r.regs[0] != (uint64_t)a[0] && write(b[1], "B", 1) != 1) check(0, "write", errno);
+        EXPECT(r.regs[0] == (uint64_t)b[0], "the restart is the read the tracer left", r.regs[0]);
+        if (r.regs[0] == (uint64_t)b[0] && write(b[1], "B", 1) != 1) check(0, "write", errno);
         ptrace(PTRACE_SYSCALL, pid, 0, 0);
         st = stop(pid);
         regs(pid, &r);
@@ -416,10 +420,10 @@ static void case_restart(const char *name, int sig, int flags) {
         EXPECT(out[3] == -EINTR && out[4] == (long)site + 4,
                "the handler's frame: EINTR, past the SVC", out[3]);
     } else {
-        EXPECT(out[0] == 1 && out[1] == 'A', "the read restarted, as it was made", out[0]);
+        EXPECT(out[0] == 1 && out[1] == 'B', "the read restarted, as the tracer left it", out[0]);
         if (flags >= 0)
-            EXPECT(out[2] == sig && out[3] == a[0] && out[4] == (long)site,
-                   "the handler's frame: the restart, from x0 as made", out[3]);
+            EXPECT(out[2] == sig && out[3] == b[0] && out[4] == (long)site,
+                   "the handler's frame: the restart, from the tracer's x0", out[3]);
     }
 #undef EXPECT
     close(a[0]); close(a[1]); close(b[0]); close(b[1]); close(rep[0]); close(rep[1]);

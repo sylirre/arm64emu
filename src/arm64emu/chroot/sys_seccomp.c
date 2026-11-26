@@ -383,8 +383,8 @@ int seccomp_gate(CPU *c, u64 nr, const u64 *args, s64 *ret, u16 *trap_data, int 
         s32 now_nr = g_ptrace_scno;
         if (now_nr < 0) { *ret = (s64)c->x[0]; return 1; }
         /* ...judged on the arguments as they stand, the first being
-         * orig_x0 still: a tracer's x0 is no more the filter's here than at
-         * the entry stop. */
+         * orig_x0 -- which follows what the tracer wrote at the stop
+         * (e057b9477232; ptracetab.c, pt_orig_x0_sync). */
         u64 now[6];
         for (int i = 0; i < 6; i++) now[i] = c->x[i];
         now[0] = g_tls.sc_orig_x0;

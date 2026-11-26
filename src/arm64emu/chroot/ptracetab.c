@@ -520,6 +520,19 @@ static u32 pt_regset_geom(u32 which, u32 *size) {
     }
 }
 
+/* This thread is at a call's entry stop or its PTRACE_EVENT_SECCOMP stop,
+ * where orig_x0 follows what a tracer writes (pt_orig_x0_sync). */
+static __thread int pt_at_entry;
+
+/* update_syscall_orig_x0_after_ptrace, as gpr_set and system_call_set call it
+ * (e057b9477232 and its follow-up): orig_x0 is x0 as the tracer leaves it at
+ * those stops -- what seccomp judges, GET_SYSCALL_INFO reports and a restart
+ * starts from -- unless the call is -1, whose x0 is the answer by then. Not
+ * at an exit stop, where x0 is the call's return value. */
+static void pt_orig_x0_sync(CPU *c) {
+    if (pt_at_entry && g_ptrace_scno != -1) g_tls.sc_orig_x0 = c->x[0];
+}
+
 /* Takes a whole regset image, as pt_build_regset writes it: a short write
  * has been laid over the regset as it stands (PT_CMD_SETREGS). */
 static int pt_apply_regset(CPU *c, u32 which, const u8 *in) {
@@ -537,6 +550,7 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in) {
         *cpu_cur_sp(c) = r.sp;
         c->pc = r.pc;
         el0_pstate_put(c, ps);
+        pt_orig_x0_sync(c);
         return 0;
     }
     case G_NT_PRFPREG: {
@@ -562,6 +576,7 @@ static int pt_apply_regset(CPU *c, u32 which, const u8 *in) {
         s32 nr;
         memcpy(&nr, in, sizeof nr);
         g_ptrace_scno = nr;
+        pt_orig_x0_sync(c);
         return 0;
     }
     default:
@@ -940,7 +955,9 @@ void ptrace_report_syscall(CPU *c, int is_exit) {
      * once it is over. */
     g_self_link->eventmsg = is_exit ? G_PTRACE_EVENTMSG_SYSCALL_EXIT
                                     : G_PTRACE_EVENTMSG_SYSCALL_ENTRY;
+    pt_at_entry = !is_exit;
     pt_stop(c, SIGTRAP, 0, 1 /* syscall stop */, si);
+    pt_at_entry = 0;
     if (g_self_link) g_self_link->eventmsg = 0;
 }
 
@@ -1367,7 +1384,9 @@ s32 ptrace_tracer_of(s32 tid) {
 void ptrace_report_event(CPU *c, int event, u64 msg) {
     if (!g_ptrace_active || !g_self_link) return;
     g_self_link->eventmsg = msg;
+    pt_at_entry = event == G_PTRACE_EVENT_SECCOMP;
     pt_event_stop(c, event);
+    pt_at_entry = 0;
 }
 
 /* ---- followed fork: the child's link, made by the parent ----

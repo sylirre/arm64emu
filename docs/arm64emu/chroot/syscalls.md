@@ -1188,11 +1188,14 @@ its first mismatch would kill the emulator rather than the guest. But the
 emulator already sees every guest syscall at one choke point, so the filter is
 simply evaluated there, between the ptrace syscall-entry stop and the handler —
 the kernel's own order, since a tracer may have rewritten the number the filter
-is meant to judge. The first argument it judges is `orig_x0`, x0 as the `SVC`
-found it (`syscall_get_arguments`): a tracer's change of x0 at the entry stop
-or at a `TRACE` stop is not the filter's business, nor is the `-ENOSYS` a call
-of -1 has in x0 by then (`tests/arm64emu/chroot/ptrace/origx0.c`, checked
-against a 6.8 kernel).
+is meant to judge. The first argument it judges is `orig_x0`
+(`syscall_get_arguments`): x0 as the `SVC` found it, or as a tracer left it at
+the entry stop or at a `TRACE` stop before the recheck -- `orig_x0` follows
+every register write there, for a call that is made (e057b9477232, "arm64:
+syscall: Ensure saved x0 is kept in-sync with tracer updates", in every stable
+kernel; `pt_orig_x0_sync`) -- and never the `-ENOSYS` a call of -1 has in x0 by
+then (`tests/arm64emu/chroot/ptrace/origx0.c`, checked against Ubuntu's
+6.8.0-151, which has the fix).
 
 What that buys: `bwrap --seccomp`, flatpak's syscall blacklists and any
 libseccomp-generated program behave as they would on a kernel. The accepted

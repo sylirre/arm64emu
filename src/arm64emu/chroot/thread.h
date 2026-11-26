@@ -87,9 +87,10 @@ typedef struct {
     /* Syscall-restart bookkeeping (SA_RESTART on EINTR, and the emulator's own
      * internal wakeups -- syscall_restart_internal, src/arm64emu/chroot/syscall.c).
      * sc_orig_x0 is the kernel's regs->orig_x0, x0 as the SVC found it, before
-     * a tracer's entry stop or the -ENOSYS of a call of -1: what seccomp
-     * judges as args[0], what RET_TRAP puts back, what a restart the kernel
-     * shows starts from. sc_restart_x0 is the x0 a restart is made with: the
+     * the -ENOSYS of a call of -1 -- or as a tracer left it at the call's
+     * entry or seccomp stop (e057b9477232; ptracetab.c, pt_orig_x0_sync):
+     * what seccomp judges as args[0], what RET_TRAP puts back, what a restart
+     * the kernel shows starts from. sc_restart_x0 is the x0 a restart is made with: the
      * call's own (an interruption of the emulator's, which no kernel would
      * have made, is invisible), until a stop or a handler -- the kernel's
      * do_signal -- has shown the restart, from orig_x0 (syscall.c,

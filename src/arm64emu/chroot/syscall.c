@@ -629,6 +629,12 @@ void syscall_dispatch(CPU *c) {
          * call it was stopped at the entry of is never made. The safepoint
          * the run loop reaches next is where this thread goes. */
         if (dethread_callout(c->m)) { ptrace_leave_syscall(); return; }
+        /* ...and orig_x0 is x0 as the tracer left it, for a call that is
+         * made (e057b9477232, "arm64: syscall: Ensure saved x0 is kept in-sync
+         * with tracer updates", in every stable kernel): what seccomp judges
+         * and what a restart starts from. Kept so as the tracer writes it
+         * (ptracetab.c, pt_orig_x0_sync); this is the after-the-stop half. */
+        if (g_ptrace_scno != -1) g_tls.sc_orig_x0 = c->x[0];
     }
 
     u64 nr = (u64)(s64)g_ptrace_scno;
@@ -665,8 +671,9 @@ void syscall_dispatch(CPU *c) {
      * number the filter is meant to judge) and before the handler, which is the
      * kernel's order. Gated on a mode byte that is zero for every guest that
      * never installed a filter. The first argument the filter is given is
-     * orig_x0 (syscall_get_arguments), not x0: neither a tracer's change at
-     * the entry stop nor a call of -1's -ENOSYS is any of its business. */
+     * orig_x0 (syscall_get_arguments), not x0: a call of -1's -ENOSYS is no
+     * business of it, and a tracer's change at the entry stop reaches it
+     * through orig_x0 (synced above). */
     s64 scret = 0;
     u16 sctrap = 0;   /* SECCOMP_RET_DATA of a trapping filter -> si_errno */
     int scskip = 0;   /* 1 = filtered out, 2 = filtered out + SIGSYS to deliver */
@@ -679,6 +686,7 @@ void syscall_dispatch(CPU *c) {
          * tracer left, in the registers and in its number. */
         scskip = 0;
         nr = (u64)(s64)g_ptrace_scno;
+        g_tls.sc_orig_x0 = c->x[0];   /* the same resync after this stop */
         a0 = c->x[0]; a1 = c->x[1]; a2 = c->x[2];
         a3 = c->x[3]; a4 = c->x[4]; a5 = c->x[5];
         av[0] = a0; av[1] = a1; av[2] = a2; av[3] = a3; av[4] = a4; av[5] = a5;
