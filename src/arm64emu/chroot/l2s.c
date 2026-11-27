@@ -300,7 +300,7 @@ static void h_log(const char *fmt, ...) {
     va_end(ap);
 }
 
-const struct l2s_ops l2s_host = {
+const struct l2s_ops l2s_chroot_ops = {
     .lstat = h_lstat,
     .stat = h_stat,
     .readlink = h_readlink,

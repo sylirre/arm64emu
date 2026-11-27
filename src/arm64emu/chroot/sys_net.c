@@ -165,7 +165,7 @@ static void abs_tag_out(CPU *c, struct sockaddr_un *un, socklen_t *sl, size_t po
  * bind. (A program comparing the readback with what it bound -- a datagram
  * service replying to its client's address -- is the casualty.)
  *
- * So, as chroot-ng does: the descriptor named in the spelling is the binder's
+ * So, as the native tier does: the descriptor named in the spelling is the binder's
  * own, kept above every number the guest can hold for as long as the socket
  * is open in this process, which makes the spelling resolvable by any process
  * of the user while the binding lasts; and the binder records what the guest

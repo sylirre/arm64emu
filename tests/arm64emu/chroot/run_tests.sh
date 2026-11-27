@@ -1373,6 +1373,28 @@ if [ -n "$AGCC" ]; then
     fi
 fi
 
+# ---- A guest's queued si_code from the band the emulator's own marks and
+# carriers use comes back as it was queued, and is not taken for one of them
+# (src/arm64emu/chroot/signal.c, SIG_CODE_BAND): arm64emu run as a guest
+# sent its probe with a code of the SIGSTOP carrier's range, and the emulator
+# under it stopped. Self-checking: a kernel's own answer, byte for byte
+# (checked natively). ----
+if [ -n "$AGCC" ]; then
+    if "$AGCC" -static -O2 -o build/tests/arm64emu/chroot/fixtures/sigcode_band.bin \
+            tests/arm64emu/chroot/fixtures/sigcode_band.c 2>/dev/null; then
+        expect=$'sig=64 queue=0 wait=64 code=-2147479843 same=1 errno=23130 val=1234567\nsig=64 queue=0 wait=64 code=-2147479843 same=1 errno=23130 val=1234567\nsig=10 queue=0 wait=10 code=-2147483397 same=1 errno=23130 val=1234567\nsig=10 queue=0 wait=10 code=-2147483141 same=1 errno=23130 val=1234567\nsig=12 queue=0 wait=12 code=-2147483648 same=1 errno=23130 val=1234567\ncaught sig=10 queue=0 got=10 same=1\ncaught sig=10 queue=0 got=10 same=1\ncaught sig=12 queue=0 got=12 same=1\ncaught sig=64 queue=0 got=64 same=1\ndone'
+        got=$(timeout -s KILL 60 "$EMU" chroot / build/tests/arm64emu/chroot/fixtures/sigcode_band.bin 2>/dev/null)
+        if [ "$got" = "$expect" ]; then pass=$((pass+1)); echo "PASS fixture: sigcode_band"
+        else
+            fail=$((fail+1)); echo "FAIL fixture: sigcode_band"
+            diff <(echo "$expect") <(echo "$got") | head -8 | sed 's/^/     /'
+        fi
+        fx_rm build/tests/arm64emu/chroot/fixtures/sigcode_band.bin
+    else
+        skip_build "fixtures/sigcode_band"
+    fi
+fi
+
 # ---- the resource limits that bound an address space (RLIMIT_AS/DATA/STACK).
 # Self-checking, and it has to be: qemu-user makes setrlimit of these three a
 # silent no-op -- it reached the same conclusion, that handing them to the host
@@ -4101,8 +4123,8 @@ check_fixture recvname0 $'inet 0: r=1 namelen=16 untouched=1\ninet null: r=1 nam
 # back, a growth refused into the next mapping and up against it (the kernel
 # keeps a page between), RLIMIT_DATA, a fork child's own, none of it left
 # after an exec, and the heap named in maps. The expected block is a kernel's
-# (6.8, static and dynamic glibc alike); chroot-ng's suite runs the same
-# program (tests/chroot-ng/guests/brkheap.c).
+# (6.8, static and dynamic glibc alike); the native tier's suite runs the
+# same program (tests/arm64emu/chroot/native/guests/brkheap.c).
 check_fixture brkheap $'brk(0) answers the break: yes\nbelow start_brk: unchanged\ngrow by 100: exactly as asked\ngrow by three pages: exactly as asked, mapped to the break\nshrink: exactly as asked, pages given back\ngrow back: exactly as asked, zero-filled\nunaligned break kept: yes\ninto a mapping: refused\nup against a mapping: refused\na page short of a mapping: allowed\nthe mapping is untouched: yes\npast every address: refused\npast RLIMIT_DATA: refused\nRLIMIT_DATA 0: refused\nlimit lifted: allowed\nmaps [heap]: named, end to end, ending at the break\nfork: the child grew its own, the parent\'s break unchanged, its heap its own\nexec: the old heap is gone'
 
 # mremap(MREMAP_DONTUNMAP): the pages move and the old range stays mapped

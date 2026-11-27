@@ -1,7 +1,7 @@
-# arm64emu: build it and run its suites, both modes', whenever something it is
-# built from changes — its own sources and tests, the AArch64 emulation it runs
-# (lib/arm64), the hardlink emulation its chroot mode shares with chroot-ng
-# (lib/link2symlink), or the build itself.
+# arm64emu: build it and run its suites, both modes' and chroot mode's native
+# tier's, whenever something it is built from changes — its own sources and
+# tests, the AArch64 emulation it runs (lib/arm64), the hardlink emulation
+# both of chroot mode's tiers run (lib/link2symlink), or the build itself.
 #
 # Boot mode's firmware + Linux gates (the *-consist and full-boot log stages
 # of test-arm64emu-boot-pd / test-arm64emu-boot-jit) want a kernel and initrd
@@ -218,6 +218,49 @@ jobs:
 
       - name: Chroot mode, JIT (aarch64 host)
         run: make test-arm64emu-chroot-jit
+
+  # Chroot mode's native tier (--native) on a real AArch64 machine: the guest
+  # on the CPU, under the host kernel's own seccomp filter, the kernel a device
+  # runs. (On x86_64 the tier's suite runs the AArch64 cross build under the
+  # emulator's chroot mode, which applies a guest's filter as a kernel does;
+  # that is the developer's run, not this one: docs/arm64emu/chroot/
+  # native-testing.md.) tests/arm64emu/chroot/native/lib.sh resolves
+  # everything host-dependent (no emulator, native gcc as the guest toolchain,
+  # static-PIE guests) and prints what it found at the top of the log; it
+  # provisions the Alpine and Debian images it needs too, pinned by hash
+  # there, and only their tarballs are cached between runs. The emulator's
+  # chroot mode is the oracle of its differential legs. Warnings in the
+  # tier's code fail the build (ARM64EMU_NATIVE_CFLAGS), job-wide, so every
+  # step builds with the same flags.
+  native:
+    name: chroot mode's native tier (aarch64 host)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      ARM64EMU_NATIVE_CFLAGS: -Werror
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain
+        run: |
+          cc --version
+          make --version
+          uname -srm
+
+      # Every run unpacks a fresh tree, since one restored from a cache would
+      # have to be trusted to keep every mode bit and symlink intact; the pins
+      # are in lib.sh, so editing it renews the cache.
+      - name: Restore rootfs tarballs
+        uses: actions/cache@v6
+        with:
+          path: build/cache/arm64emu/chroot/native/rootfs/downloads
+          key: rootfs-downloads-${{ hashFiles('tests/arm64emu/chroot/native/lib.sh') }}
+
+      - name: Build
+        run: make -j"$(nproc)" arm64emu
+
+      - name: Native tier
+        run: make test-arm64emu-chroot-native
 
   # Chroot mode's suite built with clang, because the compiler is part of what
   # is under test here. The FP core reads the host's exception flags to build

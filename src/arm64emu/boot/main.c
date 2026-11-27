@@ -497,7 +497,7 @@ int boot_main(int argc, char **argv)
                 if      (c == 'h') help();
                 else if (c == 'v') version();
                 else if (engine_short_opt(c)) ;
-                else if (c == 'm') { ram_mb = strtoull(short_value("--memory", p, argv, argc, &i), 0, 0); break; }
+                else if (c == 'm') { ram_mb = strtoull(short_value("-m", p, argv, argc, &i), 0, 0); break; }
                 else usage();
             }
         }

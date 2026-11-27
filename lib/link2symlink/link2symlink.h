@@ -2,9 +2,9 @@
 /* Copyright 2026 Sylirre */
 /* link2symlink: emulate hardlinks with tracked symlinks + a backing file, for
  * hosts that refuse link(2) (Android/SELinux returns EACCES/EXDEV, some EPERM).
- * Shared by chroot-ng and arm64emu's chroot mode; each compiles it with its
- * own flags and hands it the host through struct l2s_ops (below), as
- * `l2s_host`.
+ * Shared by both of arm64emu's chroot-mode tiers, the emulator and the native
+ * tier (--native): each hands it the host through a struct l2s_ops of its own
+ * (below), which it points `l2s_host` at before the first call.
  *
  * A guest hardlink group lives in the per-rootfs object store "<rootfs>/.l2s":
  *   data   ".l2s.<ino>"          the linked file itself, moved here — a regular
@@ -24,7 +24,7 @@
  * mount: rename returns EXDEV), the group falls back to the pre-store layout —
  * data + marker in the first-linked name's own directory, names as same-
  * directory *relative* symlinks. That legacy format (also what arm64emu's
- * chroot mode wrote before it used this engine) is still recognized
+ * emulator wrote before it used this engine) is still recognized
  * everywhere; absolute targets whose rootfs prefix went stale (the tree was
  * moved or copied) self-heal onto the current store. A link is ours only where its target names
  * a data file the emulation could have written — in a place of the guest's
@@ -51,10 +51,10 @@
  * the scheme above, which proot does not read (l2s.c, "proot's groups").
  *
  * All paths here are already rootfs-resolved *host* paths, and every one the
- * engine hands back to the host goes through the program's l2s_ops, which keep
- * it inside the guest's places. Freestanding: no C library beyond the string
- * functions both programs have, no state but the ops and two flags, so it is
- * safe wherever the program's ops are (chroot-ng: the SIGSYS handler).
+ * engine hands back to the host goes through the tier's l2s_ops, which keep
+ * it inside the guest's places. No C library beyond the string functions, no
+ * state but the ops and two flags, so it is safe wherever the tier's ops are
+ * (the native tier's: its SIGSYS handler).
  */
 #ifndef LINK2SYMLINK_H
 #define LINK2SYMLINK_H
@@ -124,7 +124,7 @@ struct l2s_ops {
     void (*close)(long fd);
 
     /* An update of a group runs between these, under its lock: what the
-     * program must hold off meanwhile (chroot-ng blocks every signal, since
+     * tier must hold off meanwhile (the native one blocks every signal, since
      * a handler that linked a name would wait for its own lock). `saved` is
      * the program's to keep what it puts back. */
     void (*hold)(unsigned long long *saved);
@@ -150,8 +150,9 @@ struct l2s_ops {
     void (*log)(const char *fmt, ...);
 };
 
-/* The host: every program that compiles the engine defines this table. */
-extern const struct l2s_ops l2s_host;
+/* The host: the table of the tier that runs the engine, which each sets
+ * before its first call (chroot/l2s.c's, native/monitor/l2s.c's). */
+extern const struct l2s_ops *l2s_host;
 
 /* Emulate link(src, dst) (host paths) via the backing-file symlink scheme.
  * Returns 0 or -errno. */

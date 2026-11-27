@@ -1,16 +1,16 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
-/* link2symlink backing-file scheme (see link2symlink.h). Freestanding: the host is
- * reached only through the program's l2s_ops, and the C library only for the
- * string functions below, which chroot-ng's runtime provides as well — so it
- * is safe wherever the program's ops are (chroot-ng: the SIGSYS handler).
- * Every path here is an already-resolved host path. */
+/* link2symlink backing-file scheme (see link2symlink.h). The host is reached
+ * only through the tier's l2s_ops, and the C library only for the string
+ * functions below -- so it is safe wherever the tier's ops are (the native
+ * tier's: its SIGSYS handler). Every path here is an already-resolved host
+ * path. */
 #include "link2symlink.h"
 
 #include <asm-generic/errno.h>
 
-/* The string functions, as both programs' C runtimes define them (no header:
- * chroot-ng has no C library's, and this unit wants nothing else of one). */
+/* The string functions, the C library's (no header: this unit wants nothing
+ * else of one). */
 size_t strlen(const char *s);
 int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, size_t n);
@@ -22,8 +22,9 @@ void *memcpy(void *d, const void *s, size_t n);
 #define L2S_PREFIX     ".l2s."
 #define L2S_PREFIX_LEN 5
 
-/* The host: the program's (l2s_host). */
-#define O (&l2s_host)
+/* The host: the running tier's. */
+const struct l2s_ops *l2s_host;
+#define O (l2s_host)
 
 /* Failure-path diagnostics. */
 #define L2S_LOG(...)                                                          \
@@ -68,7 +69,7 @@ static long l2s_symlink(const char *target, const char *linkpath) {
 static long l2s_rename(const char *o, const char *n) {
     return O->rename(o, n, 0);
 }
-/* -ENOSYS where the program cannot ask for it: in chroot-ng's SIGSYS handler
+/* -ENOSYS where the tier cannot ask for it: in the native tier's SIGSYS handler
  * a renameat2 the ambient filter refuses is a nested SIGSYS, and the process
  * dies of it. */
 static long l2s_exchange(const char *a, const char *b) {
@@ -342,7 +343,8 @@ static int l2s_store_dir(char *out, size_t sz);
  * behind. A lock FILE in the store did, and in a rootfs proot-distro
  * installed the store is the very directory proot keeps its own groups in,
  * which was then no longer as proot leaves it; such a file, left by an
- * earlier chroot-ng, is removed under the lock by each process's first
+ * earlier chroot-ng (the native tier, before it was one), is removed under
+ * the lock by each process's first
  * update. The data file (either way it can be opened) and then its directory
  * stand in only where the store cannot be had at all — a rootfs on which
  * nothing can be created, where no link is going to be made either — or
@@ -354,10 +356,11 @@ static int l2s_store_dir(char *out, size_t sz);
  * and that can be a FIFO or a device: only a regular file is opened to stand
  * in, since opening one of those blocks or acts.
  *
- * What the program holds off during an update (l2s_ops.hold) is held from
- * before the lock is asked for until it is given back. In chroot-ng that is
- * every signal, as its view's and credentials' writers block theirs: on its
- * -R tier the dispatcher runs on the guest's own mask, and a signal is
+ * What the tier holds off during an update (l2s_ops.hold) is held from
+ * before the lock is asked for until it is given back. In the native tier
+ * that is every signal, as its view's and credentials' writers block theirs:
+ * a dispatch bounced to the guest's context runs on the guest's own mask
+ * (as its -R tier did, since dropped), and a signal is
  * delivered on the way out of any syscall an update makes: a handler that
  * linked or unlinked a name itself opened the lock file again and waited for
  * the lock its own thread held, forever — an flock belongs to the open file,

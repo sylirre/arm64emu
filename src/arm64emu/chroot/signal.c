@@ -918,6 +918,19 @@ static int g_sig_nocld_ok = 1;    /* SA_NOCLDWAIT reaps and SA_NOCLDSTOP
 #define SIG_THR_BIAS 0x7fffff00
 #define SIG_THR_SPAN 127
 
+/* Every code a mark or a carrier of ours sends is drawn from one band, at the
+ * bottom of the negative range: the thread mark's and the origin mark's spans
+ * (SIG_THR_BIAS, SIG_ORG_BIAS) and the job-control carriers' ranges
+ * (SIG_JC_BIAS), all of -SIG_CODE_BAND and below. A guest may queue a code of
+ * that band itself -- the kernel lets a process claim any negative one, and
+ * an emulator running in the guest marks its own signals the same way -- and
+ * sent on as written it would be read for one of ours: arm64emu's own
+ * sig_probe_sicode, run in a guest, sent its kick with a code of the
+ * SIGSTOP carrier's range, and the emulator underneath stopped. So a guest's
+ * queued siginfo with such a code goes through the receiver's inbox
+ * (sig_carry_send), which carries it exactly. */
+#define SIG_CODE_BAND 0x7ffff000
+
 int sig_thread_code(int code) {
     /* Not on a host that cannot carry the mark (sig_probe_host): there the
      * signal goes through the receiver's inbox, whose slot names the thread
@@ -1085,7 +1098,8 @@ static int sig_carry_claim(int hs, const siginfo_t *si, int jc, PendSig *p) {
  * guest's queued siginfo (SIG_CARRY_QUEUED) even then, since what the host
  * would hand on could not say a guest wrote it (sig_origin_code), whose pid
  * and uid are then not the host's to translate (sig_ident); on every tier, a
- * value the host's sigval does not hold -- an ILP32 host's is 4 bytes, the
+ * guest's queued siginfo whose code is of the band ours are drawn from
+ * (SIG_CODE_BAND), and a value the host's sigval does not hold -- an ILP32 host's is 4 bytes, the
  * guest's 8, and a real 32-bit device, whose kernel carries everything else,
  * would hand on the low half alone. 1 when it went that way (*ret the send's
  * 0 or -errno), 0 when the caller is to send what the host can carry. */
@@ -1093,6 +1107,7 @@ int sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
                    int code, s32 err, s32 pid, u32 uid, u64 value, s64 *ret) {
     if (hs <= 0) return 0;   /* a null signal carries nothing */
     if ((u64)(uintptr_t)value == value &&
+        !(jc == SIG_CARRY_QUEUED && code <= -SIG_CODE_BAND) &&
         (g_sig_sicode_ok ||
          (jc == SIG_CARRY_PLAIN && !tid && code == SI_QUEUE && !err)))
         return 0;
@@ -1158,6 +1173,8 @@ int sig_carry_send(s32 tgid, s32 tid, int pidfd, int hs, int gsig, int jc,
  * (sig_send_jc); the kick net queues the signal it stands for. */
 #define SIG_JC_BIAS  0x7ffff000
 #define SIG_JC_SPAN  255
+_Static_assert(SIG_JC_BIAS >= SIG_CODE_BAND && SIG_ORG_BIAS >= SIG_CODE_BAND &&
+               SIG_THR_BIAS >= SIG_CODE_BAND, "a code of ours outside the band");
 static const int sig_jc_nr[5] = { SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT };
 
 static int sig_jc_uncode(int *code, int *sig, int *thr) {

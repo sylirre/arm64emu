@@ -4,7 +4,7 @@
  * of it, whichever task the file describes (src/arm64emu/chroot/proctab.c, "blocked
  * sets"). The emulator's own host numbers are never in a host mask, so the
  * host's line showed a task that blocks everything as leaving a dozen signals
- * open -- chroot-ng, run in a guest, took that for "my kick signal gets
+ * open -- chroot-ng (now the native tier), run in a guest, took that for "my kick signal gets
  * through" and waited for ever on an attach that never happened.
  *
  * Self-checking: qemu-user answers these reads with the host's line too. The

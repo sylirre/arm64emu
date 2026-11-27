@@ -14,7 +14,11 @@ AArch64 emulator with two modes, one program:
   devices), booting EDK2 firmware and Linux.
 * `arm64emu chroot` — Linux user space: runs the programs of an AArch64 rootfs
   in unprivileged, isolated chroot environments, with directory binding, a
-  fake user id and hardlink emulation via symlinks.
+  fake user id and hardlink emulation via symlinks. On an AArch64 host
+  `--native` runs them on the CPU itself instead: the native tier
+  (`chroot/native/`), an in-process, ptrace-free proot -- a seccomp filter
+  traps the guest's system calls into a SIGSYS handler of ours -- which was
+  the program chroot-ng until it became this tier.
 
 Both modes run the same CPU (`lib/arm64`): the plain interpreter (the
 reference), the predecoded tier (the default) and the JIT (`--jit`).
@@ -29,6 +33,9 @@ Packages required to compile the program and run its suites:
 
 * gcc or clang
 * make
+* clang, lld and the aarch64-linux-gnu cross libc — `make arm64emu-a64`, the
+  AArch64 cross build that boot mode's AArch64 JIT backend and, on an x86_64
+  host, chroot mode's native tier are tested in
 * aarch64-linux-gnu-gcc (aarch64-linux-gnu-gcc-13) — builds the guest programs
   of both modes' suites on an x86_64 host
 * qemu-aarch64 — chroot mode's differential oracle, and proot's interpreter
@@ -344,8 +351,43 @@ src/arm64emu/chroot/      chroot mode: Linux user space (`arm64emu chroot`)
   machine.h thread.h      Per-process shared Machine state + per-thread state
                           (CPU is per-thread; Machine is shared)
   guest_abi.h             ARM64 syscall numbers + explicit guest struct layouts
-  main.c                  the mode's entry (chroot_main): its CLI, --help text,
-                          rootfs setup, initial exec
+  main.c                  the mode's entry (chroot_main): its CLI (both
+                          tiers'), --help text, the guest environment, the
+                          native tier's hand-off and fallback, rootfs setup,
+                          initial exec
+src/arm64emu/chroot/native/  chroot mode's native tier (`--native`; AArch64
+                          targets only): the guest on the host CPU, its
+                          syscalls trapped by a seccomp filter. Its names carry
+                          chroot-ng's prefix, cng_; docs/arm64emu/chroot/native.md
+                          is its design
+  native.h                the tier as chroot mode sees it: struct native_opts,
+                          native_run (weak in chroot mode, null where the tier
+                          is not built)
+  run.c                   native_run: the view, the preflight, the point of no
+                          return (the exec-like entry), the load, the filter
+  preflight.c             what the tier asks of the host before it takes the
+                          process over: one thread, a filter a forked child is
+                          trapped by, code that can be made executable, a free
+                          ET_EXEC range; the host auxv through getauxval
+  loader/                 userland ELF loader: map a guest from a read-only fd,
+                          its initial stack (stack.c), the entry (enter.S)
+  monitor/                the syscall monitor: the seccomp filter (seccomp.c),
+                          the SIGSYS handler and its scratch stacks (sigsys.c),
+                          every handler's entry (hentry.S: the host's thread
+                          pointer and x18), the dispatcher (dispatch.c), the
+                          emulated execve (execve.c), guest threads as host
+                          pthreads (thread.c), the program break (brk.c), and
+                          the emulated subsystems: /proc (procfs.c, procreg.c),
+                          ptrace (ptrace.c, ptsig.c, ptstep.c), System V IPC
+                          (shm.c, sysvipc.c, ipcreg.c, over broker.c), netlink,
+                          AF_UNIX, ttys, credentials, link2symlink's host (l2s.c)
+  path/                   rootfs path translation and containment
+  rt/                     the runtime: the syscall gate (gate.S, the monitor's
+                          only svc #0, and the bounce), formatting helpers, the
+                          host's code ranges (hostcode.c), the syscall table's
+                          check (unistd_check.c)
+  include/cng/            its headers, the UAPI constants and its own syscall
+                          table (unistd.h) re-declared from the AArch64 ABI
 tests/arm64emu/boot/
   run_tests.sh            builds and runs the asm suite (ARM64EMU_EMU_FLAGS picks the
                           engine; ARM64EMU_EMU/ARM64EMU_RUNNER pick an alternate binary)
@@ -415,9 +457,14 @@ tests/arm64emu/chroot/    chroot mode's differential suite: asm + C tests and
                           fixtures against an oracle, run_tests.sh;
                           hostenv.sh picks the compiler and the oracle
                           (qemu-aarch64, or an AArch64 host's own CPU)
+tests/arm64emu/chroot/native/  the native tier's suite: run.sh + lib.sh (host
+                          detection) + one m*.sh per milestone (chroot-ng's);
+                          guests/ are the AArch64 programs they build
 docs/arm64emu/            README.md, the user guide (both modes); jit.md,
                           pd.md, parity.md, todo/ (the engines); chroot/
-                          (chroot mode's design and internals)
+                          (chroot mode's design and internals; native.md,
+                          native-testing.md and native-history.md, the native
+                          tier's design, suite and milestone log)
 ```
 
 ## Conventions and rules
@@ -447,7 +494,7 @@ Extras:
 * `make test-arm64emu-boot-pd-full`: the above plus run_bootlog_gate.sh (full 1.6B-insn boot log diff)
 * `make test-arm64emu-boot-jit-full`: same as previous but under JIT
 * `make fuzz-arm64emu`: 200 random-block seeds across interpreter/pd/jit/jit-slowmem/nofuse/novra
-* `make test-arm64emu-boot-jit-a64`: cross-builds a static aarch64 binary (clang+lld) and runs the JIT suite under qemu-aarch64
+* `make test-arm64emu-boot-jit-a64`: cross-builds a static-PIE aarch64 binary (clang+lld) and runs the JIT suite under qemu-aarch64
 * `make test-arm64emu-embed`: builds the `-DANDROID_JNI` embedded configuration (`arm64emu_main`, `_exit` on fatal paths) behind a stub main and runs the asm suite against it
 
 The consistency and full-boot log gates boot firmware + Linux and want a kernel
@@ -475,6 +522,12 @@ skips instead of failing — it declares what it needs in a `REQUIRES:` marker
 naming HWCAP strings (see `tests/arm64emu/chroot/hostenv.sh`). Add one to any new test that
 uses an instruction outside ARMv8.0-A.
 
+Chroot mode's native tier:
+
+* `make test-arm64emu-chroot-native`: the tier's suite (`tests/arm64emu/chroot/native/run.sh`), every run of it `arm64emu chroot --native` under `ARM64EMU_NATIVE_NO_FALLBACK=1`, so none passes on the emulator's answers. On an AArch64 host it runs `build/arm64emu` directly; elsewhere it runs the AArch64 cross build, `build/arm64emu-a64` (clang + lld + the cross libc, a static PIE), under `build/arm64emu chroot --jit`, whose emulation of a guest's seccomp filter (`RET_TRAP`, `SIGSYS`) is what lets the tier run at all there -- qemu-user ignores a guest's filter. `ARM64EMU_NATIVE_BIN` picks another build (`build/arm64emu-embed`); `docs/arm64emu/chroot/native-testing.md` lists the rest of its knobs and what each host provides. The emulator's chroot mode is the oracle of its differential legs.
+
+The tier's code runs in the guest's threads, and its monitor calls nothing of the libc but mem/str: raw syscalls through its gate (rt/gate.S) only, its own formatting helpers, its own syscall table. Every handler it installs is entered through monitor/hentry.S, which switches to the host's thread pointer and x18 and back; the guest's FP/SIMD registers are kept by the signal frame, and in a dispatch bounced to guest context by the gate's save area. Its sources and lib/link2symlink are built with a global stack-protector canary (the Makefile has the story). Guest threads are pthreads of the host libc's (monitor/thread.c), and every filter lets the host's own code through by instruction pointer, as it does the gate. What the libc's startup leaves that an execve would not (handlers, an alternate stack, an rseq area, the thread pointer) is undone at the point of no return, and the kernel's program break is the libc's, the guest's being emulated (monitor/brk.c). Device rounds (Termux: `make CC=clang test-arm64emu-chroot-native`) are where its Android behavior is checked: the suite's Termux notes are in native-testing.md.
+
 Specialized tests focused at Android OS compatibility:
 
 * `make test-arm64emu-chroot-android-sim`: Android-behavior build (statx ENOSYS fallback + Bionic keyring gate + the emulated-hardlink scheme, which is compiled and forced only here). It also runs the proot-group rows (`tests/arm64emu/chroot/l2s_proot.sh`: a rootfs installed through proot — proot-distro's — read, presented and kept by `--link2symlink`, and the hostile layouts around it; `ARM64EMU_L2S_BUILD=1` tells the harness the scheme is in).
@@ -492,7 +545,9 @@ No `-E PATH=...` is needed for these: the guest gets PATH=/usr/local/sbin:/usr/l
 ### Acceptance criteria
 
 * Test suites pass, both modes': interpreter + JIT, and chroot mode's 32-bit
-  host build.
+  host build; and the native tier's, for a change it runs (its own code,
+  lib/link2symlink, chroot mode's command line) -- on an AArch64 host, and on
+  the devices for what Android decides.
 * Real-workload runs produce desired results.
 * No crashes.
 * No hangups.
@@ -566,6 +621,18 @@ Behavior fallbacks:
 * `ARM64EMU_SICODE_FORCE_KNOWN`: sends the emulator's own signals between processes with si_codes of a layout the kernel knows only — the tier a host that cannot carry a private si_code is served by (qemu-user: E2BIG for an unknown layout, si_code cut to 16 bits, si_errno zeroed): a queued siginfo the host would not carry whole (a thread-directed one, one with an si_errno or a code of its own, a job-control signal's with a payload) is posted to the receiver's inbox in its registry entry and sent as an SI_QUEUE naming the slot, and the other job-control signals to a traced process ride the kick as SI_QUEUE with a descriptor in si_value. The suite's `(known-layout-tier)` ptrace, sqiread and carrystale rows run over it.
 * `ARM64EMU_NOCLDWAIT_FORCE_EMULATE`: reaps an SA_NOCLDWAIT parent's children and drops an SA_NOCLDSTOP parent's stop and continue notices in the emulator's capture instead of leaving them to the host — the tier a host that ignores the two flags (qemu-user) is served by; the suite's `sigchldflags (nocld-tier)` row runs over it.
 * `ARM64EMU_STACKGROW_FORCE_PIECE`: reserves no host room below a stack and never extends its backing downward, so a stack that grows goes on in a new piece of backing of its own below it — the tier a host whose address space under a stack is taken is served by. Nothing mapped moves, so another thread's pointer into the stack, a host-atomic access and a transfer lent to the host all survive the growth; the suite's `growsdown (piece-tier)` and `growsnomove (piece-tier)` rows run over it.
+
+Chroot mode's native tier (`--native`): a knob both tiers have is one name
+(`ARM64EMU_PROCSTAT_FORCE_SYNTH`, `ARM64EMU_OVERFLOWID_FORCE_SYNTH`,
+`ARM64EMU_PROCSYNTH_FORCE_STAT_DENY`, `ARM64EMU_NETLINK_FORCE_BLOCK`,
+`ARM64EMU_PROCTAB_FORCE_FILE`, `ARM64EMU_SHM_FORCE_FILE`,
+`ARM64EMU_TERMIOS2_FORCE_DENY`, `ARM64EMU_TIOCGSID_FORCE_DENY` above); its
+own are in `arm64emu chroot --help` and native-testing.md, chroot-ng's
+`CHROOTNG_*` renamed (`_DENY` to `_FORCE_DENY`, and the like). Two of them
+are what a session is debugged with:
+
+* `ARM64EMU_NATIVE_DEBUG=1`: the tier's syscall-error log on stderr -- each syscall the host refuses and the tier emulates, the filter's admitted host-code ranges -- headed by the build's stamp (`[cng] arm64emu <version> (built ...)`): a tree copied to a device by hand says which build it is.
+* `ARM64EMU_NATIVE_NO_FALLBACK=1`: a `--native` that cannot be used ends the run (exit 126) with the reason, rather than going on under the emulator. The tier's suite runs under it.
 
 Tuning:
 

@@ -87,7 +87,7 @@ static int any_ro_bind(void) {
  * exists at all. That over-refuses exactly one shape -- a read-only descriptor
  * on a hardlinked file opened through a writable name, then written through by
  * descriptor or reopened for writing through its fd link, while some :ro bind
- * exists -- and nothing else (chroot-ng draws the same line). `real` is where
+ * exists -- and nothing else (the native tier draws the same line). `real` is where
  * the kernel says the description's file is; `fd` is the descriptor, or -1
  * for another process's, which cannot be asked and is taken as read-only,
  * the side that refuses. */
@@ -914,7 +914,7 @@ static u64 sigfd_read_guest(CPU *c, int fd, const GIovec *seg, int nseg, size_t 
  * only when the last name goes. One inode, matching st_ino, shared contents --
  * unlike a copy. The groups proot's own link2symlink made (proot-distro's
  * rootfs) are read and kept too. The scheme and its engine are
- * lib/link2symlink (link2symlink.h), shared with chroot-ng; l2s.c is the host
+ * lib/link2symlink (link2symlink.h), shared with the native tier; l2s.c is the host
  * it runs on, and what is here is what the engine leaves to the program: the
  * stat a name of a group answers, in this host's struct stat, and a listing's
  * record for one. Compiled only where the host needs it (Android, where
@@ -1001,7 +1001,7 @@ static int l2s_dirent(int dirfd, const char *dhost, const char *name,
  * lookup (resolve_pin). The store is judged by the name as written, made
  * absolute against the root and the cwd: a walk that FOLLOWS a name of a
  * group lands in the store, and must. A dirfd-relative name reaches the store
- * only through "..", which is let be (as chroot-ng does). */
+ * only through "..", which is let be (as the native tier does). */
 int l2s_guest_denied(struct Machine *m, int dirfd, const char *gp) {
     if (!gp[0]) return 0;
     const char *b = strrchr(gp, '/');

@@ -1372,6 +1372,9 @@ extern __thread int g_fdwin_depth;  /* windows this thread is inside */
 struct stat;
 int l2s_host_pin(const char *host, PathPin *p);
 int l2s_host_stat(const char *host, struct stat *st, int follow);
+/* The emulator's host for the engine, which chroot_main points
+ * lib/link2symlink's l2s_host at. */
+extern const struct l2s_ops l2s_chroot_ops;
 
 #ifdef L2S_ENABLED
 /* sys_file.c: does the guest name (dirfd, gp) name the emulation's own files

@@ -8,7 +8,10 @@ dependencies** (libc/POSIX only), with two modes:
   userspace shell**, with the **serial console on your terminal**.
 - **`arm64emu chroot`** — **Linux user space**: it runs the programs of an
   AArch64 root filesystem in an **unprivileged, isolated chroot** on the host's
-  own kernel, with bind mounts, a fake root and hardlink emulation.
+  own kernel, with bind mounts, a fake root and hardlink emulation. On an
+  AArch64 host, **`--native`** runs them on the CPU itself instead of
+  emulating it, with no ptrace and no root: the [native
+  tier](#the-native-tier---native).
 
 Both modes run the same CPU: the plain **interpreter**, which is the reference,
 the **predecoded tier**, the default (`--no-predecode` opts out), and the
@@ -29,6 +32,13 @@ engine options mean the same in both modes: `-j/--jit`, `--no-predecode`,
 and the diagnostics `-d/--debug`, `--reg-trace` and `--max-insn N` (see
 [Diagnostics](#diagnostics)).
 
+> **Breaking change (the merge of chroot-ng).** chroot-ng, this repository's other program, is
+> arm64emu's now: `chroot-ng ARGS` is `arm64emu chroot --native ARGS`, with
+> the same options and the emulator's environment (PATH has its default, see
+> `-E`), and its `CHROOTNG_*` knobs are `ARM64EMU_*`
+> (`arm64emu chroot --help`). Its `-R`, `--no-ptrace`, `--probe`, `-t` and
+> `-L` are gone, and the guest's kernel release reads `6.1.0-arm64emu`.
+>
 > **Breaking change (2.0).** arm64emu and arm64chroot used to be two
 > programs; they are one now. `arm64chroot ARGS` is `arm64emu chroot ARGS`,
 > and the old `arm64emu ARGS` is `arm64emu boot ARGS`, with its `--trace` now
@@ -38,10 +48,12 @@ and the diagnostics `-d/--debug`, `--reg-trace` and `--max-insn N` (see
 ## Building
 
 ```sh
-make arm64emu                  # build/arm64emu: both modes (boot on 64-bit hosts)
+make arm64emu                  # build/arm64emu: both modes (boot on 64-bit hosts,
+                               # chroot --native on AArch64)
 make arm64emu32                # its 32-bit build (gcc -m32 on x86-64, armhf on an ARM host)
 make test-arm64emu-boot        # boot mode's assembly self-tests
 make test-arm64emu-chroot      # chroot mode's differential test suite
+make test-arm64emu-chroot-native  # the native tier's suite
 make help                      # every target and variant build
 ```
 
@@ -302,6 +314,11 @@ arm64emu chroot [options] <rootfs> <program> [args...]
 
   -h, --help              Show this help (options + environment variables)
   -v, --version           Show version and exit
+      --native            Run the guest's code on the host CPU (AArch64 hosts):
+                          the native tier, below. Where it cannot run, a warning
+                          says why and the emulator runs the guest, with --jit
+                          (the interpreter for a step diagnostic); the engine
+                          options apply to that fallback only
       --strace            Log guest syscalls to stderr
       --strace-full       Like --strace, but decode arguments strace-style
                           (symbolic flags, quoted strings, structs, errno)
@@ -346,7 +363,10 @@ arm64emu chroot [options] <rootfs> <program> [args...]
       --setgid-root       The same for set-gid executables and the effective gid
   -F, --file-backed       Load the program and its interpreter by mapping their
                           file pages (shared with the page cache) instead of
-                          copying them; a segment that cannot be mapped is copied
+                          copying them; a segment that cannot be mapped is copied.
+                          Under --native the code is always mapped from its file
+                          (otherwise only where anonymous memory may not become
+                          executable)
       --share-abstract-sockets  Do not isolate abstract-namespace AF_UNIX sockets
                           per rootfs; share the host's global abstract namespace
                           (default: isolate, like pathname sockets)
@@ -361,8 +381,9 @@ arm64emu chroot [options] <rootfs> <program> [args...]
                           fd, so an inherited one is a live handle onto a host
                           file outside the rootfs)
   -w, --work-dir DIR      Start the guest with this directory as its working
-                          directory (a guest path resolved inside the rootfs);
-                          default is '/'
+                          directory (a guest path resolved inside the rootfs, a
+                          relative one against the default); default is '/', or
+                          under the identity rootfs '/' the host's own cwd
 ```
 
 Basic usage example with Alpine Linux rootfs:
@@ -607,6 +628,84 @@ Wipe test environment with `make clean-testenv` (`make clean` keeps it).
   generation/propagation match hardware.
 - No vDSO (`AT_SYSINFO_EHDR` absent) — libc falls back to real syscalls.
 - Big-endian hosts are not supported (the SIMD register union is little-endian).
+
+### The native tier (`--native`)
+
+On an AArch64 host, `arm64emu chroot --native` runs the guest's code on the
+CPU itself: no instruction is emulated, and the chroot is emulated around it
+the way `proot` emulates one, but **without ptrace** and its per-syscall
+cost. A userland ELF loader maps the program and its interpreter into
+arm64emu's own process, and a seccomp filter traps the guest's system calls
+(`RET_TRAP` -> `SIGSYS`) into a handler that serves them against the same
+view of the rootfs the emulator serves -- the binds, the fake identity, the
+synthesized `/proc` and `/dev`, `--link2symlink`'s hardlinks, `--shared-proc`,
+AF_UNIX and rtnetlink, System V IPC and a guest's own `ptrace` (`strace`,
+`gdb` and `proot` run inside the rootfs). It was chroot-ng, a program of its
+own, until it became this tier; its design is
+[chroot/native.md](chroot/native.md) and its history
+[chroot/native-history.md](chroot/native-history.md).
+
+```sh
+arm64emu chroot --native -u ./rootfs /bin/sh -l
+arm64emu chroot --native -u -l ./rootfs /sbin/apk add busybox   # hardlinked packages
+arm64emu chroot --native -u ./rootfs /usr/bin/strace -f /bin/ls  # tracing inside the rootfs
+```
+
+**What it needs.** An AArch64 host (the tier is compiled only there), a
+kernel that applies a seccomp filter (3.5 and later, every supported Android),
+and a way to make guest code executable: anonymous memory turned executable
+(the W^X flow ART's JIT uses), or, where SELinux denies that (`execmem`, after
+`no_new_privs`), the program's files mapped executable from an exec-permitted
+mount, which the loader then does by itself. It works for glibc and musl
+(dynamic and static), Go and Rust, with no version pinning, where
+`LD_PRELOAD` tricks fail; and since the guest is loaded rather than
+`execve`d, a program without its execute bit, or off a mount that forbids
+`execve`, runs.
+
+**The fallback.** What it needs is asked before anything is done that cannot
+be undone -- in a forked child, which installs a filter and is trapped by it,
+and makes code executable -- and where any of it is missing, or an option
+needs the emulator (`--strace`, `--strace-full`, `--debug`, `--reg-trace`,
+`--max-insn`, `ARM64EMU_PROF`/`RING`/`TPC`/`COV`), a warning names it and the
+emulator runs the guest:
+
+```
+arm64emu: --native: the kernel refused the seccomp filter (EACCES); continuing with --jit
+```
+
+with the interpreter instead where a step diagnostic is the reason.
+`ARM64EMU_NATIVE_NO_FALLBACK=1` makes it an error.
+
+**How the guest starts** is how a kernel's `execve` would start it, not how
+arm64emu itself was started: no descriptors above stdin/stdout/stderr
+(`--keep-fds` keeps them, less one on a directory the guest has no name for),
+every caught signal back at its default (an ignored one stays ignored), no
+alternate signal stack, no rseq registration and no thread pointer. The
+program break is the guest's own, a region apart from the one the kernel keeps
+for arm64emu's libc; `PR_PAC_RESET_KEYS` is answered by the kernel's checks
+without resetting, since the keys sign arm64emu's own frames too. The
+environment is the emulator's (see `-E`).
+
+**What differs from the emulator.**
+
+- **Containment, not a sandbox.** The monitor shares the guest's address
+  space, so it confines a guest's mistakes, not a guest's malice: put a kernel
+  boundary around a guest that may be hostile ([chroot/native.md, the threat
+  model](chroot/native.md#threat-model--containment-not-a-sandbox)).
+- **A guest's `ptrace`** is emulated from inside the processes involved, and a
+  traced task stops on every syscall, which is slow by construction (a guest
+  that never traces pays nothing). A `poll`, `select`, `nanosleep` or timed
+  futex a task sleeps in when a tracer attaches returns `EINTR`, where the
+  kernel would let it finish; a traced child's stop and continue reach its
+  parent's `waitpid(WUNTRACED/WCONTINUED)` only when the parent's waits pass
+  through the monitor (a tracer's, a tracee's).
+- **POSIX message queues** answer `ENOSYS`, as on Android: an mq name is not a
+  path, so nothing scopes it to the rootfs.
+- **Sessions are each tier's own**: a `--shared-proc` registry and the System V
+  IPC namespace of an emulated session and a native one do not meet. The
+  hardlink groups `-l` keeps on disk are one format.
+- The knobs of its own are listed in `arm64emu chroot --help` (ENVIRONMENT),
+  with `ARM64EMU_NATIVE_DEBUG`, its syscall-error log, first.
 
 ## The CPU
 

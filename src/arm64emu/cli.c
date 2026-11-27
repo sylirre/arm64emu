@@ -32,6 +32,19 @@ void version(void) {
 /* Terminal width for help output, clamped to [HELP_MIN_COLS, HELP_MAX_COLS].
  * Help is written to stdout, so probe stdout first, then stdin/stderr, then
  * $COLUMNS (for redirected runs), finally a sane default. */
+/* A leading run of decimal digits ($COLUMNS); 0 for none. The accumulator
+ * saturates instead of wrapping: the digits come out of the environment, an
+ * int holds ten of them, and atoi's overflow is undefined -- glibc's wrapped
+ * "4294967296" to 0, read as no width at all, where it asks for the widest
+ * there is. The cap is far above any terminal; the caller clamps anyway. */
+#define HELP_COLS_CAP 100000
+static int parse_cols(const char *s) {
+    int v = 0;
+    for (; *s >= '0' && *s <= '9'; s++)
+        if (v <= HELP_COLS_CAP) v = v * 10 + (*s - '0');
+    return v;
+}
+
 int help_cols(void) {
     struct winsize ws;
     static const int fds[] = { 1, 0, 2 };   /* stdout, stdin, stderr */
@@ -44,7 +57,7 @@ int help_cols(void) {
     }
     int c = 80;
     const char *cols = getenv("COLUMNS");
-    if (cols && *cols) { int v = atoi(cols); if (v > 0) c = v; }
+    if (cols && *cols) { int v = parse_cols(cols); if (v > 0) c = v; }
     return c < HELP_MIN_COLS ? HELP_MIN_COLS
          : c > HELP_MAX_COLS ? HELP_MAX_COLS : c;
 }

@@ -4,44 +4,45 @@ Guidelines for AI agents when working with this repository.
 
 ## Overview
 
-Two programs, built from one tree by one Makefile, sharing code as libraries:
-
-* **arm64emu** — AArch64 emulator (interpreter, predecoded tier, JIT) with two
-  modes: `arm64emu boot`, a full system, the QEMU `virt` machine; and
-  `arm64emu chroot`, Linux user space, for unprivileged chroot environments.
-  `src/arm64emu/`
-* **chroot-ng** — native in-process chroot/bind emulation for AArch64 hosts, a
-  ptrace-free proot (seccomp/SIGSYS, no CPU emulation). `src/chroot-ng/`
+One program, **arm64emu**, built from this tree by one Makefile, with code it
+shares between its parts as libraries: an AArch64 emulator (interpreter,
+predecoded tier, JIT) with two modes -- `arm64emu boot`, a full system, the
+QEMU `virt` machine; and `arm64emu chroot`, Linux user space, for unprivileged
+chroot environments -- and, on an AArch64 host, chroot mode's native tier
+(`arm64emu chroot --native`): the guest on the host CPU itself, an in-process,
+ptrace-free proot (seccomp/SIGSYS, no CPU emulation), which was a program of
+its own, chroot-ng, until it became that tier. `src/arm64emu/`
 
 Target platforms are regular Linux distributions (musl, GNU libc) and Android
 (Bionic, restricted by SELinux and seccomp).
 
-Each program has its own guide, `src/<program>/AGENTS.md`: its structure,
-tooling, test suites and diagnostics. Read it before working on that program.
+The program has its own guide, `src/arm64emu/AGENTS.md`: its structure,
+tooling, test suites and diagnostics. Read it before working on it.
 
 ## Layout
 
 ```
 Makefile               the one build of everything (see "Building")
-VERSION                the version of both programs
+VERSION                the version
 lib/arm64/             AArch64 emulation: the CPU arm64emu runs in both modes
 lib/arm64/jit/         the JIT: translator (IR, frontend), runtime, the four host backends
-lib/link2symlink/      hardlink emulation (--link2symlink) shared by arm64emu's
-                       chroot mode and chroot-ng
-src/<program>/         each program's own sources, and its AGENTS.md
-                       (arm64emu: what both modes share, and boot/, chroot/)
-tests/<program>/       each program's test suites (arm64emu: boot/, chroot/)
-docs/<program>/        each program's documentation; README.md is its user guide
-.github/workflows/     one workflow per program, plus version.yml (release tags)
+lib/link2symlink/      hardlink emulation (--link2symlink) shared by both of chroot
+                       mode's tiers
+src/arm64emu/          the program's sources, and its AGENTS.md: what both modes
+                       share, and boot/, chroot/ (chroot/native/: the native tier)
+tests/arm64emu/        its test suites: boot/, chroot/ (chroot/native/)
+docs/arm64emu/         its documentation; README.md is its user guide
+.github/workflows/     arm64emu.yml, plus version.yml (release tags)
 build/                 everything the build makes (gitignored, see below)
 ```
 
 The whole emulation core is one: the interpreter, the predecoded tier and
 the JIT, both of arm64emu's modes running the same code. `lib/arm64` is
 compiled once (per host compiler) and linked into every build of arm64emu;
-`lib/link2symlink` is compiled into each program that uses it, with that
-program's flags. Either way a change there must pass every suite that runs
-it: both modes', and for `lib/link2symlink` chroot-ng's too.
+`lib/link2symlink` is compiled with arm64emu's sources (with the native
+tier's stack-protector flags where the tier is in the build). Either way a
+change there must pass every suite that runs it: both modes', and for
+`lib/link2symlink` chroot mode's two tiers'.
 
 What differs between the modes is configured, not forked, and decided at run
 time, not at build time: each CPU carries the mode it runs in (`c->eng.sys`:
@@ -79,39 +80,44 @@ option helpers, the version, the engine options -- is `src/arm64emu/cli.c`'s.
 Each mode's own sources and headers are in its directory (`boot/`, `chroot/`),
 which the other's never include. A 32-bit host builds chroot mode only (boot
 mode's guest-RAM model needs `__int128`), and `arm64emu boot` says so there.
+The native tier (`chroot/native/`) is built only where the target is AArch64;
+its headers are its own (`native/include/cng/`, the prefix `cng_` from
+chroot-ng), and chroot mode reaches it through one, `native/native.h`:
+`chroot_main` parses the command line for both tiers and hands `--native` to
+`native_run`, which hands the guest back to the emulator, with a warning,
+where the tier cannot run.
 
 `lib/link2symlink` includes no program header at all: it reaches the host only
-through the table of operations the program defines as `l2s_host` (`struct
-l2s_ops` in `link2symlink.h`: path calls kept inside the guest's places, a few
-descriptor calls, the view), and it never fills a `struct stat` — it says which
-file and which link count a name stands for, and the program makes the stat
-call in its own host's layout.
+through the table of operations the running tier points `l2s_host` at
+(`struct l2s_ops` in `link2symlink.h`: path calls kept inside the guest's
+places, a few descriptor calls, the view), and it never fills a `struct stat`
+— it says which file and which link count a name stands for, and the tier
+makes the stat call in its own host's layout.
 
 ## Building
 
-`make` builds every program the host can build: chroot-ng needs an AArch64 C
-compiler (native, or the `aarch64-linux-gnu` cross toolchain); arm64emu builds
-anywhere, its boot mode on a 64-bit host only. `make <program>` builds one;
+`make` builds arm64emu, which builds anywhere: its boot mode on a 64-bit host
+only, chroot mode's native tier where the compiler targets AArch64 only.
 `make help` lists every target, arm64emu's variant builds among them.
 
-Everything produced goes under `build/`: the programs as `build/<name>`,
-objects in `build/obj/<flavour>/`, the programs the suites build in
-`build/tests/<program>/`, the provisioned test rootfs images and recordings in
-`build/cache/<program>/`. `make clean` keeps `build/cache/`;
+Everything produced goes under `build/`: the program and its variant builds as
+`build/<name>`, objects in `build/obj/<flavour>/`, the programs the suites build
+in `build/tests/arm64emu/`, the provisioned test rootfs images and recordings in
+`build/cache/arm64emu/`. `make clean` keeps `build/cache/`;
 `make clean-testenv` removes it.
 
 `CC`, `CFLAGS` and `LDFLAGS` are arm64emu's host compiler and extra flags, of
 its own sources and of the `lib/arm64` it links alike (`make CFLAGS="-O3
--flto=8"` is the fast recipe). Every other build variable belongs to one program and
-carries its prefix: `ARM64EMU_OPT`, `ARM64EMU_M32CC`, `CHROOTNG_CC`,
-`CHROOTNG_CFLAGS`, ...
+-flto=8"` is the fast recipe). Every other build variable carries the
+program's prefix: `ARM64EMU_OPT`, `ARM64EMU_M32CC`, `ARM64EMU_A64_CC`, ...
 
 ## Testing
 
-Each program has its own suites, arm64emu one family per mode
-(`test-arm64emu-boot*`, `test-arm64emu-chroot*`, `test-chroot-ng`; see the
-program's guide). `make test` runs the three main suites one after another:
-`test-arm64emu-boot`, `test-arm64emu-chroot`, `test-chroot-ng`.
+arm64emu has one family of suites per mode (`test-arm64emu-boot*`,
+`test-arm64emu-chroot*`, the native tier's `test-arm64emu-chroot-native`
+among the latter; see the program's guide). `make test` runs the three main
+suites one after another: `test-arm64emu-boot`, `test-arm64emu-chroot`,
+`test-arm64emu-chroot-native`.
 
 **Important**: never run two suites at the same time. They share fixed scratch
 names and have timing-sensitive rows. The Makefile chains several suites named
@@ -119,23 +125,23 @@ on one command line, but it cannot see a suite started from another shell.
 
 A change to `lib/arm64/`, or to what both of arm64emu's modes share, is tested
 by both modes' suites, interpreter and JIT; a change to `lib/link2symlink/` by
-both chroot mode's and chroot-ng's.
+chroot mode's and its native tier's.
 
 ## Environment variables
 
-Every environment variable a program or its test harness reads carries that
-program's prefix: `ARM64EMU_` (`ARM64EMU_JIT_` for JIT knobs), whichever the
-mode, and `CHROOTNG_`. Shared code takes the prefix from the program
-that runs it (`lib/arm64`'s `g_env_prefix`, `lib/link2symlink`'s from the
-program that compiles it). New variables must also be added to the program's
-built-in help.
+Every environment variable the program or its test harnesses read carries
+its prefix: `ARM64EMU_` (`ARM64EMU_JIT_` for JIT knobs, `ARM64EMU_NATIVE_` for
+the native tier's own and its suite's), whichever the mode or the tier; a knob
+both tiers have is one name. Shared code takes the prefix from the program
+(`lib/arm64`'s `g_env_prefix`). New variables must also be added to the
+program's built-in help.
 
 ## Versioning
 
-Both programs share one version, written only in `VERSION`. The Makefile
-passes it as `PROJECT_VERSION` to the units that print it. A release is the
-tag `vX.Y.Z`, which CI checks against `VERSION`. Older history carries
-per-program tags (`<program>/vX.Y.Z`).
+The version is written only in `VERSION`. The Makefile passes it as
+`PROJECT_VERSION` to the units that print it. A release is the tag `vX.Y.Z`,
+which CI checks against `VERSION`. Older history carries per-program tags
+(`<program>/vX.Y.Z`, chroot-ng's among them).
 
 ## Conventions and rules
 
@@ -158,7 +164,7 @@ Commit messages:
 
 * Each commit must consist of header and description.
 * The header must follow this format: `scope(area): brief description of change`, or `scope: ...` without an area. The scope is what the change is to:
-  * `arm64emu`, `chroot-ng` — a program (its `src/`, `tests/` and `docs/` trees); a change to one of arm64emu's modes names it as the area, or the part of it touched (`arm64emu(boot): ...`, `arm64emu(chroot): ...`, `arm64emu(syscall): ...`);
+  * `arm64emu` — the program (its `src/`, `tests/` and `docs/` trees); a change to one of its modes names it as the area, or the part of it touched (`arm64emu(boot): ...`, `arm64emu(chroot): ...`, `arm64emu(syscall): ...`, `arm64emu(native): ...` for chroot mode's native tier);
   * `arm64` — the shared AArch64 emulation, `lib/arm64/**` (e.g. `arm64(jit): ...`);
   * `l2s` — the shared hardlink emulation, `lib/link2symlink/`;
   * `repo` — repository-level work: the Makefile, `VERSION`, CI, the root documents (e.g. `repo(ci): ...`).

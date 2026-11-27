@@ -694,7 +694,7 @@ Anything else that cannot be pinned is **refused**, never handed to the host as
 a path.
 
 **The emulated-hardlink scheme** (`--link2symlink`, Android) is
-`lib/link2symlink`, the engine chroot-ng's `-l` runs too (since 2.0; before it
+`lib/link2symlink`, the engine the native tier's `-l` runs too (since 2.0; before it
 chroot mode had a scheme of its own, whose groups are still read). A guest
 hardlink moves the file into the rootfs's store, `<rootfs>/.l2s`, as
 `.l2s.<ino>` (its host inode, kept by the rename), beside an empty marker
@@ -799,7 +799,7 @@ and walked as any guest path, under the same containment. Each name is then
   by-descriptor calls and for a reopen through its `/proc/self/fd` link).
   That over-refuses one shape — a read-only descriptor on a hardlinked file
   opened through a writable name, then written through by descriptor while
-  some `:ro` bind exists — as chroot-ng does.
+  some `:ro` bind exists — as the native tier does.
 
 A program run through a name sees the name, as it does through a hardlink:
 `/proc/self/exe` (and the mapping names) is where a kernel's walk ends, which

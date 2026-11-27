@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Sylirre
 #
-# The one build of this repository's two programs:
+# The one build of this repository's program:
 #
 #   arm64emu   AArch64 emulator of a full system (boot mode)    src/arm64emu
-#              and of Linux user space (chroot mode)
-#   chroot-ng  in-process chroot for AArch64 hosts              src/chroot-ng
+#              and of Linux user space (chroot mode), with, on
+#              an AArch64 host, chroot mode's native tier
+#              (--native: the guest on the host CPU)
 #
 # and of the code in lib/: lib/arm64 is the AArch64 emulation arm64emu runs,
-# compiled once per host compiler; lib/link2symlink, shared by arm64emu's
-# chroot mode and chroot-ng, is compiled into each with that program's flags,
-# since chroot-ng is freestanding.
+# compiled once per host compiler; lib/link2symlink, the hardlink emulation
+# both of chroot mode's tiers run, is compiled with arm64emu's sources.
 #
 # Everything this file produces lands under build/ (and nowhere else):
 #   build/<program>          the programs, plus arm64emu's variant builds
@@ -21,25 +21,23 @@
 #   build/cache/<program>/   provisioned test rootfs images and recordings,
 #                            which `make clean` keeps (see clean-testenv)
 #
-# `make` builds every program this host can build: chroot-ng needs an AArch64
-# C compiler (native, or the aarch64-linux-gnu cross one); arm64emu builds
-# anywhere, with its boot mode only on a 64-bit host. `make test` runs the
-# main suites one after another. `make help` lists the rest.
+# `make` builds arm64emu, which builds anywhere: its boot mode only on a 64-bit
+# host, chroot mode's native tier only where the compiler targets AArch64.
+# `make test` runs the main suites one after another. `make help` lists the
+# rest.
 #
 # Variables: CC, CFLAGS and LDFLAGS are arm64emu's host compiler and extra
 # flags, for its own sources and the lib/arm64 it links alike (`make
-# CFLAGS="-O3 -flto=8"` optimizes all of it). Everything specific to one
-# program carries its prefix: ARM64EMU_*, CHROOTNG_* (chroot-ng is cross-built,
-# so it has a compiler and flags of its own: CHROOTNG_CC, CHROOTNG_CFLAGS,
-# CHROOTNG_LDFLAGS, CHROOTNG_LINKMODE).
+# CFLAGS="-O3 -flto=8"` optimizes all of it). Everything else carries the
+# program's prefix: ARM64EMU_*.
 
 BUILD    := build
 OBJDIR   := $(BUILD)/obj
 HOSTARCH := $(shell uname -m)
 
-# The version of both programs, defined in one place: the VERSION file. Only
-# the units that print it get it on their command line, and they depend on
-# the file, so a bump rebuilds exactly them (see each program's *_VERSIONED).
+# The version, defined in one place: the VERSION file. Only the units that
+# print it get it on their command line, and they depend on the file, so a
+# bump rebuilds exactly them (ARM64EMU_VERSIONED).
 PROJECT_VERSION := $(shell cat VERSION)
 VERSION_DEFINE  := -DPROJECT_VERSION='"$(PROJECT_VERSION)"'
 
@@ -60,7 +58,7 @@ lib_arm64_atomic = $(shell echo 'int main(){return 0;}' | $(1) $(2) \
 LIB_ARM64_NOATOMICWARN := $(shell echo 'int main(){return 0;}' | $(CC) -Werror \
                     -Wno-atomic-alignment -x c - -o /dev/null 2>/dev/null \
                     && echo -Wno-atomic-alignment)
-# Hardlink emulation, shared by arm64emu's chroot mode and chroot-ng.
+# Hardlink emulation, shared by both of chroot mode's tiers.
 LIB_L2S := $(wildcard lib/link2symlink/*.c)
 
 # $(call cfgstamp,TREE,TEXT): the path of a stamp file holding TEXT, rewritten
@@ -146,29 +144,62 @@ ARM64EMU_BASEFLAGS = $(ARM64EMU_OPT) -g -std=gnu11 -Wall -Wextra -Wno-unused-par
 ARM64EMU_FLAGS     = $(ARM64EMU_BASEFLAGS) $(LIB_ARM64_NOATOMICWARN) $(CFLAGS)
 # Each mode's sources see the headers of their own directory and none of the
 # other's: both modes have a machine.h and an mmu.h, each its own Machine.
+# The native tier (src/arm64emu/chroot/native) sees its own alone, and is
+# built with a stack protector whose canary is a global, as lib/link2symlink,
+# which it runs, is wherever the tier is in the build ($(2) non-empty): its
+# code runs in the guest's threads, and a dispatch it bounces to the guest's
+# context runs on the guest's thread pointer, where the canary's other place
+# (Bionic's TLS slot) is whatever the guest keeps there. The global is the
+# libc's (glibc, musl) or the tier's own (rt/rt.c, on Bionic). Its syscall
+# table (native/include/cng/unistd.h) is held against the build host's
+# <asm/unistd.h> by rt/unistd_check.c, where a number the two spell
+# differently is a macro redefinition, an error under -Werror.
+# ARM64EMU_NATIVE_CFLAGS is extra flags of the tier's sources alone (CI's
+# -Werror).
+ARM64EMU_NATIVE_CFLAGS ?=
+ARM64EMU_NATIVE_FLAGS := -Isrc/arm64emu/chroot/native/include -Isrc/arm64emu/chroot/native \
+                         -fstack-protector-strong -mstack-protector-guard=global \
+                         -fno-asynchronous-unwind-tables $(ARM64EMU_NATIVE_CFLAGS)
 arm64emu_modeinc = $(if $(filter src/arm64emu/boot/%,$(1)),-Isrc/arm64emu/boot,$(if \
-                     $(filter src/arm64emu/chroot/%,$(1)),-Isrc/arm64emu/chroot -Isrc/arm64emu/chroot/jit))
+                     $(filter src/arm64emu/chroot/native/%,$(1)),$(ARM64EMU_NATIVE_FLAGS) $(if \
+                       $(filter %/rt/unistd_check.c,$(1)),-Werror),$(if \
+                     $(filter src/arm64emu/chroot/%,$(1)),-Isrc/arm64emu/chroot -Isrc/arm64emu/chroot/jit,$(if \
+                     $(and $(2),$(filter lib/link2symlink/%,$(1))),-fstack-protector-strong \
+                       -mstack-protector-guard=global))))
 
 ARM64EMU_COMMON := $(wildcard src/arm64emu/*.c)
 ARM64EMU_BOOT   := $(sort $(wildcard src/arm64emu/boot/*.c src/arm64emu/boot/*/*.c))
 ARM64EMU_CHROOT := $(sort $(wildcard src/arm64emu/chroot/*.c src/arm64emu/chroot/jit/*.c)) $(LIB_L2S)
+# Chroot mode's native tier, C and assembly, for an AArch64 target only.
+ARM64EMU_NATIVE := $(shell find src/arm64emu/chroot/native -name '*.c' -o -name '*.S' 2>/dev/null | \
+                     LC_ALL=C sort)
 # (The JIT backends, lib/arm64/jit's, self-select by host #ifdef — empty TUs
 # elsewhere — so the source lists are host-independent, and a host with none
 # gets the runtime's inert stubs.)
 
-# Is CC 64-bit, i.e. are its builds to have boot mode?
+# Is CC 64-bit, i.e. are its builds to have boot mode? Does it target AArch64,
+# i.e. are they to have the native tier?
 ARM64EMU_HOST64 := $(shell printf '__SIZEOF_POINTER__\n' | \
                      $(CC) $(CFLAGS) -E -P -x c - 2>/dev/null | tr -d ' \n')
+ARM64EMU_HOSTA64 := $(filter 1,$(shell printf '__aarch64__\n' | \
+                     $(CC) $(CFLAGS) -E -P -x c - 2>/dev/null | tr -d ' \n'))
 ARM64EMU_SRC    := $(ARM64EMU_COMMON) $(if $(filter 8,$(ARM64EMU_HOST64)),$(ARM64EMU_BOOT)) \
-                   $(ARM64EMU_CHROOT)
+                   $(ARM64EMU_CHROOT) $(if $(ARM64EMU_HOSTA64),$(ARM64EMU_NATIVE))
 ARM64EMU_LIBS    = -lm -lpthread
 
-ARM64EMU_OBJ    := $(ARM64EMU_SRC:%.c=$(OBJDIR)/arm64emu/native/%.o)
-ARM64EMU_CFG     = $(call cfgstamp,arm64emu/native,$(CC) $(ARM64EMU_FLAGS))
+# $(call arm64emu_obj,TREE,SOURCES): the objects of SOURCES (.c and .S) in TREE.
+arm64emu_obj = $(patsubst %.S,$(OBJDIR)/$(1)/%.o,$(patsubst %.c,$(OBJDIR)/$(1)/%.o,$(2)))
+
+ARM64EMU_OBJ    := $(call arm64emu_obj,arm64emu/native,$(ARM64EMU_SRC))
+ARM64EMU_CFG     = $(call cfgstamp,arm64emu/native,$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_NATIVE_CFLAGS))
 
 $(OBJDIR)/arm64emu/native/%.o: %.c $(ARM64EMU_CFG)
 	@mkdir -p $(@D)
-	$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<,$(ARM64EMU_HOSTA64)) \
+	    $(DEPFLAGS) -c -o $@ $<
+$(OBJDIR)/arm64emu/native/%.o: %.S $(ARM64EMU_CFG)
+	@mkdir -p $(@D)
+	$(CC) $(ARM64EMU_FLAGS) $(call arm64emu_modeinc,$<,1) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD)/arm64emu: $(ARM64EMU_OBJ) $(LIB_ARM64_OBJ)
 	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ $(ARM64EMU_LIBS) \
@@ -207,7 +238,7 @@ ARM64EMU_M32_OBJ := $(ARM64EMU_COMMON:%.c=$(OBJDIR)/arm64emu/m32/%.o) \
 ARM64EMU_M32_CFG  = $(call cfgstamp,arm64emu/m32,$(ARM64EMU_M32CC) $(ARM64EMU_FLAGS) $(ARM64EMU_M32FLAGS))
 $(OBJDIR)/arm64emu/m32/%.o: %.c $(ARM64EMU_M32_CFG)
 	@mkdir -p $(@D)
-	$(ARM64EMU_M32CC) $(ARM64EMU_FLAGS) $(ARM64EMU_M32FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<) \
+	$(ARM64EMU_M32CC) $(ARM64EMU_FLAGS) $(ARM64EMU_M32FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<,) \
 	    $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD)/arm64emu32: $(ARM64EMU_M32_OBJ) $(LIB_ARM64_M32_OBJ)
@@ -224,11 +255,15 @@ $(BUILD)/arm64emu32: $(ARM64EMU_M32_OBJ) $(LIB_ARM64_M32_OBJ)
 ARM64EMU_ASIMFLAGS := -DA64_STATX_FORCE_FALLBACK -DA64_KEYRING_ENOSYS \
                       -DA64_LINK2SYMLINK -DA64_L2S_FORCE
 
-ARM64EMU_ASIM_OBJ := $(ARM64EMU_SRC:%.c=$(OBJDIR)/arm64emu/asim/%.o)
-ARM64EMU_ASIM_CFG  = $(call cfgstamp,arm64emu/asim,$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_ASIMFLAGS))
+ARM64EMU_ASIM_OBJ := $(call arm64emu_obj,arm64emu/asim,$(ARM64EMU_SRC))
+ARM64EMU_ASIM_CFG  = $(call cfgstamp,arm64emu/asim,$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_ASIMFLAGS) $(ARM64EMU_NATIVE_CFLAGS))
 $(OBJDIR)/arm64emu/asim/%.o: %.c $(ARM64EMU_ASIM_CFG)
 	@mkdir -p $(@D)
-	$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_ASIMFLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_ASIMFLAGS) $(ARM64EMU_VER) \
+	    $(call arm64emu_modeinc,$<,$(ARM64EMU_HOSTA64)) $(DEPFLAGS) -c -o $@ $<
+$(OBJDIR)/arm64emu/asim/%.o: %.S $(ARM64EMU_ASIM_CFG)
+	@mkdir -p $(@D)
+	$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_ASIMFLAGS) $(call arm64emu_modeinc,$<,1) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD)/arm64emu_asim: $(ARM64EMU_ASIM_OBJ) $(LIB_ARM64_OBJ)
 	$(CC) $(ARM64EMU_FLAGS) $(ARM64EMU_ASIMFLAGS) $(LDFLAGS) -o $@ $^ $(ARM64EMU_LIBS) \
@@ -242,12 +277,16 @@ $(BUILD)/arm64emu_asim: $(ARM64EMU_ASIM_OBJ) $(LIB_ARM64_OBJ)
 # is the same code here, as it never leaves the process itself. The stub main
 # stands in for the caller a real embedder supplies.
 ARM64EMU_EMBED_FLAGS = $(ARM64EMU_FLAGS) -DANDROID_JNI -include src/arm64emu/embed.h
-ARM64EMU_EMBED_OBJ  := $(ARM64EMU_SRC:%.c=$(OBJDIR)/arm64emu/embed/%.o)
-ARM64EMU_EMBED_CFG   = $(call cfgstamp,arm64emu/embed,$(CC) $(ARM64EMU_EMBED_FLAGS))
+ARM64EMU_EMBED_OBJ  := $(call arm64emu_obj,arm64emu/embed,$(ARM64EMU_SRC))
+ARM64EMU_EMBED_CFG   = $(call cfgstamp,arm64emu/embed,$(CC) $(ARM64EMU_EMBED_FLAGS) $(ARM64EMU_NATIVE_CFLAGS))
 
 $(OBJDIR)/arm64emu/embed/%.o: %.c $(ARM64EMU_EMBED_CFG)
 	@mkdir -p $(@D)
-	$(CC) $(ARM64EMU_EMBED_FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(ARM64EMU_EMBED_FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<,$(ARM64EMU_HOSTA64)) \
+	    $(DEPFLAGS) -c -o $@ $<
+$(OBJDIR)/arm64emu/embed/%.o: %.S $(ARM64EMU_EMBED_CFG)
+	@mkdir -p $(@D)
+	$(CC) $(ARM64EMU_FLAGS) -DANDROID_JNI $(call arm64emu_modeinc,$<,1) $(DEPFLAGS) -c -o $@ $<
 
 $(OBJDIR)/arm64emu/embed/stub.c:
 	@mkdir -p $(@D)
@@ -257,16 +296,22 @@ $(BUILD)/arm64emu-embed: $(ARM64EMU_EMBED_OBJ) $(LIB_ARM64_OBJ) $(OBJDIR)/arm64e
 	$(CC) $(ARM64EMU_FLAGS) $(LDFLAGS) -o $@ $^ $(ARM64EMU_LIBS) \
 	    $(call lib_arm64_atomic,$(CC),$(ARM64EMU_FLAGS))
 
-# AArch64-backend validation without ARM hardware: a static aarch64 build
-# (clang + lld + the Debian cross libc) run under qemu-user, with a copy of
-# lib/arm64 of its own. No CFLAGS or LDFLAGS: they are the host compiler's.
+# The AArch64 cross build: a static aarch64 build (clang + lld + the Debian
+# cross libc) with a copy of lib/arm64 of its own. Boot mode's AArch64 JIT
+# backend runs in it under qemu-user (test-arm64emu-boot-jit-a64), and chroot
+# mode's native tier under arm64emu's own chroot mode
+# (test-arm64emu-chroot-native on a foreign host), which applies a guest's
+# seccomp filter as a kernel does. A static PIE, so the loader places it where
+# nothing a guest names can be: a non-PIE guest (gcc's cc1) loads at its
+# link-time 0x400000, and under --native the guest shares its address space.
+# No CFLAGS or LDFLAGS: they are the host compiler's.
 ARM64EMU_A64_SYSROOT ?= /usr/aarch64-linux-gnu
 ARM64EMU_A64_CC      ?= clang --target=aarch64-linux-gnu -nostdlibinc \
                         -I$(ARM64EMU_A64_SYSROOT)/include
-ARM64EMU_A64_LDFLAGS ?= -fuse-ld=lld -static -L$(ARM64EMU_A64_SYSROOT)/lib \
+ARM64EMU_A64_LDFLAGS ?= -fuse-ld=lld -static-pie -L$(ARM64EMU_A64_SYSROOT)/lib \
                         -B$(ARM64EMU_A64_SYSROOT)/lib
-ARM64EMU_A64_FLAGS    = $(ARM64EMU_BASEFLAGS)
-LIB_ARM64_A64_FLAGS   = $(LIB_ARM64_BASEFLAGS)
+ARM64EMU_A64_FLAGS    = $(ARM64EMU_BASEFLAGS) -fPIE
+LIB_ARM64_A64_FLAGS   = $(LIB_ARM64_BASEFLAGS) -fPIE
 
 LIB_ARM64_A64_OBJ := $(LIB_ARM64:%.c=$(OBJDIR)/arm64/a64/%.o)
 LIB_ARM64_A64_CFG  = $(call cfgstamp,arm64/a64,$(ARM64EMU_A64_CC) $(LIB_ARM64_A64_FLAGS))
@@ -275,19 +320,25 @@ $(OBJDIR)/arm64/a64/%.o: %.c $(LIB_ARM64_A64_CFG)
 	$(ARM64EMU_A64_CC) $(LIB_ARM64_A64_FLAGS) $(LIB_ARM64_PIN) $(DEPFLAGS) -c -o $@ $<
 $(addprefix $(OBJDIR)/arm64/a64/,$(LIB_ARM64_PINNED)): LIB_ARM64_PIN := -O2 -fno-lto
 
-ARM64EMU_A64_SRC := $(ARM64EMU_COMMON) $(ARM64EMU_BOOT) $(ARM64EMU_CHROOT)
-ARM64EMU_A64_OBJ := $(ARM64EMU_A64_SRC:%.c=$(OBJDIR)/arm64emu/a64/%.o)
-ARM64EMU_A64_CFG  = $(call cfgstamp,arm64emu/a64,$(ARM64EMU_A64_CC) $(ARM64EMU_A64_FLAGS))
+ARM64EMU_A64_SRC := $(ARM64EMU_COMMON) $(ARM64EMU_BOOT) $(ARM64EMU_CHROOT) $(ARM64EMU_NATIVE)
+ARM64EMU_A64_OBJ := $(call arm64emu_obj,arm64emu/a64,$(ARM64EMU_A64_SRC))
+ARM64EMU_A64_CFG  = $(call cfgstamp,arm64emu/a64,$(ARM64EMU_A64_CC) $(ARM64EMU_A64_FLAGS) $(ARM64EMU_NATIVE_CFLAGS))
 $(OBJDIR)/arm64emu/a64/%.o: %.c $(ARM64EMU_A64_CFG)
 	@mkdir -p $(@D)
-	$(ARM64EMU_A64_CC) $(ARM64EMU_A64_FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<) $(DEPFLAGS) -c -o $@ $<
+	$(ARM64EMU_A64_CC) $(ARM64EMU_A64_FLAGS) $(ARM64EMU_VER) $(call arm64emu_modeinc,$<,1) \
+	    $(DEPFLAGS) -c -o $@ $<
+$(OBJDIR)/arm64emu/a64/%.o: %.S $(ARM64EMU_A64_CFG)
+	@mkdir -p $(@D)
+	$(ARM64EMU_A64_CC) $(ARM64EMU_A64_FLAGS) $(call arm64emu_modeinc,$<,1) $(DEPFLAGS) -c -o $@ $<
 
 $(BUILD)/arm64emu-a64: $(ARM64EMU_A64_OBJ) $(LIB_ARM64_A64_OBJ)
 	$(ARM64EMU_A64_CC) $(ARM64EMU_A64_FLAGS) $(ARM64EMU_A64_LDFLAGS) -o $@ $^ $(ARM64EMU_LIBS) \
 	    $(call lib_arm64_atomic,$(ARM64EMU_A64_CC) $(ARM64EMU_A64_LDFLAGS),)
 
-# The version is printed by cli.c alone, in every build.
-ARM64EMU_VERSIONED := $(foreach v,native m32 asim embed a64,$(OBJDIR)/arm64emu/$(v)/src/arm64emu/cli.o)
+# The version is printed by cli.c, in every build, and the native tier's
+# debug stamp (native/run.c) carries it.
+ARM64EMU_VERSIONED := $(foreach v,native m32 asim embed a64,$(OBJDIR)/arm64emu/$(v)/src/arm64emu/cli.o \
+                        $(OBJDIR)/arm64emu/$(v)/src/arm64emu/chroot/native/run.o)
 $(ARM64EMU_VERSIONED): VERSION
 $(ARM64EMU_VERSIONED): ARM64EMU_VER := $(VERSION_DEFINE)
 
@@ -296,124 +347,20 @@ $(ARM64EMU_VERSIONED): ARM64EMU_VER := $(VERSION_DEFINE)
          $(LIB_ARM64_M32_OBJ:.o=.d) $(LIB_ARM64_A64_OBJ:.o=.d)
 
 # ============================================================================
-# chroot-ng — ptrace-free chroot/bind emulation for rootless Android (AArch64).
-# An ordinary hosted program, linked against the libc of its toolchain, built
-# with an AArch64 compiler -- the aarch64-linux-gnu cross toolchain on other
-# hosts, run there under arm64emu's chroot mode.
-# ============================================================================
-
-# The cross toolchain when one is installed, else the host compiler (on an
-# AArch64 host, natively or Termux/NDK clang on-device, that is the right one;
-# anywhere else the target check below finds it is not, and chroot-ng is
-# skipped). CHROOTNG_CC set by hand always wins.
-CHROOTNG_CROSS ?= aarch64-linux-gnu-
-ifeq ($(origin CHROOTNG_CC),undefined)
-ifneq ($(shell command -v $(CHROOTNG_CROSS)gcc-13 2>/dev/null),)
-CHROOTNG_CC := $(CHROOTNG_CROSS)gcc-13
-else ifneq ($(shell command -v $(CHROOTNG_CROSS)gcc 2>/dev/null),)
-CHROOTNG_CC := $(CHROOTNG_CROSS)gcc
-else
-CHROOTNG_CC := $(CC)
-endif
-endif
-# Non-empty when CHROOTNG_CC produces AArch64 code.
-CHROOTNG_OK := $(filter aarch64% arm64%,$(shell $(CHROOTNG_CC) -dumpmachine 2>/dev/null))
-
-# How to run chroot-ng here. On an AArch64 host (native Linux or Termux) that is
-# "directly", so CHROOTNG_RUN stays EMPTY; elsewhere it runs under arm64emu's
-# chroot mode with the host's tree as the rootfs, which applies a guest's
-# seccomp filter as a kernel does (qemu-user does not, and chroot-ng runs
-# nothing untranslated). tests/chroot-ng/lib.sh does the same for the suite.
-ifeq ($(filter aarch64 arm64,$(HOSTARCH)),)
-CHROOTNG_RUN ?= $(BUILD)/arm64emu chroot --jit --keep-fds -w $(CURDIR) /
-else
-CHROOTNG_RUN ?=
-endif
-
-# Position-independent, as the link below is, and an ordinary build otherwise:
-# the monitor's code runs on the guest's thread and stack, but with the FP/SIMD
-# half of the guest's register file kept where the guest gets it back from --
-# the kernel's signal frame in the SIGSYS handler, a save area of ours for a
-# dispatch bounced to guest context (rt/gate.S, cng_bounce_dispatch) -- so it
-# may spend those registers, and its mem/str are the libc's.
-#
-# The stack protector's canary is the global __stack_chk_guard, which gcc
-# takes on AArch64 anyway and clang does only when asked: Bionic's own place
-# for it is a TLS slot, and a dispatch bounced to guest context runs on the
-# guest's thread pointer, where that slot is whatever the guest keeps there.
-CHROOTNG_FLAGS = -O2 -g -std=gnu11 -fPIE \
-                 -fstack-protector-strong -mstack-protector-guard=global \
-                 -fno-asynchronous-unwind-tables \
-                 -ffunction-sections -fdata-sections \
-                 -Wall -Wextra -Wno-unused-parameter -Isrc/chroot-ng/include \
-                 -Ilib/link2symlink \
-                 $(CHROOTNG_CFLAGS)
-
-# A PIE, which the loader places where nothing a guest names can be: a non-PIE
-# guest (gcc's cc1) loads at its link-time 0x400000, and the monitor shares its
-# address space. Dynamic where it runs on the system that built it; static-PIE
-# where it runs under arm64emu on a foreign host, whose tree has no AArch64
-# dynamic loader for it to find. CHROOTNG_LINKMODE overrides the choice.
-CHROOTNG_LINKMODE ?= $(if $(CHROOTNG_RUN),-static-pie,-pie)
-CHROOTNG_LDFLAGS ?=
-CHROOTNG_LINK     = $(CHROOTNG_LDFLAGS) $(CHROOTNG_LINKMODE) -Wl,-z,noexecstack \
-                    -Wl,--gc-sections
-
-CHROOTNG_SRC := $(shell find src/chroot-ng -name '*.c' -o -name '*.S' 2>/dev/null | LC_ALL=C sort) \
-                $(LIB_L2S)
-CHROOTNG_OBJ := $(CHROOTNG_SRC:%=$(OBJDIR)/chroot-ng/%.o)
-CHROOTNG_CFG  = $(call cfgstamp,chroot-ng,$(CHROOTNG_CC) $(CHROOTNG_FLAGS))
-
-$(OBJDIR)/chroot-ng/%.c.o: %.c $(CHROOTNG_CFG)
-	@mkdir -p $(@D)
-	$(CHROOTNG_CC) $(CHROOTNG_FLAGS) $(DEPFLAGS) -c -o $@ $<
-$(OBJDIR)/chroot-ng/%.S.o: %.S $(CHROOTNG_CFG)
-	@mkdir -p $(@D)
-	$(CHROOTNG_CC) $(CHROOTNG_FLAGS) $(DEPFLAGS) -c -o $@ $<
-
-# The syscall table is ours (src/chroot-ng/include/cng/unistd.h); this unit
-# holds it against the build host's <asm/unistd.h>, and a number the two spell
-# differently is a macro redefinition — an error here, so it cannot be built past.
-$(OBJDIR)/chroot-ng/src/chroot-ng/rt/unistd_check.c.o: CHROOTNG_FLAGS += -Werror
-
-CHROOTNG_VERSIONED := $(addprefix $(OBJDIR)/chroot-ng/src/chroot-ng/,main.c.o run.c.o)
-$(CHROOTNG_VERSIONED): VERSION
-$(CHROOTNG_VERSIONED): CHROOTNG_FLAGS += $(VERSION_DEFINE)
-
-$(BUILD)/chroot-ng: $(CHROOTNG_OBJ)
-	$(CHROOTNG_CC) $(CHROOTNG_LINK) -o $@ $(CHROOTNG_OBJ)
-
--include $(CHROOTNG_OBJ:.o=.d)
-
-# ============================================================================
 # Programs
 # ============================================================================
 
-PROGRAMS := arm64emu
-ifneq ($(CHROOTNG_OK),)
-PROGRAMS += chroot-ng
-endif
-
-all: $(PROGRAMS)
+all: $(BUILD)/arm64emu
 ifneq ($(ARM64EMU_HOST64),8)
 	@echo "arm64emu: boot mode left out: it needs a 64-bit host compiler ($(CC))"
 endif
-ifeq ($(CHROOTNG_OK),)
-	@echo "skipped chroot-ng: no AArch64 C compiler (install $(CHROOTNG_CROSS)gcc, or set CHROOTNG_CC)"
-endif
 
-.PHONY: arm64emu arm64emu32 arm64emu_asim arm64emu-embed arm64emu-a64 chroot-ng
+.PHONY: arm64emu arm64emu32 arm64emu_asim arm64emu-embed arm64emu-a64
 arm64emu: $(BUILD)/arm64emu
 arm64emu32: $(BUILD)/arm64emu32
 arm64emu_asim: $(BUILD)/arm64emu_asim
 arm64emu-embed: $(BUILD)/arm64emu-embed
 arm64emu-a64: $(BUILD)/arm64emu-a64
-ifneq ($(CHROOTNG_OK),)
-chroot-ng: $(BUILD)/chroot-ng
-else
-chroot-ng:
-	@echo "chroot-ng: no AArch64 C compiler (install $(CHROOTNG_CROSS)gcc, or set CHROOTNG_CC)" >&2; exit 1
-endif
 
 # ============================================================================
 # Test suites
@@ -428,13 +375,13 @@ SUITES := $(filter test-% fuzz-%,$(MAKECMDGOALS))
 $(foreach n,$(wordlist 2,$(words $(SUITES)),$(shell seq 1 $(words $(SUITES)))),\
   $(eval $(word $(n),$(SUITES)): | $(word $(shell expr $(n) - 1),$(SUITES))))
 
-# The main suites: arm64emu's, one per mode, and chroot-ng's. A failing suite
-# does not stop the next one; the run fails at the end if any did.
+# The main suites: boot mode's, chroot mode's and its native tier's. A failing
+# suite does not stop the next one; the run fails at the end if any did.
 test:
 	@rc=0; \
 	$(MAKE) --no-print-directory test-arm64emu-boot || rc=1; \
 	$(MAKE) --no-print-directory test-arm64emu-chroot || rc=1; \
-	$(MAKE) --no-print-directory test-chroot-ng || rc=1; \
+	$(MAKE) --no-print-directory test-arm64emu-chroot-native || rc=1; \
 	exit $$rc
 
 # ---- arm64emu, boot mode ----
@@ -517,7 +464,8 @@ test-arm64emu-boot-jit-a64:
 
 .PHONY: test-arm64emu-chroot test-arm64emu-chroot-jit test-arm64emu-chroot32 \
         test-arm64emu-chroot32-jit test-arm64emu-chroot-android-sim \
-        test-arm64emu-chroot-seccomp test-arm64emu-chroot-pack test-arm64emu-chroot-env
+        test-arm64emu-chroot-seccomp test-arm64emu-chroot-pack test-arm64emu-chroot-env \
+        test-arm64emu-chroot-native
 
 ARM64EMU_CHROOT_TESTS := $(BUILD)/tests/arm64emu/chroot
 
@@ -643,25 +591,28 @@ test-arm64emu-chroot-pack:
 	    $(ARM64EMU_CHROOT_CACHE)/recorded $(ARM64EMU_CHROOT_CACHE)/rootfs/glibc
 	@ls -lh $(BUILD)/arm64emu-chroot-testpack.tar.gz
 
-# ---- chroot-ng ----
-
-.PHONY: test-chroot-ng run-chroot-ng
-
-# The suite runs chroot-ng natively on an AArch64 host and under arm64emu's
-# chroot mode elsewhere; its differential legs (M10/M17/M19) take arm64emu's
-# chroot mode as their oracle too, so that is built first.
-ifneq ($(CHROOTNG_OK),)
-test-chroot-ng:
-	@$(MAKE) --no-print-directory $(BUILD)/chroot-ng $(BUILD)/arm64emu
-	@sh tests/chroot-ng/run.sh
-
-# Run the tool itself, natively or under arm64emu:
-# `make run-chroot-ng CHROOTNG_ARGS="--version"`.
-run-chroot-ng: $(BUILD)/chroot-ng $(if $(CHROOTNG_RUN),$(BUILD)/arm64emu)
-	$(CHROOTNG_RUN) $(BUILD)/chroot-ng $(CHROOTNG_ARGS)
+# ---- arm64emu, chroot mode's native tier ----
+#
+# `arm64emu chroot --native` runs on an AArch64 host, and the suite runs it
+# there directly (build/arm64emu, or what ARM64EMU_NATIVE_BIN names: the
+# embedded build, say). Elsewhere it runs the AArch64 cross build
+# (arm64emu-a64) under this host's arm64emu, in its chroot mode with the
+# host's tree as the rootfs, which applies a guest's seccomp filter as a
+# kernel does -- qemu-user does not, and so cannot run the tier at all. Its
+# differential legs (M10/M17/M19) take the emulator's chroot mode as their
+# oracle too, so build/arm64emu is built either way.
+test-arm64emu-chroot-native:
+ifneq ($(ARM64EMU_HOSTA64),)
+	@$(MAKE) --no-print-directory $(BUILD)/arm64emu
+	@sh tests/arm64emu/chroot/native/run.sh
 else
-test-chroot-ng run-chroot-ng:
-	@echo "SKIP $@: no AArch64 C compiler (install $(CHROOTNG_CROSS)gcc, or set CHROOTNG_CC)"
+	@if command -v clang >/dev/null 2>&1 && [ -e $(ARM64EMU_A64_SYSROOT)/lib/libc.a ]; then \
+	    $(MAKE) --no-print-directory $(BUILD)/arm64emu $(BUILD)/arm64emu-a64 && \
+	    ARM64EMU_NATIVE_BIN=$${ARM64EMU_NATIVE_BIN:-$(CURDIR)/$(BUILD)/arm64emu-a64} \
+	      sh tests/arm64emu/chroot/native/run.sh; \
+	else \
+	    echo "SKIP $@: not an AArch64 host, and no clang / aarch64 cross libc for arm64emu-a64"; \
+	fi
 endif
 
 # ============================================================================
@@ -680,15 +631,14 @@ clean-testenv:
 
 help:
 	@echo 'Programs (into build/):'
-	@echo '  all (default)            every program this host can build'
-	@echo '  arm64emu                 the emulator: boot and chroot modes (boot on 64-bit hosts)'
+	@echo '  all (default)            arm64emu'
+	@echo '  arm64emu                 boot and chroot modes (boot on 64-bit hosts, --native on AArch64)'
 	@echo '  arm64emu32               its ILP32-host build (chroot mode)'
 	@echo '  arm64emu_asim            its Android-behavior build'
 	@echo '  arm64emu-embed           its embedded (-DANDROID_JNI) configuration'
-	@echo '  arm64emu-a64             its static AArch64 cross build (clang + lld)'
-	@echo '  chroot-ng                in-process chroot (needs an AArch64 compiler)'
+	@echo '  arm64emu-a64             its static-PIE AArch64 cross build (clang + lld)'
 	@echo 'Tests (one suite at a time):'
-	@echo '  test                     the main suites: boot, chroot, chroot-ng'
+	@echo '  test                     the main suites: boot, chroot, chroot-native'
 	@echo '  test-arm64emu-boot       boot mode: asm suite, plain interpreter'
 	@echo '  test-arm64emu-boot-pd    predecoded tier + consistency'
 	@echo '  test-arm64emu-boot-jit   --jit + consistency'
@@ -703,8 +653,7 @@ help:
 	@echo '  test-arm64emu-chroot-seccomp  suite under an Android-Oreo seccomp filter'
 	@echo '  test-arm64emu-chroot-pack  record a replayable test pack'
 	@echo '  test-arm64emu-chroot-env  provision the test rootfs'
-	@echo '  test-chroot-ng           chroot-ng suite'
-	@echo '  run-chroot-ng            run it with CHROOTNG_ARGS'
+	@echo '  test-arm64emu-chroot-native  the native tier, chroot --native'
 	@echo 'Housekeeping:'
 	@echo '  clean                    remove build/ but the test cache'
 	@echo '  clean-testenv            remove the test cache (rootfs images, recordings)'

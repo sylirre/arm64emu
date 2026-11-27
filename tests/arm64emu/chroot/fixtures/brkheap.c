@@ -1,6 +1,6 @@
 /* The program break, by the kernel's rules (mm/mmap.c, brk): every line names
  * what was asked and what the kernel answers, so the expected block in the
- * milestone is the kernel's output and a run under chroot-ng is compared with
+ * milestone is the kernel's output and a run under the native tier is compared with
  * it line for line. Raw syscalls throughout, and nothing that allocates
  * once the rows have begun: the libc's sbrk keeps a cached break of its own,
  * and a malloc that grew its heap from there would move the break under the

@@ -31,7 +31,13 @@
 #include "ptrace.h"
 #include "sys.h"
 #include "cli.h"
+#include "native/native.h"
+#include "link2symlink.h"
 
+/* The native tier (native/): built where the target is AArch64 only, and
+ * null elsewhere, where --native says so and the emulator runs the guest. */
+extern int native_run(const struct native_opts *o, char *why, size_t whysz)
+    __attribute__((weak));
 
 struct Machine g_machine;
 
@@ -76,6 +82,21 @@ static void help(void) {
     static const struct help_def opts[] = {
         HELP_OPT_HELP,
         HELP_OPT_VERSION,
+        {"    --native", "Run the guest's code on the host CPU instead of "
+                        "emulating it (AArch64 hosts): the native tier loads "
+                        "the program and its interpreter into this process "
+                        "and intercepts its system calls with a seccomp "
+                        "filter (SIGSYS), serving them against the same view "
+                        "of the rootfs as the emulator -- the binds, the fake "
+                        "identity, /proc and /dev, the emulated hardlinks. "
+                        "Where it cannot run -- another host architecture, a "
+                        "kernel or a policy that refuses the filter, code "
+                        "that cannot be made executable, an option that "
+                        "needs the emulator (--strace, the step diagnostics) "
+                        "-- a warning says why and the emulator runs the "
+                        "guest, with --jit (with the interpreter for a step "
+                        "diagnostic). The engine options apply to that "
+                        "fallback only."},
         {"    --strace", "Log guest syscalls to stderr."},
         {"    --strace-full", "Like --strace, but decode arguments strace-style: "
                         "symbolic flags, quoted strings, structs, errno returns."},
@@ -115,7 +136,11 @@ static void help(void) {
         {"-F, --file-backed", "Load the program and its interpreter by mapping "
                         "their file pages (shared with the page cache) "
                         "instead of copying them; a segment that cannot be "
-                        "mapped is copied."},
+                        "mapped is copied. Under --native the program's code "
+                        "is always mapped from its file this way -- which is "
+                        "otherwise the choice only where anonymous memory "
+                        "may not become executable (Android's no-new-privs, "
+                        "SELinux execmem)."},
         {"    --share-abstract-sockets", "Share abstract namespace sockets "
                         "of the host, disable per-rootfs socket isolation."},
         {"    --host-keyring", "Forward keyctl/add_key/request_key to the host "
@@ -127,8 +152,11 @@ static void help(void) {
                         "closed before the guest starts by default: guest fd is "
                         "host fd, so an inherited one is a live handle onto a "
                         "host file outside the rootfs."},
-        {"-w, --work-dir DIR", "Use a given absolute path of the guest as "
-                        "current working directory. Default is '/'."},
+        {"-w, --work-dir DIR", "Use a given path of the guest as current "
+                        "working directory, resolved through the rootfs and "
+                        "its binds; a relative one against the default, which "
+                        "is '/', or under the identity rootfs '/' the host's "
+                        "own working directory."},
         {"    --",      "Stop option parsing."},
     };
     static const struct help_def env_tune[] = {
@@ -270,8 +298,84 @@ static void help(void) {
                         "own (the tier a host whose address space under a "
                         "stack is taken is served by)."},
     };
+    static const struct help_def env_native[] = {
+        {"ARM64EMU_NATIVE_DEBUG", "Under --native, log verbose syscall-error "
+                        "diagnostics to stderr, including each syscall the "
+                        "host refuses and the tier emulates."},
+        {"ARM64EMU_NATIVE_NO_FALLBACK", "Make a --native that cannot be used "
+                        "an error (exit 126, after the reason) instead of a "
+                        "run under the emulator. Test aid: the tier's suite "
+                        "must not pass on the emulator's answers."},
+        {"ARM64EMU_L2S_FORCE", "With -l, route every linkat through the "
+                        "emulation without trying the real hardlink first. "
+                        "Test aid for hosts whose filesystem allows link(2)."},
+        {"ARM64EMU_UACCESS_FORCE_MEMFD", "Validate guest pointers through a "
+                        "scratch memfd instead of process_vm_readv/writev: "
+                        "the fallback a host without that pair uses."},
+        {"ARM64EMU_MMAP_FORCE_ANON", "Serve every executable file mapping from "
+                        "an anonymous copy without asking the kernel first: "
+                        "what a true noexec mount forces anyway."},
+        {"ARM64EMU_PROCTAB_FORCE_NONE", "Behave as if the guest-PID registry "
+                        "could not be mapped at all."},
+        {"ARM64EMU_EXEC_RECLAIM_FORCE", "Treat the process as single-threaded "
+                        "when an emulated execve gives the replaced program's "
+                        "mappings back (a host emulator running a thread of "
+                        "its own beside the guest's); against a genuinely "
+                        "multithreaded guest it unmaps memory those threads "
+                        "are running on."},
+        {"ARM64EMU_SCRATCH_FORCE_NONE", "Behave as if the per-thread scratch "
+                        "stack table had no slot to give, so every dispatch "
+                        "runs on a stack mapped for the call (what a host "
+                        "reaches only with 256 threads live at once)."},
+        {"ARM64EMU_ALTSTACK_DELAY=US", "Spend US microseconds on the monitor's "
+                        "own stack, at the start of a trap's handling, before "
+                        "the guest's alternate signal stack is disarmed: "
+                        "widens a window of a few instructions, in which a "
+                        "SIGSYS sent from elsewhere must not reach that stack."},
+        {"ARM64EMU_DEVSHM_FORCE_TMP", "Serve the guest's /dev/shm from the "
+                        "per-uid directory under $TMPDIR even where the host "
+                        "has a real /dev/shm, as a device must."},
+        {"ARM64EMU_TMP_FORCE_ENV", "Look for the tier's private temp "
+                        "directories (the /dev/shm stand-in, read-only /proc "
+                        "views) only under $TMPDIR and $XDG_RUNTIME_DIR, "
+                        "passing over /data/local/tmp and /tmp, as an Android "
+                        "app with an unusable $TMPDIR has to."},
+        {"ARM64EMU_PROCFS_REOPEN_FORCE_DENY", "Take the reopen that makes a "
+                        "synthesized /proc file read-only as refused, as "
+                        "Android's policy refuses an app the reopen of a "
+                        "memfd, so the read-only view is served from a file "
+                        "in a private directory under $TMPDIR."},
+        {"ARM64EMU_TCSETSF_FORCE_DENY", "Refuse TCSETSF (tcsetattr with "
+                        "TCSAFLUSH) with EACCES before the host is asked, as "
+                        "Android 8's policy does on a pty, so it is served "
+                        "from TCFLSH and TCSETSW -- and so is TCSETSF2."},
+        {"ARM64EMU_SETID_FORCE_DENY", "Without -u, take the uid and gid "
+                        "setters as refused by the host, as Android's app "
+                        "filter refuses them, so they are answered from the "
+                        "real ids and capabilities the way the kernel would."},
+        {"ARM64EMU_OPENAT2_FORCE_DENY", "Take openat2 as refused by the host, "
+                        "as Android's app filter refuses it, so a guest's is "
+                        "emulated, as on a kernel without one."},
+        {"ARM64EMU_MM_MAP_FORCE_DENY", "Take PR_SET_MM_MAP as refused, as "
+                        "Android's kernels refuse it, so /proc/<pid>/cmdline "
+                        "and environ are read out of guest memory."},
+        {"ARM64EMU_BROKER_FORCE_NO_PEERCRED", "Behave as if the kernel would "
+                        "not say who is on the other end of the IPC broker's "
+                        "rendezvous socket, which refuses the connection."},
+        {"ARM64EMU_NETLINK_FORCE_NO_RELAY", "Force the netlink fallback, and "
+                        "take the host's relay socket as refused too, so the "
+                        "dump is the loopback-only one of a host that grants "
+                        "none."},
+        {"ARM64EMU_NETLINK_FORCE_DENY_GETLINK", "Force the netlink fallback, "
+                        "with RTM_GETLINK refused on the relay socket "
+                        "(Android's nlmsg_readpriv), so the link dump is "
+                        "synthesized."},
+        {"ARM64EMU_NETLINK_FORCE_DENY_AUDIT", "Take a NETLINK_AUDIT socket as "
+                        "refused (EACCES), as Android's SELinux policy does."},
+    };
     static const char *const examples[] = {
         "arm64emu chroot ./rootfs /bin/sh",
+        "arm64emu chroot --native -u ./rootfs /bin/sh -l",
         "arm64emu chroot --jit --fake-id ./rootfs /bin/bash -l",
         ("arm64emu chroot -b \"$PWD:/work\" --bind /etc/ssl:/etc/ssl:ro "
             "./rootfs /bin/su -l"),
@@ -285,7 +389,9 @@ static void help(void) {
         "User-space emulation of AArch64 Linux, for running unprivileged, "
         "isolated chroot-like environments. Implements a full user ISA "
         "including FP, ASIMD, AES, PMULL, SHA*, CRC32, atomics. Supports "
-        "~190 system calls which should be enough for most of workloads.\n\n"
+        "~190 system calls which should be enough for most of workloads. On "
+        "an AArch64 host --native runs the guest's code on the CPU itself "
+        "instead.\n\n"
         "Directory layout for /dev expose a minimal set of device nodes "
         "needed for correct functioning of guest programs. The /proc is "
         "almost entirely synthesized to provide process data correct "
@@ -309,6 +415,16 @@ static void help(void) {
                  "facilities force the interpreter):", w, 2, 0);
     fputc('\n', f);
     help_defs(f, env_diag, HELP_N(env_diag), w);
+    fputc('\n', f);
+    help_wrap(f, "The native tier's (--native), test aids but the first; it "
+                 "reads these of the ones above too: "
+                 "ARM64EMU_PROCSTAT_FORCE_SYNTH, ARM64EMU_OVERFLOWID_FORCE_SYNTH, "
+                 "ARM64EMU_PROCSYNTH_FORCE_STAT_DENY, ARM64EMU_NETLINK_FORCE_BLOCK, "
+                 "ARM64EMU_PROCTAB_FORCE_FILE, ARM64EMU_SHM_FORCE_FILE, "
+                 "ARM64EMU_TERMIOS2_FORCE_DENY and ARM64EMU_TIOCGSID_FORCE_DENY:",
+              w, 2, 0);
+    fputc('\n', f);
+    help_defs(f, env_native, HELP_N(env_native), w);
 
     help_section(f, "EXAMPLES");
     help_examples(f, examples, HELP_N(examples), w);
@@ -332,13 +448,31 @@ static int is_id_spec(const char *s) {
     return digits;
 }
 
-/* Parse "N" (uid, gid defaults to uid) or "N:M" into *uid,*gid. */
+/* Accumulate one decimal id, refusing anything a uid_t cannot hold. One that
+ * simply wraps is the wrong kind of wrong here: "4294967296" is 0, and 0 is
+ * root -- so a spec out of range did not fail, it quietly asked for the fake
+ * identity with the most authority there is. -1 on overflow. */
+static int parse_id_num(const char **pp, u32 *out) {
+    unsigned long long v = 0;
+    const char *p = *pp;
+    for (; isdigit((unsigned char)*p); p++) {
+        v = v * 10 + (unsigned long long)(*p - '0');
+        if (v > 0xffffffffull) return -1;
+    }
+    *pp = p;
+    *out = (u32)v;
+    return 0;
+}
+
+/* Parse "N" (uid, gid defaults to uid) or "N:M" into *uid,*gid; fatal on an
+ * id out of range. */
 static void parse_id_spec(const char *s, u32 *uid, u32 *gid) {
-    char *end;
-    unsigned long u = strtoul(s, &end, 10);
-    *uid = (u32)u;
-    if (*end == ':') *gid = (u32)strtoul(end + 1, NULL, 10);
-    else *gid = (u32)u;   /* single value applies to both */
+    const char *p = s;
+    if (parse_id_num(&p, uid) < 0 ||
+        (*p == ':' ? (p++, parse_id_num(&p, gid) < 0) : (*gid = *uid, 0))) {
+        fprintf(stderr, "arm64emu: --fake-id '%s': expected UID or UID:GID\n", s);
+        exit(2);
+    }
 }
 
 /* Lexically canonicalize an absolute guest path (collapse '.', '..', '//',
@@ -368,11 +502,12 @@ static int canon_guest(const char *in, char *out) {
     return 0;
 }
 
-/* Parse and register a --bind mount "src:dst[:ro]": host directory src (realpath'd)
- * is exposed at absolute guest mount point dst; an optional trailing ":ro" (or
- * the default ":rw") marks it read-only. Host paths may not contain ':'. Fatal
- * on any malformed spec. */
-static void add_bind(struct Machine *m, const char *spec) {
+/* Parse a --bind mount "src:dst[:ro]": host path src, realpath'd into `host`
+ * (PATH_MAX), is exposed at the absolute guest mount point dst, canonicalized
+ * into `guest` (PATH_MAX); an optional trailing ":ro" (or the default ":rw")
+ * marks it read-only. Host paths may not contain ':'. Fatal on any malformed
+ * spec, for both tiers alike. */
+static void parse_bind(const char *spec, char *host, char *guest, int *ro_out) {
     char buf[2 * PATH_MAX];
     if (strlen(spec) + 1 > sizeof buf) {
         fprintf(stderr, "arm64emu: --bind '%s': too long\n", spec);
@@ -395,9 +530,16 @@ static void add_bind(struct Machine *m, const char *spec) {
         fprintf(stderr, "arm64emu: --bind '%s': destination path must be absolute\n", spec);
         exit(2);
     }
-    char host[PATH_MAX], guest[PATH_MAX];
     if (!realpath(src, host)) {
         fprintf(stderr, "arm64emu: --bind source path '%s': not found\n", src);
+        /* The operands the other way round -- a guest path first, which is
+         * what chroot-ng took before its 0.1.0 -- read as a missing source
+         * whose destination is there on the host: say so, since the bind
+         * that would have worked is otherwise a guess. */
+        struct stat st;
+        if (stat(dst, &st) == 0)
+            fprintf(stderr, "arm64emu: --bind takes SRC:DST, the host path "
+                            "first; did you mean '%s:%s'?\n", dst, src);
         exit(126);
     }
     if (!strcmp(host, "/")) {
@@ -412,6 +554,12 @@ static void add_bind(struct Machine *m, const char *spec) {
         fprintf(stderr, "arm64emu: --bind '%s': cannot bind over guest root\n", spec);
         exit(2);
     }
+    *ro_out = ro;
+}
+
+/* Register a parsed --bind mount with the emulator. */
+static void add_bind(struct Machine *m, const char *spec, const char *host,
+                     const char *guest, int ro) {
     /* Register into the shared bind table (same path the runtime mount(2) uses). */
     /* A --bind source is a host path the invoker chose: nothing the guest can
      * rename lies above it, so all of it may be opened by name (path.c). And
@@ -531,12 +679,34 @@ static void seccomp_notice(void) {
 
 /* --- command-line option parsing helpers ------------------------------- */
 
-/* Append a guest -E/--env "VAR=VAL" entry. */
+/* Append a guest -E/--env "VAR=VAL" entry. The name is everything before the
+ * first '=', so a value may contain more of them. A spec with no '=' at all is
+ * refused rather than guessed at: the bare string in envp is an entry no
+ * getenv() can ever match, so a mistyped name would do nothing at all. A
+ * repeated name overwrites the earlier entry in place instead of adding a
+ * duplicate, which getenv() (first match) and a shell re-exporting envp (last
+ * match) would disagree about. */
 static void push_env(char ***env, int *n, char *v) {
+    const char *eq = strchr(v, '=');
+    if (!eq || eq == v) {
+        fprintf(stderr, "arm64emu: --env '%s': expected VAR=VAL\n", v);
+        exit(2);
+    }
+    size_t kl = (size_t)(eq - v) + 1;   /* compare through the '=' */
+    for (int k = 0; k < *n; k++)
+        if (!strncmp((*env)[k], v, kl)) { (*env)[k] = v; return; }
     char **nv = realloc(*env, sizeof(char *) * (size_t)(*n + 1));
     if (!nv) { perror("arm64emu: realloc"); exit(127); }
     *env = nv;
     (*env)[(*n)++] = v;
+}
+
+/* Collect a --bind spec, parsed once the tier is known. */
+static void push_bind(char ***specs, int *n, char *v) {
+    char **nv = realloc(*specs, sizeof(char *) * (size_t)(*n + 1));
+    if (!nv) { perror("arm64emu: realloc"); exit(127); }
+    *specs = nv;
+    (*specs)[(*n)++] = v;
 }
 
 /* Apply -u/--fake-id: enable fake identity and parse its optional ID. `attached`
@@ -547,7 +717,11 @@ static void set_fake_id(struct Machine *m, const char *attached,
                         char **argv, int argc, int *pi, u32 *uid, u32 *gid) {
     m->fake_id = 1;
     if (attached && *attached) {
-        if (!is_id_spec(attached)) usage();
+        if (!is_id_spec(attached)) {
+            fprintf(stderr, "arm64emu: --fake-id '%s': expected UID or UID:GID\n",
+                    attached);
+            exit(2);
+        }
         parse_id_spec(attached, uid, gid);
     } else if (*pi + 1 < argc && is_id_spec(argv[*pi + 1])) {
         parse_id_spec(argv[++*pi], uid, gid);
@@ -568,6 +742,45 @@ static int enter_guest_cwd(struct Machine *m, const char *canon) {
     return 0;
 }
 
+/* --native that cannot be used: why, and what runs the guest instead. The
+ * emulator, with --jit -- unless what made the tier unusable is a step
+ * diagnostic, which needs the interpreter (engine_settle). A test aid makes
+ * it the end of the run instead (ARM64EMU_NATIVE_NO_FALLBACK). */
+static void native_fallback(const char *why, bool per_insn) {
+    const char *strict = arm64_getenv("NATIVE_NO_FALLBACK");
+    if (strict && *strict && strcmp(strict, "0")) {
+        fprintf(stderr, "arm64emu: --native: %s\n", why);
+        exit(126);
+    }
+    fprintf(stderr, "arm64emu: --native: %s; continuing with %s\n", why,
+            per_insn ? "the interpreter" : "--jit");
+    if (!per_insn) g_jit = 1;
+}
+
+/* Why --native cannot be what runs this command line, before the tier is
+ * asked anything (it asks the rest itself: native_run): no tier in this build,
+ * or an option or a knob that needs the emulator. NULL when there is none. */
+static const char *native_unusable(struct Machine *m, char *buf, size_t n) {
+    if (!native_run)
+        return "this build has no native tier (it runs on AArch64 hosts only)";
+    const char *opt = m->strace_full ? "--strace-full" : m->strace ? "--strace"
+                    : g_trace ? "--debug" : g_rtrace ? "--reg-trace"
+                    : g_max_insn ? "--max-insn" : NULL;
+    if (!opt) {
+        static const char *const knobs[] = { "PROF", "RING", "TPC", "COV" };
+        for (unsigned k = 0; k < sizeof knobs / sizeof *knobs; k++) {
+            const char *v = arm64_getenv(knobs[k]);
+            if (v && *v) {
+                snprintf(buf, n, "ARM64EMU_%s needs the emulator", knobs[k]);
+                return buf;
+            }
+        }
+        return NULL;
+    }
+    snprintf(buf, n, "%s needs the emulator", opt);
+    return buf;
+}
+
 /* Chroot mode's entry (../main.c): argv[0] is the mode's name. */
 int chroot_main(int argc, char **argv)
 {
@@ -576,13 +789,12 @@ int chroot_main(int argc, char **argv)
     const char *work_dir = NULL;
     char **extra_env = NULL;
     int n_extra = 0;
+    char **bind_specs = NULL;
+    int n_binds = 0;
+    int native = 0;
 
     u32 fake_uid = 0, fake_gid = 0;
     int fake_explicit = 0;   /* -u/--fake-id given, not only implied */
-
-    /* Create the process-shared bind table before any --bind registration below
-     * and before the first fork, so every guest process maps the same mounts. */
-    bindtab_init();
 
     /* GNU-style options: single-letter short (-j), --word long. Value-taking
      * options accept "-b VAL"/"-bVAL" and "--bind VAL"/"--bind=VAL"; no-arg
@@ -600,6 +812,7 @@ int chroot_main(int argc, char **argv)
             const char *n = arg + 2;
             if      (!strcmp(n, "help"))         { if (val) opt_no_value(arg); help(); }
             else if (!strcmp(n, "version"))      { if (val) opt_no_value(arg); version(); }
+            else if (!strcmp(n, "native"))       { if (val) opt_no_value(arg); native = 1; }
             else if (!strcmp(n, "strace"))       { if (val) opt_no_value(arg); m->strace = 1; }
             else if (!strcmp(n, "strace-full"))   { if (val) opt_no_value(arg); m->strace = 1; m->strace_full = 1; }
             else if (engine_long_opt(n, val, arg, argv, argc, &i)) ;
@@ -610,7 +823,7 @@ int chroot_main(int argc, char **argv)
             else if (!strcmp(n, "share-abstract-sockets")) { if (val) opt_no_value(arg); m->share_abstract = 1; }
             else if (!strcmp(n, "keep-fds"))     { if (val) opt_no_value(arg); m->keep_fds = 1; }
             else if (!strcmp(n, "host-keyring")) { if (val) opt_no_value(arg); m->host_keyring = 1; }
-            else if (!strcmp(n, "bind"))   add_bind(m, long_value("--bind", val, argv, argc, &i));
+            else if (!strcmp(n, "bind"))   push_bind(&bind_specs, &n_binds, long_value("--bind", val, argv, argc, &i));
             else if (!strcmp(n, "env"))    push_env(&extra_env, &n_extra, long_value("--env", val, argv, argc, &i));
             else if (!strcmp(n, "argv0"))  argv0 = long_value("--argv0", val, argv, argc, &i);
             else if (!strcmp(n, "work-dir")) work_dir = long_value("--work-dir", val, argv, argc, &i);
@@ -626,10 +839,10 @@ int chroot_main(int argc, char **argv)
                 else if (c == 'v') version();
                 else if (engine_short_opt(c)) ;
                 else if (c == 'l') m->link2symlink = 1;
-                else if (c == 'b') { add_bind(m, short_value("--bind", p, argv, argc, &i)); break; }
-                else if (c == 'E') { push_env(&extra_env, &n_extra, short_value("--env", p, argv, argc, &i)); break; }
-                else if (c == '0') { argv0 = short_value("--argv0", p, argv, argc, &i); break; }
-                else if (c == 'w') { work_dir = short_value("--work-dir", p, argv, argc, &i); break; }
+                else if (c == 'b') { push_bind(&bind_specs, &n_binds, short_value("-b", p, argv, argc, &i)); break; }
+                else if (c == 'E') { push_env(&extra_env, &n_extra, short_value("-E", p, argv, argc, &i)); break; }
+                else if (c == '0') { argv0 = short_value("-0", p, argv, argc, &i); break; }
+                else if (c == 'w') { work_dir = short_value("-w", p, argv, argc, &i); break; }
                 else if (c == 'u') { set_fake_id(m, p, argv, argc, &i, &fake_uid, &fake_gid); fake_explicit = 1; break; }
                 else if (c == 'F') m->file_backed = 1;
                 else usage();
@@ -638,13 +851,37 @@ int chroot_main(int argc, char **argv)
     }
     if (argc - i < 2) usage();
 
+    const char *rootfs = argv[i];
+    const char *prog = argv[i + 1];
+    char **gargv_in = &argv[i + 1];
+
+    /* An empty <rootfs> is almost always an unset variable -- `arm64emu chroot
+     * "$ROOTFS" rm -rf /` -- and "/" is how the host's root is asked for on
+     * purpose. */
+    if (!*rootfs) {
+        fprintf(stderr, "arm64emu: <rootfs> is empty (use '/' for the host root)\n");
+        return 2;
+    }
+
+    /* The --bind specs, parsed (and refused, when malformed) the same way for
+     * both tiers; each tier registers them its own way below. */
+    char (*bind_host)[PATH_MAX] = NULL, (*bind_guest)[PATH_MAX] = NULL;
+    int *bind_ro = NULL;
+    if (n_binds) {
+        bind_host = malloc(sizeof *bind_host * (size_t)n_binds);
+        bind_guest = malloc(sizeof *bind_guest * (size_t)n_binds);
+        bind_ro = malloc(sizeof *bind_ro * (size_t)n_binds);
+        if (!bind_host || !bind_guest || !bind_ro) { perror("arm64emu: malloc"); exit(127); }
+        for (int k = 0; k < n_binds; k++)
+            parse_bind(bind_specs[k], bind_host[k], bind_guest[k], &bind_ro[k]);
+    }
+
     /* The step diagnostics (--debug, --reg-trace, ARM64EMU_PROF/RING/TPC/COV)
      * are the per-instruction facilities here; --jit yields to them and to a
      * host without a code generator, the interpreter being always the correct
      * fallback. --max-insn needs none of that: every engine stops at it. */
     step_diag_env();
-    g_debug_hooks = cpu_step_diag_on();
-    engine_settle(g_debug_hooks);
+    bool per_insn = cpu_step_diag_on();
 
     /* Capture the real invoking identity (stat remap source) and, in fake mode,
      * seed the credential set to the configured identity. */
@@ -657,6 +894,99 @@ int chroot_main(int argc, char **argv)
         fake_uid = m->host_uid;
         fake_gid = m->host_gid;
     }
+
+    if (!realpath(rootfs, m->rootfs)) {
+        fprintf(stderr, "arm64emu: rootfs '%s': not found\n", rootfs);
+        return 126;
+    }
+
+    /* Guest argv: program args as given; argv[0] overridable. */
+    int gargc = 0;
+    while (gargv_in[gargc]) gargc++;
+    char **gargv = malloc(sizeof(char *) * (size_t)(gargc + 1));
+    if (!gargv) { perror("arm64emu: malloc"); exit(127); }
+    for (int k = 0; k < gargc; k++) gargv[k] = gargv_in[k];
+    gargv[gargc] = NULL;
+    if (argv0) gargv[0] = (char *)argv0;
+
+    /* Guest environ: a clean environment, the same for both tiers. Only the
+     * host's terminal-appearance variables (TERM, COLORTERM) are inherited;
+     * every other host variable (PATH, HOME, LD_*, XDG_*, ...) names host
+     * locations, not guest ones, and is dropped. What the guest gets instead of
+     * the dropped PATH is a guest-side default (guest_default below), not the
+     * host's; HOME stays unset, as it is in a process nothing logged in (a
+     * login shell, su -, or -E sets it), since no home directory can be assumed
+     * for whatever identity the guest runs as.
+     * -E/--env entries come first and win: a host var is inherited, and a
+     * default supplied, only when no -E entry already sets that key. (Emitting
+     * both as duplicates is not enough -- getenv() would return the -E copy but
+     * a shell importing envp keeps the *last* duplicate, i.e. the other value,
+     * defeating the override.) Callers re-add anything else they need with -E.
+     *
+     * Dropping PATH without replacing it was not neutral: it left the guest with
+     * no PATH at all, which nothing on a real system ever has. Programs that
+     * search it themselves rather than going through execvp(3) then fail before
+     * they exec anything -- gcc's collect2 looks for `ld` over COMPILER_PATH +
+     * $PATH and dies with "cannot find 'ld'", so compiling in a Debian rootfs
+     * needed an explicit -E PATH=... The value is the one a login sets for
+     * root, login.defs ENV_SUPATH: a superset of the user one, and nothing in
+     * it is outside the rootfs. */
+    static const char *const host_keep[] = { "TERM=", "COLORTERM=" };
+    static const char *const guest_default[] = {
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    };
+    int n_keep = (int)(sizeof host_keep / sizeof *host_keep);
+    int n_def  = (int)(sizeof guest_default / sizeof *guest_default);
+    char **genv = malloc(sizeof(char *) * (size_t)(n_extra + n_keep + n_def + 1));
+    if (!genv) { perror("arm64emu: malloc"); exit(127); }
+    int ge = 0;
+    for (int k = 0; k < n_extra; k++) genv[ge++] = extra_env[k];
+    for (int k = 0; k < n_keep; k++) {
+        if (env_set_by_flag(extra_env, n_extra, host_keep[k])) continue;
+        size_t kl = strlen(host_keep[k]);
+        for (char **e = environ; *e; e++)
+            if (!strncmp(*e, host_keep[k], kl)) { genv[ge++] = *e; break; }
+    }
+    for (int k = 0; k < n_def; k++)
+        if (!env_set_by_flag(extra_env, n_extra, guest_default[k]))
+            genv[ge++] = (char *)guest_default[k];
+    genv[ge] = NULL;
+
+    /* --native: the guest's code on this CPU, in this process. It returns only
+     * when it could not be entered: a fallback, before it did anything the
+     * emulator below would mind, or a failure the emulator would meet too. */
+    if (native) {
+        char why[512];
+        const char *no = native_unusable(m, why, sizeof why);
+        if (!no) {
+            struct native_bind *nb = calloc((size_t)n_binds + 1, sizeof *nb);
+            if (!nb) { perror("arm64emu: malloc"); exit(127); }
+            for (int k = 0; k < n_binds; k++)
+                nb[k] = (struct native_bind){ bind_host[k], bind_guest[k], bind_ro[k] };
+            struct native_opts o = {
+                .rootfs = m->rootfs, .workdir = work_dir, .prog = prog,
+                .argv = gargv, .envp = genv, .binds = nb, .nbinds = n_binds,
+                .fake_id = m->fake_id, .fake_explicit = fake_explicit,
+                .fake_uid = fake_uid, .fake_gid = fake_gid,
+                .setuid_root = m->setuid_root, .setgid_root = m->setgid_root,
+                .link2symlink = m->link2symlink, .file_backed = m->file_backed,
+                .no_proc = m->no_proc, .no_dev = m->no_dev,
+                .keep_fds = m->keep_fds, .host_keyring = m->host_keyring,
+                .share_abstract = m->share_abstract,
+                .shared_proc = m->shared_proc,
+            };
+            int r = native_run(&o, why, sizeof why);
+            if (r != NATIVE_FALLBACK) return r;
+            free(nb);
+            no = why;
+        }
+        native_fallback(no, per_insn);
+    }
+
+    g_debug_hooks = per_insn;
+    engine_settle(g_debug_hooks);
+    l2s_host = &l2s_chroot_ops;   /* --link2symlink's host: the emulator's */
+
     if (m->fake_id) {
         m->fake_uid = fake_uid;
         m->fake_gid = fake_gid;
@@ -665,14 +995,16 @@ int chroot_main(int argc, char **argv)
         m->cred.ngroups = 0;
     }
 
-    const char *rootfs = argv[i];
-    const char *prog = argv[i + 1];
-    char **gargv_in = &argv[i + 1];
+    /* Create the process-shared bind table before the --bind registration
+     * below and before the first fork, so every guest process maps the same
+     * mounts. */
+    bindtab_init();
+    for (int k = 0; k < n_binds; k++)
+        add_bind(m, bind_specs[k], bind_host[k], bind_guest[k], bind_ro[k]);
+    free(bind_host);
+    free(bind_guest);
+    free(bind_ro);
 
-    if (!realpath(rootfs, m->rootfs)) {
-        fprintf(stderr, "arm64emu: rootfs '%s': not found\n", rootfs);
-        return 126;
-    }
     if (!strcmp(m->rootfs, "/")) m->rootfs[0] = 0;   /* rootfs "/": no prefix */
 
     /* Per-rootfs tag spliced into guest abstract AF_UNIX socket names to isolate
@@ -732,58 +1064,6 @@ int chroot_main(int argc, char **argv)
         strcpy(m->cwd, canon);
         if (enter_guest_cwd(m, m->cwd) != 0) return 126;
     }
-
-    /* Guest argv: program args as given; argv[0] overridable. */
-    int gargc = 0;
-    while (gargv_in[gargc]) gargc++;
-    char **gargv = malloc(sizeof(char *) * (size_t)(gargc + 1));
-    if (!gargv) { perror("arm64emu: malloc"); exit(127); }
-    for (int k = 0; k < gargc; k++) gargv[k] = gargv_in[k];
-    gargv[gargc] = NULL;
-    if (argv0) gargv[0] = (char *)argv0;
-
-    /* Guest environ: a clean environment. Only the host's terminal-appearance
-     * variables (TERM, COLORTERM) are inherited; every other host variable
-     * (PATH, HOME, LD_*, XDG_*, ...) names host locations, not guest ones, and
-     * is dropped. What the guest gets instead of the dropped PATH is a
-     * guest-side default (guest_default below), not the host's; HOME stays
-     * unset, as it is in a process nothing logged in (a login shell, su -,
-     * or -E sets it), since no home directory can be assumed for whatever
-     * identity the guest runs as.
-     * -E/--env entries come first and win: a host var is inherited, and a
-     * default supplied, only when no -E entry already sets that key. (Emitting
-     * both as duplicates is not enough -- getenv() would return the -E copy but
-     * a shell importing envp keeps the *last* duplicate, i.e. the other value,
-     * defeating the override.) Callers re-add anything else they need with -E.
-     *
-     * Dropping PATH without replacing it was not neutral: it left the guest with
-     * no PATH at all, which nothing on a real system ever has. Programs that
-     * search it themselves rather than going through execvp(3) then fail before
-     * they exec anything -- gcc's collect2 looks for `ld` over COMPILER_PATH +
-     * $PATH and dies with "cannot find 'ld'", so compiling in a Debian rootfs
-     * needed an explicit -E PATH=... The value is the one a login sets for
-     * root, login.defs ENV_SUPATH: a superset of the user one, and nothing in
-     * it is outside the rootfs. */
-    static const char *const host_keep[] = { "TERM=", "COLORTERM=" };
-    static const char *const guest_default[] = {
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    };
-    int n_keep = (int)(sizeof host_keep / sizeof *host_keep);
-    int n_def  = (int)(sizeof guest_default / sizeof *guest_default);
-    char **genv = malloc(sizeof(char *) * (size_t)(n_extra + n_keep + n_def + 1));
-    if (!genv) { perror("arm64emu: malloc"); exit(127); }
-    int ge = 0;
-    for (int k = 0; k < n_extra; k++) genv[ge++] = extra_env[k];
-    for (int k = 0; k < n_keep; k++) {
-        if (env_set_by_flag(extra_env, n_extra, host_keep[k])) continue;
-        size_t kl = strlen(host_keep[k]);
-        for (char **e = environ; *e; e++)
-            if (!strncmp(*e, host_keep[k], kl)) { genv[ge++] = *e; break; }
-    }
-    for (int k = 0; k < n_def; k++)
-        if (!env_set_by_flag(extra_env, n_extra, guest_default[k]))
-            genv[ge++] = (char *)guest_default[k];
-    genv[ge] = NULL;
 
     m->dumpable = 1;  /* SUID_DUMP_USER, as a process starts (sys_proc.c prctl) */
     rlim_init(m);     /* seed the guest's resource limits from the host's,

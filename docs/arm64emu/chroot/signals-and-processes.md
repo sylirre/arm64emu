@@ -807,6 +807,18 @@ emulator on a 64-bit host, which is every 32-bit Termux on a current phone.
 The guest's own siginfo is rebuilt from the fields and never shows the
 carried code.
 
+The marks and the job-control carriers below all draw their codes from one
+band at the bottom of the negative range, `-0x7ffff000` and below
+(`SIG_CODE_BAND`), and a guest may queue a code from that band itself: the
+kernel lets a process claim any negative code, and an emulator running as the
+guest marks its own signals the same way. Sent on as written, such a code was
+read as one of ours — arm64emu run in a guest (the native tier's fallback, in
+its suite on an x86 host) probes its host with its kick and a code of the
+`SIGSTOP` carrier's range, and the emulator underneath took it for a
+`SIGSTOP` and stopped. So a guest's queued siginfo with a code of the band
+goes through the receiver's inbox (below), which carries it exactly, on every
+tier (`tests/arm64emu/chroot/fixtures/sigcode_band.c`).
+
 #### A host that cannot carry a private `si_code`
 
 The thread mark and the job-control carrier below both ride `si_code`, and
