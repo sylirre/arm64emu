@@ -2635,7 +2635,10 @@ run-loop safepoint, and two things get a thread there:
   (`PTRACE_KICKSIG`, carrying `DETHREAD_MAGIC` so the handler can tell it from a
   guest-directed signal of that number) and does nothing but interrupt the
   syscall. Threads are re-kicked every 10 ms while the rendezvous waits, because
-  a thread can enter a *new* blocking syscall after consuming the previous kick.
+  a thread can enter a *new* blocking syscall after consuming the previous kick
+  -- those not parked at the rendezvous yet: the kick is never blocked, and
+  re-kicking a parked one only woke it for nothing, thousands of them a round
+  in a process of thousands of threads.
   Who to kick comes from the **thread registry** (`sys_proc.c`), the emulator's
   own list of its guest threads, so no `/proc` is needed to find them.
   The emulator's own blocking loops — `wait4`/`waitid`, `rt_sigsuspend`,
@@ -2668,7 +2671,12 @@ reason the rendezvous waits for the carrier *by name* (`dethread_carrier_here`)
 and not only by arrival count.
 
 **The handshake is two-phase, and never gives up.** Siblings park at the
-rendezvous and are told to die once *every* one of them has arrived. A kernel's
+rendezvous and are told to die once *every* one of them has arrived. Parked,
+they sleep on a futex -- the rendezvous state, which the commit wakes, and for
+the main thread the image's arrival after it -- that a signal also ends, which is
+how a fatal one reaches them. They used to poll every 200 µs instead, and 4500
+of them kept every CPU of the host busy (thousands runnable at once, the
+desktop starved) and the exec'ing thread off them: the exec took 88 s, now 2. A kernel's
 `de_thread` runs past the point of no return: it SIGKILLs the other threads and
 waits for them for as long as that takes — a thread in an uninterruptible sleep
 included — and only a fatal signal, which takes the whole group down with the

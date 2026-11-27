@@ -2746,6 +2746,22 @@ static void dt_nap(long us) {
     nanosleep(&ts, NULL);
 }
 
+/* Sleep while *word still reads `val`, until a dt_wake on it. FUTEX_WAIT
+ * rechecks the value itself, so a store and wake landing between the caller's
+ * test and this call return EAGAIN instead of sleeping through it. A signal
+ * ends the wait as well -- the capture handler has no SA_RESTART -- which is
+ * how a fatal one reaches the caller's check. The rendezvous's waiters used to
+ * poll every 200 us instead: 4500 parked threads asked the host for 22 million
+ * wakeups a second, kept the CPUs saturated, and held the exec'ing thread off
+ * them for over a minute. */
+static void dt_wait(s32 *word, s32 val) {
+    syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, val, NULL, NULL, 0);
+}
+
+static void dt_wake(s32 *word) {
+    syscall(SYS_futex, word, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+}
+
 /* Interrupt one thread's blocked host syscall. Carries DETHREAD_MAGIC on the
  * reserved kick signal so the handler can tell it from a guest-directed signal
  * of the same number (signal.c, sig_kick_net). */
@@ -2891,10 +2907,15 @@ static int host_task_count(void) {
 /* Kick every guest thread of this process but `self` -- the thread registry's
  * list, which is exactly the guest's threads (an interposer's own host tasks
  * are never in it) and needs no /proc to read. */
+/* Every thread not yet at the rendezvous. One already parked there is where
+ * the kick would send it, and the kick is never blocked: each one only woke it
+ * to sleep again, a round of thousands of them every DT_KICK_MS for a process
+ * of thousands of threads. */
 static void dethread_kick_all(s32 self) {
     EMU_LOCK(&thr_lock, EMU_LK_THR);
     for (int i = 0; i < thr_n; i++)
-        if (thr_tab[i].tid != self) dethread_kick(thr_tab[i].tid);
+        if (thr_tab[i].tid != self && !thr_tab[i].parked)
+            dethread_kick(thr_tab[i].tid);
     EMU_UNLOCK(&thr_lock, EMU_LK_THR);
 }
 
@@ -2962,7 +2983,7 @@ static void dethread_join(CPU *c) {
     if (carrier) __atomic_store_n(&m->dethread_carrier_here, 1, __ATOMIC_RELEASE);
     while (__atomic_load_n(&m->dethread_state, __ATOMIC_ACQUIRE) == DT_PENDING) {
         dethread_die_if_fatal(c);
-        dt_nap(200);
+        dt_wait(&m->dethread_state, DT_PENDING);
     }
     __atomic_sub_fetch(&m->dethread_parked, 1, __ATOMIC_ACQ_REL);
 
@@ -2983,7 +3004,7 @@ static void dethread_join(CPU *c) {
     /* The main thread: wait for the image, then take it over. */
     while (!__atomic_load_n(&m->dethread_done, __ATOMIC_ACQUIRE)) {
         dethread_die_if_fatal(c);
-        dt_nap(200);
+        dt_wait(&m->dethread_done, 0);
     }
 
     /* The thread that loaded this image is on its way out but is not gone yet:
@@ -3176,6 +3197,7 @@ static int dethread_begin(CPU *c, const char *gpath, int *carrier_is_me) {
      * alone -- a task entry that outlives its guest thread by a moment is a
      * far smaller lie than a syscall that never returns. */
     __atomic_store_n(&m->dethread_state, DT_COMMIT, __ATOMIC_RELEASE);
+    dt_wake(&m->dethread_state);
     int want = *carrier_is_me ? 1 : 2;   /* this thread, plus the carrier */
     for (u64 ms = 0;; ms++) {
         if (__atomic_load_n(&m->as.nthreads, __ATOMIC_ACQUIRE) <= want) {
@@ -3641,6 +3663,7 @@ u64 do_execve(CPU *c, const char *gpath, ExecVec argv_in, ExecVec envp_in) {
          * where the old leader's tracees go with its death. */
         ptrace_tracer_exec_rename((s32)g_tls.tid);
         __atomic_store_n(&m->dethread_done, 1, __ATOMIC_RELEASE);
+        dt_wake(&m->dethread_done);
         return 0;
     }
     /* load_elf built the new image's initial state on m->cpu (the main-thread
