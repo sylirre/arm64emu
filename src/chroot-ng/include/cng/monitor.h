@@ -625,6 +625,10 @@ int cng_sig_take_deferred(void);
  * own work, where a request carried by SIGSYS is left for later. Never across
  * a guest's handler, which may siglongjmp out and leave the mark behind. */
 void cng_sig_in_handler(int d);
+/* A fork's child, before anything else: the forking thread's scratch slot,
+ * found under the parent's tid `ptid`, is this thread's now, at the same
+ * index; the parent's other threads' are given back (sigsys.c). */
+void cng_sig_fork_child(long ptid);
 /* Set once the SIGSYS handler has taken a trap out of guest code: the filter
  * is live (it is not under qemu-user, which installs it and ignores it). */
 extern int cng_g_traps_live;

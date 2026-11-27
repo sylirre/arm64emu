@@ -13,6 +13,7 @@
 #include "cng/procreg.h"
 #include "cng/ptrace.h"
 #include "cng/rt.h"
+#include "cng/seccomp.h"
 #include "cng/shm.h"
 #include "cng/syscall.h"
 #include "cng/uapi.h"
@@ -692,8 +693,11 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
  * spawns short-lived threads (Go, a JVM's GC workers) runs through hundreds, and
  * a slot keyed by a TID that has since exited was never coming back into use. So
  * when the table is full, a slot whose thread is gone is taken over, stack and
- * all. Nothing else frees one: there is no thread-exit hook — exit_group is not
- * trapped, and a SIGKILL never could be. */
+ * all. Otherwise a slot is given back only by a thread of ours that leaves
+ * through its start routine (cng_scratch_release) and, for all the parent's
+ * other threads, in a fork's child (cng_sig_fork_child): there is no exit hook
+ * for any other thread -- exit_group is not trapped, and a SIGKILL never could
+ * be. */
 extern long cng_run_on_stack(void *newsp, void *fn, void *a0, void *a1);
 
 #define CNG_SCR_N  256
@@ -1323,11 +1327,16 @@ static void sigsys_kick(struct cng_ucontext *uc) {
     /* Left for later: inside a dispatch this handler is making, inside the
      * work of another handler of ours (one taking a stop, above all — a stop
      * nested in it would be a second stop, its writes undone when that
-     * handler returns), or in any other code of ours but a dispatch running
-     * in guest context, which is where the kick's own stops are taken too. */
+     * handler returns), or in any other code of the host's but a dispatch
+     * running in guest context, which is where the kick's own stops are taken
+     * too. The host's is the libc's as well as ours: a fork's child comes
+     * back from the kernel inside the libc's fork(), before its hooks have
+     * marked anything (dispatch.c, cng_clone_convert), and a frame there is
+     * no guest's to stop on. */
     int later = i >= 0 && ((cng_scr[i].busy && cng_scr[i].uc) || cng_scr[i].inh);
-    if (!later && pc >= cng_image_lo() && pc < cng_image_hi() && !pc_in_stub(pc) &&
-        !(i >= 0 && cng_scr[i].gf))
+    if (!later &&
+        ((pc >= cng_image_lo() && pc < cng_image_hi()) || cng_seccomp_host_pc(pc)) &&
+        !pc_in_stub(pc) && !(i >= 0 && cng_scr[i].gf))
         later = 1;
     if (later) {
         if (i >= 0)
@@ -1518,6 +1527,54 @@ void cng_scratch_gone(void) {
     cng_scr[i].tps = 0;
     cng_scr[i].attach = 0;
     cng_scr[i].inh = 0;
+}
+
+/* A fork's child (dispatch.c, cng_clone_convert, before anything else
+ * there): one thread, the one that forked, in a table that came across with
+ * every thread of the parent's, this one's slot among them under the
+ * parent's tid `ptid`. The handler making the fork stands on that slot's
+ * stack and holds the slot by its index -- its busy flag, the frame it
+ * returns the guest to (cng_sig_note_return), a request left for it -- and
+ * so does a dispatch running in guest context (cng_run_bounced, the gate's
+ * pointer to the busy flag). So the slot keeps its index and takes the
+ * child's tid, and the slots on a probe's way to it from that tid's hash are
+ * marked given back (-1), which a probe goes on past.
+ *
+ * Looked up under the new tid, it used to be a fresh slot instead, and the
+ * frame the handler noted on its way out went to the parent's index. A
+ * tracer's attach carried by SIGSYS that landed on the child's first guest
+ * instruction, the fork's own svc behind it, then took the fork for a trap
+ * it had displaced and made it again: the child forked a child of its own
+ * and went on as its parent, about one run in eight on a slow device.
+ *
+ * The other slots are threads the child has none of, and their stacks are
+ * given back. SIGSYS is held off meanwhile, so that no request comes in to
+ * take a slot halfway; nothing here can trap. */
+void cng_sig_fork_child(long ptid) {
+    if (cng_g_scratch_none)
+        return;
+    long tid = sys_gettid();
+    unsigned long sp = (unsigned long)&tid, g = cng_page_size;
+    unsigned long sys = 1UL << (CNG_SIGSYS - 1), was = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &sys, &was, 8, 0, 0);
+    int keep = -1;
+    for (int i = 0; i < CNG_SCR_N; i++) {
+        if (keep < 0 && ptid > 0 && cng_scr[i].tid == ptid) {
+            keep = i;
+            continue;
+        }
+        unsigned long lo = cng_scr[i].lo;
+        if (lo && !(sp >= lo - g && sp < lo + CNG_SCR_SZ + g))
+            scr_unmap(lo);
+        memset(&cng_scr[i], 0, sizeof cng_scr[i]);
+    }
+    if (keep >= 0) {
+        unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+        for (unsigned i = h; i != (unsigned)keep; i = (i + 1) % CNG_SCR_N)
+            cng_scr[i].tid = -1;
+        cng_scr[keep].tid = tid;
+    }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &was, 0, 8, 0, 0);
 }
 
 /* The FP/SIMD registers of the frame `uc`, as a user_fpsimd_state: its

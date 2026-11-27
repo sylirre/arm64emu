@@ -66,4 +66,11 @@ uint32_t cng_bpf_run(const struct sock_filter *f, int n, const uint32_t *data,
 int cng_seccomp_traps(long nr, const uint64_t *a, unsigned long ip,
                       int traceall, int tracer);
 
+/* Is `pc` in the host's own code (seccomp.c, "the host's own code"): every
+ * executable segment the filters admit by instruction pointer, the cngtrap
+ * section of ours included -- whose code it is, not whether a call made
+ * there traps. The guest's images and the vDSO are not. 0 before the base
+ * filter's build. */
+int cng_seccomp_host_pc(unsigned long pc);
+
 #endif /* CNG_SECCOMP_H */

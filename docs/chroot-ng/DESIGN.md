@@ -314,7 +314,11 @@ the rest (its TLS, a shadow call stack, an alternate stack), so each thread
 marks an address inside each of those -- its thread pointer, x18, the
 alternate stack bionic set -- and the sweep keeps the mapping a mark lies in
 with the guards that abut it. bionic's fork child keeps every thread's record
-on its list of threads, so it keeps the other threads' stacks too.
+on its list of threads, so it keeps the other threads' stacks too. Of the
+scratch stacks the handler's work runs on, keyed by tid, a fork child keeps
+the forking thread's, which the handler making the fork stands on and holds by
+its index: the child takes it over under its own tid at that index, and gives
+the other threads' back.
 
 **The filter is the whole of the interception.** When it cannot be installed
 there is nothing left that intercepts, and the invocation — a rootfs, binds,
@@ -494,11 +498,15 @@ still returns `EINTR` (a known gap, recorded under M106 in STATUS.md).
 The kick is an ordinary signal, and a thread can block it, where the kernel's
 attach is a `SIGSTOP` no mask holds back. To a thread whose mask holds the
 kick, the request also goes as a `SIGSYS` of ours, the one signal a guest can
-never block, and is sent again while it is not taken. A standard signal
+never block, and is sent again while it is not taken. It is taken where it
+lands only in guest code; in the host's -- ours, or the libc's that ours calls
+into -- it is left for the handler underneath, or for the next time it is
+sent. A standard signal
 absorbs a trap the thread takes while it is pending, so the handler makes a
 call that was skipped that way again. It judges whether the call trapped by
 running the installed filters over it, and whether a handler of ours already
-answered it by the frame that handler returned to.
+answered it by the frame that handler returned to, noted in the thread's
+scratch slot.
 
 Which filters a task carries is kept per task, but a thread or a fork child
 that a traced task makes later inherits the filter from the kernel without

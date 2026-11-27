@@ -430,3 +430,25 @@ if guest_xlate_ready "threads after an exec leg" &&
         "a fork child of a thread's exec: the new program's threads ran" "$out"
 fi
 rm -rf "$FTD"
+
+# A fork's child keeps one of chroot-ng's scratch stacks: the one its handler
+# stands on, the forking thread's, which it takes over under its own tid at
+# the same index (monitor/sigsys.c, cng_sig_fork_child); the parent's other
+# threads' are given back. It used to keep them all, under the parent's tids,
+# and to look a fresh slot up besides, where the frame the handler returned it
+# to had not been noted: a tracer's attach landing on that frame made the fork
+# again (m18's forkafter, one run in eight on a slow device). Counted in its
+# maps, from a fork of the main thread and of another one.
+FSD=$(mktemp -d)
+if guest_xlate_ready "fork child scratch stack leg" &&
+    guest_cc_report "$FSD/forkslots" tests/chroot-ng/guests/forkslots.c -lpthread; then
+    # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split list
+    out=$(run_t 60 $CHROOTNG_GUEST_BINDS "$FSD" /forkslots 2>&1)
+    check_contains "a threaded program holds a scratch stack a thread" \
+        "the parent holds 5 stack(s)" "$out"
+    check_contains "a fork child keeps only the one its handler stands on" \
+        "a fork of the main thread kept 1 stack(s)" "$out"
+    check_contains "...and so does one a thread that is not the main one made" \
+        "a fork of another thread kept 1 stack(s)" "$out"
+fi
+rm -rf "$FSD"

@@ -391,6 +391,13 @@ static struct {
 } g_admit[CNG_ADMIT_MAX];
 static int g_nadmit;
 
+int cng_seccomp_host_pc(unsigned long pc) {
+    for (int i = 0; i < g_nadmit; i++)
+        if (pc >= g_admit[i].lo && pc < g_admit[i].hi)
+            return 1;
+    return 0;
+}
+
 static void admit_add(unsigned long lo, unsigned long hi) {
     while (lo < hi && g_nadmit < CNG_ADMIT_MAX) {
         unsigned long cut = (lo | 0xffffffffUL) + 1; /* the next 4 GiB boundary */

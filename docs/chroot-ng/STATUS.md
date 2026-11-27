@@ -5503,6 +5503,53 @@ kernel 3.18 (Galaxy S7).
     process_vm_readv's iovec count (older kernels), accept (the policy's
     EACCES), and posix_spawn (bionic before API 28).
 
+- [x] **M123 — a fork child that forked again under a tracer's attach**
+  - The re-run of all three devices at d1f36d0d: the Zenfone 953/0/25 and
+    the Pixel 5 946/0/28 clean; the S7 928/1/43, m18's forkafter, which had
+    passed there the round before. Soaked alone it failed eight runs in
+    sixty, the tracee's fork reporting a pid where the child's 0 belonged:
+    the child had made the fork a second time, gone on as the parent of
+    that second child, attached to it and waited for it as its own tracer.
+  - The tracer attaches the instant its fork returns, and to the child,
+    whose mask holds the kick, the request goes as a SIGSYS of ours. One that
+    lands on the child's first guest instruction, the fork's svc behind it,
+    is judged as any other (sigsys.c, sigsys_kick; ptrace.c,
+    pt_trap_displaced): a trap it displaced is made again, unless a handler
+    of ours answered the call and returned to that very frame, which the
+    handler notes in the thread's scratch slot. The child's handler noted it
+    in the slot index it had found before the fork, the parent's, still
+    under the parent's tid in the child's copy of the table; looked up
+    under the child's tid, the slot was a fresh one with nothing noted. So
+    the fork counted as displaced, and the kick made it again.
+  - A fork child now takes the forking thread's slot over under its own tid
+    at the same index, before anything looks a slot up (cng_sig_fork_child,
+    first in cng_clone_convert's child): the handler making the fork, and a
+    dispatch running from guest context, hold the slot by index and by a
+    pointer to its busy flag, so it keeps its place, and the slots on the
+    probe's way to it from the new tid's hash are marked given back. The
+    parent's other threads are not in the child, and their stacks are
+    given back -- they were kept for good before, a copy of each, and the
+    fresh slot besides.
+  - The request is now left for later wherever it lands in the host's own
+    code, the libc's as well as ours (cng_seccomp_host_pc, the ranges every
+    filter admits): a fork child comes back from the kernel inside the
+    libc's fork(), before any hook of ours has marked anything, and a stop
+    used to be taken there on a frame that is no guest's. That window did
+    not show under dtstall -s (the child held at its first stop, 2 ms and
+    20 ms): the request it held came out where nothing it did was wrong.
+  - Tests: forkafter, soaked on the S7, none in 120 runs after the change
+    (eight in sixty before). The race itself cannot be held open from
+    outside, but what a fork child keeps can be counted: m8's forkslots row
+    counts scratch stacks (256 KiB read-write between inaccessible
+    mappings) in a threaded parent's maps (five) and in fork children of
+    its main thread and of another one -- six each before (the S7; the
+    VM's six counted from outside), one each now on every host. A kernel
+    before 4.5 names the mapping a thread's SP is in "[stack:TID]", which
+    the maps read stands on.
+  - After this: 932 passed, 0 failed, 43 skipped on the S7; the Zenfone
+    956/0/25, the Pixel 5 949/0/28, the aarch64 VM 1069/0/2, the x86
+    runner 1022/0/8.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

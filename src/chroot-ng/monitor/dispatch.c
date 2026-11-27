@@ -4423,9 +4423,16 @@ void cng_clone_convert(struct cng_uregs *ur) {
      * else is the raw clone, as before. */
     const unsigned long tidw = CNG_CLONE_PARENT_SETTID | CNG_CLONE_CHILD_SETTID |
                                CNG_CLONE_CHILD_CLEARTID;
-    long ret;
-    if (((unsigned long)flags & ~tidw) == 17 /* SIGCHLD */) {
-        ret = cng_host_fork();
+    int plain = ((unsigned long)flags & ~tidw) == 17 /* SIGCHLD */;
+    /* And the tid the scratch slot this handler stands on is under, which
+     * the child takes over (sigsys.c, cng_sig_fork_child). */
+    long ftid = sys_gettid();
+    long ret = plain ? cng_host_fork()
+                     : cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
+                                    (long)ur->x[4], (long)ur->x[5], __NR_clone);
+    if (ret == 0)
+        cng_sig_fork_child(ftid); /* before anything looks a slot up */
+    if (plain) {
         u32 id;
         if (ret == 0) {
             CNG_SYS(__NR_set_tid_address,
@@ -4438,9 +4445,6 @@ void cng_clone_convert(struct cng_uregs *ur) {
             id = (u32)ret;
             cng_user_copyout((void *)ur->x[2], &id, sizeof id);
         }
-    } else {
-        ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
-                           (long)ur->x[4], (long)ur->x[5], __NR_clone);
     }
     if (ret == 0 && (orig_flags & CNG_CLONE_SETTLS) && gtp) {
         __asm__ volatile("msr tpidr_el0, %0" ::"r"(htp));
