@@ -276,6 +276,9 @@ int cng_thread_altstack(struct cng_ucontext *uc, const void *uss, void *uoss,
                         long *ret);
 int cng_thread_host_mark(unsigned long lo, unsigned long hi);
 long cng_thread_tid_address(unsigned long addr);
+/* A thread of ours on its way in or out, which holds SIGSYS off meanwhile: an
+ * exec's de_thread waits for it instead of giving it up (thread.c). */
+int cng_thread_unsettled(long tid);
 /* This thread's scratch slot, given up for good: the thread is leaving
  * through no frame of ours (sigsys.c). */
 void cng_scratch_gone(void);

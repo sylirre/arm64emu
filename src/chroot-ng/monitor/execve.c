@@ -760,7 +760,10 @@ static int task_unreachable(long tid) {
  * counted, and are looked at again once a second: a zombie a tracer reaps
  * has its tid free to be reused by a thread that is the guest's. A thread
  * that is reachable and merely slow — parked in an uninterruptible wait, say
- * — is waited for as long as it takes, as the kernel would. */
+ * — is waited for as long as it takes, as the kernel would; and so is a thread
+ * of ours on its way in or out (cng_thread_unsettled), which holds SIGSYS off
+ * for its libc meanwhile and was given up on as one of qemu-user's, to run on
+ * beside the new program once it had started. */
 static struct cng_tab g_dt_left = CNG_TAB_INIT(long);
 static unsigned long g_dt_nleft;
 
@@ -876,7 +879,8 @@ static long dt_round(long pid, long me, int mark, int first, int grace,
                 if (st == TASK_NONE)
                     continue;
                 if (st == TASK_ZOMBIE ||
-                    (st == TASK_BLOCKED && !first && task_unreachable(tid))) {
+                    (st == TASK_BLOCKED && !first &&
+                     !cng_thread_unsettled(tid) && task_unreachable(tid))) {
                     dt_leave(tid);
                     continue;
                 }

@@ -5417,11 +5417,39 @@ kernel 3.18 (Galaxy S7).
     that handler's frames, where the kernel would put it below its SP.
     And on the x86 runner m6's "execve reaches every sibling (chain 16)"
     leaves threads behind in one run in four or so, the build before this
-    change as often (9 runs in 20 against 5): arm64emu runs every guest
-    thread as a host thread of its own, the row comes after the 4500-thread
-    one, and a sibling the de_thread cannot reach in a second is given up
-    on. It held on the devices and the VM.
+    change as often (9 runs in 20 against 5); found and fixed in M121.
   - After this: 945 passed, 0 failed, 28 skipped, on the device.
+
+- [x] **M121 — an exec's de_thread killed a thread inside its libc's exit**
+  - m6's chain shape on the x86 runner (sixteen chains of threads, each
+    cloning its successor, then an exec) left threads behind after the exec
+    in a run in three: the de_thread gave up on them, as it gives up on a
+    task that holds SIGSYS blocked for good. They did: asleep in futex waits
+    on glibc's malloc arena lock and its stack-list lock, for ever. A thread
+    of ours that exits unwinds out of our handler and leaves through its
+    libc, and glibc frees its malloc cache under the arena lock before it
+    blocks the signals itself; the de_thread tells every thread still
+    listed again once a second, and one told there had no record left to
+    unwind by, and took the raw exit with the lock held. Every malloc and
+    free after it waited: the next exiting threads', and the TLS a
+    pthread_create of ours allocates.
+  - A thread of ours now holds SIGSYS off from the moment its exit unwinds
+    (thread.c, thr_start), and is buried before anything else, so an exec
+    finds it on its way out and waits for it (cng_thread_unsettled) rather
+    than telling it again. The way in likewise: SIGSYS is held off from
+    before our pthread_create until the new thread's start routine has
+    somewhere to unwind to, so neither the parent, inside the libc's locks
+    there, nor the child, in its libc's start, can be killed half-way; a
+    request sent meanwhile is taken once the child can unwind. A count of
+    the threads starting keeps a de_thread from giving up on either while
+    the libc holds every signal off for them, which under arm64emu, where a
+    new thread has its translations to make first, lasts long enough to
+    be.
+  - 50 chain runs on the x86 runner after it, none with a thread left.
+  - The freezes of the dev box under the x86 suite were arm64emu's, not
+    this: its own de_thread polled every 200 us in each parked sibling, and
+    the 4500-thread row's reference run kept every CPU busy for 88 s
+    (arm64emu, the same series).
   - What only this kernel skips: faccessat2 (5.8), MREMAP_DONTUNMAP (5.7),
     ptrace's PTRACE_GET_SYSCALL_INFO, two-word NT_ARM_TLS and restart
     references (5.3, 5.19, e057b9477232); and the NULL-pathname

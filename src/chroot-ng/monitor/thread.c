@@ -248,6 +248,35 @@ static void thr_bury(long tid, unsigned long map, unsigned long len) {
 
 void cng_thread_reclaim(void) { thr_reclaim(); }
 
+/* Threads of ours on their way in: counted from before the pthread_create
+ * (cng_thread_clone) until the new thread's start routine has somewhere to
+ * unwind an exit to (thr_start), with SIGSYS held off the whole way -- which
+ * the libcs' own pthread_create does for every signal over the clone anyway,
+ * in the parent and in the child until its start, and a thread caught there
+ * by an exec's de_thread looked like one that can never take the request,
+ * which is given up on after a few milliseconds of it -- not long under
+ * arm64emu, whose new thread has its translations to make first. Held off by
+ * us so that a request sent meanwhile is delivered once the thread can leave
+ * through its libc, and so that the parent cannot die of one inside the
+ * pthread_create, holding the libc's locks there (its stack list, the malloc
+ * arena) for every later thread to wait on, or between the count and the
+ * call, which would leave the count up for good. */
+static int g_thr_starting;
+
+/* Is `tid` possibly a thread of ours on its way in or out, which holds SIGSYS
+ * off for a moment and is to be waited for rather than given up on (execve.c,
+ * de_thread)? On its way out: buried, and not gone yet. On its way in: any
+ * thread at all while one is starting, as a starting one has no record yet
+ * and the parent making it is blocked too. */
+int cng_thread_unsettled(long tid) {
+    if (__atomic_load_n(&g_thr_starting, __ATOMIC_SEQ_CST) > 0)
+        return 1;
+    for (int i = 0; i < DEAD_N; i++)
+        if (__atomic_load_n(&g_dead[i].tid, __ATOMIC_ACQUIRE) == tid)
+            return 1;
+    return 0;
+}
+
 /* The flags our alternate stack is armed with: SS_AUTODISARM where the kernel
  * has it (4.7). A handler of ours leaves the alternate stack for its scratch
  * stack, and has it disarmed while it is away, or a signal delivered to it
@@ -309,6 +338,7 @@ static void *thr_start(void *arg) {
     struct cng_thr *t = thr_claim(tid);
     if (!t) {
         thr_bury(tid, s->map, s->maplen);
+        __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
         thr_report(s, -EAGAIN);
         return 0;
     }
@@ -336,21 +366,44 @@ static void *thr_start(void *arg) {
     t->pthread = 1;
     if (cng_ctx_save(&t->back)) {
         /* An exit, unwound to here (cng_thread_exit): off the scratch stack
-         * now, which goes back, and this one with the thread. */
+         * now, which goes back, and this one with the thread.
+         *
+         * SIGSYS is held off from here to the end, and the thread buried
+         * first, so that an exec's de_thread waits for it (it is unsettled
+         * now: cng_thread_unsettled) instead of telling it again. Told, it
+         * died where it stood -- with no record left to unwind by, the raw
+         * exit -- and where it stood was its libc's exit, which frees the
+         * thread's malloc cache under the arena lock before it blocks the
+         * signals itself: the lock stayed held, and every malloc and free
+         * after it waited for good, a pthread_create of ours and the next
+         * exiting thread's among them (m6's chain shape on the x86 runner,
+         * threads left behind by the exec one run in four). */
+        unsigned long sys = 1UL << (CNG_SIGSYS - 1);
+        CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, (long)&sys, 0, sizeof sys,
+                0, 0);
         long me = sys_gettid();
-        cng_scratch_release(me);
         struct cng_thr *u = thr_find(me);
+        if (u)
+            thr_bury(me, u->map, u->maplen);
+        cng_scratch_release(me);
         if (u) {
             if (u->ctid) { /* the kernel's mm_release, for the guest's */
                 u32 z = 0;
                 if (cng_user_copyout((void *)u->ctid, &z, sizeof z) == 0)
                     CNG_SYS(__NR_futex, u->ctid, 1 /* FUTEX_WAKE */, 1, 0, 0, 0);
             }
-            thr_bury(me, u->map, u->maplen);
             thr_free(u);
         }
         return 0;
     }
+    /* Started: an exit has somewhere to unwind to now, so SIGSYS, held off
+     * since the parent's pthread_create (g_thr_starting), comes back -- and a
+     * de_thread request sent meanwhile is taken here, and unwinds. Uncounted
+     * first: that unwind does not come back here. */
+    __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
+    unsigned long sys = 1UL << (CNG_SIGSYS - 1);
+    CNG_SYS(__NR_rt_sigprocmask, 1 /*SIG_UNBLOCK*/, (long)&sys, 0, sizeof sys, 0,
+            0);
 
     /* What its libc set up that a kernel's new thread has none of. The
      * robust list is given to the kernel as the call asked, none (where the
@@ -465,7 +518,17 @@ long cng_thread_clone(const struct cng_uregs *ur, const void *fp,
     pthread_attr_init(&attr);
     pthread_attr_setstack(&attr, (void *)(base + g + THR_ALT), THR_STACK);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* SIGSYS held off, and the thread counted as starting (g_thr_starting),
+     * until it is: the child inherits the mask and gives it back itself. */
+    unsigned long sys = 1UL << (CNG_SIGSYS - 1), was;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, (long)&sys, (long)&was,
+            sizeof sys, 0, 0);
+    __atomic_add_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
     int err = pthread_create(&pt, &attr, thr_start, &s);
+    if (err)
+        __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, (long)&was, 0, sizeof was,
+            0, 0);
     pthread_attr_destroy(&attr);
     for (int k = 0; k < 2; k++)
         if (had[k])
@@ -509,6 +572,7 @@ void cng_thread_exit(void) {
  * threads still holds their records, on those stacks (see the top). */
 void cng_thread_fork_child(void) {
     long tid = sys_gettid();
+    g_thr_starting = 0; /* the parent's, starting there: none here */
     unsigned long tp, x18;
     __asm__ volatile("mrs %0, tpidr_el0\n\tmov %1, x18" : "=r"(tp), "=r"(x18));
     struct cng_thr keep;

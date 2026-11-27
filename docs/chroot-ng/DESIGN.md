@@ -287,7 +287,11 @@ guest's robust list and clear_child_tid stay the kernel's, untrapped, so the
 kernel processes them when the thread dies however it dies. A thread's exit is
 trapped and unwinds to its start routine, for the libc to end the thread as it
 ends its own -- the leader's is the kernel's, its code being the group's -- and
-an exec's de_thread ends its siblings the same way. Each thread of ours has a
+an exec's de_thread ends its siblings the same way. A thread holds SIGSYS off
+from the unwind to its end, and from before its pthread_create until its start
+routine can unwind, so that no request kills it inside its libc, whose locks
+(the malloc arena's among them) would stay held; the de_thread waits for a
+thread on its way in or out instead (`cng_thread_unsettled`). Each thread of ours has a
 kernel alternate signal stack of ours while the guest has none, so the SIGSYS
 frame of an exit made after unmapping the thread's own stack (musl's
 `__unmapself`, bionic's teardown) has somewhere to go; `sigaltstack` is trapped
