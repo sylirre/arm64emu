@@ -431,11 +431,13 @@ else
     # where bionic's alternate stack is 16 KiB). The tracer that holds them is
     # a native program (dtstall.c): under an emulator a guest's tracer sees the
     # emulated ptrace's stops, not the kernel's delivery, so a host that
-    # emulates AArch64 has no such run.
+    # emulates AArch64 has no such run, nor of the held starts below.
     if [ -n "$CHROOTNG_EMU" ]; then
         skip "de_thread with each request held at delivery: the tracer that holds them needs the kernel's own signal delivery, not an emulator's"
+        skip "de_thread with each new thread held at its start: the tracer that holds them needs the kernel's own stops, not an emulator's"
     elif ! guest_cc "$SED/dtstall" tests/chroot-ng/guests/dtstall.c; then
         skip "de_thread with each request held at delivery: could not build tests/chroot-ng/guests/dtstall.c"
+        skip "de_thread with each new thread held at its start: could not build tests/chroot-ng/guests/dtstall.c"
     else
         se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec chain 16 2>/dev/null | grep '^report:')
         # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
@@ -453,6 +455,34 @@ else
             else
                 fail=$((fail + 1))
                 printf '  FAIL execve with each request held at delivery (rc %s)\n' "$se_rc"
+                printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
+            fi
+            ;;
+        esac
+        # ...and with each new thread held at the stop it starts in instead,
+        # its parent back from the clone meanwhile and waiting for its word.
+        # The exec found the parent there and killed it, and the child then
+        # read what the parent had left it on a stack that had gone with the
+        # parent: a SIGSEGV, the whole process with it (Android 8: one chain
+        # run in two unheld, every one held). A host that maps the next stack
+        # into the same place, as the aarch64 VM does, hid it: the child read
+        # that stack instead, and died of its own request before it used
+        # anything it had read.
+        # shellcheck disable=SC2086  # $CHROOTNG_GUEST_BINDS is a deliberately split arg list
+        se_g=$(emu_t 240 "$SED/dtstall" -s 2 "$CHROOTNG_BIN" $CHROOTNG_GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
+        se_rc=$?
+        case "$se_g" in
+        SKIP:*)
+            skip "de_thread with each new thread held at its start: ${se_g#SKIP: }"
+            ;;
+        *)
+            se_g=$(printf '%s\n' "$se_g" | grep '^report:')
+            if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
+                pass=$((pass + 1))
+                printf '  ok   execve reaches every sibling with each new thread held at its start (%s)\n' "$se_g"
+            else
+                fail=$((fail + 1))
+                printf '  FAIL execve with each new thread held at its start (rc %s)\n' "$se_rc"
                 printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
             fi
             ;;

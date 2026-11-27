@@ -249,18 +249,31 @@ static void thr_bury(long tid, unsigned long map, unsigned long len) {
 void cng_thread_reclaim(void) { thr_reclaim(); }
 
 /* Threads of ours on their way in: counted from before the pthread_create
- * (cng_thread_clone) until the new thread's start routine has somewhere to
- * unwind an exit to (thr_start), with SIGSYS held off the whole way -- which
- * the libcs' own pthread_create does for every signal over the clone anyway,
- * in the parent and in the child until its start, and a thread caught there
- * by an exec's de_thread looked like one that can never take the request,
- * which is given up on after a few milliseconds of it -- not long under
- * arm64emu, whose new thread has its translations to make first. Held off by
- * us so that a request sent meanwhile is delivered once the thread can leave
- * through its libc, and so that the parent cannot die of one inside the
- * pthread_create, holding the libc's locks there (its stack list, the malloc
- * arena) for every later thread to wait on, or between the count and the
- * call, which would leave the count up for good. */
+ * (cng_thread_clone) until the new thread has told its parent how it went
+ * and is on its way into the guest (thr_start), with SIGSYS held off the
+ * whole way, in the parent and in the child -- which the libcs' own
+ * pthread_create does for every signal over the clone anyway, in the parent
+ * and in the child until its start, and a thread caught there by an exec's
+ * de_thread looked like one that can never take the request, which is given
+ * up on after a few milliseconds of it -- not long under arm64emu, whose new
+ * thread has its translations to make first. Held off by us so that a
+ * request sent meanwhile is delivered once neither thread needs the other:
+ *
+ *  - the parent must not die of one inside the pthread_create, holding the
+ *    libc's locks there (its stack list, the malloc arena) for every later
+ *    thread to wait on, or between the count and the call, which would leave
+ *    the count up for good; nor while it waits for the child's word, since
+ *    what the child starts from (struct thr_start) is on the parent's
+ *    scratch stack, which a death there unmaps (cng_scratch_release) while
+ *    the child is still reading it: a SIGSEGV in thr_start, the whole
+ *    process with it (Android 8's M6 chain shape, about one run in two,
+ *    where a slow core leaves the new thread waiting to run that long);
+ *  - and the child must not die of one before it has given that word, or
+ *    the parent, holding SIGSYS off for it, would wait for good.
+ *
+ * The child's comes back with the guest's mask, by the rt_sigreturn into the
+ * guest (cng_thread_enter), and a request sent meanwhile is taken there, at
+ * the guest's first instruction, and unwinds the thread to its start. */
 static int g_thr_starting;
 
 /* Is `tid` possibly a thread of ours on its way in or out, which holds SIGSYS
@@ -338,8 +351,8 @@ static void *thr_start(void *arg) {
     struct cng_thr *t = thr_claim(tid);
     if (!t) {
         thr_bury(tid, s->map, s->maplen);
-        __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
         thr_report(s, -EAGAIN);
+        __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
         return 0;
     }
     __asm__ volatile("mrs %0, tpidr_el0\n\tmov %1, x18"
@@ -396,14 +409,11 @@ static void *thr_start(void *arg) {
         }
         return 0;
     }
-    /* Started: an exit has somewhere to unwind to now, so SIGSYS, held off
-     * since the parent's pthread_create (g_thr_starting), comes back -- and a
-     * de_thread request sent meanwhile is taken here, and unwinds. Uncounted
-     * first: that unwind does not come back here. */
-    __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
-    unsigned long sys = 1UL << (CNG_SIGSYS - 1);
-    CNG_SYS(__NR_rt_sigprocmask, 1 /*SIG_UNBLOCK*/, (long)&sys, 0, sizeof sys, 0,
-            0);
+    /* Started: an exit has somewhere to unwind to now. SIGSYS stays held off,
+     * as it has been since the parent's pthread_create (g_thr_starting),
+     * until the parent has been told how it went and the guest's mask comes
+     * back with the guest (see the top): a de_thread request sent meanwhile
+     * is taken there. */
 
     /* What its libc set up that a kernel's new thread has none of. The
      * robust list is given to the kernel as the call asked, none (where the
@@ -429,6 +439,7 @@ static void *thr_start(void *arg) {
         thr_bury(tid, t->map, t->maplen);
         thr_free(t);
         thr_report(s, (int)e);
+        __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
         return 0;
     }
     u32 me32 = (u32)tid;
@@ -461,7 +472,11 @@ static void *thr_start(void *arg) {
     /* the terminator: zeroed by the memset */
     unsigned long tp = (flags & CNG_CLONE_SETTLS) ? r.x[3] : s->gtp;
 
+    /* `s` is not touched again: the parent may be gone with it once told.
+     * Uncounted before the guest's mask comes back: the unwind a request
+     * then makes does not come back here. */
     thr_report(s, (int)tid);
+    __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
     cng_thread_enter(f, tp);
 }
 
@@ -519,7 +534,8 @@ long cng_thread_clone(const struct cng_uregs *ur, const void *fp,
     pthread_attr_setstack(&attr, (void *)(base + g + THR_ALT), THR_STACK);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     /* SIGSYS held off, and the thread counted as starting (g_thr_starting),
-     * until it is: the child inherits the mask and gives it back itself. */
+     * until the child has said how it went: `s` is on this stack. The child
+     * inherits the mask and enters the guest with the guest's. */
     unsigned long sys = 1UL << (CNG_SIGSYS - 1), was;
     CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, (long)&sys, (long)&was,
             sizeof sys, 0, 0);
@@ -527,22 +543,22 @@ long cng_thread_clone(const struct cng_uregs *ur, const void *fp,
     int err = pthread_create(&pt, &attr, thr_start, &s);
     if (err)
         __atomic_sub_fetch(&g_thr_starting, 1, __ATOMIC_SEQ_CST);
-    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, (long)&was, 0, sizeof was,
-            0, 0);
     pthread_attr_destroy(&attr);
     for (int k = 0; k < 2; k++)
         if (had[k])
             CNG_SYS(__NR_rt_sigaction, 32 + k, sa_was[k], 0, 8, 0, 0);
+    /* A thread that started and refused has buried its own stack, given
+     * back once it is gone. */
+    int v = 0;
+    while (!err && (v = __atomic_load_n(&s.state, __ATOMIC_ACQUIRE)) == 0)
+        CNG_SYS(__NR_futex, &s.state, 0 /* FUTEX_WAIT */, 0, 0, 0, 0);
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, (long)&was, 0, sizeof was,
+            0, 0);
     if (err) {
         cng_own_drop(m, len);
         sys_munmap(m, len);
         return -err;
     }
-    /* A thread that started and refused has buried its own stack, given
-     * back once it is gone. */
-    int v;
-    while ((v = __atomic_load_n(&s.state, __ATOMIC_ACQUIRE)) == 0)
-        CNG_SYS(__NR_futex, &s.state, 0 /* FUTEX_WAIT */, 0, 0, 0, 0);
     if (cng_g_debug)
         cng_dprintf(2, "[cng] thread %d (flags %lx)\n", v, flags);
     return v;

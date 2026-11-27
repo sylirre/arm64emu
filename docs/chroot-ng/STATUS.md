@@ -5419,6 +5419,11 @@ kernel 3.18 (Galaxy S7).
     leaves threads behind in one run in four or so, the build before this
     change as often (9 runs in 20 against 5); found and fixed in M121.
   - After this: 945 passed, 0 failed, 28 skipped, on the device.
+  - What only this kernel skips: faccessat2 (5.8), MREMAP_DONTUNMAP (5.7),
+    ptrace's PTRACE_GET_SYSCALL_INFO, two-word NT_ARM_TLS and restart
+    references (5.3, 5.19, e057b9477232); and the NULL-pathname
+    differential, whose reference Android's filter kills there at its
+    openat2 before it prints (the guest's is the emulation's, M97).
 
 - [x] **M121 — an exec's de_thread killed a thread inside its libc's exit**
   - m6's chain shape on the x86 runner (sixteen chains of threads, each
@@ -5450,11 +5455,53 @@ kernel 3.18 (Galaxy S7).
     this: its own de_thread polled every 200 us in each parked sibling, and
     the 4500-thread row's reference run kept every CPU busy for 88 s
     (arm64emu, the same series).
-  - What only this kernel skips: faccessat2 (5.8), MREMAP_DONTUNMAP (5.7),
-    ptrace's PTRACE_GET_SYSCALL_INFO, two-word NT_ARM_TLS and restart
-    references (5.3, 5.19, e057b9477232); and the NULL-pathname
-    differential, whose reference Android's filter kills there at its
-    openat2 before it prints (the guest's is the emulation's, M97).
+
+- [x] **M122 — the kernel floor, and an exec that killed a thread's parent mid-clone**
+  - Step 2.5's device round on the Galaxy S7 (Android 8.0, 3.18, the
+    oldest kernel chroot-ng runs on): 926 passed, 4 failed, 41 skipped.
+  - m6's chain row and its held-delivery row died of a SIGSEGV, about one
+    run in two, in thr_start reading what the new thread starts from
+    (struct thr_start), which its parent leaves on its own scratch stack and
+    waits beside for the child's word. The wait was made with SIGSYS
+    taken: an exec's de_thread request killed the parent in it, its unwind
+    unmapped that scratch stack (cng_scratch_release), and the child, which
+    a slow core had not run yet, read a stack that was gone. Every crashed
+    run had a parent killed in that wait (an instrumented build). Parents
+    are killed there on the aarch64 VM too, one run in three, and nothing
+    showed: its kernel maps the next scratch stack of the same size
+    into the hole, so the child read that, and died of its own pending
+    request at the guest's first instruction, before it used any of it.
+  - The parent now holds SIGSYS off until its child has said how the start
+    went, and the child until the rt_sigreturn into the guest brings the
+    guest's mask back (thread.c), the child counted as starting until then
+    (cng_thread_unsettled), so the de_thread waits for both instead of
+    giving up on them: a request sent meanwhile is taken by the parent once
+    told, by the child at the guest's first instruction. Neither can now
+    die where the other needs it -- the child before its word, which a
+    parent holding SIGSYS off would wait for for good. A kick of the
+    emulated ptrace no longer finds the child in our start code either.
+  - Tests: dtstall -s holds each new thread at the stop it starts in, for
+    2 ms, serving every other stop meanwhile; m6's chain under it is a new
+    row. On the S7 it failed every run of ten before, and after none of
+    twenty -- nor of twenty each unheld, with held deliveries, or with 20 ms
+    starts. It passes before the change on the VM, for the reason above.
+  - m18's execsys and execsys0 compared against a kernel that forgets the
+    call at an exec: execve's exit stop reads -1 for its number before
+    de6921856f99 (6.0, and the stable trees from 5.10), and the emulation
+    answers as 6.1 does. Skipped where the reference shows it, as the other
+    references a kernel predates are.
+  - After this: 929 passed, 0 failed, 43 skipped, on the device; the
+    Zenfone 953/0/25, the aarch64 VM 1066/0/2, the x86 runner 1019/0/8 (the new
+    row needs a native tracer, as the held deliveries do). The Pixel 5 was
+    not reachable for this round.
+  - What it skips that the Zenfone's 5.15 does not, each a reference its
+    kernel or libc predates: execveat (3.19), statx (4.11, four rows),
+    NLM_F_CAPPED (4.12), SO_PEERGROUPS (4.13, three), the NoNewPrivs line
+    (4.10), the NUL after an overflowed title (4.18), pidfd_open and
+    PTRACE_GET_SYSCALL_INFO (5.3), MREMAP_DONTUNMAP (5.7, two), execve's
+    number at its exit stop (two, above), a zero-length recvmsg name and
+    process_vm_readv's iovec count (older kernels), accept (the policy's
+    EACCES), and posix_spawn (bionic before API 28).
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

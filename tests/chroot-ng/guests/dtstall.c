@@ -1,6 +1,6 @@
-/* dtstall MS PROG ARGS... -- run PROG under ptrace, every thread of it, and
- * hold each de_thread request (a SIGSYS with si_code SI_DETHREAD, which only
- * chroot-ng's emulated execve sends) at its delivery for MS milliseconds
+/* dtstall [-s] MS PROG ARGS... -- run PROG under ptrace, every thread of it,
+ * and hold each de_thread request (a SIGSYS with si_code SI_DETHREAD, which
+ * only chroot-ng's emulated execve sends) at its delivery for MS milliseconds
  * before letting it through; every other signal goes through untouched (M6).
  *
  * The exec tells each sibling to die with that signal and waits for it to be
@@ -12,6 +12,15 @@
  * was no room for the next one, and the kernel killed the whole process with
  * a SIGSEGV: a few runs in a hundred on a slow device. Holding the delivery
  * is that wait, every time.
+ *
+ * With -s, each new thread (and process) is held instead, for MS
+ * milliseconds at the stop it starts in, while every other stop goes on being
+ * served: the thread that made it is back from the clone meanwhile, waiting
+ * for its child's word, which is where an exec's de_thread found the parent
+ * under chroot-ng, and killed it while the child was still reading what the
+ * parent had left it on a stack that went with the parent: a SIGSEGV in the
+ * new thread, the whole process with it, about one run in two on a slow
+ * device whose scheduler left the new thread waiting to run as long.
  *
  * Exits with PROG's status (128 + the signal that killed it), or prints a
  * lone SKIP line when the host will not let it trace its own child. Runs
@@ -32,9 +41,51 @@
 #define SI_DETHREAD (-7)
 #endif
 
+/* -s: the threads held at their start, each until its time comes. */
+#define HOLD_N 4096
+static struct {
+    pid_t tid;
+    struct timespec due;
+} held[HOLD_N];
+static int nheld;
+
+static int is_due(const struct timespec *d) {
+    struct timespec n;
+    clock_gettime(CLOCK_MONOTONIC, &n);
+    return n.tv_sec > d->tv_sec ||
+           (n.tv_sec == d->tv_sec && n.tv_nsec >= d->tv_nsec);
+}
+
+static void hold(pid_t tid, long ms) {
+    clock_gettime(CLOCK_MONOTONIC, &held[nheld].due);
+    held[nheld].due.tv_sec += ms / 1000;
+    held[nheld].due.tv_nsec += (ms % 1000) * 1000000L;
+    if (held[nheld].due.tv_nsec >= 1000000000L) {
+        held[nheld].due.tv_sec++;
+        held[nheld].due.tv_nsec -= 1000000000L;
+    }
+    held[nheld++].tid = tid;
+}
+
+/* Let go of those whose time has come, and of `gone` (0: none), which is. */
+static void release(pid_t gone) {
+    for (int i = 0; i < nheld;) {
+        if (held[i].tid == gone || is_due(&held[i].due)) {
+            if (held[i].tid != gone)
+                ptrace(PTRACE_CONT, held[i].tid, 0, 0);
+            held[i] = held[--nheld];
+        } else {
+            i++;
+        }
+    }
+}
+
 int main(int argc, char **argv) {
+    int starts = argc > 1 && !strcmp(argv[1], "-s");
+    argv += starts;
+    argc -= starts;
     if (argc < 3) {
-        fprintf(stderr, "usage: dtstall MS PROG ARGS...\n");
+        fprintf(stderr, "usage: dtstall [-s] MS PROG ARGS...\n");
         return 2;
     }
     long ms = atol(argv[1]);
@@ -59,22 +110,36 @@ int main(int argc, char **argv) {
     ptrace(PTRACE_CONT, c, 0, 0);
     int rc = 1;
     for (;;) {
-        pid_t p = waitpid(-1, &st, __WALL);
+        if (nheld)
+            release(0);
+        pid_t p = waitpid(-1, &st, __WALL | (nheld ? WNOHANG : 0));
+        if (p == 0) { /* none stopped, some held: look again shortly */
+            struct timespec nap = {0, 100 * 1000L};
+            nanosleep(&nap, 0);
+            continue;
+        }
         if (p < 0)
             break;
         if (WIFEXITED(st) || WIFSIGNALED(st)) {
             if (p == c)
                 rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+            if (nheld)
+                release(p);
             continue;
         }
         int sig = WSTOPSIG(st);
-        /* An event stop, or the stop a new thread starts in: nothing to
-         * deliver. */
+        /* The stop a new thread starts in: held with -s, and nothing to
+         * deliver either way. */
+        if (!(st >> 16) && sig == SIGSTOP && starts && nheld < HOLD_N) {
+            hold(p, ms);
+            continue;
+        }
+        /* An event stop, or that start: nothing to deliver. */
         if ((st >> 16) || sig == SIGSTOP) {
             ptrace(PTRACE_CONT, p, 0, 0);
             continue;
         }
-        if (sig == SIGSYS) {
+        if (sig == SIGSYS && !starts) {
             siginfo_t si;
             memset(&si, 0, sizeof si);
             ptrace(PTRACE_GETSIGINFO, p, 0, &si);

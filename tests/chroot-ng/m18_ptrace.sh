@@ -155,8 +155,15 @@ else
     # parent's waitpid(WUNTRACED/WCONTINUED) -- with the SIGSTOP's own delivery
     # stop before the group stop, and SIGCONT delivered to its handler. strace
     # was one stop out from every exec and every fork on, the wait answered
-    # EINTR, and the parent waited forever.
-    for _sc in execsys execsys0 forksys waitrestart jobctl; do
+    # EINTR, and the parent waited forever. The exec's exit stop is told
+    # from the next call's entry by its number, which a kernel before
+    # de6921856f99 (6.0, and the stable trees from 5.10) forgets at the exec:
+    # -1 there (Android 8's 3.18), where the emulation answers as 6.1 does.
+    for _sc in execsys execsys0; do
+        pt_case "$_sc" "execve exit 0 at another call's stop" \
+            "the host kernel predates de6921856f99 (the syscall number kept across an exec), so it is no reference"
+    done
+    for _sc in forksys waitrestart jobctl; do
         pt_case "$_sc"
     done
     # NT_ARM_SYSTEM_CALL, regs->syscallno: the call's number at its stops, -1
