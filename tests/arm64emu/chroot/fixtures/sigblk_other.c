@@ -9,7 +9,8 @@
  *
  * Self-checking: qemu-user answers these reads with the host's line too. The
  * expected block is what a kernel prints (checked natively); masks are set
- * with the raw system call, whose set no C library trims. */
+ * with the raw system call, whose set no C library trims, and the child whose
+ * mask is read at the fork is made by one (below). */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -22,6 +23,7 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static unsigned long long blk_of(const char *path) {
@@ -84,10 +86,18 @@ int main(int argc, char **argv) {
     kill(k, SIGKILL);
     waitpid(k, NULL, 0);
 
-    /* Inherited at the fork: read before the child can have run much. */
+    /* Inherited at the fork: read before the child can have run much. The
+     * child is the raw system call's, not fork(3)'s: glibc 2.41's _Fork
+     * blocks every signal around the call (its abort lock) and gives the
+     * child its mask back only once the child runs, so the read raced that
+     * -- and under an emulator, whose child takes longer to start, lost it,
+     * reading the whole set, which was then the child's. */
     setmask(0xc000000080000010ull);
-    k = fork();
-    if (k == 0) for (;;) usleep(1000);
+    k = (pid_t)syscall(SYS_clone, (long)SIGCHLD, 0L, 0L, 0L, 0L);
+    if (k == 0) {
+        struct timespec ts = { 1, 0 };
+        for (;;) syscall(SYS_nanosleep, &ts, NULL);
+    }
     printf("at_fork=%016llx\n", blk_pid(k));
     kill(k, SIGKILL);
     waitpid(k, NULL, 0);
